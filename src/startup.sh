@@ -1323,8 +1323,41 @@ elif twilio_creds_present; then
   else
     echo "  ✗ conversation server process found ($(echo $_cs_running | tr ' ' ,)) but nothing listens on port 3100 — check /tmp/conversation-server.log; ngrok not started"
   fi
-  if [ "$_cs_up" -ne 1 ]; then
+  # A Funnel URL is this host's own tunnel: conversation-server binds it directly
+  # and never starts ngrok, so attempting one prints a failure for something that
+  # is not needed. Nothing else compares the configured URL to the live funnel,
+  # so a webhook naming another machine boots silently.
+  FUNNEL_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
+    | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
+  FUNNEL_MODE=0
+  case "$FUNNEL_CFG_URL" in *.ts.net) FUNNEL_MODE=1 ;; esac
+  # origin/main's _cs_up guard (nothing behind the port -> no tunnel at all,
+  # Funnel included) runs first; it is the only line this merge adds here.
+  # Default unset to "up" -- real callers always set it above; the funnel-drift
+  # test extracts this block standalone and never defines it.
+  if [ "${_cs_up:-1}" -ne 1 ]; then
     : # nothing behind the port, so no tunnel to it (reported above)
+  elif [ "$FUNNEL_MODE" = 1 ]; then
+    TS_BIN="${TAILSCALE_BIN:-}"
+    [ -n "$TS_BIN" ] || TS_BIN="$(command -v tailscale 2>/dev/null || true)"
+    [ -n "$TS_BIN" ] || TS_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+    if [ ! -x "$TS_BIN" ]; then
+      # An absent CLI must not read as agreement: say UNCHECKED, never a tick.
+      echo "  ⊘ Funnel configured ($FUNNEL_CFG_URL) — tailscale CLI not found, drift UNCHECKED"
+    else
+      FUNNEL_LIVE=$("$TS_BIN" funnel status 2>/dev/null \
+        | grep -oE 'https://[A-Za-z0-9.-]+\.ts\.net' | head -1)
+      if [ -z "$FUNNEL_LIVE" ]; then
+        echo "  ⊘ Funnel configured ($FUNNEL_CFG_URL) — no funnel is serving, drift UNCHECKED"
+      elif [ "$FUNNEL_CFG_URL" = "$FUNNEL_LIVE" ]; then
+        echo "  ✓ Funnel ($FUNNEL_LIVE — matches TWILIO_WEBHOOK_URL)"
+      else
+        echo "  ⚠ TWILIO_WEBHOOK_URL names a DIFFERENT host than this machine's funnel:"
+        echo "      configured: $FUNNEL_CFG_URL"
+        echo "      this host:  $FUNNEL_LIVE"
+        echo "      Twilio reaches the configured host, not this one — repoint one of them."
+      fi
+    fi
   elif ! pgrep -f "ngrok" > /dev/null 2>&1; then
     echo "  Starting ngrok tunnel..."
     # If NGROK_DOMAIN is set in .env, use the reserved domain for a stable URL.
