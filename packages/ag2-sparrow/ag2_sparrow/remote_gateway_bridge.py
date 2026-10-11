@@ -323,6 +323,7 @@ from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
+from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
 from .workspace_lock import retain as _ws_retain
 from .workspace_lock import _host_label as _stable_host_label
 
@@ -2170,13 +2171,15 @@ def _append_log_file(line: str) -> None:
         pass
 
 
+_REQ_TIMEOUT_S = 35
+
 # urllib wraps only the send in URLError; a socket closed after it raises http.client's
 # errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
 _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = 35):
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
     """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
@@ -5297,6 +5300,22 @@ _LOCK_ROLE = f"gateway-bridge{_INST_SUFFIX}"  # per-instance: dual-poller guard 
 _LOCK_WS = _STATE.parent  # _STATE = <workspace>/state (injected) or ~/.ag2-sparrow/state
 
 
+_LOCK_STALE_S = _WS_STALE_SECONDS
+# A loop pass (long poll + backoff + retries) can outlast the stale window, so
+# the lock is refreshed off-loop; the loop only reads the verdict.
+_LOCK_LOST = threading.Event()
+_LOCK_HB_MUTEX = threading.Lock()
+_POLL_BACKOFF_MAX_S = 60
+# Typical worst case for one pass (a queued retry backlog can exceed it): the
+# long poll at its timeout, the largest backoff and two requests, doubled.
+_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOOP_TICK = {"at": time.monotonic()}
+
+
+def _stamp_loop_progress() -> None:
+    _LOOP_TICK["at"] = time.monotonic()
+
+
 def _lock_on() -> bool:
     return os.environ.get("SUTANDO_BRIDGE_LOCK", "1") != "0"
 
@@ -5333,10 +5352,41 @@ def _heartbeat_singleton() -> bool:
     → True) so a lock bug never wedges task delivery."""
     if not _lock_on():
         return True
-    try:
-        return bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
-    except Exception:
-        return True
+    with _LOCK_HB_MUTEX:
+        try:
+            held = bool(_ws_heartbeat(_LOCK_ROLE, _LOCK_WS))
+        except Exception:
+            return True
+        if not held:
+            _LOCK_LOST.set()
+        return held
+
+
+def _lock_heartbeat_loop() -> None:
+    """Refresh the lock only while the main loop keeps making passes. A loop
+    stuck past the pass bound is a hung holder, and the lock must go stale for
+    it exactly as it did when the loop refreshed the lock itself."""
+    interval = max(0.5, _LOCK_STALE_S / 3)
+    stalled = False
+    while not _OWNERSHIP_RELINQUISHED.wait(interval):
+        idle = time.monotonic() - _LOOP_TICK["at"]
+        if idle > _LOCK_PASS_MAX_S:
+            if not stalled:
+                stalled = True
+                _log(f"singleton: main loop has made no progress for {idle:.0f}s "
+                     f"(bound {_LOCK_PASS_MAX_S:.0f}s) — letting the lock go stale "
+                     "so a successor can take over")
+            continue
+        stalled = False
+        if not _heartbeat_singleton():
+            return
+
+
+def _start_lock_heartbeat() -> None:
+    _stamp_loop_progress()
+    if _lock_on():
+        threading.Thread(target=_lock_heartbeat_loop, name="sparrow-lock-heartbeat",
+                         daemon=True).start()
 
 
 def _exit_on_signal(signum, _frame) -> None:
@@ -5364,7 +5414,7 @@ def _acquire_singleton() -> bool:
     if not _lock_on():
         return True
     try:
-        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS)
+        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S)
     except Exception as e:  # fail-open — never wedge task delivery on a lock bug
         _log(f"singleton: acquire error ({e}) — proceeding without lock")
         return True
@@ -5373,6 +5423,7 @@ def _acquire_singleton() -> bool:
         _log(f"singleton: another live gateway-bridge owns this workspace "
              f"(host={h.get('host')} pid={h.get('pid')}) — exiting to avoid dual-poll")
         return False
+    _LOCK_LOST.clear()
     atexit.register(_release_singleton)
     for _sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -5489,6 +5540,7 @@ def main() -> None:
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
+    _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     abandoned_suspects: set[str] = set()
@@ -5509,8 +5561,9 @@ def main() -> None:
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
+        _stamp_loop_progress()
         try:
-            if not _heartbeat_singleton():
+            if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
                 # polling immediately so we don't dual-poll the relay bearer with
                 _log("singleton: lost workspace poller lock (reaped after stale takeover) "
@@ -5591,18 +5644,18 @@ def main() -> None:
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
                  f"{int(time.time() - last_poll_ok)}s since last successful poll — "
                  f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {e} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff)
-            time.sleep(backoff); backoff = min(backoff * 2, 60)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
 if __name__ == "__main__":
