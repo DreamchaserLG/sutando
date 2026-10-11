@@ -8,7 +8,13 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 from pathlib import Path
+
+# The resolver also reads the vault; a stub keeps the host Keychain out.
+_FAKE_VI = types.ModuleType("vault_intercept")
+_FAKE_VI.get_vault_key = lambda var: (_ for _ in ()).throw(KeyError(var))
+sys.modules["vault_intercept"] = _FAKE_VI
 
 REPO = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
@@ -84,19 +90,18 @@ def main() -> int:
     check("record_ping tolerates non-dict", cn.record_ping(None, "c", 5) == {"c": 5})
 
     # ── gateway config + delivery (urllib mocked — no network) ──────────
-    # _load_gateway now delegates to the canonical resolver (ensure-cron-room.py:
-    # resolve_token): it reads process env AND <repo>/.env across all gateway
-    # alias keys, honoring combined "url|secret" and split URL+token. It takes a
-    # REPO DIR (reads <repo>/.env), repo-anchored regardless of cwd — not a .env
-    # file path. Tests clear the process-env gateway keys so the running core's
-    # real creds can't leak in and make a negative meaningless.
+    # _load_gateway(repo) resolves through src/relay_credentials.py with <repo>/.env
+    # as the last tier; env, channel dir and vault are isolated so negatives hold.
     import unittest.mock as um
     import os as _os
     _GW_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN",
-                "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
+                "GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                "REMOTE_TASK_CHANNEL_DIR", "AG2_DEVICE_ENV", "SUTANDO_APP_SUPPORT", "CLAUDE_HOME")
+    _claude = tempfile.mkdtemp(prefix="cron-notify-claude-")
 
     def _clean_env(**over):
         e = {k: v for k, v in _os.environ.items() if k not in _GW_KEYS}
+        e["CLAUDE_CONFIG_DIR"] = _claude
         e.update(over)
         return um.patch.dict(_os.environ, e, clear=True)
 

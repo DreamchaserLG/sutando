@@ -190,6 +190,8 @@ class Consumers(_Hermetic):
         cls.notify = _load("notify_relay_test",
                            REPO / "skills" / "task-progress" / "scripts" / "notify.py")
         cls.hc = _load("hc_relay_test", REPO / "src" / "health-check.py")
+        cls.cron = _load("cron_notify_relay_test",
+                         REPO / "skills" / "schedule-crons" / "cron-notify.py")
         import dispatcher
         import _gateway
         cls.dispatcher, cls.gateway = dispatcher, _gateway
@@ -237,6 +239,21 @@ class Consumers(_Hermetic):
             self.assertIsNotNone(plan)
             self.assertTrue(plan[1]["REMOTE_TASK_TOKEN"].endswith(tok))
         self._each_tier(check)
+
+    def test_cron_notify(self):
+        def check(tok):
+            self.assertEqual(self.cron._load_gateway(), (self.URL, tok))
+        self._each_tier(check)
+
+    def test_ensure_cron_room_explicit_repo(self):
+        self.only_in_channel()
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        resolve = self.cron._canonical_resolver()
+        self.assertEqual(resolve(str(repo)), (self.URL, "fake-channel-secret"))
+        (repo / ".env").write_text(f"AG2_REMOTE_TOKEN={self.URL}|fake-repo-secret\n")
+        (self.tmp / "claude" / "channels" / "ag2space" / ".env").unlink()
+        self.assertEqual(resolve(str(repo)), (self.URL, "fake-repo-secret"))
 
     def test_runtime_api_message_send(self):
         def check(tok):
@@ -298,6 +315,12 @@ class Delegation(_Hermetic):
                 plan = self.hc._bridge_launch_plan("gateway-bridge")
         self.assertEqual(m.call_count, 2)
         self.assertEqual(plan[1]["REMOTE_TASK_TOKEN"], self.SENTINEL.raw)
+
+    def test_cron_notify(self):
+        with self._spy() as m:
+            got = self.cron._load_gateway()
+        m.assert_called_once()
+        self.assertEqual(got, ("https://sentinel.invalid", "sentinel-token"))
 
     def test_runtime_api_dispatcher(self):
         _Stub.auth.clear()
