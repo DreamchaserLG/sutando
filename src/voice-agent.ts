@@ -970,6 +970,10 @@ async function main() {
 		agents: [mainAgent],
 		initialAgent: 'main',
 		subagentConfigs: { work: relayAgentSubagentConfig(relayAgent) },
+		// The model's own voice from a speaker loops back into the mic and cut its answers off
+		// (Gemini's server VAD and the client barge-in both heard it): drop it at ingress.
+		// bodhi's BODHI_ECHO_GUARD=0 turns it off.
+		echoGuard: { enabled: true },
 		port: PORT,
 		host: HOST,
 		model: google(VOICE_MODEL),
