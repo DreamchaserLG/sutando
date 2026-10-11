@@ -286,7 +286,8 @@ class Delegation(_Hermetic):
         with mock.patch.object(self.notify, "_resolve_relay",
                                mock.Mock(return_value=self.SENTINEL)) as m:
             got = self.notify._gateway_config("ag2space")
-        m.assert_called_once_with("ag2space")
+        m.assert_called_once()
+        self.assertEqual(m.call_args.args, ("ag2space",))
         self.assertEqual(got, ("https://sentinel.invalid", "sentinel-token"))
 
     def test_health_check(self):

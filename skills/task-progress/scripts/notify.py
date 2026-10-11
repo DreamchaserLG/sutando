@@ -277,17 +277,18 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _load_relay_resolver():
-    """src/relay_credentials.resolve_relay_credentials, or None when src/ is absent."""
+def _load_relay():
+    """src/relay_credentials (the shared relay resolver), or None when src/ is absent."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-        from relay_credentials import resolve_relay_credentials  # type: ignore
-        return resolve_relay_credentials
+        import relay_credentials  # type: ignore
+        return relay_credentials
     except Exception:
         return None
 
 
-_resolve_relay = _load_relay_resolver()
+_relay = _load_relay()
+_resolve_relay = _relay.resolve_relay_credentials if _relay is not None else None
 
 
 def _gateway_config(source: str) -> "tuple[str, str] | None":
@@ -307,12 +308,14 @@ def _gateway_config(source: str) -> "tuple[str, str] | None":
         print("[task-progress] relay resolver unavailable (src/relay_credentials.py)",
               file=sys.stderr)
         return None
-    # The resolver selects the channel file with the same containment rule;
-    # vault and repo .env serve only the primary source.
-    creds = _resolve_relay(source)
+    contained = _channel_env_is_contained(env_path, channels_dir, source)
+    # The channel-env.sh pick when one qualifies, else the contained `.env`; read through _env_file.
+    picked = _relay.channel_env_file(source, channels_dir=channels_dir) if _relay else None
+    target = picked or (os.path.realpath(env_path) if contained else None)
+    creds = _resolve_relay(source, channel=_env_file(str(target)) if target else None)
     if creds.base_url and creds.token:
         return creds.base_url, creds.token
-    if env_path.exists() and not _channel_env_is_contained(env_path, channels_dir, source):
+    if not contained:
         print(f"[task-progress] refusing env path outside channels dir: {env_path}",
               file=sys.stderr)
         return None
