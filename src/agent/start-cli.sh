@@ -13,20 +13,12 @@ esac
 REPO="$(cd "$_self_dir/../.." && pwd)"
 unset _self_dir
 
-# Sourced in a subshell; credential-shaped keys are not exported, since every
-# process the core starts would inherit them (the relay token most of all).
-_sutando_env_exports() {
-  set -e
-  set -a
-  # shellcheck disable=SC1090
-  source "$1"
-  set +a
+# Relay credentials stay with the relay lanes, which load them themselves: every
+# process the core starts inherits its environment, whichever launcher ran it.
+_sutando_withhold_relay_env() {
   local _n
   for _n in $(compgen -e); do
-    case "$_n" in
-      *TOKEN*|*SECRET*|*PASSWORD*|*PASSCODE*|*API_KEY*|*_KEY|AG2_REMOTE_*|REMOTE_TASK_*) continue ;;
-    esac
-    printf 'export %s=%q\n' "$_n" "${!_n}"
+    case "$_n" in AG2_REMOTE_*|REMOTE_TASK_*) unset "$_n" ;; esac
   done
 }
 
@@ -48,9 +40,10 @@ if [ -f "$REPO/.env" ]; then
     _codex_reset_was_set=1
     _codex_reset_ambient="$SUTANDO_CODEX_AUTO_RESET_ENABLED"
   fi
-  _env_exports="$(_sutando_env_exports "$REPO/.env")"
-  eval "$_env_exports"
-  unset _env_exports
+  set -a
+  # shellcheck disable=SC1091
+  source "$REPO/.env"
+  set +a
   if [ "$_self_dev_was_set" = 1 ]; then
     export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
   fi
@@ -60,6 +53,7 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
   unset _codex_reset_was_set _codex_reset_ambient
 fi
+_sutando_withhold_relay_env
 
 # `--runtime <name>` names the runtime for THIS launch (leading arg only). A
 # caller that recorded one must not get the core's config substituted for it.
@@ -147,6 +141,16 @@ esac
 if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-watcher" 2>/dev/null || true
   tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
+fi
+
+# A running tmux server hands new sessions its global environment, which may
+# predate this launch; drop relay keys there too.
+if command -v tmux >/dev/null 2>&1; then
+  for _n in $(tmux -S "$tmux_socket" show-environment -g 2>/dev/null \
+                | awk -F= '$1 ~ /^-?(AG2_REMOTE|REMOTE_TASK)_/ { sub(/^-/, "", $1); print $1 }'); do
+    tmux -S "$tmux_socket" setenv -gu "$_n" 2>/dev/null || true
+  done
+  unset _n
 fi
 
 exec bash "$launcher" "$@"
