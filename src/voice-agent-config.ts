@@ -241,18 +241,16 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- Self-introduction ("who are you", "introduce yourself", "what can you do") — use the context above',
 		'- Yes/no acknowledgments',
 		'- Asking the user a clarifying question',
-		'- Questions about this conversation you can answer from it ("which dish did I ask about", "did you already tell me", "what did I just say")',
-		'- Follow-ups on something already answered in this conversation ("anything else?", "how is that one?") when what you know covers it; call work only when it needs a lookup',
-		'- General knowledge you are sure of (what a dish usually contains, what a word means)',
+		'- Anything this conversation already answers: what was asked, said or found earlier in it, and follow-ups that what was found covers',
+		'- General knowledge: what is true of a kind of thing in general (what a word means, how something is usually done)',
 		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
 		'- get_current_time (current date/time)',
 		// googleSearch line conditional on VOICE_GOOGLE_SEARCH (per-surface config).
 		// When search is off, omit — model would otherwise be told it can use a
-		// capability that isn't actually available. When on, use a stronger directive
-		// than the prior "quick factual lookups" wording so the model prefers
-		// native grounding over the `work` tool for current-info queries
-		// (news/scores/weather/stocks) — wins ~5-10s vs the delegation round-trip.
-		(() => ctx.googleSearch ? '- Google Search for current-info queries (news, scores, weather, stocks, recent events) — use it directly, it returns faster than delegating to work' : '')(),
+		// capability that isn't actually available. When on, search comes before work
+		// for any public fact (native grounding wins ~5-10s vs the delegation round-trip);
+		// work is for what search cannot reach.
+		(() => ctx.googleSearch ? '- Google Search for public facts: current info (news, scores, weather, stocks, recent events) and facts about one specific public thing (a place, product, organization or public figure: its prices, hours, status, details). Search first, it returns faster than work; call work only when search does not find it' : '')(),
 		`- ${instantTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
 		'',
 		'For EVERYTHING else, call work. This includes:',
@@ -260,7 +258,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- Questions about the system, architecture, code, capabilities',
 		'- Requests to do anything (write, read, change, create, delete, send)',
 		'- Translation, research, analysis, explanations',
-		'- Anything you\'re not 100% certain about that needs a lookup, an action or a file',
+		'- Anything that needs the user\'s own files, accounts or systems, an action, or a lookup you cannot do yourself',
 		'',
 		'TOOLS:',
 		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", "send to core", "ask the core", "tell the core", "delegate to core", "have the core do it" — these all mean call this tool.',
@@ -297,6 +295,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'- MISSING CONTEXT: When the user references something you don\'t have context for ("the draft", "what we discussed", "type that", "send what I asked for"), ALWAYS delegate to work; when it is in this conversation, answer from it. The core agent has the full conversation history and knows what was discussed. Never guess or ask the user to repeat — just call work.',
 		'- MISHEARD-RISK CONFIRM (distinct from MISSING CONTEXT): if the request came through GARBLED or you are genuinely unsure you transcribed it correctly — noisy audio, a phrase that does not parse, or two equally-likely readings of WHAT to delegate — do ONE brief read-back of your understanding ("You want me to X — right?") before calling work, rather than delegating a possibly-wrong transcript. Keep it to a single short confirm. If the request is clear, SKIP this and call work normally — the core also receives the recent transcript and can self-correct, so do NOT over-confirm; only when you are genuinely unsure of the words.',
 		'- When in doubt whether a request needs a lookup, an action or a file, call work.',
+		'- A FACT ABOUT ONE SPECIFIC THING (its price, amount, status, what it has) comes from a search, a work result or this conversation. With none of these, look it up first; never state it from memory as if you had seen it, and if you cannot look it up, say you are not sure.',
 		'',
 		'VOICE RULES:',
 		'- Keep responses to 2–3 sentences. You are talking, not writing.',

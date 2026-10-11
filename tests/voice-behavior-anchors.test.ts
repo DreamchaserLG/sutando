@@ -144,7 +144,7 @@ test('instructions: injected seams land where tuned', () => {
 	assert.ok(instructions.includes('[ANCHOR-VOICE-CONTEXT]'), 'voice context block');
 	assert.ok(instructions.includes('[ANCHOR-AGENT-CONTEXT]'), 'agent context block');
 	assert.ok(instructions.includes('The Sutando GitHub repo is https://github.com/sonichi/sutando.'), 'repo line');
-	assert.ok(instructions.includes('- Google Search for current-info queries'), 'googleSearch=true line');
+	assert.ok(instructions.includes('- Google Search for public facts:'), 'googleSearch=true line');
 });
 
 test('instructions identify the actual host platform', () => {
@@ -154,7 +154,7 @@ test('instructions identify the actual host platform', () => {
 
 test('instructions: googleSearch=false omits the search line (capability honesty)', () => {
 	const off = cfg.buildInstructions(ctx({ googleSearch: false }), OVERRIDES);
-	assert.ok(!off.includes('- Google Search for current-info queries'));
+	assert.ok(!off.includes('- Google Search for public facts:'));
 });
 
 test('instructions: meeting mode is dictation, with no prompt-only meeting rules', () => {
@@ -164,6 +164,7 @@ test('instructions: meeting mode is dictation, with no prompt-only meeting rules
 		assert.ok(text.includes('- MEETING MODE: Call switch_mode("meeting")'));
 		assert.ok(!text.includes('save_meeting_note'));
 		assert.ok(text.includes('- When in doubt whether a request needs a lookup, an action or a file, call work.'));
+		assert.ok(text.includes('- A FACT ABOUT ONE SPECIFIC THING'));
 	}
 });
 
