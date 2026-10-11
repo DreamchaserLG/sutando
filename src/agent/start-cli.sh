@@ -13,6 +13,23 @@ esac
 REPO="$(cd "$_self_dir/../.." && pwd)"
 unset _self_dir
 
+# Sourced in a subshell; credential-shaped keys are not exported, since every
+# process the core starts would inherit them (the relay token most of all).
+_sutando_env_exports() {
+  set -e
+  set -a
+  # shellcheck disable=SC1090
+  source "$1"
+  set +a
+  local _n
+  for _n in $(compgen -e); do
+    case "$_n" in
+      *TOKEN*|*SECRET*|*PASSWORD*|*PASSCODE*|*API_KEY*|*_KEY|AG2_REMOTE_*|REMOTE_TASK_*) continue ;;
+    esac
+    printf 'export %s=%q\n' "$_n" "${!_n}"
+  done
+}
+
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
 # switches such as SUTANDO_SELF_DEVELOPMENT_ENABLED survive every launch path.
@@ -31,10 +48,9 @@ if [ -f "$REPO/.env" ]; then
     _codex_reset_was_set=1
     _codex_reset_ambient="$SUTANDO_CODEX_AUTO_RESET_ENABLED"
   fi
-  set -a
-  # shellcheck disable=SC1091
-  source "$REPO/.env"
-  set +a
+  _env_exports="$(_sutando_env_exports "$REPO/.env")"
+  eval "$_env_exports"
+  unset _env_exports
   if [ "$_self_dev_was_set" = 1 ]; then
     export SUTANDO_SELF_DEVELOPMENT_ENABLED="$_self_dev_ambient"
   fi
