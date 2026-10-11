@@ -163,7 +163,7 @@ test('instructions: meeting mode is dictation, with no prompt-only meeting rules
 	for (const text of [meeting, instructions]) {
 		assert.ok(text.includes('- MEETING MODE: Call switch_mode("meeting")'));
 		assert.ok(!text.includes('save_meeting_note'));
-		assert.ok(text.includes('- When in doubt, call work.'));
+		assert.ok(text.includes('- When in doubt whether a request needs a lookup, an action or a file, call work.'));
 	}
 });
 
