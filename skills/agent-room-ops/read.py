@@ -16,6 +16,12 @@ from pathlib import Path
 from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, urlencode, HTTPError, URLError)
 
+# The core src/ holds the shared read-side policy (redaction chain, people-only flag).
+_CORE_SRC = str((Path(__file__).resolve().parents[2] / "src"))
+if _CORE_SRC not in sys.path:
+    sys.path.insert(0, _CORE_SRC)
+from people_only import is_people_only, omitted_note, split_people_only  # noqa: E402,F401
+
 DEFAULT_LIMIT = 20
 # Must not exceed the gateway's clamp; beyond it the widest windows repeat the
 # previous page and buy nothing.
@@ -45,14 +51,19 @@ def _windows(start, cap):
     return out
 
 
-def _result(ok, messages=None, reason=None, room_id=None, complete=None, order="newest_first"):
+def _result(ok, messages=None, reason=None, room_id=None, complete=None, order="newest_first",
+            people_only_omitted=0):
     # `complete` is False when the raw-event window was still growing when we stopped, so a
     # caller can tell "this room is quiet" from "I did not look far enough". None on error
     # paths, where the question does not arise.
     # `order` is in-band because the default is newest-first, so `tail` returns the OLDEST
     # rows and a caller reads a prefix of history as the present.
-    return {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or [],
-            "complete": complete, "order": order}
+    out = {"ok": bool(ok), "room_id": room_id, "reason": reason, "messages": messages or [],
+           "complete": complete, "order": order, "people_only_omitted": people_only_omitted}
+    # The count is in-band so a quiet result is distinguishable from a filtered one.
+    if people_only_omitted:
+        out["people_only_note"] = omitted_note(people_only_omitted)
+    return out
 
 
 _REDACTOR = None
@@ -80,9 +91,8 @@ def _redactor():
     global _REDACTOR
     if _REDACTOR is not None:
         return _REDACTOR
-    src = str((Path(__file__).resolve().parents[2] / "src"))
-    if src not in sys.path:
-        sys.path.insert(0, src)
+    if _CORE_SRC not in sys.path:
+        sys.path.insert(0, _CORE_SRC)
     try:
         # The shared chain, not one half of it: chat_secret_filter alone is blind
         # to a vault-set value with no provider signature, at any length.
@@ -181,7 +191,9 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
         _, body, _h = http_request("GET", url, headers)
         parsed = json.loads(body.decode("utf-8") or "{}")
         items = parsed.get("messages") if isinstance(parsed, dict) else parsed
-        return _normalize(items)
+        # People-only messages never reach the agent; they do not count toward `limit`.
+        items, omitted = split_people_only(items)
+        return _normalize(items), omitted
 
     # NO EARLY STOP ON A REPEATED COUNT. An unchanged message count across a wider raw
     # window looks like "history exhausted" and is not: the extra raw events may all be
@@ -196,10 +208,10 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     # message-type items, so a short page is indistinguishable from a noisy window. So the
     # only sound stop conditions are "we have what was asked for" and "we have looked as
     # far as the API allows", and `complete` means strictly the former.
-    messages = []
+    messages, omitted = [], 0
     try:
         for raw in _windows(limit, MAX_LIMIT):
-            messages = _fetch(raw)
+            messages, omitted = _fetch(raw)
             if len(messages) >= limit:
                 break
     except HTTPError as e:
@@ -220,4 +232,5 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     if oldest_first:
         kept = list(reversed(kept))
     return _result(True, kept, room_id=room_id, complete=len(messages) >= limit,
-                   order="oldest_first" if oldest_first else "newest_first")
+                   order="oldest_first" if oldest_first else "newest_first",
+                   people_only_omitted=omitted)

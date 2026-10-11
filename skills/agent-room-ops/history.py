@@ -4,7 +4,7 @@ from urllib.parse import urlsplit
 
 from _gateway import gateway, http_request, quote, urlencode, load_gate, gate_allows
 from rooms import joined_rooms
-from read import _redactor
+from read import _redactor, omitted_note, split_people_only
 from history_collection import collect_window
 
 
@@ -17,6 +17,7 @@ def history(since_ms, until_ms, pages=20, agent_mxid=None):
         return {"ok": False, "complete_available_history": False, "reason": "Gateway unavailable", "rooms": []}
     gate = load_gate()
     redact = _redactor()
+    omitted = {}
 
     def fetch(room_id, before):
         if not gate_allows(agent_mxid, room_id, gate):
@@ -27,6 +28,9 @@ def history(since_ms, until_ms, pages=20, agent_mxid=None):
         _, body, _ = http_request("GET", base + "/v1/rooms/" + quote(room_id) + "/messages?" + urlencode(params), headers)
         page = json.loads(body)
         if isinstance(page, dict) and isinstance(page.get("messages"), list):
+            # People-only messages never reach the agent; counted so the window reads honestly.
+            page["messages"], n = split_people_only(page["messages"])
+            omitted[room_id] = omitted.get(room_id, 0) + n
             for message in page["messages"]:
                 if isinstance(message, dict):
                     for field in ("body", "text", "message", "formatted_body"):
@@ -35,6 +39,12 @@ def history(since_ms, until_ms, pages=20, agent_mxid=None):
         return page
 
     result = collect_window(inventory.get("rooms"), fetch, since_ms, until_ms, pages)
+    for row in result.get("rooms", []):
+        row["people_only_omitted"] = omitted.get(row.get("room_id"), 0)
+    total = sum(omitted.values())
+    result["people_only_omitted"] = total
+    if total:
+        result["people_only_note"] = omitted_note(total)
     parsed = urlsplit(base)
     result["scope"] = parsed.hostname
     return result

@@ -96,11 +96,14 @@ def _events_stream(a):
     With --cursor-file the durable-cursor wrapper reconnects forever (#184);
     without it, one connection is made and its end is reported."""
     max_events = 1 if a.once else a.max_events
-    seen = {"n": 0, "cursor": None}
+    seen = {"n": 0, "cursor": None, "omitted": 0}
 
     def on_event(cur, envelope):
-        seen["n"] += 1
         seen["cursor"] = cur
+        if _read.is_people_only(envelope):
+            seen["omitted"] += 1                 # people-only: counted, never printed
+            return
+        seen["n"] += 1
         print(json.dumps(envelope, ensure_ascii=False), flush=True)
 
     try:
@@ -113,6 +116,9 @@ def _events_stream(a):
         out = {"ok": True, "events": seen["n"], "cursor": seen["cursor"], "reason": "interrupted"}
     except (_events.StreamDisconnected, RuntimeError) as e:
         out = {"ok": False, "events": seen["n"], "cursor": seen["cursor"], "reason": str(e)}
+    out["people_only_omitted"] = seen["omitted"]
+    if seen["omitted"]:
+        out["people_only_note"] = _read.omitted_note(seen["omitted"])
     print(json.dumps(out, ensure_ascii=False), flush=True)
     return _strict_rc(out, getattr(a, "strict", False))
 
@@ -142,7 +148,13 @@ def _dispatch_events(a):
         return _events.unsubscribe(a.room_id, agent_mxid=a.agent_mxid)
     if a.events_cmd == "list":
         return _events.subscriptions(a.agent_mxid)
-    return _events.pull(cursor=a.cursor, wait=a.wait)  # pull
+    res = _events.pull(cursor=a.cursor, wait=a.wait)  # pull
+    if isinstance(res, dict) and isinstance(res.get("events"), list):
+        res["events"], omitted = _read.split_people_only(res["events"])
+        res["people_only_omitted"] = omitted
+        if omitted:
+            res["people_only_note"] = _read.omitted_note(omitted)
+    return res
 
 
 def _main(argv):

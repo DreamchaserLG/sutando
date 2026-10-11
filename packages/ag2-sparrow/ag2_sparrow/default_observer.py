@@ -7,6 +7,8 @@ import queue
 import threading
 import time
 
+from .people_only import is_people_only
+
 # 👀 = "observed" — distinct from the task-intake ack the gateway emits
 # server-side, so a glance separates "seen" from "accepted as a task".
 OBSERVE_REACTION = "\U0001F440"
@@ -67,6 +69,8 @@ class ReactObserverHandler:
     def _maybe_react(self, event) -> None:
         if not isinstance(event, dict) or event.get("type") != "message.created":
             return
+        if is_people_only(event):
+            return                               # people-only: no receipt, it is not for us
         if not self._mxid or event.get("actor_id") == self._mxid:
             # No own-mxid means self-echo can't be detected — reacting to our
             # own messages is noise, so without it the receipt stays off.

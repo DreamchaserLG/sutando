@@ -86,6 +86,11 @@ does the privileged Matrix ops + authoritative membership enforcement.
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
+#   People-only messages (content `"space.ag2.no_agent": true`, the composer's "/noagent")
+#   are never in `messages`; `people_only_omitted` counts them and `people_only_note` reads
+#   "N people-only messages omitted" when N > 0 — so a filtered room is distinguishable from
+#   a quiet one. `history`, `events stream` and `events pull` apply the same rule (one
+#   predicate: src/people_only.py). An agent must not react to or act on such a message.
 python3 skills/agent-room-ops/room_ops.py fetch  'mxc://hs/abc' --room '!room:hs' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py send   '!room:hs' /tmp/pic.png --caption 'fig 1' --agent '@a:hs'
 python3 skills/agent-room-ops/room_ops.py react  '!room:hs' '$evt' --ack received --agent '@a:hs'

@@ -62,6 +62,9 @@ MAP = {
     # worker-pool completion-record contract: the pool skill writes through it
     # and the bridge reads through it, so neither keeps a private predicate.
     "skills/worker-pool/scripts/pool_record.py": "pool_record.py",
+    # people-only (space.ag2.no_agent) predicate: room-ops readers and the
+    # package's observer/taskify consumers share one spelling of the flag.
+    "src/people_only.py": "people_only.py",
 }
 PKG_DIR = Path(__file__).resolve().parent.parent / "ag2_sparrow"
 REPO_ROOT = Path(__file__).resolve().parents[3]

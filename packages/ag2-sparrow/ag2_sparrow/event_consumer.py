@@ -22,6 +22,7 @@ import os
 import time
 
 from .chat_secret_filter import filter_chat_secrets
+from .people_only import is_people_only
 
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
@@ -74,6 +75,8 @@ class TaskifyHandler:
             return [eid] if eid else []          # noise → settled, skip
         if self.agent_mxid and event.get("actor_id") == self.agent_mxid:
             return [eid] if eid else []          # self-echo → settled, never wakes Core
+        if is_people_only(event):
+            return [eid] if eid else []          # people-only → settled, never reaches the Core
         room = str(event.get("room_id") or "?")
         batch = self._batch.setdefault(room, [])
         seen = self._seen.setdefault(room, set())
