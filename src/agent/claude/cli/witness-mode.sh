@@ -125,7 +125,7 @@ witness_record_set() {
 witness_proc_id() {
   local st
   [ -n "$1" ] || return 1
-  st="$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
+  st="$(LC_ALL=C TZ=UTC0 ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
 }
 
 # Positive proof of death: no process holds the pid at all. A start-time mismatch is not proof.

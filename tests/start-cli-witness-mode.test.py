@@ -380,6 +380,18 @@ class WitnessTeardown(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertFalse(self.root.exists())
 
+    def test_stop_without_tmux_in_another_timezone_keeps_state_and_fails(self):
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        run = self.h.run("--witness-stop", "t2",
+                         extra_env={"PATH": self.h.path_without_tmux(), "TZ": "Asia/Tokyo"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("stopped", run.stdout)
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue(self.root.exists() and self.sock.exists(), "witness state removed while its server lives")
+        self.assertEqual(self.h.record("t2"), rec)
+
     def test_stop_with_failing_hash_keeps_the_config(self):
         shims = self.h.shim_dir(shasum="exit 42\n")
         run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
@@ -536,8 +548,9 @@ class ProductionTargetGuard(unittest.TestCase):
 class ProcIdentity(unittest.TestCase):
     """A process recorded in one locale is the same process when checked in another."""
 
-    def fn(self, func, pid, lc_all=None):
-        env = {"PATH": os.environ["PATH"], "LANG": "en_US.UTF-8", **({"LC_ALL": lc_all} if lc_all else {})}
+    def fn(self, func, pid, lc_all=None, tz=None):
+        env = {"PATH": os.environ["PATH"], "LANG": "en_US.UTF-8", **({"LC_ALL": lc_all} if lc_all else {}),
+               **({"TZ": tz} if tz else {})}
         script = 'REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; "$2" "$3"'
         return subprocess.run(["/bin/bash", "-c", script, "id", str(REPO), func, pid],
                               capture_output=True, text=True, env=env)
@@ -552,6 +565,28 @@ class ProcIdentity(unittest.TestCase):
         finally:
             probe.kill()
             probe.wait()
+
+    def test_a_live_process_stays_live_across_timezones(self):
+        probe = subprocess.Popen(["sleep", "60"])
+        try:
+            recorded = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
+            self.assertEqual(self.fn("witness_proc_live", recorded, tz="Asia/Tokyo").returncode, 0,
+                             "a live recorded process read as dead in another time zone")
+        finally:
+            probe.kill()
+            probe.wait()
+
+    def test_gone_only_when_no_process_holds_the_pid(self):
+        probe = subprocess.Popen(["sleep", "60"])
+        live = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
+        stale = f"{probe.pid}:Thu Jan  1 00:00:00 1970"
+        self.assertNotEqual(self.fn("witness_proc_gone", live).returncode, 0, "a live pid read as gone")
+        self.assertNotEqual(self.fn("witness_proc_gone", stale).returncode, 0,
+                            "a start-time mismatch on a live pid read as gone")
+        probe.kill()
+        probe.wait()
+        self.assertEqual(self.fn("witness_proc_gone", live).returncode, 0, "a dead pid not read as gone")
+        self.assertNotEqual(self.fn("witness_proc_gone", "").returncode, 0, "an empty record read as gone")
 
 if __name__ == "__main__":
     unittest.main()
