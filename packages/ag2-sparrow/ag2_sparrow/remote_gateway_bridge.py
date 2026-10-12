@@ -1130,6 +1130,11 @@ def _is_redelivery_control(body: str) -> bool:
     return (body or "").strip() == GATEWAY_REDELIVERY_RESULT.strip()
 
 
+# The one marker verdict every delivery decision here reads on the guarded body; the
+# suppression journal reads it too, so whatever the drain closes silently is recorded.
+DELIVERY_SKIP_AFTER_CHANNEL = True
+
+
 def _guarded_result_body(tid: str, body: str):
     """Scan a non-owner result BEFORE any marker is interpreted.
 
@@ -1184,7 +1189,8 @@ def _guarded_result_body(tid: str, body: str):
     verdict = materialize(
         verdict, body, _STATE, tid, context=context, agent_id=agent_id,
         now=time.time())
-    if guarded_tier(tier) and suppression_only(body):
+    if guarded_tier(tier) and suppression_only(
+            body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL):
         # Honouring a guarded close without recording it is the accountability
         # gap the guard used to answer with a refusal.
         verdict = journal_suppression(
@@ -4102,7 +4108,7 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
                          _proactive_thread_root and posts in that thread
       * bare [thread]  → task results only; stripped and ignored here
     """
-    parsed = parse_markers(body, skip_after_channel=True)
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     if any(a.kind == "skip" for a in parsed.actions):
         return ("drop", None, "")
     redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -4916,7 +4922,7 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
     if body is None:
         _log(f"result {tid}: {why}; the result guard is unavailable ({withheld}), left for the next pass")
         return
-    parsed = parse_markers(body, skip_after_channel=True)
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
     actions = parsed.actions
     skip = next((a for a in actions if a.kind == "skip"), None)
     if skip is not None:
@@ -5162,7 +5168,7 @@ def _post_ready_results(inflight: set[str]) -> None:
             _log(f"withheld non-owner result for {tid}: {_withheld}")
         # Route marker decisions through the unified parser (#873); the guard has run,
         # so a skip after [channel:] is a skip here, not text posted into that room.
-        parsed = parse_markers(body, skip_after_channel=True)
+        parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
         skip = next((a for a in parsed.actions if a.kind == "skip"), None)
         # Every dedup marker routes through the shared plan, malformed included:
         # it owns the reject-and-report policy (dedup_recovery.plan_dedup_recovery).
@@ -5520,7 +5526,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             continue
         if _withheld:
             _log(f"orphan sweep: withheld non-owner result for {tid}: {_withheld}")
-        parsed = parse_markers(body, skip_after_channel=True)
+        parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
         if [a for a in parsed.actions if a.kind == "attach"]:
             # Delivering without the files would silently drop them — park
             # for a human instead of composing a partial delivery.
