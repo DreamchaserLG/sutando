@@ -100,9 +100,11 @@ witness_resolved_workspace() {
 
 # Any .alive beaten within the last 2 minutes means a live core uses that workspace.
 witness_workspace_has_live_core() {
-  local cores="$1/state/cores"
-  [ -d "$cores" ] || return 1
-  [ -n "$(find "$cores" -maxdepth 1 -name '*.alive' -mmin -2 2>/dev/null | head -1)" ]
+  local cores="$1/state/cores" found
+  [ -e "$cores" ] || return 1
+  # A failed listing proves nothing, so it counts as a live core.
+  found="$(find "$cores" -maxdepth 1 -name '*.alive' -mmin -2 2>/dev/null)" || return 0
+  [ -n "$found" ]
 }
 
 # Fails unless a real sha256 came back: an empty hash must never prove ownership.
@@ -128,31 +130,46 @@ witness_proc_id() {
   st="$(LC_ALL=C TZ=UTC0 ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
 }
 
-# Positive proof of death: no process holds the pid at all. A start-time mismatch is not proof.
-witness_proc_gone() {
-  [ -n "$1" ] && ! ps -p "${1%%:*}" > /dev/null 2>&1
+# alive, dead or unknown for a recorded <pid>:<start>. Only a readable process table
+# that lists this shell is evidence; dead means the pid is absent or now another process.
+witness_proc_state() {
+  local pid="${1%%:*}" table now
+  [[ "$pid" =~ ^[0-9]+$ ]] && [ "$pid" != "$1" ] || { echo unknown; return; }
+  table="$(ps -A -o pid= 2>/dev/null)" || { echo unknown; return; }
+  awk -v p="$$" '$1 == p { f = 1 } END { exit !f }' <<< "$table" || { echo unknown; return; }
+  awk -v p="$pid" '$1 == p { f = 1 } END { exit !f }' <<< "$table" || { echo dead; return; }
+  now="$(witness_proc_id "$pid")" || { echo unknown; return; }
+  if [ "$now" = "$1" ]; then echo alive; else echo dead; fi
 }
 
-witness_proc_live() {
-  [ -n "$1" ] && [ "$(witness_proc_id "${1%%:*}")" = "$1" ]
-}
+witness_proc_live() { [ "$(witness_proc_state "$1")" = alive ]; }
+witness_proc_gone() { [ "$(witness_proc_state "$1")" = dead ]; }
 
 # Called by start-cli.sh after launch: the server, core pane, any claude under it, and watcher pane.
+# Fails unless server, core and watcher are all recorded; stop needs every one to prove the teardown.
 witness_record_launch() {
-  local pid id
-  pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "=$SESSION" '#{pid}' 2>/dev/null)"
-  id="$(witness_proc_id "$pid")" && witness_record_set server "$id"
-  pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
-  if id="$(witness_proc_id "$pid")"; then
-    witness_record_set core "$id"
-    for pid in $(claude_named_pids); do
-      [ "$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')" = "${id%%:*}" ] || continue
-      id="$(witness_proc_id "$pid")" && witness_record_set core_claude "$id"
-    done
-  fi
-  pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
-  id="$(witness_proc_id "$pid")" && witness_record_set watcher "$id"
-  return 0
+  local pid id core role panes
+  pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "=$SESSION" '#{pid}' 2>/dev/null)" || return 1
+  id="$(witness_proc_id "$pid")" && witness_record_set server "$id" || return 1
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null)" || return 1
+  core="$(witness_proc_id "${panes%%$'\n'*}")" && witness_record_set core "$core" || return 1
+  for pid in $(claude_named_pids); do
+    [ "$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')" = "${core%%:*}" ] || continue
+    id="$(witness_proc_id "$pid")" && witness_record_set core_claude "$id" || return 1
+  done
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null)" || return 1
+  id="$(witness_proc_id "${panes%%$'\n'*}")" && witness_record_set watcher "$id" || return 1
+  for role in server core watcher; do [ -n "$(witness_record_get "$role")" ] || return 1; done
+}
+
+# A launch that failed, or could not record what it owns, kills its own server and exits nonzero.
+witness_abort_launch() {
+  tmux -S "$TMUX_SOCKET" kill-server 2>/dev/null \
+    || echo "  ⚠ could not kill the witness tmux server on $TMUX_SOCKET" >&2
+  echo "  ⚠ witness '$WITNESS' launch FAILED: it did not come up, or not every process it started was recorded." >&2
+  echo "    Its record is incomplete, so --witness-stop will refuse. Check that nothing of it runs" >&2
+  echo "    (tmux -S $TMUX_SOCKET ls; ps), then remove $WITNESS_ROOT and $WITNESS_CONFIG." >&2
+  exit 1
 }
 
 # The main checkout's resolved CLAUDE_CONFIG_DIR: where the production core keeps its settings.
@@ -291,7 +308,7 @@ witness_enter() {
 }
 
 witness_stop() {
-  local name="$1" py server role proc left="" want have _
+  local name="$1" py server state role proc left="" want have _
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION"
   [ -f "$WITNESS_RECORD" ] || witness_refuse "no witness '$name' at $WITNESS_ROOT"
@@ -307,41 +324,41 @@ witness_stop() {
       SUTANDO_TMUX_SOCKET="$WITNESS_SOCKET" SUTANDO_TMUX_SESSION="$WITNESS_SESSION" \
       "$py" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 || true
   fi
+  for role in server core watcher; do
+    [ -n "$(witness_record_get "$role")" ] || witness_fail "the witness record has no $role, so stop cannot prove it is gone; nothing was removed. Check that nothing of it runs (tmux -S $WITNESS_SOCKET ls; ps), then remove $WITNESS_ROOT and $WITNESS_CONFIG"
+  done
   server="$(witness_record_get server)"
-  if [ -z "$server" ] && [ -S "$WITNESS_SOCKET" ] && witness_tmux_usable; then
-    server="$(witness_proc_id "$(tmux -S "$WITNESS_SOCKET" display-message -p '#{pid}' 2>/dev/null)")" || server=""
-  fi
-  if witness_proc_live "$server" || [ -S "$WITNESS_SOCKET" ]; then
+  state="$(witness_proc_state "$server")"
+  if [ "$state" != dead ] || [ -S "$WITNESS_SOCKET" ]; then
     if witness_tmux_usable; then
       tmux -S "$WITNESS_SOCKET" kill-server 2>/dev/null || echo "  ⚠ tmux kill-server failed on $WITNESS_SOCKET" >&2
     else
       echo "  ⚠ tmux is missing or not runnable; cannot stop the server on $WITNESS_SOCKET" >&2
     fi
   fi
-  for _ in $(seq 1 25); do witness_proc_live "$server" || break; sleep 0.2; done
-  witness_proc_live "$server" && witness_fail "the witness tmux server (pid ${server%%:*}) is still running"
-  if [ -S "$WITNESS_SOCKET" ]; then
-    if ! witness_tmux_usable; then
-      witness_proc_gone "$server" || witness_fail "no tmux to prove the server on $WITNESS_SOCKET is dead"
-    elif tmux -S "$WITNESS_SOCKET" list-sessions > /dev/null 2>&1; then
-      witness_fail "a tmux server still answers on $WITNESS_SOCKET"
-    fi
+  for _ in $(seq 1 25); do state="$(witness_proc_state "$server")"; [ "$state" = alive ] || break; sleep 0.2; done
+  [ "$state" = dead ] || witness_fail "the witness tmux server (pid ${server%%:*}) is $state, not proven dead; nothing was removed"
+  if [ -S "$WITNESS_SOCKET" ] && witness_tmux_usable && tmux -S "$WITNESS_SOCKET" list-sessions > /dev/null 2>&1; then
+    witness_fail "a tmux server still answers on $WITNESS_SOCKET"
   fi
-  # Only the processes this witness recorded at launch; a recycled pid fails the start-time check.
+  # Only the processes this witness recorded at launch; a recycled pid reads as dead.
   for role in core_claude core watcher; do
     proc="$(witness_record_get "$role")"
-    witness_proc_live "$proc" && { kill "${proc%%:*}" 2>/dev/null || true; }
+    [ -n "$proc" ] || continue
+    [ "$(witness_proc_state "$proc")" = alive ] && { kill "${proc%%:*}" 2>/dev/null || true; }
   done
   for _ in $(seq 1 25); do
     left=""
     for role in core_claude core watcher; do
       proc="$(witness_record_get "$role")"
-      witness_proc_live "$proc" && left="$left $role=${proc%%:*}"
+      [ -n "$proc" ] || continue
+      state="$(witness_proc_state "$proc")"
+      [ "$state" = dead ] || left="$left $role=${proc%%:*}($state)"
     done
     [ -n "$left" ] || break
     sleep 0.2
   done
-  [ -z "$left" ] || witness_fail "recorded witness processes still running:$left"
+  [ -z "$left" ] || witness_fail "recorded witness processes not proven gone:$left; nothing was removed"
   if [ -f "$WITNESS_CONFIG" ]; then
     want="$(witness_record_get config_sha)"
     if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || ! have="$(witness_sha "$WITNESS_CONFIG")"; then

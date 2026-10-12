@@ -693,7 +693,7 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
-    [ -z "$WITNESS" ] || witness_record_launch || true
+    [ -z "$WITNESS" ] || witness_abort_launch
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
@@ -701,7 +701,7 @@ if [ -t 1 ]; then
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
-  [ -z "$WITNESS" ] || witness_record_launch || true
+  [ -z "$WITNESS" ] || witness_record_launch || witness_abort_launch
   ensure_core_heartbeat
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
@@ -710,7 +710,7 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
-    [ -z "$WITNESS" ] || witness_record_launch || true
+    [ -z "$WITNESS" ] || witness_abort_launch
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
@@ -721,7 +721,7 @@ else
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
-  [ -z "$WITNESS" ] || witness_record_launch || true
+  [ -z "$WITNESS" ] || witness_record_launch || witness_abort_launch
   ensure_core_heartbeat
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal

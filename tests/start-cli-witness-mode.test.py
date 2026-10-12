@@ -154,6 +154,7 @@ class Harness:
         for name in ("t1", "t2", "t3"):
             if self.witness(name)[0].exists():
                 self.run("--witness-stop", name)
+            self.tm(self.witness(name)[1], "kill-server")
         self.tm(self.decoy_sock, "kill-server")
         shutil.rmtree(self.td, ignore_errors=True)
 
@@ -392,6 +393,57 @@ class WitnessTeardown(unittest.TestCase):
         self.assertTrue(self.root.exists() and self.sock.exists(), "witness state removed while its server lives")
         self.assertEqual(self.h.record("t2"), rec)
 
+    def assertStopRefusedKeepingState(self, run, rec, pids):
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("stopped", run.stdout)
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue(self.root.exists(), "witness root removed while recorded processes live")
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+        self.assertEqual(self.h.record("t2"), rec)
+
+    def test_stop_with_failing_ps_and_tmux_keeps_state_and_fails(self):
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        shims = self.h.shim_dir(tmux="exit 1\n", ps="exit 42\n")
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertStopRefusedKeepingState(run, rec, pids)
+        again = self.h.run("--witness-stop", "t2")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertFalse(self.root.exists())
+
+    def test_stop_with_failing_ps_after_the_server_died_keeps_a_live_recorded_process(self):
+        self.h.tm(self.sock, "kill-server")
+        # Detached, so its exit is reaped elsewhere and never lingers as this test's zombie.
+        pid = int(subprocess.run(["/bin/bash", "-c", "nohup sleep 120 >/dev/null 2>&1 & echo $!"],
+                                 capture_output=True, text=True).stdout)
+        self.addCleanup(lambda: subprocess.run(["kill", str(pid)], capture_output=True))
+        script = 'REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; witness_proc_id "$2"'
+        ident = subprocess.run(["/bin/bash", "-c", script, "id", str(REPO), str(pid)],
+                               capture_output=True, text=True).stdout.rstrip("\n")
+        record = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / "t2" / "witness.env"
+        lines = [l for l in record.read_text().splitlines() if not l.startswith("core=")]
+        record.write_text("\n".join(lines + [f"core={ident}"]) + "\n")
+        rec = self.h.record("t2")
+        shims = self.h.shim_dir(ps="exit 42\n")
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertStopRefusedKeepingState(run, rec, [pid])
+        again = self.h.run("--witness-stop", "t2")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        with self.assertRaises(ProcessLookupError, msg="the recorded process was not stopped on retry"):
+            os.kill(pid, 0)
+
+    def test_stop_refuses_a_record_missing_an_owned_process(self):
+        record = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / "t2" / "witness.env"
+        record.write_text("".join(l + "\n" for l in record.read_text().splitlines()
+                                  if not l.startswith("watcher=")))
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core")]
+        run = self.h.run("--witness-stop", "t2")
+        self.assertStopRefusedKeepingState(run, rec, pids)
+        self.assertIn("no watcher", run.stderr)
+        self.assertTrue(self.sock.exists())
+
     def test_stop_with_failing_hash_keeps_the_config(self):
         shims = self.h.shim_dir(shasum="exit 42\n")
         run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
@@ -471,6 +523,11 @@ class WitnessRefusals(unittest.TestCase):
         self.h.before["checkout"] = snapshot(self.h.checkout_ws)
         self.assertRefusedCleanly(self.h.run("--witness", "t1"), "live core")
 
+    def test_an_unreadable_cores_dir_counts_as_a_live_core(self):
+        shims = self.h.shim_dir(find='case "$*" in */state/cores*) exit 1;; esac\nexec /usr/bin/find "$@"\n')
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertRefusedCleanly(run, "live core")
+
     def test_witness_flag_after_another_flag_refuses(self):
         self.assertRefusedCleanly(self.h.run("--restart", "--witness", "t1"), "must be the first argument")
 
@@ -506,6 +563,26 @@ class WitnessRefusals(unittest.TestCase):
         shims = self.h.shim_dir(shasum="exit 42\n")
         run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
         self.assertRefusedCleanly(run, "sha")
+
+    def test_launch_that_cannot_record_its_processes_fails_and_kills_them(self):
+        shims = self.h.shim_dir(ps='case "$*" in *lstart*) exit 42;; esac\nexec /bin/ps "$@"\n')
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("launch FAILED", run.stderr)
+        _, sock, _, _ = self.h.witness("t1")
+        self.assertNotEqual(self.h.tm(sock, "list-sessions").returncode, 0, "the unrecorded witness server survived")
+        self.h.production_untouched(self)
+
+    def test_the_record_writer_reports_a_failed_write(self):
+        d = Path(tempfile.mkdtemp(dir=self.h.td))
+        (d / "witness.env").write_text("repo=x\n")
+        (d / "witness.env.tmp").mkdir()
+        script = ('REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; WITNESS_RECORD="$2"; '
+                  'witness_record_set server "1:x"')
+        run = subprocess.run(["/bin/bash", "-c", script, "w", str(REPO), str(d / "witness.env")],
+                             capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0, "a failed record write reported success")
+        self.assertEqual((d / "witness.env").read_text(), "repo=x\n")
 
     def test_stop_of_unknown_witness_refuses(self):
         self.assertRefusedCleanly(self.h.run("--witness-stop", "t1"), "no witness")
@@ -576,17 +653,37 @@ class ProcIdentity(unittest.TestCase):
             probe.kill()
             probe.wait()
 
-    def test_gone_only_when_no_process_holds_the_pid(self):
+    def state(self, rec, path=None):
+        env = {"PATH": path or os.environ["PATH"]}
+        script = 'REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; witness_proc_state "$2"'
+        return subprocess.run(["/bin/bash", "-c", script, "st", str(REPO), rec],
+                              capture_output=True, text=True, env=env).stdout.strip()
+
+    def shim_path(self, ps_body):
+        d = Path(tempfile.mkdtemp(prefix="psshim"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "ps").write_text("#!/bin/bash\n" + ps_body)
+        (d / "ps").chmod(0o755)
+        return f"{d}:{os.environ['PATH']}"
+
+    def test_state_is_alive_dead_or_unknown_and_only_evidence_is_dead(self):
         probe = subprocess.Popen(["sleep", "60"])
         live = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
-        stale = f"{probe.pid}:Thu Jan  1 00:00:00 1970"
-        self.assertNotEqual(self.fn("witness_proc_gone", live).returncode, 0, "a live pid read as gone")
-        self.assertNotEqual(self.fn("witness_proc_gone", stale).returncode, 0,
-                            "a start-time mismatch on a live pid read as gone")
-        probe.kill()
-        probe.wait()
-        self.assertEqual(self.fn("witness_proc_gone", live).returncode, 0, "a dead pid not read as gone")
-        self.assertNotEqual(self.fn("witness_proc_gone", "").returncode, 0, "an empty record read as gone")
+        try:
+            self.assertEqual(self.state(live), "alive")
+            self.assertEqual(self.state(f"{probe.pid}:Thu Jan  1 00:00:00 1970"), "dead",
+                             "a pid now held by another process is not the recorded one")
+            self.assertEqual(self.state(""), "unknown", "an empty record proves nothing")
+            self.assertEqual(self.state(live, self.shim_path("exit 42\n")), "unknown",
+                             "a failing ps read as a verdict")
+            self.assertEqual(self.state(live, self.shim_path("exit 0\n")), "unknown",
+                             "an empty process table read as a verdict")
+        finally:
+            probe.kill()
+            probe.wait()
+        self.assertEqual(self.state(live), "dead")
+        self.assertEqual(self.state(live, self.shim_path("exit 42\n")), "unknown",
+                         "a failing ps proves no death")
 
 if __name__ == "__main__":
     unittest.main()
