@@ -91,6 +91,17 @@ witness_assert_linked_worktree() {
   esac
 }
 
+# Where this worktree durably records each witness's root: its own git dir, so a later TMPDIR cannot hide it.
+witness_root_pointer() {
+  local line dir
+  IFS= read -r line < "$REPO/.git" 2>/dev/null || return 1
+  dir="${line#gitdir: }"
+  [ "$dir" != "$line" ] && [ -n "$dir" ] || return 1
+  case "$dir" in /*) ;; *) dir="$REPO/$dir" ;; esac
+  [ -d "$dir" ] || return 1
+  printf '%s/sutando-witness-%s.root\n' "$dir" "$WITNESS_NAME"
+}
+
 # The workspace this checkout resolves to, through the same helper every service uses.
 witness_resolved_workspace() {
   env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
@@ -100,6 +111,8 @@ witness_resolved_workspace() {
 # Any .alive beaten within the last 2 minutes means a live core uses that workspace.
 witness_workspace_has_live_core() {
   local cores="$1/state/cores" found d
+  # A symlink on the path could point at any directory, so it counts as a live core.
+  { [ -L "$1/state" ] || [ -L "$cores" ]; } && return 0
   if ! [ -e "$cores" ]; then
     # Absent only when the nearest existing ancestor is a searchable directory; else it could not be statted.
     d="$cores"; while d="${d%/*}"; [ -n "$d" ] && ! [ -e "$d" ]; do :; done
@@ -217,6 +230,14 @@ witness_record_watcher() {
   pid="$(witness_first_pane_pid "$WATCHER_SESSION")" && witness_record_pid watcher "$pid"
 }
 
+# The heartbeat writer this launch started, as core_heartbeat.py itself identifies its writers.
+witness_record_heartbeat() {
+  local pid
+  pid="$("$PY" -c 'import sys; sys.path.insert(0, sys.argv[1]); import core_heartbeat as h; print(*h.running_writer_pids()[:1])' \
+    "$REPO/src" 2>/dev/null)" || return 1
+  [ -n "$pid" ] && witness_record_pid heartbeat "$pid"
+}
+
 # After a failed launch: record whatever did come up, so the exit path and stop can reach it.
 witness_record_partial() {
   witness_record_server_core || true
@@ -226,7 +247,7 @@ witness_record_partial() {
 # Signals only processes whose recorded identity is alive right now.
 witness_kill_recorded() {
   local role proc
-  for role in core_claude core watcher server; do
+  for role in core_claude core watcher heartbeat server; do
     proc="$(witness_record_get "$role")"
     [ -n "$proc" ] && [ "$(witness_proc_state "$proc")" = alive ] && { kill "${proc%%:*}" 2>/dev/null || true; }
   done
@@ -238,7 +259,7 @@ witness_wait_recorded_gone() {
   local i role proc left=""
   for ((i = 0; i < 25; i++)); do
     left=""
-    for role in server core core_claude watcher; do
+    for role in server core core_claude watcher heartbeat; do
       proc="$(witness_record_get "$role")"
       [ -z "$proc" ] || [ "$(witness_proc_state "$proc")" = dead ] || left="$left $role=${proc%%:*}"
     done
@@ -252,7 +273,7 @@ witness_wait_recorded_gone() {
 # Launch succeeded: mark the record complete and release the lock (before any attach).
 witness_launch_complete() {
   local role
-  for role in server core watcher; do [ -n "$(witness_record_get "$role")" ] || exit 1; done
+  for role in server core watcher heartbeat; do [ -n "$(witness_record_get "$role")" ] || exit 1; done
   witness_record_set complete 1 || exit 1
   trap - EXIT
   witness_unlock
@@ -264,7 +285,7 @@ witness_launch_complete() {
 witness_launch_exit() {
   local rc=$? left role recorded=""
   [ "$rc" != 0 ] || rc=1
-  for role in server core core_claude watcher; do [ -z "$(witness_record_get "$role")" ] || recorded=1; done
+  for role in server core core_claude watcher heartbeat; do [ -z "$(witness_record_get "$role")" ] || recorded=1; done
   witness_kill_recorded
   if [ -z "$recorded" ]; then
     left=" (nothing was recorded, so whatever it started cannot be identified)"
@@ -314,7 +335,7 @@ PY
 }
 
 witness_start() {
-  local name="$1" ws0 ccd py sha tmp login="" mirror_bypass="" prod_ccd wccd
+  local name="$1" ws0 ccd py sha tmp ptr login="" mirror_bypass="" prod_ccd wccd
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION" \
     "${SUTANDO_TMUX_SOCKET:-}" "${SUTANDO_TMUX_SESSION:-}"
@@ -347,6 +368,8 @@ witness_start() {
   [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT. If it runs, stop it: --witness-stop $name. If it is stopped, remove its local config first, confirm with --witness-status $name, then remove that root"
   [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one. If a stopped witness wrote it, remove it, then that witness's root (check with --witness-status <name>)"
   mkdir -m 700 "$WITNESS_ROOT" 2>/dev/null || witness_refuse "cannot create $WITNESS_ROOT"
+  ptr="$(witness_root_pointer)" && printf '%s\n' "$WITNESS_ROOT" > "$ptr" \
+    || witness_start_fail "could not record the witness root in this worktree's git dir"
   # The record, with its intent marker, exists before anything else is made, so stop can always reach it.
   printf 'intent=launch\nrepo=%s\nsocket=%s\nsession=%s\nworkspace=%s\n' \
     "$REPO" "$WITNESS_SOCKET" "$WITNESS_SESSION" "$WITNESS_WS" > "$WITNESS_RECORD" \
@@ -438,7 +461,7 @@ witness_check_socket_owner() {
       || "$on_fail" "the tmux server answering on $WITNESS_SOCKET (pid $answering) is not the recorded one"
   else
     case "$answering" in
-      *"no server running"*|*"error connecting"*) ;;
+      *"no server running"*) ;;
       *) "$on_fail" "cannot tell what holds $WITNESS_SOCKET ($answering)" ;;
     esac
   fi
@@ -455,7 +478,7 @@ witness_check_record() {
 }
 
 witness_stop() {
-  local name="$1" py server role proc left
+  local name="$1" server role proc left want
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION"
   [ -f "$WITNESS_RECORD" ] || witness_refuse "no witness '$name' at $WITNESS_ROOT"
@@ -463,11 +486,11 @@ witness_stop() {
   # Every check runs before the first side effect, and refuses (exit 2).
   witness_check_record
   if [ "$(witness_record_get complete)" = 1 ]; then
-    for role in server core watcher; do
+    for role in server core watcher heartbeat; do
       [ -n "$(witness_record_get "$role")" ] || witness_refuse "the completed witness record has no $role, so stop cannot prove it is gone"
     done
   fi
-  for role in server core core_claude watcher; do
+  for role in server core core_claude watcher heartbeat; do
     proc="$(witness_record_get "$role")"
     [ -z "$proc" ] || [ "$(witness_proc_state "$proc")" != unknown ] \
       || witness_refuse "cannot tell whether the recorded $role (pid ${proc%%:*}) is alive"
@@ -475,14 +498,6 @@ witness_stop() {
   server="$(witness_record_get server)"
   witness_check_socket_owner "$server" witness_refuse
 
-  . "$REPO/scripts/python-binary.sh"
-  py="$(resolve_python "$REPO")"
-  # The heartbeat writer resolves its workspace through the override, so stop it while that still holds.
-  if [ -n "$py" ] && [ "$(witness_resolved_workspace)" = "$WITNESS_WS" ]; then
-    env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" \
-      SUTANDO_TMUX_SOCKET="$WITNESS_SOCKET" SUTANDO_TMUX_SESSION="$WITNESS_SESSION" \
-      "$py" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 || true
-  fi
   witness_kill_recorded
   left="$(witness_wait_recorded_gone)" || witness_fail "recorded witness processes not proven gone:$left"
   witness_check_socket_owner "" witness_fail
@@ -492,37 +507,76 @@ witness_stop() {
   echo "  ✓ witness '$name' stopped: every recorded process is gone. Nothing was deleted; left in place:"
   echo "    $WITNESS_ROOT  (its workspace)"
   echo "    $WITNESS_RECORD  (its record, inside that root)"
-  [ -e "$WITNESS_CONFIG" ] && echo "    $WITNESS_CONFIG  (this checkout's local config)"
+  want="$(witness_record_get config_sha)"
+  local owned=""
+  if [ -e "$WITNESS_CONFIG" ]; then
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ "$(witness_sha "$WITNESS_CONFIG")" = "$want" ] && owned=1
+    if [ -n "$owned" ]; then echo "    $WITNESS_CONFIG  (the local config this witness wrote)"
+    else echo "    $WITNESS_CONFIG  (CHANGED since the witness wrote it: not this witness's to remove)"; fi
+  fi
   echo "  To remove them, in this order:"
-  [ -e "$WITNESS_CONFIG" ] && echo "    - first the local config this witness wrote, $WITNESS_CONFIG"
+  if [ -n "$owned" ]; then
+    echo "    - first the local config this witness wrote, $WITNESS_CONFIG"
+  elif [ -e "$WITNESS_CONFIG" ]; then
+    echo "    - do NOT remove $WITNESS_CONFIG: it changed. Inspect it, and edit it if it still points into the root"
+  fi
   echo "    - check that nothing still points into the root (exits 0 only when none does):"
   echo "        bash $(printf '%q' "$REPO/src/agent/start-cli.sh") --witness-status $name"
   echo "    - then the root, $WITNESS_ROOT"
 }
 
 
-# Entry from start-cli.sh. A witness flag anywhere but first is refused: a later
-# position would otherwise fall through to a production launch.
-# Read-only: for each local config it knows of, whether that config points into the witness root.
-# Exits 0 only when every one definitely does not; an unreadable or unparsable one is UNKNOWN.
+# Read-only: whether this checkout's local config points into the witness root, judged as the launcher
+# resolves it (${REPO_DIR}, ${WORKSPACE_DIR}, the resolved workspace) and by filesystem identity.
 witness_status() {
-  local name="$1" py
+  local name="$1" py ptr root
   witness_paths "$name"
+  root="$WITNESS_ROOT"
+  # The root recorded at launch wins over the one the current TMPDIR derives.
+  if ptr="$(witness_root_pointer)" && [ -e "$ptr" ]; then
+    root="$(cat "$ptr" 2>/dev/null)" || root=""
+    case "$root" in
+      /*/sutando-witness/"$name") ;;
+      *) echo "  witness '$name': UNKNOWN, the root recorded at $ptr is unreadable or malformed" >&2; exit 1 ;;
+    esac
+  fi
   . "$REPO/scripts/python-binary.sh"
   py="$(resolve_python "$REPO")"
   [ -n "$py" ] || witness_refuse "no runnable Python interpreter to read $WITNESS_CONFIG"
-  if [ -e "$WITNESS_ROOT" ]; then echo "  witness '$name': root $WITNESS_ROOT is present"
-  else echo "  witness '$name': root $WITNESS_ROOT is absent"; fi
-  if _root="$WITNESS_ROOT" "$py" - "$WITNESS_CONFIG" <<'PY'
-import json, os, sys
-root = os.path.realpath(os.environ["_root"])
+  if [ -e "$root" ]; then echo "  witness '$name': root $root is present"
+  else echo "  witness '$name': root $root is absent"; fi
+  if env -i PATH="$PATH" HOME="$HOME" TMPDIR="${TMPDIR:-/tmp}" PYTHONDONTWRITEBYTECODE=1 _root="$root" _repo="$REPO" \
+      "$py" - "$WITNESS_CONFIG" <<'PY'
+import json, os, sys, unicodedata
+sys.path.insert(0, os.path.join(os.environ["_repo"], "src"))
+repo, root = os.environ["_repo"], os.environ["_root"]
 
-def inside(value):
-    path = os.path.expanduser(value) if isinstance(value, str) else ""
-    if not os.path.isabs(path):
+def norm(p):
+    return unicodedata.normalize("NFC", os.path.realpath(p))
+
+def identity(p):
+    try:
+        st = os.stat(p)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+root_id, root_norm = identity(root), norm(root)
+
+def inside(path):
+    real = norm(path)
+    if real == root_norm or real.startswith(root_norm + os.sep):
+        return True
+    if root_id is None:
         return False
-    real = os.path.realpath(path)
-    return real == root or real.startswith(root + os.sep)
+    p = real
+    while True:
+        if identity(p) == root_id:
+            return True
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
 
 def strings(value):
     if isinstance(value, str):
@@ -534,33 +588,47 @@ def strings(value):
         for v in value:
             yield from strings(v)
 
-ok = True
-for path in sys.argv[1:]:
+def verdict(path):
     if not os.path.lexists(path):
-        print(f"    {path}: absent, so it does not point into the root")
-        continue
+        return "absent, so it does not point into the root", True
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"    {path}: UNKNOWN, cannot be read as JSON ({type(e).__name__})")
-        ok = False
-        continue
-    if any(inside(s) for s in strings(data)):
-        print(f"    {path}: POINTS INTO the root")
-        ok = False
-    else:
-        print(f"    {path}: does not point into the root")
+        import sutando_config as sc
+        workspace = str(sc.resolve_workspace(repo_root=__import__("pathlib").Path(repo)))
+    except Exception as e:
+        return f"UNKNOWN, cannot be read or resolved ({type(e).__name__})", False
+    candidates = [workspace]
+    for value in strings(data):
+        value = value.replace("${REPO_DIR}", repo).replace("${WORKSPACE_DIR}", workspace)
+        if "${" in value:
+            return f"UNKNOWN, unsupported placeholder in {value!r}", False
+        value = os.path.expanduser(value)
+        if os.path.isabs(value):
+            candidates.append(value)
+        elif "/" in value or value.startswith("."):
+            candidates.append(os.path.join(repo, value))
+    if any(inside(c) for c in candidates):
+        return "POINTS INTO the root", False
+    return "does not point into the root", True
+
+ok = True
+for path in sys.argv[1:]:
+    text, safe = verdict(path)
+    print(f"    {path}: {text}")
+    ok = ok and safe
 sys.exit(0 if ok else 1)
 PY
   then
-    echo "  Nothing known points into $WITNESS_ROOT; it is safe to remove."
+    echo "  Nothing known points into $root; it is safe to remove."
   else
-    echo "  Do not remove $WITNESS_ROOT yet: fix or remove each config above, then rerun --witness-status $name." >&2
+    echo "  Do not remove $root yet: fix or remove each config above, then rerun --witness-status $name." >&2
     exit 1
   fi
 }
 
+# Entry from start-cli.sh. A witness flag anywhere but first is refused: a later
+# position would otherwise fall through to a production launch.
 witness_dispatch() {
   local i=0 a
   for a in "$@"; do

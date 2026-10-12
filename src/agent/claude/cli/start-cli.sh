@@ -707,6 +707,7 @@ if [ -t 1 ]; then
   ensure_task_notifier   # the supervisor needs the core session to exist first
   [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_record_heartbeat || exit 1
   [ -z "$WITNESS" ] || witness_launch_complete
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
@@ -729,6 +730,7 @@ else
   ensure_task_notifier
   [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_record_heartbeat || exit 1
   [ -z "$WITNESS" ] || witness_launch_complete
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
