@@ -251,14 +251,16 @@ relay rejects the token. Keep the `.env` file mode 600.
 | --- | --- |
 | `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a copy an earlier `install` wrote is replaced, so re-run `install` after upgrading ag2-sparrow; a locally modified copy is shown as a diff and kept unless you pass `--force`) |
 | `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
-| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON` (mode 600) |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
 resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
 `AGENT_CONNECT_STATE_DIR`, else under `~/.ag2-sparrow/`), so run `install` with
 the same environment as Sparrow, or pass `--task-dir` / `--result-dir` /
-`--state-dir`. `--activity-file` moves the marker.
+`--state-dir`. `GATEWAY_INSTANCE` (empty for the primary gateway) is taken from
+the environment, or from `--gateway-instance`; it names the status file the
+heartbeat and `verify` read. `--activity-file` moves the marker.
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
@@ -266,11 +268,59 @@ tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, exits non-z
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
 
-Nothing restarts Sparrow for you: after a reboot or a crash the hook sees no
-new task files and only sends heartbeat wakes. `verify` fails its `sparrow`
-check when Sparrow's `state/gateway-status.json` is missing, not connected, or
-older than 3 minutes (Sparrow rewrites it every poll), so run it again after a
-restart.
+### Keeping Sparrow running
+
+The hook cannot start Sparrow, and a stopped Sparrow writes no task files.
+Where systemd is available, run Sparrow as a user service so it restarts after
+a crash or a reboot. Put this in `~/.config/systemd/user/ag2-sparrow.service`,
+with `ExecStart` set to the output of `command -v ag2-sparrow`:
+
+```ini
+[Unit]
+Description=ag2-sparrow (AG2 Space listener)
+
+[Service]
+Environment=AG2_DEVICE_ENV=%h/.config/ag2-sparrow/relay.env
+ExecStart=%h/.local/bin/ag2-sparrow
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Then run `systemctl --user daemon-reload && systemctl --user enable --now ag2-sparrow`,
+and `loginctl enable-linger "$USER"` so it runs while you are logged out. Run
+`install` and `verify` with the same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE`
+variables as the service, if it sets any.
+
+Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
+`sparrow` check when that file is missing, not connected, or older than 3
+minutes, and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
+when Sparrow is not running and 11 when it is running but not connected. The
+5-minute heartbeat runs it too:
+
+- Not running: the hook logs `ag2-sparrow-hatch sparrow down`, and the
+  heartbeat wake carries `sparrow_down` and tells the worker to restart it
+  (`systemctl --user restart ag2-sparrow`, or start `ag2-sparrow` again as at
+  install).
+- Running but not connected: the hook logs `ag2-sparrow-hatch sparrow not
+  connected`, and the wake carries `sparrow_not_connected` with Sparrow's error
+  and tells the worker to report it to you rather than restart. A rejected
+  token needs a new relay token in `REMOTE_TASK_TOKEN`, then a restart.
+- Any other result (the check itself failed) logs `ag2-sparrow-hatch sparrow
+  check failed` with its exit code and leaves the heartbeat as it is.
+
+### Not from the single-file downloads
+
+Install the adapter with pip: the zipapp and the Linux binary
+(`tools/build_zipapp.py`, `tools/build_linux_binary.sh`) start the bridge only.
+The hook runs `SPARROW_PYTHON -m ag2_sparrow.adapters.hatch.task_fields` on every
+poll, which needs `ag2_sparrow` importable by that interpreter; the binary has
+no interpreter to run it, and the zipapp would need its path in the hook's
+config, which `install` does not write. `verify` reports such a setup as
+`cannot import ag2_sparrow`. Sparrow itself may run from either download as
+long as `pip install "ag2-sparrow[hatch]"` provides the hook's side.
 
 ## Optional: room-event subscription (0.3.0)
 

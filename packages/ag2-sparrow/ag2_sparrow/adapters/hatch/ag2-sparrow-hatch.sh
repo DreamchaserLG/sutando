@@ -14,6 +14,7 @@ AGENT="${AGENT_MXID:-}"
 TASK_DIR="${TASK_DIR:-$HOME/.ag2-sparrow/task_dir}"
 RESULT_DIR="${RESULT_DIR:-$HOME/.ag2-sparrow/result_dir}"
 PY="${SPARROW_PYTHON:-python3}"
+SPARROW_STATE_DIR="${STATE_DIR:-$HOME/.ag2-sparrow/state}"
 
 HOOK_ID="${HATCH_HOOK_ID:-ag2-sparrow-hatch}"
 STATE_DIR="$HOME/hooks/state"
@@ -105,6 +106,34 @@ if [[ "$n" -eq 0 ]]; then
   log "ag2-sparrow-hatch heartbeat wake" "{\"interval_ms\":$HEARTBEAT_INTERVAL_MS,\"activity_idle_ms\":$ACTIVITY_IDLE_MS}"
   reason="heartbeat: do nothing, exit immediately, post nothing"
   payload="$(jq -cn --arg note "$HEARTBEAT_NOTE" '{heartbeat: true, matches: [], total: 0, worker_note: $note}')"
+  # A dead Sparrow writes no task files, so the heartbeat is where it gets noticed.
+  sparrow_rc=0
+  sparrow_detail="$(timeout 10 "$PY" -m ag2_sparrow.adapters.hatch.cli sparrow \
+    --state-dir "$SPARROW_STATE_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" 2>/dev/null)" \
+    || sparrow_rc=$?
+  case "$sparrow_rc" in
+    0) ;;
+    10)
+      log "ag2-sparrow-hatch sparrow down" "$(jq -cn --arg d "$sparrow_detail" '{detail: $d}')"
+      reason="heartbeat: Sparrow is not running; restart it, post nothing"
+      payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
+        matches: [], total: 0, sparrow_down: $d,
+        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+                      + $d + ". Restart Sparrow as that says, then exit; post nothing.")}')"
+      ;;
+    11)
+      log "ag2-sparrow-hatch sparrow not connected" "$(jq -cn --arg d "$sparrow_detail" '{detail: $d}')"
+      reason="heartbeat: Sparrow is running but not connected; report it to your owner, post nothing"
+      payload="$(jq -cn --arg d "$sparrow_detail" --arg marker "$ACTIVITY_FILE" '{heartbeat: true,
+        matches: [], total: 0, sparrow_not_connected: $d,
+        worker_note: ("Heartbeat. Touch " + $marker + ". No AG2 Space message reaches you: "
+                      + $d + ". Restarting Sparrow alone will not fix this: tell your owner in "
+                      + "your run report, then exit; post nothing.")}')"
+      ;;
+    *)
+      log "ag2-sparrow-hatch sparrow check failed" "$(jq -cn --argjson rc "$sparrow_rc" '{exit_code: $rc}')"
+      ;;
+  esac
 else
   reason="$n AG2 Space task(s) need answers"
   payload="$(printf '%s' "$result" | jq -c --arg note "$REMAINING_WORK_NOTE" --arg limits "$NON_OWNER_NOTE" \
