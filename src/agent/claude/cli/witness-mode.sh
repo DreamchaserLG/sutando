@@ -1,8 +1,8 @@
 #!/bin/bash
 # --witness <name>: a throwaway core from THIS checkout on its own socket, session and workspace.
 #
-# --witness-stop <name> is the only path that deletes, and only once every recorded process is proven gone
-# (else exit 1, state kept); every refusal exits 2 before a side effect. One start or stop per name at a time.
+# --witness-stop <name> stops only the processes it recorded and deletes nothing: once every one is proven
+# gone it prints what is left and the command that removes it (else exit 1). Refusals exit 2 before any side effect.
 
 WITNESS_DEFAULT_SOCKET="/tmp/sutando-tmux.sock"
 WITNESS_DEFAULT_SESSION="sutando-core"
@@ -148,29 +148,26 @@ witness_proc_state() {
 }
 
 
-# One start or stop per name: an atomic mkdir owned by this process's <pid>:<start>, taken
-# over only when that owner is positively dead. Held across both launch stages (exec keeps the pid).
+# One start or stop per name: an atomic mkdir owned by this process's <pid>:<start>, held across both
+# launch stages (exec keeps the pid). It is never taken over; a lock left by a dead owner is removed by hand.
 witness_lock() {
-  local owner moved me
+  local owner me
   me="$(witness_proc_id "$$")" || witness_refuse "cannot read this process's identity to own the witness lock"
   WITNESS_LOCK="${WITNESS_ROOT%/*}/.$WITNESS_NAME.lock"
   mkdir -p "${WITNESS_LOCK%/*}" 2>/dev/null || witness_refuse "cannot create ${WITNESS_LOCK%/*}"
   if ! mkdir "$WITNESS_LOCK" 2>/dev/null; then
     owner="$(cat "$WITNESS_LOCK/owner" 2>/dev/null)"
-    moved="$WITNESS_LOCK.stale.$$"
-    [ "$(witness_proc_state "$owner")" = dead ] && mv "$WITNESS_LOCK" "$moved" 2>/dev/null \
-      || witness_refuse "witness '$WITNESS_NAME' is busy: a start or stop holds $WITNESS_LOCK"
-    # The rename picks one claimant; a lock that changed hands meanwhile goes back untouched.
-    if [ "$(cat "$moved/owner" 2>/dev/null)" != "$owner" ]; then
-      mv "$moved" "$WITNESS_LOCK" 2>/dev/null
-      witness_refuse "witness '$WITNESS_NAME' is busy: a start or stop holds $WITNESS_LOCK"
+    local lock="$WITNESS_LOCK"
+    WITNESS_LOCK=""
+    if [ "$(witness_proc_state "$owner")" = dead ]; then
+      witness_refuse "witness '$WITNESS_NAME' is locked by a start or stop that is no longer running; if none runs, remove the lock and retry: rm -rf $(printf '%q' "$lock")"
     fi
-    rm -rf "$moved"
-    mkdir "$WITNESS_LOCK" 2>/dev/null || witness_refuse "witness '$WITNESS_NAME' is busy: a start or stop holds $WITNESS_LOCK"
+    witness_refuse "witness '$WITNESS_NAME' is busy: a start or stop holds $lock"
   fi
   if ! printf '%s\n' "$me" > "$WITNESS_LOCK/owner" 2>/dev/null; then
-    rm -rf "$WITNESS_LOCK"
-    witness_refuse "cannot record this process as the owner of $WITNESS_LOCK"
+    rmdir "$WITNESS_LOCK" 2>/dev/null
+    WITNESS_LOCK=""
+    witness_refuse "cannot record this process as the owner of its witness lock"
   fi
   trap witness_unlock EXIT
 }
@@ -234,6 +231,22 @@ witness_kill_recorded() {
   return 0
 }
 
+# Waits up to ~5s for every recorded process to be proven dead; prints the rest and fails if any remain.
+witness_wait_recorded_gone() {
+  local i role proc left=""
+  for ((i = 0; i < 25; i++)); do
+    left=""
+    for role in server core core_claude watcher; do
+      proc="$(witness_record_get "$role")"
+      [ -z "$proc" ] || [ "$(witness_proc_state "$proc")" = dead ] || left="$left $role=${proc%%:*}"
+    done
+    [ -n "$left" ] || return 0
+    sleep 0.2
+  done
+  printf '%s\n' "$left"
+  return 1
+}
+
 # Launch succeeded: mark the record complete and release the lock (before any attach).
 witness_launch_complete() {
   local role
@@ -243,19 +256,24 @@ witness_launch_complete() {
   witness_unlock
 }
 
-# Every exit of launch's second stage before completion: stop what was recorded, delete nothing.
+# Every exit of launch's second stage before completion: stop what was recorded, delete nothing,
+# and keep the lock unless every recorded process is proven gone.
 witness_launch_exit() {
-  local rc=$?
+  local rc=$? left
   [ "$rc" != 0 ] || rc=1
   witness_kill_recorded
-  echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); it stopped the processes it recorded and deleted nothing. Clean up with: --witness-stop $WITNESS_NAME" >&2
-  witness_unlock
+  if left="$(witness_wait_recorded_gone)"; then
+    witness_unlock
+    echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); its recorded processes are gone and nothing was deleted. Run --witness-stop $WITNESS_NAME for what is left." >&2
+  else
+    echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); recorded processes not proven gone:$left. Its lock is kept; check them, then: rm -rf $(printf '%q' "$WITNESS_LOCK") && bash $(printf '%q' "$REPO/src/agent/start-cli.sh") --witness-stop $WITNESS_NAME" >&2
+  fi
   exit "$rc"
 }
 
 # A first-stage failure after the root exists: nothing was started, and stop removes what was made.
 witness_start_fail() {
-  echo "start-cli witness: launch FAILED — $*; nothing is deleted here. Clean up with: --witness-stop $WITNESS_NAME" >&2
+  echo "start-cli witness: launch FAILED — $*; nothing was started or deleted. Run --witness-stop $WITNESS_NAME for what is left." >&2
   exit 1
 }
 
@@ -287,7 +305,7 @@ PY
 }
 
 witness_start() {
-  local name="$1" ws0 ccd py sha login="" mirror_bypass="" prod_ccd wccd
+  local name="$1" ws0 ccd py sha tmp login="" mirror_bypass="" prod_ccd wccd
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION" \
     "${SUTANDO_TMUX_SOCKET:-}" "${SUTANDO_TMUX_SESSION:-}"
@@ -326,7 +344,9 @@ witness_start() {
     || witness_start_fail "could not write $WITNESS_RECORD"
   mkdir -p "$WITNESS_WS"/tasks "$WITNESS_WS"/results "$WITNESS_WS"/state "$WITNESS_WS"/logs \
     || witness_start_fail "cannot create $WITNESS_WS"
-  _ws="$WITNESS_WS" _ccd="$ccd" _out="$WITNESS_ROOT/config.json" "$py" - <<'PY' || witness_start_fail "could not write the witness config"
+  # Written whole to a temp file beside it, then published by a no-clobber link: the config is never partial.
+  tmp="$REPO/.sutando.config.local.json.witness-$name.$$.tmp"
+  _ws="$WITNESS_WS" _ccd="$ccd" _out="$tmp" "$py" - <<'PY' || { rm -f "$tmp"; witness_start_fail "could not write the witness config"; }
 import json, os
 cfg = {"workspace": {"path": os.environ["_ws"]}}
 if os.environ["_ccd"]:
@@ -336,13 +356,13 @@ if os.environ["_ccd"]:
 with open(os.environ["_out"], "x") as f:
     json.dump(cfg, f, indent=2)
     f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
 PY
-  # Its hash is recorded before the file is placed; placing it never replaces an existing file.
-  sha="$(witness_sha "$WITNESS_ROOT/config.json")" && witness_record_set config_sha "$sha" \
-    || witness_start_fail "no usable sha256 (shasum) to record the config's ownership"
-  ( set -C; cat "$WITNESS_ROOT/config.json" > "$WITNESS_CONFIG" ) 2>/dev/null \
-    || witness_start_fail "could not place $WITNESS_CONFIG"
-  [ "$(witness_sha "$WITNESS_CONFIG")" = "$sha" ] || witness_start_fail "$WITNESS_CONFIG is not the config just written"
+  sha="$(witness_sha "$tmp")" && witness_record_set config_sha "$sha" \
+    || { rm -f "$tmp"; witness_start_fail "no usable sha256 (shasum) to record the config's ownership"; }
+  ln "$tmp" "$WITNESS_CONFIG" 2>/dev/null || { rm -f "$tmp"; witness_start_fail "could not publish $WITNESS_CONFIG"; }
+  rm -f "$tmp"
 
   [ "$(witness_resolved_workspace)" = "$WITNESS_WS" ] \
     || witness_start_fail "the workspace override did not take effect; nothing was launched"
@@ -414,8 +434,8 @@ witness_check_socket_owner() {
 }
 
 witness_stop() {
-  local name="$1" py server state role proc left want have claim i
-  local untouched="nothing was touched" kept="no file was removed"
+  local name="$1" py server role proc left want cmd
+  local untouched="nothing was touched"
   witness_paths "$name"
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION"
   [ -f "$WITNESS_RECORD" ] || witness_refuse "no witness '$name' at $WITNESS_ROOT"
@@ -439,13 +459,6 @@ witness_stop() {
   done
   server="$(witness_record_get server)"
   witness_check_socket_owner "$server" "$untouched"
-  want="$(witness_record_get config_sha)"
-  if [ -e "$WITNESS_CONFIG" ]; then
-    [[ "$want" =~ ^[0-9a-f]{64}$ ]] && have="$(witness_sha "$WITNESS_CONFIG")" \
-      || witness_fail "no usable sha256 to prove $WITNESS_CONFIG is the witness's own; $untouched"
-    [ "$have" = "$want" ] \
-      || witness_fail "$WITNESS_CONFIG changed since the witness wrote it; restore or remove it, then rerun; $untouched"
-  fi
 
   . "$REPO/scripts/python-binary.sh"
   py="$(resolve_python "$REPO")"
@@ -456,40 +469,26 @@ witness_stop() {
       "$py" "$REPO/src/core_heartbeat.py" --stop > /dev/null 2>&1 || true
   fi
   witness_kill_recorded
-  # An arithmetic loop: no external command can cut the wait short, and unknown never ends it.
-  for ((i = 0; i < 25; i++)); do
-    left=""
-    for role in server core core_claude watcher; do
-      proc="$(witness_record_get "$role")"
-      [ -z "$proc" ] || [ "$(witness_proc_state "$proc")" = dead ] || left="$left $role=${proc%%:*}"
-    done
-    [ -n "$left" ] || break
-    sleep 0.2
-  done
-  [ -z "$left" ] || witness_fail "recorded witness processes not proven gone:$left; $kept"
-  witness_check_socket_owner "" "$kept"
-
-  # Deletion: the config only by an atomic claim whose content still hashes to the recorded value.
-  if [ -e "$WITNESS_CONFIG" ]; then
-    claim="$REPO/.sutando.config.local.json.witness-stop.$$"
-    mv "$WITNESS_CONFIG" "$claim" 2>/dev/null || witness_fail "could not claim $WITNESS_CONFIG; $kept"
-    if [ "$(witness_sha "$claim")" = "$want" ]; then
-      rm -f "$claim"
-    else
-      ln "$claim" "$WITNESS_CONFIG" 2>/dev/null && rm -f "$claim"
-      witness_fail "$WITNESS_CONFIG changed while being removed; it is kept (or left at $claim)"
-    fi
-  fi
-  # A config that appeared meanwhile and names this witness keeps the root it points at.
-  if [ -e "$WITNESS_CONFIG" ] && ! { grep -qF "$WITNESS_ROOT" "$WITNESS_CONFIG"; [ $? = 1 ]; }; then
-    witness_fail "$WITNESS_CONFIG names $WITNESS_ROOT, so the root is kept"
-  fi
-  case "$WITNESS_ROOT" in
-    */sutando-witness/"$name") rm -rf "$WITNESS_ROOT" ;;
-  esac
+  left="$(witness_wait_recorded_gone)" || witness_fail "recorded witness processes not proven gone:$left"
+  witness_check_socket_owner "" "the recorded processes are gone"
   trap - EXIT
   witness_unlock
-  echo "  ✓ witness '$name' stopped: its recorded processes are gone, $WITNESS_ROOT removed"
+
+  # Nothing is deleted here: say what is left and the one command that removes it.
+  cmd="rm -rf $(printf '%q' "$WITNESS_ROOT")"
+  echo "  ✓ witness '$name' stopped: every recorded process is gone. Nothing was deleted; left in place:"
+  echo "    $WITNESS_ROOT  (its workspace and record)"
+  if [ -e "$WITNESS_CONFIG" ]; then
+    want="$(witness_record_get config_sha)"
+    if [[ "$want" =~ ^[0-9a-f]{64}$ ]] && [ "$(witness_sha "$WITNESS_CONFIG")" = "$want" ]; then
+      echo "    $WITNESS_CONFIG  (points this checkout at the witness workspace)"
+      cmd="$cmd $(printf '%q' "$WITNESS_CONFIG")"
+    else
+      echo "  ⚠ $WITNESS_CONFIG is not the one the witness wrote, so it is not in the command below; check it by hand" >&2
+    fi
+  fi
+  echo "  Remove them with:"
+  echo "    $cmd"
 }
 
 # Entry from start-cli.sh. A witness flag anywhere but first is refused: a later
