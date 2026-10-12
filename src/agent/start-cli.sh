@@ -12,6 +12,9 @@ case "$0" in
 esac
 REPO="$(cd "$_self_dir/../.." && pwd)"
 unset _self_dir
+# shellcheck source=witness-flags.sh
+. "$REPO/src/agent/witness-flags.sh"
+witness_flags_exact "$@"
 
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
@@ -61,7 +64,7 @@ fi
 # which act on the production socket and session.
 for _arg in "$@"; do
   case "$_arg" in
-    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
+    --witness|--witness-stop|--witness-status|--witness-scrubbed)
       if [ -n "$requested_runtime" ] && [ "$requested_runtime" != "claude" ]; then
         echo "start-cli: witness mode is supported only for the claude runtime" >&2
         exit 2

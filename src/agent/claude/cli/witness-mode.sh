@@ -1,6 +1,6 @@
 #!/bin/bash
 # --witness <name>: a throwaway core from THIS checkout on its own socket, session and workspace. --witness-stop stops only
-# what it recorded; neither ever deletes a file, the user does. Refusals exit 2 before any side effect.
+# what it recorded and --witness-status reports what still points at it; none deletes a file. Refusals exit 2 first.
 
 WITNESS_DEFAULT_SOCKET="/tmp/sutando-tmux.sock"
 WITNESS_DEFAULT_SESSION="sutando-core"
@@ -274,7 +274,7 @@ witness_launch_exit() {
     echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); its recorded processes are gone and nothing was deleted. Run --witness-stop $WITNESS_NAME for what is left." >&2
   else
     echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); not proven gone:$left. Its lock is kept." >&2
-    echo "    Check for its processes: tmux -S $(printf '%q' "$WITNESS_SOCKET") ls; ps -A -o pid=,command= | grep -F $(printf '%q' "$WITNESS_SESSION")" >&2
+    echo "    Check for its processes: tmux -S $(printf '%q' "$WITNESS_SOCKET") ls; pgrep -fl -- $(printf '%q' "$WITNESS_SESSION")" >&2
     echo "    Once none run, remove the lock by hand: rm -rf $(printf '%q' "$WITNESS_LOCK"); then run --witness-stop $WITNESS_NAME" >&2
   fi
   exit "$rc"
@@ -319,8 +319,8 @@ witness_start() {
   witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION" \
     "${SUTANDO_TMUX_SOCKET:-}" "${SUTANDO_TMUX_SESSION:-}"
   witness_assert_linked_worktree
-  [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT; stop it first: --witness-stop $name"
-  [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one"
+  [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT. If it runs, stop it: --witness-stop $name. If it is stopped, remove its local config first, confirm with --witness-status $name, then remove that root"
+  [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one. If a stopped witness wrote it, remove it, then that witness's root (check with --witness-status <name>)"
   witness_tmux_usable || witness_refuse "tmux is missing or not runnable; a witness runs only on its own tmux server"
   witness_sha "$REPO/src/agent/claude/cli/witness-mode.sh" > /dev/null \
     || witness_refuse "no usable sha256 (shasum); stop could not prove the config it writes is its own"
@@ -344,8 +344,8 @@ witness_start() {
 
   witness_lock
   # Re-checked under the lock, so a concurrent same-name start cannot have passed them too.
-  [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT; stop it first: --witness-stop $name"
-  [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one"
+  [ -e "$WITNESS_ROOT" ] && witness_refuse "witness '$name' already exists at $WITNESS_ROOT. If it runs, stop it: --witness-stop $name. If it is stopped, remove its local config first, confirm with --witness-status $name, then remove that root"
+  [ -e "$WITNESS_CONFIG" ] && witness_refuse "$WITNESS_CONFIG exists; witness mode writes its own and will not overwrite or share one. If a stopped witness wrote it, remove it, then that witness's root (check with --witness-status <name>)"
   mkdir -m 700 "$WITNESS_ROOT" 2>/dev/null || witness_refuse "cannot create $WITNESS_ROOT"
   # The record, with its intent marker, exists before anything else is made, so stop can always reach it.
   printf 'intent=launch\nrepo=%s\nsocket=%s\nsession=%s\nworkspace=%s\n' \
@@ -493,21 +493,80 @@ witness_stop() {
   echo "    $WITNESS_ROOT  (its workspace)"
   echo "    $WITNESS_RECORD  (its record, inside that root)"
   [ -e "$WITNESS_CONFIG" ] && echo "    $WITNESS_CONFIG  (this checkout's local config)"
-  echo "  Removing the root is safe only once no sutando.config.local.json points into it. Check with:"
-  echo "    grep -lF $(printf '%q' "$WITNESS_ROOT") $(printf '%q' "$WITNESS_CONFIG")"
-  echo "  (no output means this checkout's config does not point into it)."
+  echo "  To remove them, in this order:"
+  [ -e "$WITNESS_CONFIG" ] && echo "    - first the local config this witness wrote, $WITNESS_CONFIG"
+  echo "    - check that nothing still points into the root (exits 0 only when none does):"
+  echo "        bash $(printf '%q' "$REPO/src/agent/start-cli.sh") --witness-status $name"
+  echo "    - then the root, $WITNESS_ROOT"
 }
 
 
 # Entry from start-cli.sh. A witness flag anywhere but first is refused: a later
 # position would otherwise fall through to a production launch.
+# Read-only: for each local config it knows of, whether that config points into the witness root.
+# Exits 0 only when every one definitely does not; an unreadable or unparsable one is UNKNOWN.
+witness_status() {
+  local name="$1" py
+  witness_paths "$name"
+  . "$REPO/scripts/python-binary.sh"
+  py="$(resolve_python "$REPO")"
+  [ -n "$py" ] || witness_refuse "no runnable Python interpreter to read $WITNESS_CONFIG"
+  if [ -e "$WITNESS_ROOT" ]; then echo "  witness '$name': root $WITNESS_ROOT is present"
+  else echo "  witness '$name': root $WITNESS_ROOT is absent"; fi
+  if _root="$WITNESS_ROOT" "$py" - "$WITNESS_CONFIG" <<'PY'
+import json, os, sys
+root = os.path.realpath(os.environ["_root"])
+
+def inside(value):
+    path = os.path.expanduser(value) if isinstance(value, str) else ""
+    if not os.path.isabs(path):
+        return False
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+def strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from strings(v)
+
+ok = True
+for path in sys.argv[1:]:
+    if not os.path.lexists(path):
+        print(f"    {path}: absent, so it does not point into the root")
+        continue
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"    {path}: UNKNOWN, cannot be read as JSON ({type(e).__name__})")
+        ok = False
+        continue
+    if any(inside(s) for s in strings(data)):
+        print(f"    {path}: POINTS INTO the root")
+        ok = False
+    else:
+        print(f"    {path}: does not point into the root")
+sys.exit(0 if ok else 1)
+PY
+  then
+    echo "  Nothing known points into $WITNESS_ROOT; it is safe to remove."
+  else
+    echo "  Do not remove $WITNESS_ROOT yet: fix or remove each config above, then rerun --witness-status $name." >&2
+    exit 1
+  fi
+}
+
 witness_dispatch() {
   local i=0 a
   for a in "$@"; do
     i=$((i + 1))
     case "$a" in
-      --witness=*|--witness-stop=*) witness_refuse "use '--witness <name>' / '--witness-stop <name>' (no '=')" ;;
-      --witness|--witness-stop|--witness-scrubbed)
+      --witness|--witness-stop|--witness-status|--witness-scrubbed)
         [ "$i" = 1 ] || witness_refuse "$a must be the first argument" ;;
     esac
   done
@@ -515,6 +574,7 @@ witness_dispatch() {
   case "${1:-}" in
     --witness) witness_start "${2:-}" ;;
     --witness-stop) witness_stop "${2:-}"; exit 0 ;;
+    --witness-status) witness_status "${2:-}"; exit 0 ;;
     --witness-scrubbed) witness_enter "${2:-}" ;;
   esac
 }

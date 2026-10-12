@@ -29,6 +29,9 @@ case "$0" in
 esac
 REPO="$(cd "$_self_dir/../../../.." && pwd)"
 unset _self_dir
+# shellcheck source=../../witness-flags.sh
+. "$REPO/src/agent/witness-flags.sh"
+witness_flags_exact "$@"
 cd "$REPO"
 # Shared with the codex launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
@@ -46,7 +49,7 @@ fi
 WITNESS=""
 for _arg in "$@"; do
   case "$_arg" in
-    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
+    --witness|--witness-stop|--witness-status|--witness-scrubbed)
       # shellcheck source=witness-mode.sh
       . "$REPO/src/agent/claude/cli/witness-mode.sh"
       witness_dispatch "$@"
