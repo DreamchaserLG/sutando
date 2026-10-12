@@ -739,20 +739,48 @@ def _read_private_json(path: Path) -> "dict | None":
         return None
 
 
-def _gateway_owner() -> str:
-    global _GATEWAY_OWNER_DM_HINT
-    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
+def _registry_owner(timeout: "int | None" = None) -> "tuple[str, str]":
+    """(owner mxid, owner DM room id) from this agent's /v1/agents row, "" for a
+    missing or malformed reading. Raises when the request itself fails."""
     identity = _reenroll_identity()
-    answer = _req("GET", "/v1/agents")
+    answer = (_req("GET", "/v1/agents") if timeout is None
+              else _req("GET", "/v1/agents", timeout=timeout))
     agents = answer.get("agents") if isinstance(answer, dict) else None
     if not isinstance(agents, list):
-        return ""
+        return "", ""
     row = next((row for row in agents
                 if isinstance(row, dict) and row.get("id") == identity), None)
     owner = str((row or {}).get("owner") or "")
     hint = str((row or {}).get("owner_dm_room") or "")
-    _GATEWAY_OWNER_DM_HINT = hint if hint.startswith("!") else ""
-    return owner if owner.startswith("@") and ":" in owner else ""
+    return (owner if owner.startswith("@") and ":" in owner else "",
+            hint if hint.startswith("!") else "")
+
+
+def _gateway_owner() -> str:
+    global _GATEWAY_OWNER_DM_HINT
+    _GATEWAY_OWNER_DM_HINT = ""  # a lookup that never reaches a row leaves no reading behind for the caller
+    owner, _GATEWAY_OWNER_DM_HINT = _registry_owner()
+    return owner
+
+
+_HITL_OWNER = {"mxid": ""}
+
+
+def _hitl_owner() -> str:
+    """The one mxid whose clicks resolve HITL cards: SPARROW_HA_OWNER when set, else the
+    registry owner, kept for the process once read. "" = unknown (fail closed)."""
+    explicit = os.environ.get("SPARROW_HA_OWNER") or ""
+    if explicit:
+        return explicit
+    if not _HITL_OWNER["mxid"]:
+        try:
+            _HITL_OWNER["mxid"] = _registry_owner()[0]
+        except Exception as e:  # noqa: BLE001 - offline: unknown now, read again at the next click
+            _log(f"hitl: owner lookup failed ({e})")
+    return _HITL_OWNER["mxid"]
+
+
+_HITL_OWNER_UNKNOWN = "hitl: card click ignored, owner unknown"
 
 
 def _owner_review_dm(owner: str) -> str:
@@ -1007,10 +1035,14 @@ def _handle_hitl_action(task: dict):
         return "redelivered"
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
-    owner = os.environ.get("SPARROW_HA_OWNER") or ""
-    handler = _hitl_reply_handler(owner, log=_log) if owner else None
+    owner = _hitl_owner()
+    handler = _hitl_reply_handler(owner, log=_log)
     if handler is None:
-        return False  # no owner or no store on this host: the click stays an ordinary task
+        return False  # no store on this host: the click stays an ordinary task
+    if not owner:
+        if handler.task_to_event(task) is not None:
+            _log(f"{_HITL_OWNER_UNKNOWN} ({task_id})")
+        return False
     try:
         out = handler.offer_task(task)
     except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
@@ -1312,6 +1344,32 @@ def _hitl_reply_handler(owner_mxid: str, log=print):
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
         log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
         return None
+
+
+class _HitlClicks:
+    """Event-channel claimant for HITL card clicks, judged against _hitl_owner() at the
+    click, so wiring the chain makes no gateway call. Unknown owner: not claimed."""
+
+    def __init__(self, probe, log=print):
+        self._probe = probe  # owner-less: used only to recognise a click's shape
+        self._log = log
+        self._handlers: dict = {}
+        self.last_path = None
+
+    def claims(self, event: dict) -> bool:
+        if not self._probe.claims(event):
+            return False
+        if _hitl_owner():
+            return True
+        self._log(f"{_HITL_OWNER_UNKNOWN} ({event.get('event_id') or '?'})")
+        return False
+
+    def offer(self, event: dict) -> list:
+        owner = _hitl_owner()
+        handler = self._handlers.get(owner)
+        if handler is None:
+            handler = self._handlers[owner] = _hitl_reply_handler(owner, log=self._log)
+        return handler.offer(event) if handler is not None else []
 
 
 def _vault_intercept_fns():
@@ -5812,20 +5870,24 @@ def _maybe_start_event_channel() -> None:
         poster = None
         ha_owner = os.environ.get("SPARROW_HA_OWNER")
         ha_room = os.environ.get("SPARROW_HA_ROOM")
+        claimants = []
         if ha_owner:
-            from .human_action import ActionStore, CardPoster, DecisionHandler, HandlerChain
+            from .human_action import ActionStore, CardPoster, DecisionHandler
             store = ActionStore(str(_STATE / "human-actions"))
-            # HITL card clicks ride the same owner-only chain, ahead of taskify.
-            claimants = [DecisionHandler(store, ha_owner, log=_log)]
-            hitl = _hitl_reply_handler(ha_owner, log=_log)
-            if hitl is not None:
-                claimants.append(hitl)
+            claimants.append(DecisionHandler(store, ha_owner, log=_log))
+        # HITL card clicks ride an owner-only claimant ahead of taskify; its owner
+        # falls back to the registry, so it is wired whether or not ha_owner is set.
+        probe = _hitl_reply_handler("", log=_log)
+        if probe is not None:
+            claimants.append(_HitlClicks(probe, log=_log))
+        if claimants:
+            from .human_action import HandlerChain
             handler = HandlerChain(claimants + [handler])
-            if ha_room:
-                poster = CardPoster(store, URL, _AUTH_HEADERS,
-                                    ha_room, log=_log,
-                                    include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
-                                    .strip().lower() in ("1", "true", "yes", "on"))
+        if ha_owner and ha_room:
+            poster = CardPoster(store, URL, _AUTH_HEADERS,
+                                ha_room, log=_log,
+                                include_a2ui=os.environ.get("SPARROW_HA_A2UI", "")
+                                .strip().lower() in ("1", "true", "yes", "on"))
         # 👀 receipt: OPT-IN because it scopes by room_id alone, so default-on
         # would react in shared rooms. Wrapped OUTERMOST, chain-transparent.
         if (str(os.environ.get("SPARROW_OBSERVE_REACT", "")).strip().lower()

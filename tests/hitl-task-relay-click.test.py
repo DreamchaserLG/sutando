@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """remote-gateway-bridge: a card click on the TASK relay is applied to the HITL
-store and consumed; ordinary messages and unconfigured hosts stay on the task path."""
+store and consumed; ordinary messages, and clicks while the owner is unknown, stay on the task path."""
+import contextlib
 import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -27,12 +29,29 @@ OWNER = "@owner:ag2.space"
 class TaskRelayClickTests(unittest.TestCase):
     def setUp(self):
         os.environ["SPARROW_HA_OWNER"] = OWNER
+        rgb._HITL_OWNER["mxid"] = ""
         self.mgr = HitlManager(HitlStore(default_store(TMP)))
         self.req = self.mgr.create(HumanRequirement(
             kind="permission", runtime="claude", message="Claude wants to run Bash: ls",
             guard=f"hook:{os.urandom(4).hex()}", device={"id": "core-1", "name": "core-1"},
             actions=[Action(id="allow", kind="allow_once", label="Allow"),
                      Action(id="deny", kind="reject_once", label="Deny")]))
+
+    def _on_disk(self):
+        """The requirement as a fresh manager reads it from the store file."""
+        return HitlManager(HitlStore(default_store(TMP))).get(self.req.id)
+
+    @contextlib.contextmanager
+    def _registry(self, owner):
+        """A gateway whose /v1/agents row for this agent names `owner`; yields the reads."""
+        reads = []
+
+        def req(method, path, *a, **k):
+            reads.append(path)
+            return {"agents": [{"id": "@me:ag2.space", "owner": owner}]}
+        with mock.patch.object(rgb, "_req", req), \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"):
+            yield reads
 
     def _task(self, **kw):
         t = {"id": f"task-{os.urandom(5).hex()}", "channel_id": "!dm:ag2.space",
@@ -69,12 +88,89 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertFalse(rgb._handle_hitl_action(self._task(task="Allow")))
         self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
 
-    def test_no_owner_configured_leaves_the_click_as_a_task(self):
+    def test_no_owner_anywhere_leaves_the_click_as_a_task_and_says_so(self):
         os.environ.pop("SPARROW_HA_OWNER", None)
-        t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
-                                    "action_id": "allow", "guard": self.req.guard})
-        self.assertFalse(rgb._handle_hitl_action(t))
-        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+        logs = []
+
+        def offline(*a, **k):
+            raise OSError("gateway unreachable")
+        with mock.patch.object(rgb, "_req", offline), mock.patch.object(rgb, "_log", logs.append):
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(t), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+        self.assertTrue(any("hitl: card click ignored, owner unknown" in m for m in logs), logs)
+
+    def test_registry_with_no_owner_row_fails_closed_too(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        logs = []
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(t), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+        self.assertTrue(any("owner unknown" in m for m in logs), logs)
+
+    def test_an_ordinary_reply_with_no_owner_logs_nothing(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        logs = []
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            self.assertIs(rgb._handle_hitl_action(self._task(reply_to_event="$not-a-card", task="hi")), False)
+        self.assertFalse(any("owner unknown" in m for m in logs), logs)
+
+    def test_unset_variable_uses_the_registry_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry(OWNER) as reads:
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(t), "applied")
+            self.assertEqual(self._on_disk().chosen_action, "allow", "the store file records the click")
+            rgb._handle_hitl_action(self._task(task="Allow"))
+            rgb._handle_hitl_action(self._task(hitl_action=dict(t["hitl_action"])))
+        self.assertEqual(len(reads), 1, "the registry is read once per process")
+
+    def test_registry_owner_does_not_let_a_non_owner_resolve(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry(OWNER):
+            click = self._task(user_id="@someone-else:ag2.space",
+                               hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                            "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(click), "ignored")
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_explicit_variable_wins_over_the_registry(self):
+        os.environ["SPARROW_HA_OWNER"] = "@configured:ag2.space"
+        with self._registry(OWNER) as reads:
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(t), "ignored", "the registry owner is not the configured one")
+            t2 = self._task(user_id="@configured:ag2.space", hitl_action=dict(t["hitl_action"]))
+            self.assertEqual(rgb._handle_hitl_action(t2), "applied")
+        self.assertEqual(reads, [], "an explicit owner never reads the registry")
+
+    def test_event_channel_claimant_uses_the_registry_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        claimant = rgb._HitlClicks(rgb._hitl_reply_handler("", log=lambda m: None), log=lambda m: None)
+
+        def ev(actor):
+            return {"type": "message.created", "event_id": f"$e{os.urandom(3).hex()}", "room_id": "!dm:ag2.space",
+                    "actor_id": actor, "content": {"space.ag2.hitl.action": {
+                        "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                        "action_id": "allow", "guard": self.req.guard}}}
+        logs = []
+        claimant._log = logs.append
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            self.assertFalse(claimant.claims(ev(OWNER)), "unknown owner: not claimed")
+        self.assertTrue(any("owner unknown" in m for m in logs), logs)
+        rgb._HITL_OWNER["mxid"] = ""
+        with self._registry(OWNER):
+            self.assertTrue(claimant.claims(ev("@someone-else:ag2.space")))
+            claimant.offer(ev("@someone-else:ag2.space"))
+            self.assertIsNone(self._on_disk().chosen_action, "a non-owner never resolves")
+            e = ev(OWNER)
+            self.assertTrue(claimant.claims(e))
+            claimant.offer(e)
+        self.assertEqual(self._on_disk().chosen_action, "allow")
 
     def test_redelivered_click_is_consumed_without_a_second_apply(self):
         t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
