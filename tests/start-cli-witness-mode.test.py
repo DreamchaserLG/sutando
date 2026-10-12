@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""`start-cli.sh --witness <name>` boots a throwaway core beside production, and
-`--witness-stop <name>` removes only what it made.
+"""`start-cli.sh --witness <name>` boots a throwaway core beside production,
+`--witness-stop <name>` stops only what it recorded and deletes nothing, and
+`--witness-clean <name>` removes its files only when they are still its own.
 
 Real launcher, real tmux, real workspace resolution (a copied checkout with the
 tracked sutando.config.json), a stub `claude`. A fake production workspace and a
@@ -62,7 +63,7 @@ def seed_production(ws: Path) -> None:
 
 
 class Harness:
-    def __init__(self, linked: bool = True) -> None:
+    def __init__(self, linked: bool = True, tmp_name: str = "t") -> None:
         if not TMUX:
             raise unittest.SkipTest("tmux not found")
         self.td = Path(tempfile.mkdtemp(prefix="wit"))
@@ -81,7 +82,7 @@ class Harness:
         # The production workspace a worker caller's env points at.
         self.prod_ws = self.td / "prod-ws"
         seed_production(self.prod_ws)
-        self.tmp = self.td / "t"
+        self.tmp = self.td / tmp_name
         self.tmp.mkdir()
         bind = self.td / "bin"
         bind.mkdir()
@@ -365,14 +366,15 @@ class WitnessBypassMirror(unittest.TestCase):
                 self.assertIn("not seeded", run.stderr)
 
 
-def remove_with(case, stdout: str, paths) -> None:
-    """Runs the one removal line stop printed, after checking it names exactly these paths."""
-    lines = [l.strip() for l in stdout.splitlines() if l.strip().startswith("rm -rf ")]
-    case.assertEqual(len(lines), 1, stdout)
-    case.assertEqual(shlex.split(lines[0])[2:], [str(p) for p in paths], stdout)
-    subprocess.run(["/bin/bash", "-c", lines[0]], check=True)
+def clean_ok(case, h, name: str, stop_stdout: str, paths) -> None:
+    """Stop printed the clean command; running --witness-clean removes exactly these paths."""
+    lines = [l.strip() for l in stop_stdout.splitlines() if l.strip().endswith(f"--witness-clean {name}")]
+    case.assertEqual(len(lines), 1, stop_stdout)
+    case.assertNotIn("rm -rf", stop_stdout)
+    run = subprocess.run(["/bin/bash", "-c", lines[0]], env=h.env, capture_output=True, text=True, timeout=90)
+    case.assertEqual(run.returncode, 0, run.stdout + run.stderr)
     for p in paths:
-        case.assertFalse(Path(p).exists(), f"the printed command left {p}")
+        case.assertFalse(Path(p).exists(), f"clean left {p}")
 
 
 def wait_gone(pids, seconds=10.0) -> list:
@@ -425,7 +427,7 @@ class WitnessFailedLaunch(unittest.TestCase):
         stop = self.h.run("--witness-stop", "t1")
         self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
         self.assertTrue(root.exists(), "stop deleted the root")
-        remove_with(self, stop.stdout, [root, self.h.root / "sutando.config.local.json"])
+        clean_ok(self, self.h, "t1", stop.stdout, [root, self.h.root / "sutando.config.local.json"])
         self.h.production_untouched(self)
 
     def test_detached_launch_with_a_failing_watcher_stops_what_it_recorded(self):
@@ -448,6 +450,32 @@ class WitnessFailedLaunch(unittest.TestCase):
         self.assertTrue(lock.exists(), "the lock was released while recorded processes may live")
         os.kill(int(rec["server"].split(":", 1)[0]), 0)
         self.assertIn(f"rm -rf {shlex.quote(str(lock))}", out)
+
+    def test_the_server_is_recorded_from_its_creation_not_a_later_read(self):
+        real = shlex.quote(os.path.realpath(TMUX))
+        # The later ownership read fails; creation's own report still names the server.
+        shims = self.h.shim_dir(tmux=f'case "$*" in *display-message*pid*) exit 42;; esac\nexec {real} "$@"\n')
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, sock, _, _ = self.h.witness("t1")
+        self.assertEqual(int(self.h.record("t1")["server"].split(":", 1)[0]), self.h.server_pid(sock))
+
+    def test_a_launch_that_records_nothing_keeps_its_lock_while_its_server_lives(self):
+        real = shlex.quote(os.path.realpath(TMUX))
+        # The core's new-session runs but its report is lost, so no process is recorded at all.
+        shims = self.h.shim_dir(tmux=(
+            f'case "$*" in *new-session*-core\\ -P*) {real} "$@" > /dev/null; exit $?;; esac\n'
+            f'exec {real} "$@"\n'))
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        out = run.stdout + run.stderr
+        root, sock, _, _ = self.h.witness("t1")
+        self.addCleanup(lambda: self.h.tm(sock, "kill-server"))
+        self.assertNotEqual(run.returncode, 0, out)
+        self.assertNotIn("server", self.h.record("t1"))
+        self.assertEqual(self.h.tm(sock, "list-sessions").returncode, 0, "no server was created")
+        self.assertIn("not proven gone", out)
+        self.assertNotIn("recorded processes are gone", out)
+        self.assertTrue((root.parent / ".t1.lock").exists(), "the lock was released while an unrecorded server lives")
 
     def test_tty_launch_with_a_failing_watcher_stops_what_it_recorded(self):
         rc, out = self.h.run_tty("--witness", "t1", extra_env={"PATH": f"{self.watcher_fails()}:{self.h.env['PATH']}"})
@@ -475,20 +503,92 @@ class WitnessTeardown(unittest.TestCase):
         self.assertIn("Nothing was deleted", run.stdout)
         self.assertTrue(self.root.exists() and cfg.exists(), "stop deleted something")
         self.assertEqual(self.h.record("t2"), rec, "stop changed the record")
-        remove_with(self, run.stdout, [self.root, cfg])
+        clean_ok(self, self.h, "t2", run.stdout, [self.root, cfg])
         self.h.production_untouched(self)
         again = self.h.run("--witness", "t2")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
 
+    def stopped(self):
+        run = self.h.run("--witness-stop", "t2")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return run
+
+    def assertCleanRefused(self, run, needle):
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn(needle, run.stderr)
+        self.assertTrue(self.root.exists() and (self.root / "witness.env").exists(), "clean removed the root")
+
     def test_stop_never_touches_a_config_it_did_not_write(self):
         cfg = self.h.root / "sutando.config.local.json"
         cfg.write_text('{"workspace": {"path": "/somewhere/else"}}\n')
-        run = self.h.run("--witness-stop", "t2")
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("not the one the witness wrote", run.stderr)
+        self.stopped()
         self.assertEqual(cfg.read_text(), '{"workspace": {"path": "/somewhere/else"}}\n')
-        remove_with(self, run.stdout, [self.root])
-        self.assertTrue(cfg.exists())
+
+    def test_clean_refuses_a_config_replaced_after_stop(self):
+        cfg = self.h.root / "sutando.config.local.json"
+        self.stopped()
+        mine = '{"workspace": {"path": "/user/replacement"}, "keep": "mine"}\n'
+        cfg.write_text(mine)
+        run = self.h.run("--witness-clean", "t2")
+        self.assertCleanRefused(run, "not the one the witness wrote")
+        self.assertEqual(cfg.read_text(), mine, "clean touched a replacement config")
+        self.assertEqual(list(self.h.root.glob(".sutando.config.local.json.*")), [])
+
+    def test_clean_keeps_the_root_for_a_changed_config_still_pointing_into_it(self):
+        cfg = self.h.root / "sutando.config.local.json"
+        data = json.loads(cfg.read_text())
+        data["unrelated"] = True
+        cfg.write_text(json.dumps(data) + "\n")
+        self.stopped()
+        run = self.h.run("--witness-clean", "t2")
+        self.assertCleanRefused(run, "not the one the witness wrote")
+        self.assertEqual(json.loads(cfg.read_text()), data)
+        self.assertTrue(self.ws.exists(), "the workspace a kept config names was removed")
+
+    def test_clean_keeps_the_root_when_a_config_appears_while_cleaning(self):
+        cfg = self.h.root / "sutando.config.local.json"
+        self.stopped()
+        shims = self.h.shim_dir(shasum=(
+            'h=$(/usr/bin/shasum "$@") || exit $?\n'
+            f'printf \'{{"workspace": {{"path": "{self.ws}"}}}}\\n\' > {shlex.quote(str(cfg))}\n'
+            'printf "%s\\n" "$h"\n'))
+        run = self.h.run("--witness-clean", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertCleanRefused(run, "appeared")
+        self.assertIn(str(self.ws), cfg.read_text())
+        self.assertEqual(list(self.h.root.glob(".sutando.config.local.json.*")), [])
+
+    def test_clean_refuses_while_recorded_processes_live(self):
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        run = self.h.run("--witness-clean", "t2")
+        self.assertCleanRefused(run, "not proven gone")
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+
+    def test_clean_refuses_while_a_heartbeat_beats_in_the_witness(self):
+        self.stopped()
+        cores = self.ws / "state/cores"
+        cores.mkdir(parents=True, exist_ok=True)
+        (cores / "testhost.alive").write_text("{}")
+        run = self.h.run("--witness-clean", "t2")
+        self.assertCleanRefused(run, "heartbeat")
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+
+    def test_stop_fails_when_a_server_answers_after_the_recorded_one_died(self):
+        rec = self.h.record("t2")
+        server = int(rec["server"].split(":", 1)[0])
+        mark = self.h.td / "late-started"
+        late = shlex.quote(os.path.realpath(TMUX))
+        shims = self.h.shim_dir(ps=(
+            f'if [ ! -e {shlex.quote(str(mark))} ] && ! kill -0 {server} 2>/dev/null; then\n'
+            f'  touch {shlex.quote(str(mark))}; {late} -S {shlex.quote(str(self.sock))} new-session -d -s late "sleep 300"\n'
+            'fi\nexec /bin/ps "$@"\n'))
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertTrue(mark.exists(), "the late server was never started")
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("not the recorded one", run.stderr)
+        self.assertNotIn("--witness-clean", run.stdout)
 
     def test_stop_with_failing_tmux_keeps_state_and_fails(self):
         rec = self.h.record("t2")
@@ -656,14 +756,14 @@ class WitnessTeardown(unittest.TestCase):
         self.assertTrue(self.root.exists())
         shutil.rmtree(lock)
 
-    def test_stop_with_failing_hash_leaves_the_config_out_of_the_command(self):
+    def test_clean_with_a_failing_hash_keeps_the_config_and_root(self):
         cfg = self.h.root / "sutando.config.local.json"
+        before = cfg.read_text()
+        self.stopped()
         shims = self.h.shim_dir(shasum="exit 42\n")
-        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertTrue(cfg.exists())
-        remove_with(self, run.stdout, [self.root])
-        self.assertTrue(cfg.exists(), "an unprovable config was removed")
+        run = self.h.run("--witness-clean", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertCleanRefused(run, "not the one the witness wrote")
+        self.assertEqual(cfg.read_text(), before)
 
     def test_same_name_in_another_root_survives_this_stop(self):
         other = Harness()
@@ -819,9 +919,35 @@ class WitnessRefusals(unittest.TestCase):
         stop = self.h.run("--witness-stop", "t1")
         self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
         root = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / "t1"
-        remove_with(self, stop.stdout, [root])
+        clean_ok(self, self.h, "t1", stop.stdout, [root])
         retry = self.h.run("--witness", "t1")
         self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+
+    def test_a_lock_with_no_owner_is_refused_with_its_removal_command(self):
+        lock = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / ".t1.lock"
+        lock.mkdir(parents=True)
+        run = self.h.run("--witness", "t1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("no recorded owner", run.stderr)
+        self.assertIn(f"rm -rf {shlex.quote(str(lock))}", run.stderr)
+        self.assertTrue(lock.exists())
+
+    def test_the_printed_lock_removal_command_is_quoted(self):
+        h = Harness(tmp_name="t d'q $x")
+        try:
+            base = Path(os.path.realpath(h.tmp)) / "sutando-witness"
+            lock = base / ".t1.lock"
+            lock.mkdir(parents=True)
+            sibling = base / "keep me"
+            sibling.mkdir()
+            run = h.run("--witness", "t1")
+            self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+            line = run.stderr.rsplit("retry: ", 1)[1].strip()
+            subprocess.run(["/bin/bash", "-c", line], check=True)
+            self.assertFalse(lock.exists(), f"the printed command did not remove the lock: {line}")
+            self.assertTrue(sibling.exists(), "the printed command removed something else")
+        finally:
+            h.close()
 
     def test_an_unsearchable_state_dir_counts_as_a_live_core(self):
         alive = self.h.checkout_ws / "state/cores/testhost.alive"

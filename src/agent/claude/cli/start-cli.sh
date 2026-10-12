@@ -46,7 +46,7 @@ fi
 WITNESS=""
 for _arg in "$@"; do
   case "$_arg" in
-    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
+    --witness|--witness-stop|--witness-clean|--witness-scrubbed|--witness=*|--witness-stop=*|--witness-clean=*)
       # shellcheck source=witness-mode.sh
       . "$REPO/src/agent/claude/cli/witness-mode.sh"
       witness_dispatch "$@"
