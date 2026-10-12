@@ -132,6 +132,56 @@ class Harness:
             raise unittest.SkipTest("tmux is in a system directory on this host")
         return path
 
+    def run_tty(self, *args, extra_env=None, timeout=90):
+        """The launcher under a real pseudo-terminal, so it takes its TTY branch."""
+        import pty
+        import select
+        env = {**self.env, **(extra_env or {})}
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve("/bin/bash", ["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh"), *args], env)
+        out, deadline = b"", time.time() + timeout
+        try:
+            while time.time() < deadline:
+                if not select.select([fd], [], [], 0.5)[0]:
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+        finally:
+            os.close(fd)
+        if time.time() >= deadline:
+            os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
+        return os.waitstatus_to_exitcode(status), out.decode(errors="replace")
+
+    def heartbeat_writers(self) -> list:
+        root = os.path.realpath(self.root)
+        rows = subprocess.run(["ps", "-A", "-o", "pid=,command="], capture_output=True, text=True).stdout
+        return [int(r.split()[0]) for r in rows.splitlines()
+                if "core_heartbeat.py" in r and "--" not in r.split("core_heartbeat.py", 1)[1]
+                and (root in r or str(self.root) in r)]
+
+    def detached(self, command: str) -> int:
+        """A process this test does not parent, so its exit is reaped elsewhere."""
+        pid = int(subprocess.run(["/bin/bash", "-c", f"nohup {command} >/dev/null 2>&1 & echo $!"],
+                                 capture_output=True, text=True).stdout)
+        return pid
+
+    def proc_id(self, pid: int) -> str:
+        script = 'REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; witness_proc_id "$2"'
+        return subprocess.run(["/bin/bash", "-c", script, "id", str(REPO), str(pid)],
+                              capture_output=True, text=True).stdout.rstrip("\n")
+
+    def set_record(self, name: str, **fields):
+        rec = Path(os.path.realpath(self.tmp)) / "sutando-witness" / name / "witness.env"
+        lines = [l for l in rec.read_text().splitlines() if l.split("=", 1)[0] not in fields]
+        rec.write_text("".join(l + "\n" for l in lines + [f"{k}={v}" for k, v in fields.items() if v is not None]))
+
     def server_pid(self, sock) -> int:
         return int(self.tm(sock, "display-message", "-p", "#{pid}").stdout.strip() or 0)
 
@@ -314,6 +364,61 @@ class WitnessBypassMirror(unittest.TestCase):
                 self.assertIn("not seeded", run.stderr)
 
 
+def wait_gone(pids, seconds=10.0) -> list:
+    """The pids still alive after waiting."""
+    deadline = time.time() + seconds
+    while True:
+        alive = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not alive or time.time() > deadline:
+            return alive
+        time.sleep(0.2)
+
+
+class WitnessFailedLaunch(unittest.TestCase):
+    """A launch that fails after creating processes stops what it recorded, deletes nothing,
+    and leaves a record --witness-stop can clean up."""
+
+    def setUp(self):
+        self.h = Harness()
+
+    def tearDown(self):
+        self.h.close()
+
+    def watcher_fails(self):
+        return self.h.shim_dir(tmux=f'case "$*" in *new-session*-watcher*) exit 42;; esac\nexec {TMUX} "$@"\n')
+
+    def assert_failed_then_stoppable(self, rc, output):
+        self.assertNotEqual(rc, 0, output)
+        self.assertIn("launch FAILED", output)
+        root, sock, _, _ = self.h.witness("t1")
+        rec = self.h.record("t1")
+        self.assertEqual(rec.get("intent"), "launch")
+        self.assertNotIn("complete", rec)
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core")]
+        self.assertEqual(wait_gone(pids), [], "a recorded process outlived the failed launch")
+        self.assertTrue(root.exists() and (self.h.root / "sutando.config.local.json").exists(),
+                        "a failed launch deleted files; only stop deletes")
+        stop = self.h.run("--witness-stop", "t1")
+        self.assertEqual(stop.returncode, 0, stop.stdout + stop.stderr)
+        self.assertFalse(root.exists())
+        self.assertFalse((self.h.root / "sutando.config.local.json").exists())
+        self.h.production_untouched(self)
+
+    def test_detached_launch_with_a_failing_watcher_stops_what_it_recorded(self):
+        run = self.h.run("--witness", "t1", extra_env={"PATH": f"{self.watcher_fails()}:{self.h.env['PATH']}"})
+        self.assert_failed_then_stoppable(run.returncode, run.stdout + run.stderr)
+
+    def test_tty_launch_with_a_failing_watcher_stops_what_it_recorded(self):
+        rc, out = self.h.run_tty("--witness", "t1", extra_env={"PATH": f"{self.watcher_fails()}:{self.h.env['PATH']}"})
+        self.assert_failed_then_stoppable(rc, out)
+
+
 class WitnessTeardown(unittest.TestCase):
     def setUp(self):
         self.h = Harness()
@@ -332,12 +437,18 @@ class WitnessTeardown(unittest.TestCase):
         self.assertFalse((self.h.root / "sutando.config.local.json").exists(), "override left behind")
         self.h.production_untouched(self)
 
-    def test_stop_leaves_a_config_it_did_not_write(self):
+    def test_stop_refuses_a_config_it_did_not_write_and_touches_nothing(self):
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
         cfg = self.h.root / "sutando.config.local.json"
         cfg.write_text('{"workspace": {"path": "/somewhere/else"}}\n')
         run = self.h.run("--witness-stop", "t2")
-        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("changed since the witness wrote it", run.stderr)
         self.assertEqual(cfg.read_text(), '{"workspace": {"path": "/somewhere/else"}}\n')
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue(self.root.exists())
 
     def test_stop_with_failing_tmux_keeps_state_and_fails(self):
         rec = self.h.record("t2")
@@ -443,6 +554,90 @@ class WitnessTeardown(unittest.TestCase):
         self.assertStopRefusedKeepingState(run, rec, pids)
         self.assertIn("no watcher", run.stderr)
         self.assertTrue(self.sock.exists())
+
+    def test_stop_never_kills_an_unrecorded_server_on_the_socket(self):
+        server = self.h.server_pid(self.sock)
+        os.kill(server, 15)
+        self.assertEqual(wait_gone([server]), [])
+        self.assertEqual(self.h.tm(self.sock, "new-session", "-d", "-s", "innocent", "sleep 300").returncode, 0)
+        innocent = self.h.server_pid(self.sock)
+        run = self.h.run("--witness-stop", "t2")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("not the recorded one", run.stderr)
+        os.kill(innocent, 0)
+        self.assertEqual(self.h.tm(self.sock, "has-session", "-t", "=innocent").returncode, 0)
+        self.assertTrue(self.root.exists())
+
+    def test_stop_with_a_failing_process_table_read_kills_nothing(self):
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        writers = self.h.heartbeat_writers()
+        self.assertTrue(writers, "the witness heartbeat writer is not running")
+        # Identity reads work, so stop gets past its lock; only the process table fails.
+        shims = self.h.shim_dir(ps='case "$*" in *-A*) exit 42;; esac\nexec /bin/ps "$@"\n')
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertStopRefusedKeepingState(run, rec, pids)
+        self.assertEqual(sorted(self.h.heartbeat_writers()), sorted(writers), "the heartbeat writer was stopped")
+
+    def test_a_refused_stop_leaves_the_heartbeat_writer_running(self):
+        writers = self.h.heartbeat_writers()
+        self.assertTrue(writers, "the witness heartbeat writer is not running")
+        self.h.set_record("t2", watcher=None)
+        run = self.h.run("--witness-stop", "t2")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("no watcher", run.stderr)
+        self.assertEqual(sorted(self.h.heartbeat_writers()), sorted(writers), "a refused stop stopped the heartbeat")
+
+    def test_a_failing_seq_cannot_end_the_survivor_wait(self):
+        self.h.tm(self.sock, "kill-server")
+        pid = self.h.detached("bash -c 'trap \"\" TERM; sleep 120'")
+        self.addCleanup(lambda: subprocess.run(["kill", "-9", str(pid)], capture_output=True))
+        time.sleep(0.3)
+        self.h.set_record("t2", core=self.h.proc_id(pid))
+        rec = self.h.record("t2")
+        shims = self.h.shim_dir(seq="exit 42\n")
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertStopRefusedKeepingState(run, rec, [pid])
+        self.assertIn("not proven gone", run.stderr)
+
+    def test_a_config_rewritten_during_its_removal_is_kept(self):
+        cfg = self.h.root / "sutando.config.local.json"
+        shims = self.h.shim_dir(shasum=(
+            'n=$(cat "$0.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$0.n"\n'
+            'h=$(/usr/bin/shasum "$@") || exit $?\n'
+            f'[ "$n" = 2 ] && printf \'{{"x": 1}}\\n\' > "{cfg}"\n'
+            'printf "%s\\n" "$h"\n'))
+        run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
+        self.assertTrue(cfg.exists(), "stop deleted a config written while it was removing its own")
+        self.assertEqual(cfg.read_text(), '{"x": 1}\n')
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+
+    def test_a_changed_config_that_still_names_the_witness_keeps_the_root(self):
+        cfg = self.h.root / "sutando.config.local.json"
+        data = json.loads(cfg.read_text())
+        data["unrelated"] = True
+        cfg.write_text(json.dumps(data) + "\n")
+        run = self.h.run("--witness-stop", "t2")
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue(self.root.exists(), "the root a kept config points at was deleted")
+        self.assertTrue(self.ws.exists())
+        self.assertEqual(json.loads(cfg.read_text()), data)
+
+    def test_stop_is_refused_while_another_start_or_stop_holds_the_name(self):
+        holder = self.h.detached("sleep 120")
+        self.addCleanup(lambda: subprocess.run(["kill", str(holder)], capture_output=True))
+        lock = self.root.parent / ".t2.lock"
+        lock.mkdir()
+        (lock / "owner").write_text(self.h.proc_id(holder) + "\n")
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        run = self.h.run("--witness-stop", "t2")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("busy", run.stderr)
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue(self.root.exists())
+        shutil.rmtree(lock)
 
     def test_stop_with_failing_hash_keeps_the_config(self):
         shims = self.h.shim_dir(shasum="exit 42\n")
@@ -564,14 +759,45 @@ class WitnessRefusals(unittest.TestCase):
         run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
         self.assertRefusedCleanly(run, "sha")
 
-    def test_launch_that_cannot_record_its_processes_fails_and_kills_them(self):
+    def test_a_start_while_the_name_is_held_creates_nothing(self):
+        holder = self.h.detached("sleep 120")
+        self.addCleanup(lambda: subprocess.run(["kill", str(holder)], capture_output=True))
+        lock = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / ".t1.lock"
+        lock.mkdir(parents=True)
+        (lock / "owner").write_text(self.h.proc_id(holder) + "\n")
+        run = self.h.run("--witness", "t1")
+        self.assertEqual(run.returncode, 2, run.stdout + run.stderr)
+        self.assertIn("busy", run.stderr)
+        self.assertFalse((lock.parent / "t1").exists(), "a start created a root while another held the name")
+        self.assertFalse((self.h.root / "sutando.config.local.json").exists())
+        self.assertEqual((lock / "owner").read_text(), self.h.proc_id(holder) + "\n", "the held lock was taken")
+
+    def test_a_lock_whose_owner_is_dead_is_taken_over(self):
+        dead = self.h.detached("true")
+        time.sleep(0.5)
+        lock = Path(os.path.realpath(self.h.tmp)) / "sutando-witness" / ".t1.lock"
+        lock.mkdir(parents=True)
+        (lock / "owner").write_text(f"{dead}:Thu Jan  1 00:00:00 1970\n")
+        run = self.h.run("--witness", "t1")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(lock.exists(), "a completed launch kept its lock")
+
+    def test_an_unsearchable_state_dir_counts_as_a_live_core(self):
+        alive = self.h.checkout_ws / "state/cores/testhost.alive"
+        os.utime(alive, None)
+        self.h.before["checkout"] = snapshot(self.h.checkout_ws)
+        state = self.h.checkout_ws / "state"
+        state.chmod(0)
+        try:
+            run = self.h.run("--witness", "t1")
+        finally:
+            state.chmod(0o755)
+        self.assertRefusedCleanly(run, "live core")
+
+    def test_launch_that_cannot_read_its_own_identity_refuses_before_creating_anything(self):
         shims = self.h.shim_dir(ps='case "$*" in *lstart*) exit 42;; esac\nexec /bin/ps "$@"\n')
         run = self.h.run("--witness", "t1", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
-        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("launch FAILED", run.stderr)
-        _, sock, _, _ = self.h.witness("t1")
-        self.assertNotEqual(self.h.tm(sock, "list-sessions").returncode, 0, "the unrecorded witness server survived")
-        self.h.production_untouched(self)
+        self.assertRefusedCleanly(run, "identity")
 
     def test_the_record_writer_reports_a_failed_write(self):
         d = Path(tempfile.mkdtemp(dir=self.h.td))
@@ -632,12 +858,25 @@ class ProcIdentity(unittest.TestCase):
         return subprocess.run(["/bin/bash", "-c", script, "id", str(REPO), func, pid],
                               capture_output=True, text=True, env=env)
 
+    def state_in(self, rec, lc_all=None, tz=None):
+        return self.fn("witness_proc_state", rec, lc_all, tz).stdout.strip()
+
+    def test_a_failed_start_time_read_on_a_live_pid_is_unknown(self):
+        probe = subprocess.Popen(["sleep", "60"])
+        try:
+            live = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
+            path = self.shim_path('case "$*" in *lstart*) exit 42;; esac\nexec /bin/ps "$@"\n')
+            self.assertEqual(self.state(live, path), "unknown", "a pid whose identity could not be read got a verdict")
+        finally:
+            probe.kill()
+            probe.wait()
+
     def test_a_live_process_stays_live_across_locales(self):
         probe = subprocess.Popen(["sleep", "60"])
         try:
             recorded = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
             self.assertTrue(recorded.startswith(f"{probe.pid}:"), recorded)
-            self.assertEqual(self.fn("witness_proc_live", recorded, "fr_FR.UTF-8").returncode, 0,
+            self.assertEqual(self.state_in(recorded, lc_all="fr_FR.UTF-8"), "alive",
                              "a live recorded process read as dead in another locale")
         finally:
             probe.kill()
@@ -647,7 +886,7 @@ class ProcIdentity(unittest.TestCase):
         probe = subprocess.Popen(["sleep", "60"])
         try:
             recorded = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
-            self.assertEqual(self.fn("witness_proc_live", recorded, tz="Asia/Tokyo").returncode, 0,
+            self.assertEqual(self.state_in(recorded, tz="Asia/Tokyo"), "alive",
                              "a live recorded process read as dead in another time zone")
         finally:
             probe.kill()

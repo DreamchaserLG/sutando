@@ -693,16 +693,18 @@ apply_claude_tmux_defaults
 if [ -t 1 ]; then
   ensure_core_monitor   # backgrounded child survives the exec below
   if ! launch_claude_session; then
-    [ -z "$WITNESS" ] || witness_abort_launch
+    [ -z "$WITNESS" ] || witness_record_partial
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  [ -z "$WITNESS" ] || witness_record_server_core || exit 1
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
-  [ -z "$WITNESS" ] || witness_record_launch || witness_abort_launch
+  [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_launch_complete
   exec tmux -S "$TMUX_SOCKET" attach -t "$SESSION"
 else
   # Verify the core actually came up before reporting success. Without this a
@@ -710,19 +712,21 @@ else
   # exits 0 and Sutando.app reports "Core restarted" while nothing is serving —
   # the same false-success class as the --restart kill race above.
   if ! launch_claude_session; then
-    [ -z "$WITNESS" ] || witness_abort_launch
+    [ -z "$WITNESS" ] || witness_record_partial
     echo "  ⚠ $SESSION did not come up within ~5s of launch — start FAILED." >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "FAILED: core did not come up within ~5s"
     exit 1
   fi
+  [ -z "$WITNESS" ] || witness_record_server_core || exit 1
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier
-  [ -z "$WITNESS" ] || witness_record_launch || witness_abort_launch
+  [ -z "$WITNESS" ] || witness_record_watcher || exit 1
   ensure_core_heartbeat
+  [ -z "$WITNESS" ] || witness_launch_complete
   if [ "$VISIBLE" = 1 ]; then
     open_visible_terminal
     echo "Started $SESSION detached — opened a Terminal window attached to it."
