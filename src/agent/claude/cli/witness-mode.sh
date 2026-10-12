@@ -1,6 +1,6 @@
 #!/bin/bash
 # --witness <name>: a throwaway core from THIS checkout on its own socket, session and workspace. --witness-stop stops only
-# what it recorded and deletes nothing; --witness-clean then removes its files. Refusals exit 2 before any side effect.
+# what it recorded; neither ever deletes a file, the user does. Refusals exit 2 before any side effect.
 
 WITNESS_DEFAULT_SOCKET="/tmp/sutando-tmux.sock"
 WITNESS_DEFAULT_SESSION="sutando-core"
@@ -37,7 +37,8 @@ witness_paths() {
   case "$name" in
     "") witness_refuse "a witness needs a name: --witness <name>" ;;
   esac
-  if ! printf '%s' "$name" | grep -Eq '^[a-z0-9][a-z0-9-]{0,19}$'; then
+  # Matched on the whole string: a line-based grep would accept a name with an embedded newline.
+  if ! [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,19}$ ]]; then
     witness_refuse "witness name '$name' must be 1-20 of [a-z0-9-], starting alphanumeric"
   fi
   base="$(witness_physical "${TMPDIR:-/tmp}")"
@@ -257,34 +258,31 @@ witness_launch_complete() {
   witness_unlock
 }
 
-# True only when nothing can be serving the witness socket: it is absent, or tmux reports no server on it.
-witness_socket_quiet() {
-  local out
-  [ -e "$WITNESS_SOCKET" ] || return 0
-  witness_tmux_usable || return 1
-  out="$(tmux -S "$WITNESS_SOCKET" display-message -p '#{pid}' 2>&1)" && return 1
-  case "$out" in *"no server running"*|*"error connecting"*) return 0 ;; esac
-  return 1
-}
 
-# Every exit of launch's second stage before completion: stop what was recorded, delete nothing,
-# and keep the lock unless the recorded processes AND the socket both prove nothing runs.
+# Every exit of launch's second stage before completion: stop what was recorded, delete nothing, and keep
+# the lock unless at least one pid was recorded and every recorded pid is proven dead. An empty record proves nothing.
 witness_launch_exit() {
-  local rc=$? left
+  local rc=$? left role recorded=""
   [ "$rc" != 0 ] || rc=1
+  for role in server core core_claude watcher; do [ -z "$(witness_record_get "$role")" ] || recorded=1; done
   witness_kill_recorded
-  if left="$(witness_wait_recorded_gone)" && { witness_socket_quiet || { left=" a server on $WITNESS_SOCKET"; false; }; }; then
+  if [ -z "$recorded" ]; then
+    left=" (nothing was recorded, so whatever it started cannot be identified)"
+  fi
+  if [ -n "$recorded" ] && left="$(witness_wait_recorded_gone)"; then
     witness_unlock
     echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); its recorded processes are gone and nothing was deleted. Run --witness-stop $WITNESS_NAME for what is left." >&2
   else
-    echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); not proven gone:$left. Its lock is kept; check them (tmux -S $(printf '%q' "$WITNESS_SOCKET") ls; ps), then: rm -rf $(printf '%q' "$WITNESS_LOCK") && bash $(printf '%q' "$REPO/src/agent/start-cli.sh") --witness-stop $WITNESS_NAME" >&2
+    echo "  ⚠ witness '$WITNESS_NAME' launch FAILED (exit $rc); not proven gone:$left. Its lock is kept." >&2
+    echo "    Check for its processes: tmux -S $(printf '%q' "$WITNESS_SOCKET") ls; ps -A -o pid=,command= | grep -F $(printf '%q' "$WITNESS_SESSION")" >&2
+    echo "    Once none run, remove the lock by hand: rm -rf $(printf '%q' "$WITNESS_LOCK"); then run --witness-stop $WITNESS_NAME" >&2
   fi
   exit "$rc"
 }
 
-# A first-stage failure after the root exists: nothing was started; --witness-clean removes what was made.
+# A first-stage failure after the root exists: nothing was started, and its files are left for the user.
 witness_start_fail() {
-  echo "start-cli witness: launch FAILED — $*; nothing was started or deleted. Remove what was made with: --witness-clean $WITNESS_NAME" >&2
+  echo "start-cli witness: launch FAILED — $*; nothing was started or deleted. Run --witness-stop $WITNESS_NAME for what is left." >&2
   exit 1
 }
 
@@ -352,7 +350,7 @@ witness_start() {
   # The record, with its intent marker, exists before anything else is made, so stop can always reach it.
   printf 'intent=launch\nrepo=%s\nsocket=%s\nsession=%s\nworkspace=%s\n' \
     "$REPO" "$WITNESS_SOCKET" "$WITNESS_SESSION" "$WITNESS_WS" > "$WITNESS_RECORD" \
-    || { echo "start-cli witness: launch FAILED — could not write $WITNESS_RECORD; nothing was started. Remove the root by hand: rm -rf $(printf '%q' "$WITNESS_ROOT")" >&2; exit 1; }
+    || { echo "start-cli witness: launch FAILED — could not write $WITNESS_RECORD; nothing was started or deleted. $WITNESS_ROOT is left for you to remove." >&2; exit 1; }
   mkdir -p "$WITNESS_WS"/tasks "$WITNESS_WS"/results "$WITNESS_WS"/state "$WITNESS_WS"/logs \
     || witness_start_fail "cannot create $WITNESS_WS"
   # Written whole to a temp file beside it, then published by a no-clobber link: the config is never partial.
@@ -492,53 +490,14 @@ witness_stop() {
   witness_unlock
 
   echo "  ✓ witness '$name' stopped: every recorded process is gone. Nothing was deleted; left in place:"
-  echo "    $WITNESS_ROOT  (its workspace and record)"
-  [ -e "$WITNESS_CONFIG" ] && echo "    $WITNESS_CONFIG"
-  echo "  Remove them with:"
-  echo "    bash $(printf '%q' "$REPO/src/agent/start-cli.sh") --witness-clean $name"
+  echo "    $WITNESS_ROOT  (its workspace)"
+  echo "    $WITNESS_RECORD  (its record, inside that root)"
+  [ -e "$WITNESS_CONFIG" ] && echo "    $WITNESS_CONFIG  (this checkout's local config)"
+  echo "  Removing the root is safe only once no sutando.config.local.json points into it. Check with:"
+  echo "    grep -lF $(printf '%q' "$WITNESS_ROOT") $(printf '%q' "$WITNESS_CONFIG")"
+  echo "  (no output means this checkout's config does not point into it)."
 }
 
-# Removes a stopped witness's files under its lock. The config is taken by an atomic rename and kept
-# unless it still hashes to the record; the root goes only once nothing runs and no config is at the path.
-witness_clean() {
-  local name="$1" role proc want claim="" tomb
-  witness_paths "$name"
-  witness_assert_not_production "$WITNESS_SOCKET" "$WITNESS_SESSION"
-  [ -f "$WITNESS_RECORD" ] || witness_refuse "no witness '$name' at $WITNESS_ROOT"
-  witness_lock
-  witness_check_record
-  for role in server core core_claude watcher; do
-    proc="$(witness_record_get "$role")"
-    [ -z "$proc" ] || [ "$(witness_proc_state "$proc")" = dead ] \
-      || witness_refuse "the recorded $role (pid ${proc%%:*}) is not proven gone; run --witness-stop $name first"
-  done
-  witness_socket_quiet || witness_refuse "something may still answer on $WITNESS_SOCKET; run --witness-stop $name first"
-  witness_workspace_has_live_core "$WITNESS_WS" \
-    && witness_refuse "a heartbeat may still beat in $WITNESS_WS/state/cores; restore the witness config and run --witness-stop $name, or stop that writer"
-  want="$(witness_record_get config_sha)"
-  if [ -e "$WITNESS_CONFIG" ]; then
-    claim="$REPO/.sutando.config.local.json.witness-clean.$$"
-    mv "$WITNESS_CONFIG" "$claim" 2>/dev/null || witness_refuse "could not claim $WITNESS_CONFIG"
-    if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]] || [ "$(witness_sha "$claim")" != "$want" ]; then
-      ln "$claim" "$WITNESS_CONFIG" 2>/dev/null && rm -f "$claim" \
-        || witness_refuse "$WITNESS_CONFIG changed while being checked; the claimed copy is left at $claim"
-      witness_refuse "$WITNESS_CONFIG is not the one the witness wrote; move or remove it yourself, then rerun --witness-clean $name"
-    fi
-  fi
-  # The root is moved aside first, so a config written meanwhile can be honoured by putting it back.
-  tomb="${WITNESS_ROOT%/*}/.$name.removing.$$"
-  mv "$WITNESS_ROOT" "$tomb" 2>/dev/null || witness_refuse "could not move $WITNESS_ROOT aside"
-  if [ -e "$WITNESS_CONFIG" ]; then
-    mv "$tomb" "$WITNESS_ROOT"
-    [ -z "$claim" ] || rm -f "$claim"
-    witness_refuse "a config appeared at $WITNESS_CONFIG while cleaning, so $WITNESS_ROOT is kept"
-  fi
-  rm -rf "$tomb"
-  [ -z "$claim" ] || rm -f "$claim"
-  trap - EXIT
-  witness_unlock
-  echo "  ✓ witness '$name' cleaned: removed $WITNESS_ROOT${claim:+ and $WITNESS_CONFIG}"
-}
 
 # Entry from start-cli.sh. A witness flag anywhere but first is refused: a later
 # position would otherwise fall through to a production launch.
@@ -547,8 +506,8 @@ witness_dispatch() {
   for a in "$@"; do
     i=$((i + 1))
     case "$a" in
-      --witness=*|--witness-stop=*|--witness-clean=*) witness_refuse "use '--witness <name>' / '--witness-stop <name>' / '--witness-clean <name>' (no '=')" ;;
-      --witness|--witness-stop|--witness-clean|--witness-scrubbed)
+      --witness=*|--witness-stop=*) witness_refuse "use '--witness <name>' / '--witness-stop <name>' (no '=')" ;;
+      --witness|--witness-stop|--witness-scrubbed)
         [ "$i" = 1 ] || witness_refuse "$a must be the first argument" ;;
     esac
   done
@@ -556,7 +515,6 @@ witness_dispatch() {
   case "${1:-}" in
     --witness) witness_start "${2:-}" ;;
     --witness-stop) witness_stop "${2:-}"; exit 0 ;;
-    --witness-clean) witness_clean "${2:-}"; exit 0 ;;
     --witness-scrubbed) witness_enter "${2:-}" ;;
   esac
 }

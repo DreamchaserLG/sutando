@@ -61,7 +61,7 @@ fi
 # which act on the production socket and session.
 for _arg in "$@"; do
   case "$_arg" in
-    --witness|--witness-stop|--witness-clean|--witness-scrubbed|--witness=*|--witness-stop=*|--witness-clean=*)
+    --witness|--witness-stop|--witness-scrubbed|--witness=*|--witness-stop=*)
       if [ -n "$requested_runtime" ] && [ "$requested_runtime" != "claude" ]; then
         echo "start-cli: witness mode is supported only for the claude runtime" >&2
         exit 2

@@ -134,7 +134,7 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
   bash src/agent/start-cli.sh --witness pr<N>        # own tmux socket/session, own temp workspace
   # drop tasks into the workspace it prints (tasks/), read results/, attach with the printed tmux line
   bash src/agent/start-cli.sh --witness-stop pr<N>   # stops only what it recorded and deletes nothing; exits 1 if any survive
-  bash src/agent/start-cli.sh --witness-clean pr<N>  # then removes its root and local config, only if unchanged and unused
+  # it lists what is left (root, record, local config); remove those by hand once no config points into the root
   ```
 
   It refuses to run from a main checkout, over an existing local config, without a runnable tmux or
