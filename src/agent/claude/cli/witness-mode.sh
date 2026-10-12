@@ -125,7 +125,12 @@ witness_record_set() {
 witness_proc_id() {
   local st
   [ -n "$1" ] || return 1
-  st="$(ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
+  st="$(LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null)" && [ -n "$st" ] && printf '%s:%s\n' "$1" "$st"
+}
+
+# Positive proof of death: no process holds the pid at all. A start-time mismatch is not proof.
+witness_proc_gone() {
+  [ -n "$1" ] && ! ps -p "${1%%:*}" > /dev/null 2>&1
 }
 
 witness_proc_live() {
@@ -317,7 +322,7 @@ witness_stop() {
   witness_proc_live "$server" && witness_fail "the witness tmux server (pid ${server%%:*}) is still running"
   if [ -S "$WITNESS_SOCKET" ]; then
     if ! witness_tmux_usable; then
-      [ -n "$server" ] || witness_fail "no recorded server and no tmux to prove $WITNESS_SOCKET is dead"
+      witness_proc_gone "$server" || witness_fail "no tmux to prove the server on $WITNESS_SOCKET is dead"
     elif tmux -S "$WITNESS_SOCKET" list-sessions > /dev/null 2>&1; then
       witness_fail "a tmux server still answers on $WITNESS_SOCKET"
     fi

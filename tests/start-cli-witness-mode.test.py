@@ -361,6 +361,25 @@ class WitnessTeardown(unittest.TestCase):
         self.assertTrue(self.root.exists() and self.sock.exists())
         self.assertTrue((self.h.root / "sutando.config.local.json").exists())
 
+    def test_stop_without_tmux_in_another_locale_keeps_state_and_fails(self):
+        if "dim." not in subprocess.run(["ps", "-p", str(os.getpid()), "-o", "lstart="], capture_output=True,
+                                        text=True, env={**os.environ, "LC_ALL": "fr_FR.UTF-8"}).stdout:
+            self.skipTest("no fr_FR locale that changes ps start times on this host")
+        rec = self.h.record("t2")
+        pids = [int(rec[r].split(":", 1)[0]) for r in ("server", "core", "watcher")]
+        run = self.h.run("--witness-stop", "t2",
+                         extra_env={"PATH": self.h.path_without_tmux(), "LC_ALL": "fr_FR.UTF-8"})
+        self.assertNotEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertNotIn("stopped", run.stdout)
+        for pid in pids:
+            os.kill(pid, 0)
+        self.assertTrue(self.root.exists() and self.sock.exists(), "witness state removed while its server lives")
+        self.assertTrue((self.h.root / "sutando.config.local.json").exists())
+        self.assertEqual(self.h.record("t2"), rec)
+        again = self.h.run("--witness-stop", "t2")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertFalse(self.root.exists())
+
     def test_stop_with_failing_hash_keeps_the_config(self):
         shims = self.h.shim_dir(shasum="exit 42\n")
         run = self.h.run("--witness-stop", "t2", extra_env={"PATH": f"{shims}:{self.h.env['PATH']}"})
@@ -512,6 +531,27 @@ class ProductionTargetGuard(unittest.TestCase):
         run = self.guard("/x/w.sock", "witness-x-core", ambient=("/tmp/sutando-tmux.sock", "sutando-core"))
         self.assertEqual(run.returncode, 0, run.stderr)
 
+
+
+class ProcIdentity(unittest.TestCase):
+    """A process recorded in one locale is the same process when checked in another."""
+
+    def fn(self, func, pid, lc_all=None):
+        env = {"PATH": os.environ["PATH"], "LANG": "en_US.UTF-8", **({"LC_ALL": lc_all} if lc_all else {})}
+        script = 'REPO="$1"; . "$REPO/src/agent/claude/cli/witness-mode.sh"; "$2" "$3"'
+        return subprocess.run(["/bin/bash", "-c", script, "id", str(REPO), func, pid],
+                              capture_output=True, text=True, env=env)
+
+    def test_a_live_process_stays_live_across_locales(self):
+        probe = subprocess.Popen(["sleep", "60"])
+        try:
+            recorded = self.fn("witness_proc_id", str(probe.pid)).stdout.rstrip("\n")
+            self.assertTrue(recorded.startswith(f"{probe.pid}:"), recorded)
+            self.assertEqual(self.fn("witness_proc_live", recorded, "fr_FR.UTF-8").returncode, 0,
+                             "a live recorded process read as dead in another locale")
+        finally:
+            probe.kill()
+            probe.wait()
 
 if __name__ == "__main__":
     unittest.main()
