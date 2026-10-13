@@ -311,6 +311,71 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    def test_missing_state_on_an_ordinary_tick_holds_a_pending_card(self):
+        # Ordinary tick, state vanished entirely (not via pause/resume) -- the
+        # unchanged pane's own fresh first-tick evidence keeps the card alive.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_missing_state_on_an_ordinary_tick_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_corrupt_state_on_an_ordinary_tick_holds_a_pending_card(self):
+        # Same as the resumed-tick corruption test, but on an ordinary tick:
+        # isolates the corruption itself from the separate "resumed" path.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID] = "corrupted-not-a-dict"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_corrupt_state_on_an_ordinary_tick_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID] = "corrupted-not-a-dict"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_partial_state_missing_this_worker_holds_a_pending_card(self):
+        # Valid JSON, other workers intact, but THIS worker's own entry was
+        # simply never recorded (or lost) -- distinct from a corrupted value.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        del raw["workers"][WID]
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_partial_state_missing_this_worker_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        del raw["workers"][WID]
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
     def test_persistent_undecidable_queue_evidence_holds_across_many_ticks(self):
         # Holding must not be a one-tick grace period: as long as the queue
         # evidence stays undecidable, the card stays open, tick after tick.
