@@ -413,18 +413,22 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
         self.assertEqual(manager(ws).get(req.id).status, "in_progress")
 
     def test_a_pressed_card_goes_stale_through_a_kind_change_alone_not_only_departure(self):
-        # `worker_ids` is empty: staleness here can only come from the wedges
-        # kind-mismatch branch, not a seat-departure shortcut.
-        ws = pool()
-        _, _, first = card(ws, HUMAN, USAGE_LIMIT_MENU)
-        press(ws, first, "open_terminal")
-        self.assertEqual(manager(ws).get(first.id).status, "in_progress")
-        closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: CAUSE})
-        self.assertEqual(closed, [first.id])
-        out2, _, second = card(ws, HUMAN, USAGE_LIMIT_MENU)
-        self.assertEqual(out2["outcome"], "carded")
-        self.assertNotEqual(second.id, first.id)
-        self.assertEqual(manager(ws).get(second.id).status, "pending")
+        # `worker_ids` is empty for every kind: staleness here can only come
+        # from the wedges kind-mismatch branch, never a seat-departure shortcut.
+        all_kinds = [k for k, _ in OPEN_TERMINAL_CASES]
+        for i, (kind, pane) in enumerate(OPEN_TERMINAL_CASES):
+            with self.subTest(kind=kind):
+                other = all_kinds[(i + 1) % len(all_kinds)]
+                ws = pool()
+                _, _, first = card(ws, kind, pane)
+                press(ws, first, "open_terminal")
+                self.assertEqual(manager(ws).get(first.id).status, "in_progress", kind)
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: other})
+                self.assertEqual(closed, [first.id], kind)
+                out2, _, second = card(ws, kind, pane)
+                self.assertEqual(out2["outcome"], "carded", kind)
+                self.assertNotEqual(second.id, first.id, kind)
+                self.assertEqual(manager(ws).get(second.id).status, "pending", kind)
 
 
 class CodexCards(unittest.TestCase):

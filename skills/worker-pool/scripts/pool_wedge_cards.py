@@ -14,10 +14,10 @@ a card instead, through the engine's hitl store:
   shows the same frozen frame is refused and nothing is typed.
 - a gate or a limit dialog (PANE_GATE / PANE_LIMIT): the card quotes the pane's
   tail and sends the owner to the terminal; no key is offered, since only the
-  owner can choose among the dialog's own options. A backstop only: the seat's
-  own core-input-watch supervisor (pool_remedy.ensure_input_watch) already cards
-  the same dialog if it is running, so this one defers to it rather than
-  raising a second card for one pane.
+  owner can choose among the dialog's own options. A backstop only: when the
+  seat's own core-input-watch supervisor (pool_remedy.ensure_input_watch) has
+  already carded the same dialog, this one defers to it rather than raising a
+  second card for one pane.
 """
 from __future__ import annotations
 
@@ -250,7 +250,7 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
 def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
-    that card, None for a gate or limit).
+    that card).
 
     A press is left alone only while it has a further step owed: `send_escape`
     waits on `drive_escapes`, which refuses it once the frame has moved. A press
