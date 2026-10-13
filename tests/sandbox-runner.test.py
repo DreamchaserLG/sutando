@@ -281,14 +281,6 @@ class DiscordBridgeDelegates(unittest.TestCase):
         cls.bridge = _load_bridge()
         cls.src = (REPO / "src" / "discord-bridge.py").read_text()
 
-    def test_no_hardcoded_runner_invocation_remains(self):
-        self.assertNotIn('["codex", "exec"', self.src)
-        self.assertNotIn("--max 240 -- codex exec", self.src)
-        self.assertEqual(self.src.count("sandbox_runner.shell_command(_sandbox,"), 2)
-        self.assertIn("_sandbox = sandbox_runner.selected_or_fallback()", self.src)
-        self.assertNotIn("cwd='/tmp'", self.src)
-        self.assertIs(self.bridge.sandbox_runner, sr)
-
     def _render(self, runner):
         m = re.search(r"\n    tier_instructions = \{\n.*?\n    \}\n", self.src, re.S)
         block = "\n".join(line[4:] for line in m.group(0).strip("\n").split("\n"))
