@@ -4,7 +4,7 @@
 Offline: `gh`, `claude` and `codex` are stand-ins on PATH. Pins the confined argv
 (read-only file tools, --restricted, no MCP), that the run's cwd is a fresh dir
 outside the repo holding only the diff and the PR's regular files, that codex is
-never invoked, that the Team rulebook passes the flag, and that the owner path
+never invoked, that the Team rulebook's command takes that path, and that the owner path
 still runs codex.
 
 Run: python3 tests/review-pr-non-owner.test.py
@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO / "tests" / "_helpers"))
 sys.path.insert(0, str(REPO / "skills" / "claude-codex" / "scripts"))
 
 from policy import sandbox_runner as sr  # noqa: E402
-import review_pr_fixture, review_pr_sandbox as rps  # noqa: E401,E402
+import discord_env, review_pr_fixture, review_pr_sandbox as rps  # noqa: E401,E402
 
 SPEC = {
     "url": "https://github.com/example/demo/pull/7", "sha": "b" * 40,
@@ -42,7 +42,7 @@ SPEC = {
 }
 
 # Records argv + cwd + the cwd's file list, then prints a verdict.
-FAKE_CLAUDE = """#!{python}
+FAKE_CLAUDE = """#!/usr/bin/env python3
 import json, os, sys
 files = sorted(os.path.relpath(os.path.join(d, f), ".") for d, _, fs in os.walk(".") for f in fs)
 json.dump({{"argv": sys.argv[1:], "cwd": os.getcwd(), "files": files}}, open({log!r}, "w"))
@@ -86,6 +86,19 @@ class Populate(unittest.TestCase):
         self.assertNotIn(REPO, self.root.parents)
         self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
 
+    def test_review_dir_refuses_a_tmpdir_inside_the_workspace(self):
+        ws = Path(tempfile.mkdtemp(prefix="review-pr-ws-")).resolve()
+        self.addCleanup(shutil.rmtree, ws, True)
+        orig = tempfile.tempdir
+        tempfile.tempdir = str(ws / "tmp")
+        (ws / "tmp").mkdir()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "inside the workspace"):
+                rps.review_dir(workspace=ws)
+        finally:
+            tempfile.tempdir = orig
+        self.assertEqual(list((ws / "tmp").iterdir()), [])
+
 
 class ConfinedInvocation(unittest.TestCase):
     def setUp(self):
@@ -125,20 +138,20 @@ class ConfinedInvocation(unittest.TestCase):
 
 
 class Script(unittest.TestCase):
-    def run_script(self, *args):
+    def run_script(self, *args, command=None):
         tmp = Path(tempfile.mkdtemp(prefix="review-pr-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         bindir = tmp / "bin"
         review_pr_fixture.install(bindir, SPEC)
         self.claude_log, self.codex_log = tmp / "claude.json", tmp / "codex.log"
-        (bindir / "claude").write_text(FAKE_CLAUDE.format(python=sys.executable,
-                                                          log=str(self.claude_log)))
+        (bindir / "claude").write_text(FAKE_CLAUDE.format(log=str(self.claude_log)))
         (bindir / "codex").write_text(FAKE_CODEX.format(log=str(self.codex_log)))
         for n in ("claude", "codex"):
             (bindir / n).chmod(0o755)
         env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         env.pop("SUTANDO_SANDBOX_RUNNERS", None)
-        return subprocess.run(["bash", str(SCRIPT), "7", *args], cwd=REPO, env=env,
+        argv = ["bash", "-c", command] if command else ["bash", str(SCRIPT), "7", *args]
+        return subprocess.run(argv, cwd=REPO, env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
                               timeout=60)
 
@@ -161,11 +174,15 @@ class Script(unittest.TestCase):
         self.assertTrue(self.codex_log.exists(), "owner path no longer runs codex")
         self.assertFalse(self.claude_log.exists())
 
-    def test_team_rulebook_passes_non_owner(self):
-        src = (REPO / "src" / "discord-bridge.py").read_text()
-        block = src[src.index("2. PR-REVIEW REQUEST"):src.index("2b. MESSAGE OWNER")]
-        self.assertIn("review-pr.sh <N> --non-owner", block)
-        self.assertNotIn("codex exec --sandbox read-only", block)
+    def test_team_rulebook_command_never_runs_codex(self):
+        with discord_env.temp_config_root():
+            bridge = discord_env.load_bridge("dbridge_review_pr_non_owner")
+        p = self.run_script(command=bridge.TEAM_PR_REVIEW_COMMAND.replace("<N>", "7"))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("STUB REVIEW", p.stdout)
+        self.assertFalse(self.codex_log.exists(), "the Team rulebook's command ran codex")
+        rec = json.loads(self.claude_log.read_text())
+        self.assertEqual(rec["files"], ["PR.diff", "docs/b.md", "src/a.py"])
 
 
 if __name__ == "__main__":
