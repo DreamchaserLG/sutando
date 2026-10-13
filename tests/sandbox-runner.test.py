@@ -186,6 +186,18 @@ class Invocations(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(sr.FAQ_PATH.read_text().strip(), out.stdout)
 
+    def test_faq_falls_back_to_the_module_loader(self):
+        with mock.patch.object(Path, "read_text", side_effect=OSError("in a zip")):
+            self.assertIn("no tools and no files", sr.context_preamble())
+        self.assertIn(sr.FAQ_PATH.read_text().strip(), sr.context_preamble())
+
+    def test_heredoc_tag_never_matches_a_line_of_the_text(self):
+        text = "a\nSUTANDO_SANDBOX_CONTEXT\nb"
+        out = sr._heredoc(text)
+        self.assertTrue(out.startswith("$(cat <<'SUTANDO_SANDBOX_CONTEXT_X'\n"))
+        self.assertEqual(subprocess.run(["bash", "-c", f'printf %s "{out}"'], capture_output=True,
+                                        text=True, check=True).stdout, text)
+
     def test_shell_command_shape(self):
         line = sr.shell_command(sr.RUNNERS["claude"], "P", out_path="/o")
         self.assertTrue(line.startswith("/bin/sh -c 'd=$(mktemp -d) && cd \"$d\""))
