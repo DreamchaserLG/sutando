@@ -667,19 +667,12 @@ def _name_seat(req, session, seat):
 
 
 def already_carded_elsewhere(manager, session) -> bool:
-    """Is there already an active requirement for this session from a
-    DIFFERENT source? The Manager's own dedup only catches an identical
-    (runtime, kind, device, guard) — it never learns that another watcher
-    of the same pane already asked the owner. Provider-agnostic on purpose:
-    this file does not need to know what that other source is."""
-    if manager is None:
-        return False
-    try:
-        return any((r.subject or {}).get("session") == session
-                  and (r.subject or {}).get("source") != _TUI_SOURCE
-                  for r in manager.active())
-    except Exception:  # noqa: BLE001 — an unreadable store is not proof of a duplicate
-        return False
+    """The shared same-session ownership policy (src/hitl/session_ownership.py),
+    not a private check: the Manager's own dedup only catches an identical
+    (runtime, kind, device, guard), never that another watcher of the same
+    pane already asked the owner."""
+    from hitl.session_ownership import session_already_carded
+    return session_already_carded(manager, session, by_source=_TUI_SOURCE)
 
 
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):

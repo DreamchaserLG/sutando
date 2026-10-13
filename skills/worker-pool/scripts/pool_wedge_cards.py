@@ -108,11 +108,10 @@ INPUT_WATCH_SOURCE = "tui"
 
 
 def input_watch_has_card(session, manager) -> bool:
-    """By effect, not by whether its tmux session is merely alive (that stays up
-    on every sweep whether or not its classifier cards the pane it sees now)."""
-    return any((r.subject or {}).get("source") == INPUT_WATCH_SOURCE
-              and (r.subject or {}).get("session") == session
-              for r in manager.active())
+    """The shared same-session ownership policy, not a private check: by
+    effect, not by whether its tmux session is merely alive."""
+    from hitl.session_ownership import session_already_carded
+    return session_already_carded(manager, session, by_source=SOURCE)
 
 
 def _jump(session):
