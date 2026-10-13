@@ -189,6 +189,14 @@ class FrozenCard(unittest.TestCase):
         self.assertEqual(after.status, "expired")
         self.assertIn("nothing was typed", after.subject.get("refused", ""))
 
+    def test_a_pressed_send_escape_card_is_left_for_drive_escapes_not_resolve_cleared(self):
+        # #5465's fix loosened resolve_cleared only for open_terminal (qingyun-wu,
+        # #5463 review) -- a pressed send_escape must stay exactly as protected.
+        _, _, req = card(self.ws, FROZEN, PANES["frozen"])
+        press(self.ws, req, "send_escape")
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
+        self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+
 
 class CauseCard(unittest.TestCase):
     def setUp(self):
