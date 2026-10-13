@@ -34,7 +34,7 @@ ADAPTERS = {
 class TestOwnerContract(unittest.TestCase):
     def test_invocation_is_stdin_safe(self):
         self.assertIn("< /dev/null", SANDBOXED_DELEGATION)
-        self.assertIn("--tools ''", SANDBOXED_DELEGATION)
+        self.assertIn("src/policy/sandbox_runner.py run -- ", SANDBOXED_DELEGATION)
 
     def test_exit_code_is_not_evidence(self):
         """The quieter half: a hang announces itself, an exit-0 refusal does not."""

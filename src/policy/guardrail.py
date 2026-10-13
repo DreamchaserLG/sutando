@@ -89,7 +89,7 @@ SANDBOXED_DELEGATION_TEMPLATE = (
     "tell a refusal from silence."
 )
 
-_RUNNER_LABELS = {"codex": "Codex", "claude": "Claude Code"}
+_RUNNER_LABELS = {"agy": "Antigravity (agy)", "claude": "Claude Code"}
 
 
 def sandboxed_delegation_text(runner=None) -> str:
@@ -98,7 +98,7 @@ def sandboxed_delegation_text(runner=None) -> str:
         runner = selected_or_fallback()
     return SANDBOXED_DELEGATION_TEMPLATE.format(
         label=_RUNNER_LABELS.get(runner.name, runner.name), name=runner.name,
-        command=shell_command(runner, '"$(cat <prompt-file>)"'))
+        command=shell_command('"$(cat <prompt-file>)"'))
 
 
 
