@@ -71,14 +71,12 @@ class Done:
 
 class Tmux:
     """Every session alive; capture-pane shows `pane`; anything that could act on a
-    session (kill-session, send-keys, new-session) is recorded. No input-watch
-    session exists unless `input_watch=True` — the real default for a seat that
-    never got one."""
+    session (kill-session, send-keys, new-session) is recorded."""
 
     ACTING = ("kill-session", "send-keys", "new-session", "respawn-pane", "respawn-window")
 
-    def __init__(self, pane, input_watch=False):
-        self.pane, self.calls, self.input_watch = pane, [], input_watch
+    def __init__(self, pane):
+        self.pane, self.calls = pane, []
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
@@ -86,8 +84,6 @@ class Tmux:
             return Done(0, self.pane)
         if "inbox-holders" in argv:
             return Done(0, "4242 session\n")
-        if "has-session" in argv:
-            return Done(0 if self.input_watch else 1)
         return Done(0)
 
     def acted(self):
@@ -279,17 +275,17 @@ class HumanCard(unittest.TestCase):
         _, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
-    def test_an_active_input_watch_owns_the_card_not_a_second_one(self):
-        # #5463 review (qingyun-wu): ensure_input_watch already cards a gate/limit
-        # pane as core-blocked. CARD_HUMAN defers to it rather than raising a second.
-        t = Tmux(USAGE_LIMIT_MENU, input_watch=True)
-        out = wc.raise_card(self.ws, WID, HUMAN, runner=t, manager=manager(self.ws))
+    def test_an_active_input_watch_card_is_not_duplicated(self):
+        # Presence isn't proof (#5463 review) — CARD_HUMAN checks for a real card.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
+                                  subject={"source": "tui", "session": NAME}))
+        t = Tmux(USAGE_LIMIT_MENU)
+        out = wc.raise_card(self.ws, WID, HUMAN, runner=t, manager=m)
         self.assertEqual(out["outcome"], "cleared")
         self.assertEqual(out["owner"], "input-watch")
         self.assertEqual(t.acted(), [])
-        self.assertEqual(
-            [c for c in t.calls if "has-session" in c and f"{NAME}-input" in c[-1]][0][-1],
-            f"={NAME}-input")
 
 
 class LoginCard(unittest.TestCase):

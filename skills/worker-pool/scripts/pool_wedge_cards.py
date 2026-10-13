@@ -103,17 +103,16 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
-def input_watch_active(socket, session, runner=subprocess.run) -> bool:
-    """Is this seat's own core-input-watch supervisor running? It reads the same
-    gate/limit signatures and cards the same store under "core-blocked" — the
-    wedge rung's CARD_HUMAN is a backstop for when this is false, never a second
-    card alongside it."""
-    try:
-        return runner(["tmux", "-S", str(socket), "has-session",
-                      "-t", f"={session}{ps.INPUT_WATCH_SUFFIX}"],
-                      capture_output=True, text=True, timeout=8).returncode == 0
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return False
+# core-input-watch.py's own HumanRequirement.subject source tag (its _TUI_SOURCE).
+INPUT_WATCH_SOURCE = "tui"
+
+
+def input_watch_has_card(session, manager) -> bool:
+    """By effect, not by whether its tmux session is merely alive (that stays up
+    on every sweep whether or not its classifier cards the pane it sees now)."""
+    return any((r.subject or {}).get("source") == INPUT_WATCH_SOURCE
+              and (r.subject or {}).get("session") == session
+              for r in manager.active())
 
 
 def _jump(session):
@@ -122,12 +121,13 @@ def _jump(session):
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               watch_active=input_watch_active, manager=None) -> dict:
+               has_card=input_watch_has_card, manager=None) -> dict:
     """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
     from hitl.schema import Action, HumanRequirement
     socket, session = sup._open_tmux(workspace, worker_id)
     if not socket:
         return {"worker_id": worker_id, "outcome": "no-recorded-session"}
+    manager = manager or manager_for(workspace)
     runtime = worker_runtime(workspace, worker_id)
     if runtime is None:
         return {"worker_id": worker_id, "outcome": "indeterminate",
@@ -157,7 +157,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     elif which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
-        if watch_active(socket, session, runner):
+        if has_card(session, manager):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
                     "owner": "input-watch"}
         lines = [ln for ln in text.splitlines() if ln.strip()][-6:]
@@ -201,7 +201,6 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             subject=subject, title=f"{seat} · {abn.kind}: {cause}", message="\n".join(body),
             guard=f"{SOURCE}:{session}:cause:{cause}", actions=actions,
             turn_on_action=via_proxy)
-    manager = manager or manager_for(workspace)
     made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
 
