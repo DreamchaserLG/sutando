@@ -98,14 +98,15 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.assertEqual(cards[0].subject["source"], "tui")
 
     def test_escalate_is_unaffected_by_a_different_effect_on_the_same_session(self):
-        # A frozen-turn confirmation and a gate question are different
-        # concerns; sharing a session must not let one hide the other.
-        self.manager.create(HumanRequirement(
+        # Sharing a session must not let one effect hide -- or retire --
+        # the other; supersede()'s effect scoping must leave it untouched.
+        frozen = self.manager.create(HumanRequirement(
             kind="confirmation", runtime="claude", message="pool-wedge frozen card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_frozen"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
-                           "permission", "Do you want to proceed?", SESSION)
+                           "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
         self.assertIsNotNone(req)
+        self.assertEqual(self.manager.get(frozen.id).status, "pending")
 
     def test_escalate_is_unaffected_by_a_different_sessions_card(self):
         self.manager.create(HumanRequirement(
