@@ -154,8 +154,8 @@ class Supersede(unittest.TestCase):
             kind="core-blocked", runtime="claude", message="pool card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
-        made = supersede(self.manager, SESSION, by_source="tui", effect="gate",
-                         build_requirement=lambda: HumanRequirement(
+        made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                         effect="gate", build_requirement=lambda: HumanRequirement(
                              kind="permission", runtime="claude", message="tui card",
                              subject={"source": "tui", "session": SESSION, "effect": "gate"}),
                          legacy_match=lambda subj: subj.get("wedge") == "card_human")
@@ -163,27 +163,40 @@ class Supersede(unittest.TestCase):
         self.assertEqual(self.manager.get(backstop.id).status, "resolved")
         self.assertEqual([r.id for r in self.manager.active()], [made.id])
 
-    def test_never_retires_the_record_create_actually_returns(self):
-        # create()'s dedup is keyed on (runtime, kind, device, guard), not
-        # source, so it can deduplicate to an existing other-source record.
+    def test_retirement_is_bounded_to_the_named_backstop_source(self):
+        # An unrelated third producer sharing session+effect must survive --
+        # only `backstop_source` is a candidate for retirement.
+        unrelated = self.manager.create(HumanRequirement(
+            kind="confirmation", runtime="claude", message="unrelated producer",
+            guard="unrelated-guard", blocked_task_ids=["task-999"],
+            subject={"source": "some-other-watcher", "session": SESSION, "effect": "gate"}))
+        supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                 effect="gate", build_requirement=lambda: HumanRequirement(
+                     kind="permission", runtime="claude", message="tui card", guard="tui-guard",
+                     subject={"source": "tui", "session": SESSION, "effect": "gate"}),
+                 legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        self.assertEqual(self.manager.get(unrelated.id).status, "pending")
+
+    def test_refuses_on_a_dedup_collision_with_a_foreign_source_record(self):
+        # create()'s dedup can match an existing other-source record; this
+        # generic writer refuses (None) rather than hand back that record.
         backstop = self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool card",
             device={"id": SESSION}, guard="SAME_GUARD",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
-        made = supersede(self.manager, SESSION, by_source="tui", effect="gate",
-                         build_requirement=lambda: HumanRequirement(
+        made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                         effect="gate", build_requirement=lambda: HumanRequirement(
                              kind="core-blocked", runtime="claude", message="tui card",
                              device={"id": SESSION}, guard="SAME_GUARD",  # same tuple
                              subject={"source": "tui", "session": SESSION, "effect": "gate"}),
                          legacy_match=lambda subj: subj.get("wedge") == "card_human")
-        self.assertEqual(made.id, backstop.id)  # create() deduplicated to it
-        self.assertEqual(made.status, "pending")
-        self.assertEqual(len(self.manager.active()), 1)
+        self.assertIsNone(made)
+        self.assertEqual(self.manager.get(backstop.id).status, "pending")
 
     def test_no_manager_supersedes_nothing(self):
-        self.assertIsNone(supersede(None, SESSION, by_source="tui", effect="gate",
-                                    build_requirement=lambda: (_ for _ in ()).throw(
+        self.assertIsNone(supersede(None, SESSION, by_source="tui", backstop_source="pool-wedge",
+                                    effect="gate", build_requirement=lambda: (_ for _ in ()).throw(
                                         AssertionError("must not be called"))))
 
 

@@ -81,27 +81,34 @@ def claim_session(manager: Any, session: str, *, by_source: str, effect: "str | 
         return manager.create(build_requirement())
 
 
-def supersede(manager: Any, session: str, *, by_source: str, effect: "str | None",
-             build_requirement, legacy_match=None) -> Any:
+def supersede(manager: Any, session: str, *, by_source: str, backstop_source: str,
+             effect: "str | None", build_requirement, legacy_match=None) -> Any:
     """For a caller whose card always answers its dialog and whose
-    counterpart is explicitly documented as a backstop that defers to it (a
-    one-directional design, unlike `claim_session`'s mutual arbitration):
-    always create, AND atomically retire any active backstop record (another
-    source, same session, matching effect or legacy shape) under the same
-    lock — so the backstop does not coexist for the whole episode just
-    because the underlying condition persists and never resolves it on its
-    own. Returns the created record."""
+    counterpart (`backstop_source`) is explicitly documented as a backstop
+    that defers to it (a one-directional design, unlike `claim_session`'s
+    mutual arbitration): always create, AND atomically retire any active
+    record from `backstop_source` specifically (same session, matching
+    effect or legacy shape) under the same lock — so the backstop does not
+    coexist for the whole episode just because the underlying condition
+    persists and never resolves it on its own. Retirement is bounded to
+    `backstop_source`: an unrelated third producer sharing the session and
+    effect is never touched, only the one counterpart this caller actually
+    knows the shape of. Returns the created record, or None when create()
+    deduplicated to an existing record from a source other than `by_source`
+    -- an identity collision this generic writer cannot safely resolve
+    (never its own backstop, and not safely claimable as this caller's own
+    rich payload either)."""
     if manager is None:
         return None
     with manager.store.locked():
         made = manager.create(build_requirement())
+        if (made.subject or {}).get("source") != by_source:
+            return None
         for r in manager.active():
             if r.id == made.id:
-                # create() can deduplicate to an EXISTING other-source record;
-                # whatever `made` IS is never its own backstop to retire.
                 continue
             subj = r.subject or {}
-            if (subj.get("session") == session and subj.get("source") not in (None, by_source)
+            if (subj.get("session") == session and subj.get("source") == backstop_source
                     and _effect_matches(subj, effect, legacy_match)):
                 manager.resolve(r.id)
         return made

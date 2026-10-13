@@ -713,8 +713,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                 return True
             return (_state == "logged-out" and subj.get("wedge") == "card_cause"
                     and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
-        return supersede(manager, session, by_source=_TUI_SOURCE, effect=effect,
-                         build_requirement=lambda: req, legacy_match=legacy_match)
+        return supersede(manager, session, by_source=_TUI_SOURCE, backstop_source="pool-wedge",
+                         effect=effect, build_requirement=lambda: req, legacy_match=legacy_match)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None
