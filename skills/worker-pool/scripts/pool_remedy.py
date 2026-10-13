@@ -330,7 +330,7 @@ def ensure_supervisors(workspace, repo, observations: dict, *, runner=None) -> d
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
-INPUT_WATCH_SUFFIX = "-input"
+INPUT_WATCH_SUFFIX = ps.INPUT_WATCH_SUFFIX
 WATCHING = "watching"
 
 

@@ -32,6 +32,10 @@ FAST_SUSTAINED_TICKS = 2
 # Beat readings, as pool_beat classifies them.
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
+# The per-seat core-input-watch supervisor's tmux session suffix (see
+# pool_remedy.ensure_input_watch); shared so a wedge card isn't a second one.
+INPUT_WATCH_SUFFIX = "-input"
+
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
 # offering an Escape, an expired login, or a gate/limit dialog only the owner

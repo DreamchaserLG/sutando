@@ -14,7 +14,10 @@ a card instead, through the engine's hitl store:
   shows the same frozen frame is refused and nothing is typed.
 - a gate or a limit dialog (PANE_GATE / PANE_LIMIT): the card quotes the pane's
   tail and sends the owner to the terminal; no key is offered, since only the
-  owner can choose among the dialog's own options.
+  owner can choose among the dialog's own options. A backstop only: the seat's
+  own core-input-watch supervisor (pool_remedy.ensure_input_watch) already cards
+  the same dialog if it is running, so this one defers to it rather than
+  raising a second card for one pane.
 """
 from __future__ import annotations
 
@@ -100,13 +103,26 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
+def input_watch_active(socket, session, runner=subprocess.run) -> bool:
+    """Is this seat's own core-input-watch supervisor running? It reads the same
+    gate/limit signatures and cards the same store under "core-blocked" — the
+    wedge rung's CARD_HUMAN is a backstop for when this is false, never a second
+    card alongside it."""
+    try:
+        return runner(["tmux", "-S", str(socket), "has-session",
+                      "-t", f"={session}{ps.INPUT_WATCH_SUFFIX}"],
+                      capture_output=True, text=True, timeout=8).returncode == 0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               manager=None) -> dict:
+               watch_active=input_watch_active, manager=None) -> dict:
     """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
     from hitl.schema import Action, HumanRequirement
     socket, session = sup._open_tmux(workspace, worker_id)
@@ -141,6 +157,9 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     elif which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        if watch_active(socket, session, runner):
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
+                    "owner": "input-watch"}
         lines = [ln for ln in text.splitlines() if ln.strip()][-6:]
         body = [f"{seat} (tmux session {session}) owes work and its pane is waiting on you:",
                 "", *(f"  {ln.strip()}" for ln in lines), "",

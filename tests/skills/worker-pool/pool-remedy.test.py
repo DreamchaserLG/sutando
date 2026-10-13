@@ -377,11 +377,23 @@ class ApplyingATick(Base):
         after = sup.observe(self.ws, 1100.0, runner=self.t)[self.wid]
         self.assertIs(after.session_alive, True, "the worker is not back after a 'recovered'")
 
+    def test_card_human_dispatches_to_a_real_card_not_a_silent_escalate(self):
+        # #5463 review (qingyun-wu): removing CARD_HUMAN from apply()'s dispatch
+        # tuple must not pass silently — it has to raise a real card.
+        sup.pr.register_worker(self.ws, self.wid, "alpha")
+        with mock.patch.object(rem.wc, "capture", return_value=GATE_PANE):
+            out = rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)
+        self.assertEqual(out["cards"][self.wid]["outcome"], "carded")
+        req = rem.wc.manager_for(self.ws).get(out["cards"][self.wid]["hitl_id"])
+        self.assertEqual(req.subject["wedge"], ps.CARD_HUMAN)
+        self.assertIn("waiting on you", req.title)
+
 
 LOGIN_PANE = ("❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n"
               "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
 API_PANE = ("  ⎿  API Error: 500 internal server error\n❯ \n"
             "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+GATE_PANE = "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n"
 
 
 class TheSweepOnALoggedOutWorker(Base):
