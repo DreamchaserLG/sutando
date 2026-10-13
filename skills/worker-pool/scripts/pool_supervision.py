@@ -162,9 +162,9 @@ def _cleared_wedge(ev: WorkerEvidence) -> WorkerEvidence:
 def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
                 sustained_ticks: int, detect_after_s: float) -> tuple[WorkerEvidence, str]:
     """Same sustain and stale line as death, and one decision per episode: a gate
-    or limit escalates; abnormal text asks for a card naming its cause; a frozen
-    turn asks for a card offering Escape; an expired login asks for a card on
-    the tick that reads it, since the banner is the CLI's own words and not a
+    or limit cards the owner; abnormal text asks for a card naming its cause; a
+    frozen turn asks for a card offering Escape; an expired login asks for a card
+    on the tick that reads it, since the banner is the CLI's own words and not a
     timing question a sustain could answer. No wedge kind restarts a session.
     The one decision is per (episode, kind): a pane that moves from one wedge
     straight into another is owed the new kind's decision, since the card already

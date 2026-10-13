@@ -323,8 +323,8 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
     def test_a_pressed_cards_closed_episode_gets_a_fresh_card_on_recurrence(self):
-        # The consequence Kewei named: without the fix above, an identical
-        # recurrence deduplicates onto the stale pressed card and nobody is told.
+        # Without the fix above, an identical recurrence deduplicates onto
+        # the stale pressed card and nobody is told.
         m = manager(self.ws)
         _, _, first = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         press(self.ws, first, "open_terminal")
@@ -411,6 +411,20 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
         press(ws, req, "send_escape")
         self.assertEqual(wc.resolve_cleared(ws, {WID}, manager=manager(ws)), [])
         self.assertEqual(manager(ws).get(req.id).status, "in_progress")
+
+    def test_a_pressed_card_goes_stale_through_a_kind_change_alone_not_only_departure(self):
+        # `worker_ids` is empty: staleness here can only come from the wedges
+        # kind-mismatch branch, not a seat-departure shortcut.
+        ws = pool()
+        _, _, first = card(ws, HUMAN, USAGE_LIMIT_MENU)
+        press(ws, first, "open_terminal")
+        self.assertEqual(manager(ws).get(first.id).status, "in_progress")
+        closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: CAUSE})
+        self.assertEqual(closed, [first.id])
+        out2, _, second = card(ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out2["outcome"], "carded")
+        self.assertNotEqual(second.id, first.id)
+        self.assertEqual(manager(ws).get(second.id).status, "pending")
 
 
 class CodexCards(unittest.TestCase):

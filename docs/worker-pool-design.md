@@ -309,7 +309,9 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit raises a card that quotes the pane and sends the owner to the
+  terminal, deferring to the seat's own `core-input-watch` card if one already
+  covers it;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
@@ -386,7 +388,7 @@ remedy or to the core for diagnosis.
 |---|---|---|
 | process death | beat expired, session gone, not owner-paused, sustained | a pre-authorised restart |
 | task stalled | unfinished work whose progress has not advanced | diagnosis only |
-| wedged | session alive, work owed, pane on a gate, limit, abnormal text or a frozen turn, sustained | a card only: escalate, name the cause (proxy restart when proxied), or offer Escape; never a restart |
+| wedged | session alive, work owed, pane on a gate, limit, abnormal text or a frozen turn, sustained | a card only: send to the terminal, name the cause (proxy restart when proxied), or offer Escape; never a restart |
 
 **Sub-agent activity counts as progress**, or the detector escalates the busiest
 workers. Owner-paused outranks every signal. Detection and the pre-authorised remedy
