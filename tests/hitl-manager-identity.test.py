@@ -100,6 +100,13 @@ class IdentityTests(unittest.TestCase):
         self.assertNotEqual(first.id, second.id)
         self.assertIsNone(second.decided_by)
 
+    def test_create_delegates_identity_matching_to_find_duplicate(self):
+        # An inline restatement of find_duplicate()'s own loop inside create()
+        # reproduces identical behavior -- only mocking the call catches it.
+        with mock.patch.object(HitlManager, "find_duplicate", wraps=self.mgr.find_duplicate) as spy:
+            self.mgr.create(perm("ls", "g"))
+        self.assertTrue(spy.called)
+
     def test_two_sessions_same_guard_stay_two_cards(self):
         a = self.mgr.create(perm("ls", "g", session="core-1"))
         b = self.mgr.create(perm("ls", "g", session="core-2"))

@@ -156,6 +156,18 @@ class DuplicateCardArbitration(unittest.TestCase):
                 self.assertIsNotNone(req)
             self.assertFalse(spy.called)
 
+    def test_escalate_delegates_arbitration_to_the_shared_supersede(self):
+        # A private inline reimplementation reproduces identical outcomes and
+        # stays undetected above -- only mocking the real call catches it.
+        from unittest import mock
+        import hitl.session_ownership as so
+        with mock.patch.object(so, "supersede", wraps=so.supersede) as spy:
+            req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                               "permission", "Do you want to proceed?", SESSION)
+        self.assertIsNotNone(req)
+        self.assertTrue(spy.called)
+        self.assertEqual(spy.call_args.kwargs.get("effect"), civ.GATE_EFFECT)
+
     def test_escalate_still_ignores_its_own_prior_card_for_dedup_not_arbitration(self):
         # Its own earlier TUI card must not look like "someone else covers
         # this" — the Manager's own dedup handles that case, not this check.
