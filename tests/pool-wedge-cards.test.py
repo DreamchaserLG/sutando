@@ -287,6 +287,25 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(out["owner"], "input-watch")
         self.assertEqual(t.acted(), [])
 
+    def test_a_resolved_input_watch_card_does_not_suppress(self):
+        # qingyun-wu's surviving mutant: treating a resolved/expired card as active.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        made = m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
+                                         subject={"source": "tui", "session": NAME}))
+        m.resolve(made.id)
+        out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+
+    def test_a_different_sources_card_on_the_same_session_does_not_suppress(self):
+        # qingyun-wu's other surviving mutant: matching on session alone, any source.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="other",
+                                  subject={"source": "pool-wedge", "session": NAME}))
+        out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+
     def test_a_pressed_card_still_closes_once_the_seat_clears(self):
         # keweichen (#5463 review): clicking the only action, open_terminal, must
         # not leave the card stuck in_progress forever (#5465, shared by cause/login).
