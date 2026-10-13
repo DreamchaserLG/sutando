@@ -176,6 +176,26 @@ class HitlManager:
         # Optional: `decide(req) -> action id | None`; see hitl.policy.
         self.policy = policy
 
+    def find_duplicate(self, req: HumanRequirement) -> Optional[HumanRequirement]:
+        """The existing active record `create()` would treat `req` as a
+        duplicate of -- returned as-is (same guard) or refreshed in place
+        (AUTH_KIND, any guard) -- without creating or mutating anything.
+        The ONE shared predicate: `create()` uses it below, and any caller
+        that needs to know about a collision BEFORE deciding whether to
+        create (e.g. `hitl.session_ownership.supersede()`, which must not
+        let a foreign record it doesn't own get silently rewritten) uses
+        the same one, so the two can never drift out of sync with each
+        other the way two independently maintained copies eventually did."""
+        for existing in self.active():
+            if existing.decided_by == POLICY_DECIDER:
+                continue  # auto-answered, in flight: never a dedup target
+            if not (existing.runtime == req.runtime and existing.kind == req.kind
+                    and _device_id(existing) == _device_id(req)):
+                continue
+            if existing.guard == req.guard or (req.kind == AUTH_KIND and req.guard):
+                return existing
+        return None
+
     def create(self, req: HumanRequirement) -> HumanRequirement:
         """Identity is (runtime, kind, device) PLUS the guard, except for auth.
 
@@ -185,18 +205,13 @@ class HitlManager:
         is invariant, so repeat detections collapse onto one refreshed card.
         """
         with self.store.locked():
-            for existing in self.active():
-                if existing.decided_by == POLICY_DECIDER:
-                    continue  # auto-answered, in flight: never a dedup target
-                if not (existing.runtime == req.runtime and existing.kind == req.kind
-                        and _device_id(existing) == _device_id(req)):
-                    continue
+            existing = self.find_duplicate(req)
+            if existing is not None:
                 if existing.guard == req.guard:
                     return existing
-                if req.kind == AUTH_KIND and req.guard:
-                    existing.refresh_guard(req.guard)
-                    self.store.save(existing)
-                    return existing
+                existing.refresh_guard(req.guard)
+                self.store.save(existing)
+                return existing
             choice = self.policy.decide(req) if self.policy is not None else None
             if choice is not None and any(a.id == choice for a in req.actions):
                 req.chosen_action = choice
