@@ -499,8 +499,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	/** The call waiting for the user to finish speaking, not yet submitted. */
 	private holding: { args: Record<string, unknown>; origin: O | undefined; joined: boolean } | null = null;
 
-	/** When the voice model last called `work`: a turn it covered itself is not sent again by the turn check. */
-	private lastWorkCallAt = 0;
+	/** When the voice model last took a turn itself (`work`, or a tool that fetches the answer): the turn check does not send it again. */
+	private lastTakenAt = 0;
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
 	private askedAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
@@ -539,14 +539,14 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				const taken = this.turns.splice(0);
 				const since = this.lastTurnAt;
 				this.lastTurnAt = taken[taken.length - 1].at;
-				if (this.lastWorkCallAt > since) continue; // the voice model sent it itself
+				if (this.lastTakenAt > since) continue; // the voice model took it itself
 				const openTasks = this.openTasks();
 				const verdict = await this.deps.classify!({
 					utterance: taken.map((x) => x.text).join(' '),
 					recentConversation: this.deps.recentConversation?.() ?? '',
 					openTasks,
 				}).catch(() => ({ action: 'none' as const }));
-				if (this.lastWorkCallAt > since) continue; // the voice model's own call came in while the check ran
+				if (this.lastTakenAt > since) continue; // the voice model's own call came in while the check ran
 				await this.actOnTurn(verdict, taken[0].origin);
 			}
 		} catch (err) {
@@ -581,8 +581,18 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${verdict.task.replace(/"/g, "'")}". If you have not already, tell the user in one short sentence that it is being looked into. Do not call work for it.`));
 	}
 
+	/**
+	 * The voice model called a tool that fetches the answer itself (read_room): the turn is answered, not
+	 * sent to the core as well (2026-10-13 17:08: a room question was read and also sent as a task). A call
+	 * that fails tells the voice model so, and it can call work.
+	 */
+	noteAnsweringTool(name: string): void {
+		this.lastTakenAt = Date.now();
+		this.deps.log?.(`[RelayAgent] ${name} answers this turn; the turn check sends nothing`);
+	}
+
 	async invoke(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
-		this.lastWorkCallAt = Date.now();
+		this.lastTakenAt = Date.now();
 		// Taken before the waits below: a room switch during them must not re-address the request.
 		let origin = this.deps.captureOrigin?.();
 		if (this.deps.speech) {
