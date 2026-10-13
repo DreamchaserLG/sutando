@@ -378,8 +378,8 @@ class ApplyingATick(Base):
         self.assertIs(after.session_alive, True, "the worker is not back after a 'recovered'")
 
     def test_card_human_dispatches_to_a_real_card_not_a_silent_escalate(self):
-        # #5463 review (qingyun-wu): removing CARD_HUMAN from apply()'s dispatch
-        # tuple must not pass silently — it has to raise a real card.
+        # Removing CARD_HUMAN from apply()'s dispatch tuple must not pass
+        # silently — it has to raise a real card.
         sup.pr.register_worker(self.ws, self.wid, "alpha")
         with mock.patch.object(rem.wc, "capture", return_value=GATE_PANE):
             out = rem.apply(self.ws, REPO, {self.wid: ps.CARD_HUMAN}, runner=self.t)

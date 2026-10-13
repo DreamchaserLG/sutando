@@ -190,8 +190,7 @@ class FrozenCard(unittest.TestCase):
         self.assertIn("nothing was typed", after.subject.get("refused", ""))
 
     def test_a_pressed_send_escape_card_is_left_for_drive_escapes_not_resolve_cleared(self):
-        # #5465's fix loosened resolve_cleared only for open_terminal (qingyun-wu,
-        # #5463 review) -- a pressed send_escape must stay exactly as protected.
+        # A pressed send_escape must stay exactly as protected as before.
         _, _, req = card(self.ws, FROZEN, PANES["frozen"])
         press(self.ws, req, "send_escape")
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [])
@@ -234,7 +233,7 @@ class CauseCard(unittest.TestCase):
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
 
-# #5461's real dialog shape, not a paraphrase of it.
+# The real usage-limit dialog shape, not a paraphrase of it.
 USAGE_LIMIT_MENU = (
     "⏺ Writing the result file.\n"
     "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
@@ -284,7 +283,7 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
     def test_an_active_input_watch_card_is_not_duplicated(self):
-        # Presence isn't proof (#5463 review) — CARD_HUMAN checks for a real card.
+        # Presence isn't proof — CARD_HUMAN checks for a real card.
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
@@ -296,7 +295,7 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(t.acted(), [])
 
     def test_a_resolved_input_watch_card_does_not_suppress(self):
-        # qingyun-wu's surviving mutant: treating a resolved/expired card as active.
+        # A resolved/expired card must not read as active.
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         made = m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
@@ -306,7 +305,7 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(out["outcome"], "carded")
 
     def test_a_different_sources_card_on_the_same_session_does_not_suppress(self):
-        # qingyun-wu's other surviving mutant: matching on session alone, any source.
+        # Matching on session alone, any source, must not suppress either.
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="other",
@@ -315,8 +314,8 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(out["outcome"], "carded")
 
     def test_a_pressed_card_still_closes_once_the_seat_clears(self):
-        # keweichen (#5463 review): clicking the only action, open_terminal, must
-        # not leave the card stuck in_progress forever (#5465, shared by cause/login).
+        # Clicking the only action, open_terminal, must not leave the card
+        # stuck in_progress forever.
         m = manager(self.ws)
         _, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         press(self.ws, req, "open_terminal")
@@ -372,6 +371,46 @@ class LoginCard(unittest.TestCase):
             self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
                                                 wedges={WID: now_asks}), [again.id], now_asks)
         self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
+
+
+# Every card kind that offers open_terminal, proving the shared path: press it,
+# go stale, the card resolves; a fresh identical recurrence gets its own card.
+OPEN_TERMINAL_CASES = (
+    (CAUSE, PANES["abnormal"]),
+    (LOGIN, PANES["logged-out"]),
+    (FROZEN, PANES["frozen"]),
+    (HUMAN, USAGE_LIMIT_MENU),
+)
+
+
+class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
+    def setUp(self):
+        self.assertIsNotNone(wc, "no wedge card module")
+
+    def test_pressed_open_terminal_closes_and_a_recurrence_gets_a_fresh_card(self):
+        for kind, pane in OPEN_TERMINAL_CASES:
+            with self.subTest(kind=kind):
+                ws = pool()
+                out, _, first = card(ws, kind, pane)
+                self.assertEqual(out["outcome"], "carded", kind)
+                self.assertIn("open_terminal", [a.id for a in first.actions], kind)
+                press(ws, first, "open_terminal")
+                self.assertEqual(manager(ws).get(first.id).status, "in_progress", kind)
+                closed = wc.resolve_cleared(ws, {WID}, manager=manager(ws))
+                self.assertEqual(closed, [first.id], kind)
+                out2, _, second = card(ws, kind, pane)
+                self.assertEqual(out2["outcome"], "carded", kind)
+                self.assertNotEqual(second.id, first.id, kind)
+                self.assertEqual(manager(ws).get(second.id).status, "pending", kind)
+
+    def test_pressed_send_escape_is_the_one_exception_across_every_kind(self):
+        # Only FROZEN offers send_escape; confirm it alone stays protected even
+        # when probed through the same shared resolve_cleared path as the rest.
+        ws = pool()
+        _, _, req = card(ws, FROZEN, PANES["frozen"])
+        press(ws, req, "send_escape")
+        self.assertEqual(wc.resolve_cleared(ws, {WID}, manager=manager(ws)), [])
+        self.assertEqual(manager(ws).get(req.id).status, "in_progress")
 
 
 class CodexCards(unittest.TestCase):

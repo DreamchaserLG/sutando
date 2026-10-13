@@ -257,7 +257,7 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list
     of `open_terminal` owes nothing more — it is the whole action — so it is
     closed the same as an unpressed card once the seat is stale; otherwise an
     owner who jumped to the terminal once leaves that card stuck forever, and a
-    later identical wedge dedups onto it instead of raising a fresh one (#5465).
+    later identical wedge dedups onto it instead of raising a fresh one.
     """
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
