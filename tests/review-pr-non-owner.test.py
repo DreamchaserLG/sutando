@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from unittest import mock
 
@@ -154,6 +155,67 @@ class ConfinedInvocation(unittest.TestCase):
         self.assertIsNone(rps.build(self.root, "d", which=lambda n, path=None: None))
         only_codex = lambda n, path=None: "/b/codex" if n == "codex" and path is None else None  # noqa: E731
         self.assertIsNone(rps.build(self.root, "d", which=only_codex))
+
+
+class InProcess(unittest.TestCase):
+    """run()/main()/_gh in this process, with a stand-in claude picked as the runner."""
+
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp(prefix="review-pr-inproc-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.tmp, self.out = tmp, tmp / "out.txt"
+        self.claude = tmp / "claude"
+
+    def _claude(self, body):
+        self.claude.write_text("#!/bin/sh\n" + body)
+        self.claude.chmod(0o755)
+        p = mock.patch.object(rps.sr, "select_runner",
+                              return_value=(rps.sr.RUNNERS["claude"], str(self.claude)))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_run_writes_the_verdict_and_removes_the_dir(self):
+        self._claude('pwd > "$0.cwd"; echo "- no blocking issues"\n')
+        rc = rps.run("7", "", SPEC["diff"], self.out, 30, gh)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.out.read_text(), "- no blocking issues\n")
+        self.assertFalse(Path(Path(f"{self.claude}.cwd").read_text().strip()).exists())
+
+    def test_run_passes_a_failure_through(self):
+        self._claude("echo partial; echo boom >&2; exit 5\n")
+        self.assertEqual(rps.run("7", "", SPEC["diff"], self.out, 30, gh), 5)
+
+    def test_run_past_max_is_124(self):
+        self._claude("sleep 5\n")
+        self.assertEqual(rps.run("7", "", SPEC["diff"], self.out, 1, gh), 124)
+
+    def test_run_with_no_runner_is_3(self):
+        with mock.patch.object(rps.sr, "select_runner", return_value=None):
+            self.assertEqual(rps.run("7", "", SPEC["diff"], self.out, 30, gh), rps.NO_RUNNER)
+
+    def test_main_reads_the_diff_file(self):
+        diff = self.tmp / "d.diff"
+        diff.write_text(SPEC["diff"])
+        with mock.patch.object(rps, "run", return_value=0) as run:
+            self.assertEqual(rps.main(["--pr", "7", "--diff-file", str(diff),
+                                       "--out", str(self.out)]), 0)
+        run.assert_called_once_with("7", "", SPEC["diff"], self.out, 240)
+
+    def test_populate_stops_at_the_byte_cap(self):
+        root = rps.review_dir()
+        self.addCleanup(shutil.rmtree, root, True)
+        with mock.patch.object(rps, "MAX_TOTAL_BYTES", 6):
+            written = rps.populate(root, "7", "", SPEC["diff"], gh)
+        self.assertEqual(len(written), 2)
+
+    def test_gh_returns_stdout_only_on_success(self):
+        bindir = self.tmp / "bin"
+        review_pr_fixture.install(bindir, SPEC)
+        with mock.patch.dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}"):
+            self.assertEqual(rps._gh(["pr", "diff", "7"]), SPEC["diff"])
+            self.assertIsNone(rps._gh(["nope"]))
+        with mock.patch.object(rps.subprocess, "run", side_effect=OSError("no gh")):
+            self.assertIsNone(rps._gh(["pr", "diff", "7"]))
 
 
 class Script(unittest.TestCase):
