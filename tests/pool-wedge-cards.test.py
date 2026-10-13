@@ -430,6 +430,29 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
                 self.assertNotEqual(second.id, first.id, kind)
                 self.assertEqual(manager(ws).get(second.id).status, "pending", kind)
 
+    def test_a_pressed_card_stays_in_progress_while_its_own_kind_remains_current(self):
+        # Neither worker_ids nor a kind mismatch applies: the owner pressed
+        # open_terminal but the wedge they're meant to resolve is still there.
+        for kind, pane in OPEN_TERMINAL_CASES:
+            with self.subTest(kind=kind):
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                press(ws, req, "open_terminal")
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: kind})
+                self.assertEqual(closed, [], kind)
+                self.assertEqual(manager(ws).get(req.id).status, "in_progress", kind)
+
+    def test_a_pending_card_closes_on_kind_mismatch_for_every_kind_not_only_login(self):
+        all_kinds = [k for k, _ in OPEN_TERMINAL_CASES]
+        for i, (kind, pane) in enumerate(OPEN_TERMINAL_CASES):
+            with self.subTest(kind=kind):
+                other = all_kinds[(i + 1) % len(all_kinds)]
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                self.assertEqual(manager(ws).get(req.id).status, "pending", kind)
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: other})
+                self.assertEqual(closed, [req.id], kind)
+
 
 class CodexCards(unittest.TestCase):
     def setUp(self):

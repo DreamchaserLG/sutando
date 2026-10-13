@@ -16,8 +16,8 @@ a card instead, through the engine's hitl store:
   tail and sends the owner to the terminal; no key is offered, since only the
   owner can choose among the dialog's own options. A backstop only: when the
   seat's own core-input-watch supervisor (pool_remedy.ensure_input_watch) has
-  already carded the same dialog, this one defers to it rather than raising a
-  second card for one pane.
+  an active card for that session already, this one defers to it rather than
+  raising a second card for one pane.
 """
 from __future__ import annotations
 
