@@ -123,6 +123,26 @@ class LoginCardMigration(unittest.TestCase):
         state = sup.load_state(self.ws).workers[wid]
         self.assertEqual((state.wedge_kind, state.wedge_escalated), ("login", True))
 
+    def test_a_pressed_legacy_login_card_stays_acknowledged_across_ticks(self):
+        # The owner already pressed Open Terminal on the pre-upgrade card; a
+        # later sweep must not close it out from under that acknowledgment.
+        from hitl.schema import ActionReply
+        wid = WORKERS[0]
+        old = self.seed_card(wid)
+        self.seed_legacy_state()
+        self.sweep()
+        cards = self.assert_login_cards(1)
+        self.assertEqual(cards[0].id, old.id)
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=old.id, expected_revision=cards[0].revision,
+                                   action_id="open_terminal", guard=cards[0].guard))
+        self.assertEqual(wc.manager_for(self.ws).get(old.id).status, "in_progress")
+        for _ in range(2):
+            self.assertEqual(self.sweep()["decisions"][wid], ps.NOTHING)
+            active = wc.manager_for(self.ws).active()
+            self.assertEqual([c.id for c in active], [old.id])
+            self.assertEqual(active[0].status, "in_progress")
+
     def test_legacy_ack_without_a_card_does_not_silence_login(self):
         self.seed_legacy_state()
         self.sweep()

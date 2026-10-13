@@ -491,6 +491,16 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
                 self.assertEqual(closed, [], kind)
                 self.assertEqual(manager(ws).get(req.id).status, "in_progress", kind)
 
+    def test_a_cleared_seat_closes_its_pending_card_for_every_kind(self):
+        # Positive clearance (worker_ids) must close a pending card for every
+        # kind, not only the two kinds that already had their own test.
+        for kind, pane in OPEN_TERMINAL_CASES:
+            with self.subTest(kind=kind):
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                closed = wc.resolve_cleared(ws, {WID}, manager=manager(ws))
+                self.assertEqual(closed, [req.id], kind)
+
 
 class CodexCards(unittest.TestCase):
     def setUp(self):
