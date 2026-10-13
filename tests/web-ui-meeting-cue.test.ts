@@ -139,7 +139,8 @@ describe('voice agent wiring (data pins)', () => {
 		assert.match(enter, /if \(clientPlaysMeetingCue\) \{\s*try \{ sessionRef\?\.sendJsonToClient\(\{ type: 'meeting\.cue', text: MEETING_ENTRY_SAY, audio: meetingCueWav \?\? undefined \}/);
 		assert.match(AGENT, /if \(announcesMeetingCue\(message\)\) clientPlaysMeetingCue = true;/);
 		assert.match(AGENT, /onClientDisconnected: \(\) => \{[^}]*?clientPlaysMeetingCue = false;/); // the flag resets with the client, whatever else the handler does first
-		assert.match(AGENT, /return startMeeting\(\{ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry \}\);/);
+		assert.match(AGENT, /let clientPlaysMeetingCue = false;/, 'fail-safe: a client that announced nothing gets the spoken line');
+		assert.match(AGENT, /return startMeeting\(\{ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry, stillWanted: \(\) => meetingActive \}\);/);
 		assert.match(AGENT, /meetingEntry\.noteTurnCompleted\(\);/, 'the gate still serves clients that do not play the cue');
 		assert.match(AGENT, /if \(want\) enterMeetingDictation\(\);/, 'the menu-bar path enters through the same function');
 		assert.match(AGENT, /meetingCueAudio\(\{ apiKey: GEMINI_VOICE_API_KEY, voice: VOICE_NAME, text: MEETING_ENTRY_SAY/, 'rendered in the session voice from the same text');

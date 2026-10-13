@@ -154,9 +154,10 @@ export function announcesMeetingCue(message: unknown): boolean {
  * result sent after entry is held until the meeting ends); the client speaks the cue. Any other
  * client: the model speaks it, and entry waits for that turn.
  */
-export function startMeeting(opts: { clientCues: boolean; enter: () => void; gate: { schedule(): void }; defer?: (fn: () => void) => void }): Record<string, unknown> {
+export function startMeeting(opts: { clientCues: boolean; enter: () => void; gate: { schedule(): void }; defer?: (fn: () => void) => void; stillWanted?: () => boolean }): Record<string, unknown> {
 	if (opts.clientCues) {
-		(opts.defer ?? ((fn) => setTimeout(fn, 0)))(opts.enter);
+		// The deferred entry re-checks: an exit in the same batch (switch_mode("active"), the menu-bar poll) wins.
+		(opts.defer ?? ((fn) => setTimeout(fn, 0)))(() => { if (opts.stillWanted?.() ?? true) opts.enter(); });
 		return { status: 'meeting_mode', transcribing: true, instruction: 'Meeting mode is on, and the client has already told the user how to come back. Say nothing.' };
 	}
 	opts.gate.schedule();

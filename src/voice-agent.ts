@@ -477,7 +477,7 @@ const switchModeTool: ToolDefinition = {
 		writeVoiceModeSentinel();
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
-			return startMeeting({ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry });
+			return startMeeting({ clientCues: clientPlaysMeetingCue, enter: enterMeetingDictation, gate: meetingEntry, stillWanted: () => meetingActive });
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {

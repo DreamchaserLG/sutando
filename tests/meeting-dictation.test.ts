@@ -507,6 +507,21 @@ describe('starting a meeting (switch_mode)', () => {
 		assert.equal(out.say, undefined);
 	});
 
+	it('a deferred entry re-checks before entering: an exit in between wins', () => {
+		// REVIEW.md lesson 21: switch_mode("active") in the same batch, or the menu-bar poll, ran exit() before the deferred entry.
+		let entered = 0;
+		let wanted = true;
+		let deferred: (() => void) | null = null;
+		startMeeting({ clientCues: true, enter: () => entered++, gate: { schedule() {} }, defer: (fn) => { deferred = fn; }, stillWanted: () => wanted });
+		wanted = false;
+		deferred!();
+		assert.equal(entered, 0, 'not entered: the meeting was ended before the deferral ran');
+		wanted = true;
+		startMeeting({ clientCues: true, enter: () => entered++, gate: { schedule() {} }, defer: (fn) => { deferred = fn; }, stillWanted: () => wanted });
+		deferred!();
+		assert.equal(entered, 1);
+	});
+
 	it('by default the deferral is a real macrotask, after microtasks', async () => {
 		const order: string[] = [];
 		startMeeting({ clientCues: true, enter: () => order.push('enter'), gate: { schedule() {} } });
