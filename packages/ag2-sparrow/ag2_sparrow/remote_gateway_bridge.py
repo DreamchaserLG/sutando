@@ -763,21 +763,36 @@ def _gateway_owner() -> str:
     return owner
 
 
-_HITL_OWNER = {"mxid": ""}
+# A resolved owner is re-read after the TTL so a re-linked agent's former owner loses
+# click power; an unusable reading is not re-read before the retry window passes.
+HITL_OWNER_TTL_S = 300.0
+HITL_OWNER_RETRY_S = 30.0
+_HITL_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
+_hitl_owner_clock = time.monotonic
 
 
 def _hitl_owner() -> str:
-    """The one mxid whose clicks resolve HITL cards: SPARROW_HA_OWNER when set, else the
-    registry owner, kept for the process once read. "" = unknown (fail closed)."""
+    """The one mxid whose clicks resolve HITL cards: SPARROW_HA_OWNER when set, else this
+    agent's registry owner, cached for HITL_OWNER_TTL_S. "" = unknown (fail closed)."""
     explicit = os.environ.get("SPARROW_HA_OWNER") or ""
     if explicit:
         return explicit
-    if not _HITL_OWNER["mxid"]:
-        try:
-            _HITL_OWNER["mxid"] = _registry_owner()[0]
-        except Exception as e:  # noqa: BLE001 - offline: unknown now, read again at the next click
-            _log(f"hitl: owner lookup failed ({e})")
-    return _HITL_OWNER["mxid"]
+    now = _hitl_owner_clock()
+    if _HITL_OWNER["mxid"] and 0 <= now - _HITL_OWNER["at"] < HITL_OWNER_TTL_S:
+        return _HITL_OWNER["mxid"]
+    bad_at = _HITL_OWNER["bad_at"]
+    if bad_at is not None and 0 <= now - bad_at < HITL_OWNER_RETRY_S:
+        return ""
+    try:
+        owner = _registry_owner(timeout=10)[0]
+    except Exception as e:  # noqa: BLE001 - offline: unknown until the retry window passes
+        _log(f"hitl: owner lookup failed ({e})")
+        owner = ""
+    if not owner:
+        _HITL_OWNER.update(mxid="", bad_at=now)
+        return ""
+    _HITL_OWNER.update(mxid=owner, at=now, bad_at=None)
+    return owner
 
 
 _HITL_OWNER_UNKNOWN = "hitl: card click ignored, owner unknown"
@@ -1035,14 +1050,14 @@ def _handle_hitl_action(task: dict):
         return "redelivered"
     if not isinstance(task.get("hitl_action"), dict) and not task.get("reply_to_event"):
         return False
+    probe = _hitl_reply_handler("", log=_log)
+    if probe is None or probe.task_to_event(task) is None:
+        return False  # not a click, or no store on this host: an ordinary task
     owner = _hitl_owner()
-    handler = _hitl_reply_handler(owner, log=_log)
-    if handler is None:
-        return False  # no store on this host: the click stays an ordinary task
     if not owner:
-        if handler.task_to_event(task) is not None:
-            _log(f"{_HITL_OWNER_UNKNOWN} ({task_id})")
+        _log(f"{_HITL_OWNER_UNKNOWN} ({task_id})")
         return False
+    handler = _hitl_reply_handler(owner, log=_log)
     try:
         out = handler.offer_task(task)
     except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
