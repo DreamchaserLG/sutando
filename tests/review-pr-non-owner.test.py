@@ -9,6 +9,7 @@ still runs codex.
 
 Run: python3 tests/review-pr-non-owner.test.py
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -26,6 +27,22 @@ sys.path.insert(0, str(REPO / "skills" / "claude-codex" / "scripts"))
 
 from policy import sandbox_runner as sr  # noqa: E402
 import discord_env, review_pr_fixture, review_pr_sandbox as rps  # noqa: E401,E402
+
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="review-pr-ccd-")
+_CFG = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_CFG.mkdir(parents=True, exist_ok=True)
+(_CFG / "access.json").write_text('{"allowFrom": []}')
+discord_env.seed_discord_token(Path(os.environ["CLAUDE_CONFIG_DIR"]))
+
+
+def _load_bridge():
+    discord_env.install_discord_stub()
+    spec = importlib.util.spec_from_file_location("dbridge_review_pr", REPO / "src" / "discord-bridge.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["dbridge_review_pr"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 
 SPEC = {
     "url": "https://github.com/example/demo/pull/7", "sha": "b" * 40,
@@ -175,8 +192,7 @@ class Script(unittest.TestCase):
         self.assertFalse(self.claude_log.exists())
 
     def test_team_rulebook_command_never_runs_codex(self):
-        with discord_env.temp_config_root():
-            bridge = discord_env.load_bridge("dbridge_review_pr_non_owner")
+        bridge = _load_bridge()
         p = self.run_script(command=bridge.TEAM_PR_REVIEW_COMMAND.replace("<N>", "7"))
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("STUB REVIEW", p.stdout)

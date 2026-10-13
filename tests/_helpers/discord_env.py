@@ -30,7 +30,6 @@ relocated rather than removed (john-the-dev, #2357 review 2026-07-31T07:36).
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import os
 import shutil
 import sys
@@ -99,8 +98,8 @@ def temp_config_root():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def load_bridge(module_name: str):
-    """Exec-load src/discord-bridge.py under `module_name`, stubbing discord.py when absent."""
+def install_discord_stub() -> None:
+    """Put a minimal `discord` module in sys.modules when discord.py is not installed."""
     try:  # pragma: no cover - present in dev, absent in clean CI
         import discord  # noqa: F401
     except Exception:
@@ -113,9 +112,3 @@ def load_bridge(module_name: str):
         stub.Message = type("Message", (), {})
         stub.DMChannel = type("DMChannel", (), {})
         sys.modules["discord"] = stub
-    path = Path(__file__).resolve().parents[2] / "src" / "discord-bridge.py"
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    spec.loader.exec_module(mod)
-    return mod

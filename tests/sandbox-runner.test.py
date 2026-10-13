@@ -9,6 +9,7 @@ both take the runner from the module, so neither can drift.
 Run: python3 tests/sandbox-runner.test.py
 """
 import asyncio
+import importlib.util
 import itertools
 import json
 import os
@@ -256,7 +257,12 @@ os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
 
 def _load_bridge():
-    return discord_env.load_bridge("dbridge_sandbox_runner")
+    discord_env.install_discord_stub()
+    spec = importlib.util.spec_from_file_location("dbridge_sandbox_runner", REPO / "src" / "discord-bridge.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["dbridge_sandbox_runner"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class DiscordBridgeDelegates(unittest.TestCase):
