@@ -144,7 +144,8 @@ class FencedInvocations(unittest.TestCase):
 
     def setUp(self):
         self.root = _dirs(self)
-        self.native = self.root / "tool" / "codex"
+        self.native = self.root / "tool" / "vendor" / "t" / "bin" / "codex"
+        self.native.parent.mkdir(parents=True)
         self.native.write_bytes(b"\xcf\xfa\xed\xfe")
         self.native.chmod(0o755)
         (self.root / "codexhome").mkdir()
@@ -187,6 +188,35 @@ class FencedInvocations(unittest.TestCase):
         sr.release(inv)
         self.assertFalse(Path(inv.scratch).exists())
         self.assertTrue(self.auth.exists(), "release removed the real login")
+
+    def test_codex_reads_only_its_vendor_dir(self):
+        with sr.empty_dir() as d:
+            inv = sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
+            self._check_common(inv, d)
+        prof = Path(inv.argv[2]).read_text()
+        tool_rules = [l for l in prof.splitlines() if f'(process-path "{self.native.resolve()}")' in l]
+        self.assertTrue(any(f'(subpath "{self.native.parent.parent.resolve()}")' in l
+                            for l in tool_rules))
+        self.assertFalse(any(f'(subpath "{(self.root / "tool").resolve()}")' in l for l in tool_rules))
+
+    def test_codex_outside_the_npm_vendor_layout_is_not_fenced(self):
+        home = self.root / "home"
+        native = home / "bin" / "codex"
+        native.parent.mkdir(parents=True)
+        native.write_bytes(b"\xcf\xfa\xed\xfe")
+        native.chmod(0o755)
+        with mock.patch.object(Path, "home", return_value=home):
+            self.assertFalse(sr.usable(sr.RUNNERS["codex"], str(native), fenced=True))
+            with sr.empty_dir() as d, self.assertRaises(ValueError):
+                sr.invocation(sr.RUNNERS["codex"], str(native), "Q", cwd=d)
+
+    def test_a_vendor_dir_holding_home_or_the_checkout_is_not_fenced(self):
+        triple = self.native.parent.parent
+        with mock.patch.object(Path, "home", return_value=triple / "me"):
+            self.assertIsNone(sr._codex_tool_dir(str(self.native)))
+        with mock.patch.object(sr, "_skills_dirs", return_value=[triple / "repo" / "skills"]):
+            self.assertIsNone(sr._codex_tool_dir(str(self.native)))
+        self.assertEqual(sr._codex_tool_dir(str(self.native)), triple)
 
     def test_codex_review_keeps_its_shell(self):
         with sr.empty_dir() as d:

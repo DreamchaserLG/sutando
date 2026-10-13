@@ -123,9 +123,8 @@ def profile(*, cwd, scratch, tool_binary, tool_dir=None, tool_read=(), tool_rw=(
         f"(allow network-outbound (remote unix-socket (path-literal {_q(_real(MDNS_SOCKET))})))",
         "(allow system-socket)",
     ]
-    if MACH_TOOL:
-        lines.append(f"(allow mach-lookup (require-all {me} (require-any "
-                     + " ".join(f'(global-name "{m}")' for m in MACH_TOOL) + ")))")
+    lines.append(f"(allow mach-lookup (require-all {me} (require-any "
+                 + " ".join(f'(global-name "{m}")' for m in MACH_TOOL) + ")))")
     if tool_w:
         lines.append(f"(allow file-read* file-write* (require-all {me} (require-any "
                      + " ".join(f"(subpath {_q(p)})" for p in tool_w) + ")))")
