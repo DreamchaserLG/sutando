@@ -170,13 +170,14 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     straight into another is owed the new kind's decision, since the card already
     up names a condition the pane no longer shows."""
     kind = _wedge_kind(obs, ev)
-    ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
-        # An unreadable capture is no evidence either way — hold the ladder
-        # rather than clearing a real episode out from under itself.
-        if obs.session_alive is True and obs.pane in (None, PANE_UNKNOWN):
+        # Missing pane or queue evidence holds the ladder as-is (last_pane_id
+        # included) rather than clearing a real episode out from under itself.
+        if obs.session_alive is True and (obs.pane in (None, PANE_UNKNOWN)
+                                          or obs.work_outstanding is None):
             return ev, NOTHING
-        return _cleared_wedge(ev), NOTHING
+        return _cleared_wedge(replace(ev, last_pane_id=obs.pane_id)), NOTHING
+    ev = replace(ev, last_pane_id=obs.pane_id)
     # A legacy acknowledgment cannot prove a login card exists; other kinds
     # retain their existing compatibility behavior.
     if ev.wedge_escalated and (ev.wedge_kind not in (None, kind)

@@ -177,6 +177,16 @@ check("a (None, None) capture is read the same as PANE_UNKNOWN, not as a cleared
       (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
       ([N, N, HUMAN, N], True, "human"))
 
+got, st = run([obs(WORK, "same")] * 4 + [obs(ps.PANE_UNKNOWN)] + [obs(WORK, "same")])
+check("an unreadable tick between two identical frozen frames does not erase the frame identity",
+      (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
+      ([N, N, N, FROZEN, N, N], True, "stuck"))
+
+got, st = run([obs(GATE)] * 3 + [obs(GATE, work=None)])
+check("undecidable queue evidence holds the episode; it is not read as no-longer-outstanding",
+      (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
+      ([N, N, HUMAN, N], True, "human"))
+
 legacy = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
     wedge_first_detected_at=400.0, wedge_consecutive=3, wedge_escalated=True)})
 _, d = ps.evaluate(legacy, {"w": obs(ABN)}, 1300.0)

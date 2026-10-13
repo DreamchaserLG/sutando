@@ -26,6 +26,7 @@ from hitl.schema import ActionReply  # noqa: E402
 WID = "7c54b230a8d94ea9b86f52d70134ac68"
 FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 GATE = f"  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n{FOOTER}\n"
+FROZEN = f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n"
 
 
 class UnreadablePaneHoldsTheWedge(unittest.TestCase):
@@ -123,6 +124,59 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         result = self.sweep()
         self.assertEqual(result["cards_closed"], [card.id])
         self.assertEqual(self.active_cards(), [])
+
+    def test_a_card_outlives_missing_ladder_state_plus_an_unreadable_capture(self):
+        # The card is durable HITL state; losing the separate ladder-state
+        # file must not, with one unreadable tick, read as positive clearance.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        self.pane = None
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+
+class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
+    def setUp(self):
+        super().setUp()
+        self.pane = FROZEN
+
+    def raise_card_to_sustain(self):
+        # The first tick only seeds last_pane_id; "stuck" isn't detected until
+        # the next one repeats it, so sustain lands one tick later than GATE/HUMAN.
+        for _ in range(3):
+            self.assertEqual(self.sweep()["decisions"][WID], ps.NOTHING)
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.CARD_FROZEN)
+        cards = self.active_cards()
+        self.assertEqual(len(cards), 1)
+        return cards[0]
+
+    def test_an_unreadable_capture_between_two_identical_frozen_frames_holds_the_card(self):
+        # The gap must not erase the frame identity "stuck" relies on, or the
+        # same frame that follows reads as unrecognized and the card resets.
+        card = self.raise_card_to_sustain()
+        self.pane = None
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.pane = FROZEN
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_an_unreadable_capture_between_two_identical_frozen_frames_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        self.pane = None
+        self.sweep()
+        self.pane = FROZEN
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
 
 if __name__ == "__main__":
