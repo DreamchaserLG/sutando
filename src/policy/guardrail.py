@@ -130,15 +130,16 @@ AG2SPACE_GUEST_SCOPE = (
 GUEST_NO_SEND_RESULT = "[no-send] guest-tier task not answered\n"
 
 
-def ag2space_guest_dropped(tier: str, team_grant: bool, hook) -> bool:
+def ag2space_guest_dropped(tier: str, broker_grant: bool, hook) -> bool:
     """True when an AG2 Space task at effective `tier` gets GUEST_NO_SEND_RESULT, not an answer.
 
     Guest messages wait for the owner's approval upstream, so one that still arrives
-    is not answered. A broker Team grant (`team_grant`) is not a guest's message even
-    while its tier stays Guest, and neither is a fire of a hook the owner set up
+    is not answered. Upstream holds only what the broker itself puts at Guest: a
+    broker grant above Guest (`broker_grant`: Team, or Owner) capped to Guest by the
+    local tierMap was never held, and neither is a fire of a hook the owner set up
     (`hook`, the broker's hook-fire object): both keep the sandboxed Guest path.
     """
-    if tier != "guest" or team_grant:
+    if tier != "guest" or broker_grant:
         return False
     is_hook_fire = isinstance(hook, dict) and all(
         isinstance(hook.get(k), str) and hook.get(k) for k in ("hook_id", "fire_id"))

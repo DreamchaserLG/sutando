@@ -3582,9 +3582,9 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
-    team_grant = local_task_protocol.broker_team_grant(
+    broker_grant = local_task_protocol.broker_grant_above_guest(
         task.get("access_tier"), task.get("requested_access_tier"))
-    if ag2space_guest_dropped(sender_tier, team_grant, task.get("hook")):
+    if ag2space_guest_dropped(sender_tier, broker_grant, task.get("hook")):
         # No task file, so the core never sees it; the result POST closes the lease.
         _log(f"guest-tier task {tid} not queued — closing it [no-send]")
         return tid, _durable_write(RESULTS_DIR / f"{tid}.txt", GUEST_NO_SEND_RESULT)

@@ -165,6 +165,12 @@ def broker_team_grant(access_tier, requested_access_tier) -> bool:
     under the legacy Guest wire tier. A grant alone does not promote the tier."""
     return "team" in (_broker_wire_tier(access_tier), _broker_wire_tier(requested_access_tier))
 
+
+def broker_grant_above_guest(access_tier, requested_access_tier) -> bool:
+    """Whether the broker put the sender above Guest: a Team grant or an Owner attestation."""
+    return (broker_team_grant(access_tier, requested_access_tier)
+            or _broker_wire_tier(access_tier) == "owner")
+
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
 # ENFORCED in two places that must stay in lockstep (Codex P2 on PR #1954):

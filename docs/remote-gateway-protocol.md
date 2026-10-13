@@ -442,10 +442,11 @@ not promise downstream Matrix delivery.
   `collaborator: true` line before the task body. A local owner-to-Team cap does
   not opt a room in; missing/malformed controls fail closed. This setting is
   controlled per room and per agent rather than by a host-wide environment flag.
-- A task whose effective tier is **Guest** with no broker Team grant (wire Guest
-  and no `requested_access_tier: team`; missing/unknown tiers included) is not
-  queued for the agent: the bridge writes a `[no-send]` result that closes the
-  lease. A broker hook fire (a `hook` object with `hook_id` and `fire_id`) keeps
+- A task whose effective tier is **Guest** and that the broker itself put at
+  Guest (wire Guest and no `requested_access_tier: team`; missing/unknown tiers
+  included) is not queued for the agent: the bridge writes a `[no-send]` result
+  that closes the lease. A broker Team or Owner sender capped to Guest by the
+  local tierMap keeps the sandboxed Guest path (upstream never held it). A broker hook fire (a `hook` object with `hook_id` and `fire_id`) keeps
   the sandboxed Guest path. Policy: `src/policy/guardrail.py`
   `ag2space_guest_dropped`.
 - Collaborator result secret scanning defaults on. An exact broker boolean

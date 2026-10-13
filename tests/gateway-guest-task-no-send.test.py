@@ -4,7 +4,8 @@
 The gateway's real `_write_task` is driven: a plain Guest task leaves no task
 file (the core never sees it) and a `[no-send]` result that closes the lease.
 A broker Team grant (`requested_access_tier: team`, with or without the
-collaborator boolean), Team, Owner and a broker hook fire keep today's path.
+collaborator boolean), Team, Owner (also when capped to Guest locally) and a
+broker hook fire keep today's path.
 
 Run: python3 tests/gateway-guest-task-no-send.test.py
 """
@@ -89,10 +90,6 @@ class GuestTaskIsClosedNoSend(unittest.TestCase):
             self.assertDropped(*_write(_load(Path(d)), access_tier="guest",
                                        hook={"hook_id": "hk_1"}))
 
-    def test_local_cap_to_guest_without_a_team_grant_is_dropped(self):
-        with tempfile.TemporaryDirectory() as d:
-            mod = _load(Path(d), tier_map={"@stranger:ag2.space": "guest"})
-            self.assertDropped(*_write(mod, access_tier="owner"))
 
 
 class NonGuestTasksKeepTodaysPath(unittest.TestCase):
@@ -121,6 +118,14 @@ class NonGuestTasksKeepTodaysPath(unittest.TestCase):
             text = self.assertQueued(*_write(mod, access_tier="team"))
             self.assertIn("access_tier: guest", text.splitlines())
 
+    def test_owner_attestation_capped_to_guest_locally_is_still_processed(self):
+        # Upstream holds only what the broker puts at Guest, so an Owner capped here was never held.
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d), tier_map={"@stranger:ag2.space": "guest"})
+            text = self.assertQueued(*_write(mod, access_tier="owner"))
+            self.assertIn("access_tier: guest", text.splitlines())
+            self.assertIn("GUEST tier", text)
+
     def test_team_and_owner_are_unaffected(self):
         for tier in ("team", "owner"):
             with self.subTest(tier=tier), tempfile.TemporaryDirectory() as d:
@@ -141,10 +146,19 @@ class PolicyOwnerAndVendoredCopy(unittest.TestCase):
         self.assertFalse(ag2space_guest_dropped("team", False, None))
         self.assertFalse(ag2space_guest_dropped("owner", False, None))
 
+    def test_broker_grant_above_guest(self):
+        from local_task_protocol import broker_grant_above_guest
+        for wire, requested, want in (("owner", None, True), ("team", None, True),
+                                      ("guest", "team", True), ("guest", None, False),
+                                      ("guest", "owner", False), (None, None, False),
+                                      ("bogus", "team", True), ("ambient", None, False)):
+            with self.subTest(wire=wire, requested=requested):
+                self.assertIs(broker_grant_above_guest(wire, requested), want)
+
     def test_gateway_delegates_to_the_policy_owner(self):
         src = (REPO / "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py").read_text()
-        self.assertIn("ag2space_guest_dropped(sender_tier, team_grant,", src)
-        self.assertIn("local_task_protocol.broker_team_grant(", src)
+        self.assertIn("ag2space_guest_dropped(sender_tier, broker_grant,", src)
+        self.assertIn("local_task_protocol.broker_grant_above_guest(", src)
         self.assertNotIn('"[no-send] guest', src, "the result body lives in the policy owner")
 
     def test_vendored_copies_match_src(self):
