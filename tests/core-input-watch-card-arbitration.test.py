@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""core-input-watch.py's escalate() must defer to a card another source
-already raised for the same session — the reciprocal half of
-pool_wedge_cards.input_watch_has_card(), which already defers the other way.
+"""core-input-watch.py's escalate() always creates its own card for a gate or
+login episode, never deferring to pool_wedge_cards.py's CARD_HUMAN/CARD_LOGIN
+— a backstop only, by that module's own docstring, that defers to this one.
+The design is one-directional; this file pins this side of it.
 
 Real src/hitl store; no tmux, no subprocess.
 """
@@ -34,32 +35,27 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.manager = HitlManager(HitlStore(default_store(Path(tmp.name))))
 
-    def test_escalate_defers_when_another_source_already_cards_this_session(self):
-        # pool-wedge raised its CARD_HUMAN card first, in the same sweep that
-        # then starts core-input-watch for the first time.
+    def test_escalate_blocked_human_always_wins_over_an_active_pool_human_card(self):
+        # pool-wedge's CARD_HUMAN is a backstop only that defers to this
+        # monitor's card; this richer permission card must always get created.
         self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
-                           "permission", "Do you want to proceed?", SESSION)
-        self.assertIsNone(req)
-        cards = [r for r in self.manager.active() if (r.subject or {}).get("session") == SESSION]
-        self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0].subject["source"], "pool-wedge")
+                           "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "permission")
 
-    def test_escalate_defers_to_a_legacy_effectless_pool_wedge_gate_card(self):
-        # A legacy pool-wedge card, no "effect" field, recognized by its
-        # own established shape (wedge=card_human) instead.
+    def test_escalate_blocked_human_always_wins_over_a_legacy_effectless_pool_card(self):
+        # Same, against a legacy pool-wedge card with no "effect" field.
         self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
-                           "permission", "Do you want to proceed?", SESSION)
-        self.assertIsNone(req)
-        cards = [r for r in self.manager.active() if (r.subject or {}).get("session") == SESSION]
-        self.assertEqual(len(cards), 1)
-        self.assertEqual(cards[0].subject["source"], "pool-wedge")
+                           "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "permission")
 
     def test_escalate_logged_out_always_wins_over_an_active_pool_login_card(self):
         # The richer one-click auth card must never be suppressed by the
@@ -112,25 +108,16 @@ class DuplicateCardArbitration(unittest.TestCase):
                            "permission", "Do you want to proceed?", SESSION)
         self.assertIsNotNone(req)
 
-    def test_escalate_blocked_human_calls_the_shared_claim_session(self):
-        # Must genuinely delegate, not reimplement the ownership check.
+    def test_escalate_never_calls_claim_session_for_either_gate_effect(self):
+        # Structural pin: escalate() always wins by construction, never by
+        # winning a check-and-create race through the shared ownership gate.
         from unittest import mock
         import hitl.session_ownership as so
         with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
-            civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
-                        "permission", "Do you want to proceed?", SESSION)
-            self.assertTrue(spy.called)
-            self.assertEqual(spy.call_args.kwargs.get("effect"), civ.GATE_EFFECT)
-
-    def test_escalate_logged_out_bypasses_claim_session_entirely(self):
-        # The auth card always wins (see its own test above), by construction
-        # never going through the ownership-check gate at all.
-        from unittest import mock
-        import hitl.session_ownership as so
-        with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
-            req = civ.escalate(self.manager, "logged-out", "core not authenticated",
-                               None, None, SESSION)
-            self.assertIsNotNone(req)
+            for state, kind, prompt in (("blocked-human", "permission", "Do you want to proceed?"),
+                                        ("logged-out", None, None)):
+                req = civ.escalate(self.manager, state, "detail", kind, prompt, SESSION)
+                self.assertIsNotNone(req)
             self.assertFalse(spy.called)
 
     def test_escalate_still_ignores_its_own_prior_card_for_dedup_not_arbitration(self):

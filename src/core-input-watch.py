@@ -672,16 +672,18 @@ LOGIN_EFFECT = "login"
 
 
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
-    """Raise ONE requirement per episode, atomically claiming the session (and,
-    for a gate, the specific effect) so a producer on the same schedule can't
-    also create one in the window between a check and a create. The Manager's
-    own dedup only catches an identical (runtime, kind, device, guard) — the
-    prompt IS that episode key, so the same prompt returns the same record,
-    a different one mints a new card; this is the cross-SOURCE question, not
-    that one.
+    """Raise ONE requirement per episode. The Manager's own dedup only catches
+    an identical (runtime, kind, device, guard) — the prompt IS that episode
+    key, so the same prompt returns the same record, a different one mints a
+    new card.
 
-    Returns the requirement, or None when nothing could be raised (or another
-    source already owns this session for this effect).
+    This monitor's card always answers its dialog (allow/deny, authenticate);
+    pool_wedge_cards.py's own CARD_HUMAN/CARD_LOGIN docstring says it is "a
+    backstop only... defers to [this monitor's] active card" -- the design is
+    one-directional, so this side always creates and never defers to pool's
+    backstop (pool continues to defer to this one, via its own claim_session).
+
+    Returns the requirement, or None when manager is None.
     """
     if manager is None:
         return None
@@ -689,7 +691,6 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
               LOGIN_EFFECT if state == "logged-out" else None)
     try:
         from hitl import tui_gate
-        from hitl.session_ownership import claim_session
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt),
                                        runtime=runtime)
@@ -699,17 +700,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
             req = _name_seat(req, session, seat)
         if effect:
             req.subject = {**(req.subject or {}), "effect": effect}
-        if state == "logged-out":
-            # The one-click sign-in card always wins over a plain terminal
-            # jump; Manager dedup still collapses repeat ticks into one card.
-            return manager.create(req)
-        # Legacy pool-wedge shape for this same effect, pre-dating its own
-        # effect tag (card_human/card_login are its literal wedge kinds).
-        legacy_wedge = {"blocked-human": "card_human", "logged-out": "card_login"}.get(state)
-        legacy_match = ((lambda subj: subj.get("wedge") == legacy_wedge)
-                       if legacy_wedge else None)
-        return claim_session(manager, session, by_source=_TUI_SOURCE, effect=effect,
-                             build_requirement=lambda: req, legacy_match=legacy_match)
+        return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None
