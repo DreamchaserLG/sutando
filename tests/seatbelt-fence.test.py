@@ -218,6 +218,28 @@ class FencedInvocations(unittest.TestCase):
             self.assertIsNone(sr._codex_tool_dir(str(self.native)))
         self.assertEqual(sr._codex_tool_dir(str(self.native)), triple)
 
+    def test_codex_helper_beside_it_may_be_read_and_run(self):
+        helper = self.native.with_name("codex-code-mode-host")
+        helper.write_bytes(b"\xcf\xfa\xed\xfe")
+        with sr.empty_dir() as d:
+            inv = sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
+            self._check_common(inv, d)
+        prof = Path(inv.argv[2]).read_text()
+        self.assertIn(f'(allow file-read* (literal "{helper.resolve()}"))', prof)
+        self.assertIn(f'(allow process-exec (require-all (literal "{helper.resolve()}")', prof)
+
+    def test_a_failed_profile_leaves_no_scratch_dir(self):
+        before = set(Path(tempfile.gettempdir()).glob("sutando-fence-*"))
+        with mock.patch.object(seatbelt, "profile", side_effect=ValueError("bad path")), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
+            sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
+        self.assertEqual(set(Path(tempfile.gettempdir()).glob("sutando-fence-*")), before)
+
+    def test_an_unknown_fenceable_runner_is_never_ready(self):
+        other = sr.Runner("other", safe=False, stall_seconds=0, answer_on_stdout=True,
+                          fenceable=True)
+        self.assertFalse(sr.usable(other, "/b/other", fenced=True))
+
     def test_codex_review_keeps_its_shell(self):
         with sr.empty_dir() as d:
             inv = sr.confined_invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)

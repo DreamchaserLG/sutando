@@ -324,17 +324,24 @@ class DiscordBridgeDelegates(unittest.TestCase):
         self.assertNotIn("Do NOT redirect stdout", claude["team"])
         self.assertNotIn("-C /tmp", claude["guest"])
 
-    def _spawn_with(self, picked, stdout=b"", write_file=None):
+    def _spawn_with(self, picked, stdout=b"", write_file=None, rc=0, hang=False, fail=False):
         captured = {}
 
         class Proc:
-            returncode = 0
+            returncode = rc
 
             async def communicate(self):
+                if hang:
+                    await asyncio.sleep(60)
                 return stdout, b""
+
+            def kill(self):
+                captured["killed"] = True
 
         async def fake_exec(*argv, **kw):
             captured.update(argv=list(argv), kw=kw)
+            if fail:
+                raise OSError("spawn failed")
             if write_file is not None and "-o" in argv:
                 Path(argv[argv.index("-o") + 1]).write_text(write_file)
             return Proc()
@@ -343,7 +350,7 @@ class DiscordBridgeDelegates(unittest.TestCase):
         sr.select_runner = lambda *a, **k: picked
         self.bridge.asyncio.create_subprocess_exec = fake_exec
         try:
-            raw = asyncio.run(self.bridge._run_codex_subprocess("judge me", None, 5))
+            raw = asyncio.run(self.bridge._run_codex_subprocess("judge me", None, 0.2 if hang else 5))
         finally:
             sr.select_runner, self.bridge.asyncio.create_subprocess_exec = orig_sel, orig_exec
         return raw, captured
@@ -354,6 +361,14 @@ class DiscordBridgeDelegates(unittest.TestCase):
         self.assertEqual(cap["argv"][:2], ["/fake/claude", "-p"])
         self.assertIs(cap["kw"]["stdin"], asyncio.subprocess.DEVNULL)
         self.assertTrue(os.path.basename(cap["kw"]["cwd"]).startswith("sutando-sandbox-"))
+
+    def test_judge_failures_return_nothing(self):
+        claude = (sr.RUNNERS["claude"], "/fake/claude")
+        self.assertEqual(self._spawn_with(claude, stdout=b"x", fail=True)[0], "")
+        self.assertEqual(self._spawn_with(claude, stdout=b"x", rc=2)[0], "")
+        raw, cap = self._spawn_with(claude, stdout=b"x", hang=True)
+        self.assertEqual(raw, "")
+        self.assertTrue(cap.get("killed"))
 
     def test_judge_with_no_runner_spawns_nothing(self):
         raw, cap = self._spawn_with(None)
