@@ -8,7 +8,7 @@ other temp dirs, /Library, /Applications or /opt is readable or writable.
 
 The tool binary itself (matched by `process-path`) may additionally read its own
 install dir and the files listed in `tool_read`, and read/write `tool_rw` (its
-private state dir, and for codex its auth file, which it rewrites on refresh). A
+private state dir). Never put a credential file there: in-process tools can move it. A
 child it spawns (a shell, cat, grep) matches a different path and gets none of
 that, and no process may exec the tool binary or sandbox-exec again.
 

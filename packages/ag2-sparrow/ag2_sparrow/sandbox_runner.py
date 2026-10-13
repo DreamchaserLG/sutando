@@ -11,7 +11,7 @@ Order: the first runner that is both SAFE and installed, from
 declares, then DEFAULT_ORDER). A runner is SAFE only when its flags alone, with no
 persisted settings, give a session that can read NO file, write nothing and reach no
 network; one that cannot is listed with the reason and skipped, unless it is FENCED:
-on macOS, a spawned run (`invocation`, `confined_invocation`) of agy or codex is
+on macOS, a spawned run (`invocation`, `confined_invocation`) of agy is
 wrapped in a per-run Seatbelt profile (seatbelt.py) that is the boundary instead of
 its flags. The in-band text (`shell_command`) is one shell line with no fence, so
 it only ever names a flag-safe runner. None usable: `select_runner` returns None
@@ -83,8 +83,9 @@ RUNNERS = {
         unsafe_reason=(
             "codex has no sandbox policy that denies reads outside its working directory: "
             "read-only leaves every user-readable file readable, and the :minimal permission "
-            "profile still leaves temp dirs readable and writable"),
-        fenceable=True,
+            "profile still leaves temp dirs readable and writable; and fenced, its in-process "
+            "apply_patch can still read or move the login (auth.json) it must hold, with no "
+            "flag in codex 0.160 to turn it off"),
     ),
     "claude": Runner("claude", safe=True, stall_seconds=0, answer_on_stdout=True),
 }
@@ -151,15 +152,10 @@ def find_binary(name: str, which: Callable = shutil.which) -> Optional[str]:
 
 
 def _fence_ready(runner: Runner, binary: str, env) -> bool:
-    """A fenceable runner can run fenced here: macOS fence present, its real binary
-    found, and its login reachable without copying it (codex: auth.json in place;
-    agy: an API key in the env it will be handed)."""
+    """A fenceable runner can run fenced here: macOS fence present and its login in
+    the env it will be handed (agy: an API key), never in a file it could move."""
     if not (runner.fenceable and seatbelt.available()):
         return False
-    if runner.name == "codex":
-        native = _codex_native(binary)
-        return (native is not None and _codex_tool_dir(native) is not None
-                and _codex_auth(env).is_file())
     if runner.name == "agy":
         return any(env.get(k) for k in AGY_KEY_VARS)
     return False
@@ -243,51 +239,6 @@ def release(inv: Invocation) -> None:
 
 AGY_KEY_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 FENCE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-# Codex features that reach past the shell (GUI, browser, plugins, sub-agents,
-# hooks) or read files in-process; the fence holds either way.
-CODEX_DISABLED = ("shell_snapshot", "view_image", "computer_use", "browser_use",
-                  "browser_use_external", "in_app_browser", "apps", "plugins",
-                  "multi_agent", "hooks", "image_generation", "goals", "memories")
-CODEX_NO_SHELL = ("shell_tool", "unified_exec")
-
-
-def _codex_auth(env) -> Path:
-    return Path(env.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
-
-
-def _codex_native(binary: str) -> Optional[str]:
-    """The native codex executable: `binary` itself, or the one its npm launcher
-    script would spawn (a script would need node, which the fence does not admit)."""
-    real = Path(os.path.realpath(binary))
-    try:
-        with open(real, "rb") as f:
-            script = f.read(2) == b"#!"
-    except OSError:
-        return None
-    if not script:
-        return str(real)
-    pkg = real.parent.parent
-    for cand in sorted(pkg.glob("node_modules/@openai/codex-*/vendor/*/bin/codex")) + \
-            sorted(pkg.glob("vendor/*/bin/codex")):
-        if os.access(cand, os.X_OK):
-            return os.path.realpath(cand)
-    return None
-
-
-def _codex_tool_dir(native: str) -> Optional[Path]:
-    """What the fenced codex may read besides the run dirs: its npm `vendor/<triple>`
-    dir. None (no fence) for any other layout, or a dir holding HOME or the checkout."""
-    p = Path(native)
-    d = p.parent.parent
-    if p.parent.name != "bin" or d.parent.name != "vendor":
-        return None
-    for held in (Path.home(), *(s.parent for s in _skills_dirs())):
-        held = Path(os.path.realpath(held))
-        if d == held or d in held.parents:
-            return None
-    return d
-
-
 def _fenced(runner: Runner, binary: str, prompt: str, cwd: str, *, tools: bool) -> Invocation:
     if not _fence_ready(runner, binary, os.environ):
         raise ValueError(f"no safe invocation for runner {runner.name!r} on this host")
@@ -299,35 +250,18 @@ def _fenced(runner: Runner, binary: str, prompt: str, cwd: str, *, tools: bool) 
         tool_home.mkdir()
         tmp.mkdir()
         base = {"PATH": FENCE_PATH, "TMPDIR": str(tmp), "LANG": "en_US.UTF-8"}
-        if runner.name == "codex":
-            native = _codex_native(binary)
-            auth = _codex_auth(os.environ).resolve()
-            # A link, not a copy: codex reads it in place and rewrites it on refresh.
-            (tool_home / "auth.json").symlink_to(auth)
-            disabled = CODEX_DISABLED + (() if tools else CODEX_NO_SHELL)
-            argv = [native, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-                    "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox",
-                    *(a for f in disabled for a in ("--disable", f)),
-                    "--color", "never", "-C", cwd, "--", prompt]
-            env = dict(base, HOME=str(tool_home), CODEX_HOME=str(tool_home))
-            helper = Path(native).with_name("codex-code-mode-host")
-            text = seatbelt.profile(cwd=cwd, scratch=tmp, tool_binary=native,
-                                    tool_dir=_codex_tool_dir(native),
-                                    tool_rw=[tool_home, auth],
-                                    helpers=[helper] if helper.is_file() else [])
-        else:
-            agy = os.path.realpath(binary)
-            settings = tool_home / ".gemini" / "antigravity-cli" / "settings.json"
-            settings.parent.mkdir(parents=True)
-            settings.write_text(json.dumps({"modelProvider": "gemini", "trustedWorkspaces": [cwd]}))
-            argv = [agy, "--disable-slash-commands", "--log-file", str(tool_home / "cli.log"),
-                    f"-p={prompt}"]
-            env = dict(base, HOME=str(tool_home),
-                       **{k: os.environ[k] for k in AGY_KEY_VARS if os.environ.get(k)})
-            # No exec at all: agy's file tools run in its own process, so a terminal
-            # is the only way its key (in its env) could reach a child.
-            text = seatbelt.profile(cwd=cwd, scratch=tmp, tool_binary=agy, tool_dir=agy,
-                                    tool_rw=[tool_home], loopback=True, exec_children=False)
+        agy = os.path.realpath(binary)
+        settings = tool_home / ".gemini" / "antigravity-cli" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"modelProvider": "gemini", "trustedWorkspaces": [cwd]}))
+        argv = [agy, "--disable-slash-commands", "--log-file", str(tool_home / "cli.log"),
+                f"-p={prompt}"]
+        env = dict(base, HOME=str(tool_home),
+                   **{k: os.environ[k] for k in AGY_KEY_VARS if os.environ.get(k)})
+        # No exec at all: agy's file tools run in its own process, so a terminal
+        # is the only way its key (in its env) could reach a child.
+        text = seatbelt.profile(cwd=cwd, scratch=tmp, tool_binary=agy, tool_dir=agy,
+                                tool_rw=[tool_home], loopback=True, exec_children=False)
         prof = Path(scratch) / "fence.sb"
         prof.write_text(text)
         return Invocation(runner, seatbelt.wrap(str(prof), argv), cwd, env, scratch)

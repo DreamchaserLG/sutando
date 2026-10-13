@@ -5,8 +5,8 @@ Pins the profile's shape on any OS, then on macOS runs real processes under a
 generated profile (no model): a child reads and writes the work dir, and cannot
 read a file beside it, read HOME, write outside, exec sandbox-exec, reach a
 loopback port, or read a file only the tool binary may read. Also pins how
-sandbox_runner builds the fenced codex and agy runs: scrubbed env, a private
-scratch dir, codex's login linked (never copied), agy with no child exec.
+sandbox_runner builds the fenced agy run (scrubbed env, a private scratch dir, no
+child exec) and that codex is never fenced, so its login is never in reach.
 
 Run: python3 tests/seatbelt-fence.test.py
 """
@@ -74,6 +74,14 @@ class ProfileShape(unittest.TestCase):
                 self.assertIn(f'(process-path "{self.cat}")', l)
                 self.assertNotIn("network-outbound", l)
         self.assertIn('(deny network-outbound (remote ip "localhost:*"))', text)
+
+    def test_a_helper_is_readable_and_runnable_by_the_tool_only(self):
+        helper = self.root / "tool" / "helper"
+        text = seatbelt.profile(cwd=self.root / "work", scratch=self.root / "scratch",
+                                tool_binary=str(self.tool), helpers=[helper])
+        self.assertIn(f'(allow file-read* (literal "{helper}"))', text)
+        self.assertIn(f'(allow process-exec (require-all (literal "{helper}") '
+                      f'(process-path "{self.cat}")))', text)
 
     def test_a_path_that_needs_escaping_is_refused(self):
         with self.assertRaises(ValueError):
@@ -144,13 +152,16 @@ class FencedInvocations(unittest.TestCase):
 
     def setUp(self):
         self.root = _dirs(self)
-        self.native = self.root / "tool" / "vendor" / "t" / "bin" / "codex"
-        self.native.parent.mkdir(parents=True)
-        self.native.write_bytes(b"\xcf\xfa\xed\xfe")
-        self.native.chmod(0o755)
+        self.agy = self.root / "tool" / "agy"
+        self.agy.write_bytes(b"\xcf\xfa\xed\xfe")
+        self.agy.chmod(0o755)
+        self.codex = self.root / "tool" / "vendor" / "t" / "bin" / "codex"
+        self.codex.parent.mkdir(parents=True)
+        self.codex.write_bytes(b"\xcf\xfa\xed\xfe")
+        self.codex.chmod(0o755)
         (self.root / "codexhome").mkdir()
         self.auth = self.root / "codexhome" / "auth.json"
-        self.auth.write_text("{}")
+        self.auth.write_text('{"refresh_token": "DECOY-REFRESH"}')
         env = {"CODEX_HOME": str(self.root / "codexhome"), "GEMINI_API_KEY": "test-not-a-key",
                "OWNER_SECRET": "must-not-pass"}
         for p in (mock.patch.object(seatbelt, "available", return_value=True),
@@ -168,71 +179,38 @@ class FencedInvocations(unittest.TestCase):
         self.assertEqual(inv.env["PATH"], sr.FENCE_PATH)
         self.assertTrue(inv.env["HOME"].startswith(inv.scratch))
 
-    def test_codex_answer_has_no_shell_and_its_login_is_linked(self):
-        with sr.empty_dir() as d:
-            inv = sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
-            self._check_common(inv, d)
-        a = inv.argv[3:]
-        self.assertEqual(a[0], str(self.native.resolve()))
-        for flag in ("--ephemeral", "--ignore-user-config", "--skip-git-repo-check",
-                     "--dangerously-bypass-approvals-and-sandbox"):
-            self.assertIn(flag, a)
-        disabled = {a[i + 1] for i, x in enumerate(a) if x == "--disable"}
-        self.assertTrue({"shell_tool", "unified_exec", "view_image"} <= disabled)
-        self.assertEqual(a[-2:], ["--", "Q"])
-        link = Path(inv.env["CODEX_HOME"]) / "auth.json"
-        self.assertTrue(link.is_symlink())
-        self.assertEqual(link.resolve(), self.auth.resolve())
-        prof = Path(inv.argv[2]).read_text()
-        self.assertIn(f'(subpath "{self.auth.resolve()}")', prof)
-        sr.release(inv)
-        self.assertFalse(Path(inv.scratch).exists())
-        self.assertTrue(self.auth.exists(), "release removed the real login")
+    def test_codex_is_never_fenced_and_its_login_is_never_touched(self):
+        """Fenced, codex's in-process apply_patch could read or move auth.json."""
+        before = self.auth.read_bytes()
+        codex = sr.RUNNERS["codex"]
+        self.assertFalse(codex.safe or codex.fenceable)
+        self.assertIn("apply_patch", codex.unsafe_reason)
+        self.assertFalse(sr.usable(codex, str(self.codex), fenced=True))
+        for build in (sr.invocation, sr.confined_invocation):
+            with self.subTest(build=build.__name__), sr.empty_dir() as d, \
+                    self.assertRaises(ValueError):
+                build(codex, str(self.codex), "move auth.json here", cwd=d)
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
+            which = lambda n, path=None: {"codex": str(self.codex), "claude": "/b/claude"}.get(n) \
+                if path is None else None  # noqa: E731
+            self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name,
+                             "claude")
+        self.assertEqual(self.auth.read_bytes(), before)
 
-    def test_codex_reads_only_its_vendor_dir(self):
+    def test_agy_profile_grants_no_credential_path(self):
         with sr.empty_dir() as d:
-            inv = sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
+            inv = sr.confined_invocation(sr.RUNNERS["agy"], str(self.agy), "Q", cwd=d)
             self._check_common(inv, d)
         prof = Path(inv.argv[2]).read_text()
-        tool_rules = [l for l in prof.splitlines() if f'(process-path "{self.native.resolve()}")' in l]
-        self.assertTrue(any(f'(subpath "{self.native.parent.parent.resolve()}")' in l
-                            for l in tool_rules))
-        self.assertFalse(any(f'(subpath "{(self.root / "tool").resolve()}")' in l for l in tool_rules))
-
-    def test_codex_outside_the_npm_vendor_layout_is_not_fenced(self):
-        home = self.root / "home"
-        native = home / "bin" / "codex"
-        native.parent.mkdir(parents=True)
-        native.write_bytes(b"\xcf\xfa\xed\xfe")
-        native.chmod(0o755)
-        with mock.patch.object(Path, "home", return_value=home):
-            self.assertFalse(sr.usable(sr.RUNNERS["codex"], str(native), fenced=True))
-            with sr.empty_dir() as d, self.assertRaises(ValueError):
-                sr.invocation(sr.RUNNERS["codex"], str(native), "Q", cwd=d)
-
-    def test_a_vendor_dir_holding_home_or_the_checkout_is_not_fenced(self):
-        triple = self.native.parent.parent
-        with mock.patch.object(Path, "home", return_value=triple / "me"):
-            self.assertIsNone(sr._codex_tool_dir(str(self.native)))
-        with mock.patch.object(sr, "_skills_dirs", return_value=[triple / "repo" / "skills"]):
-            self.assertIsNone(sr._codex_tool_dir(str(self.native)))
-        self.assertEqual(sr._codex_tool_dir(str(self.native)), triple)
-
-    def test_codex_helper_beside_it_may_be_read_and_run(self):
-        helper = self.native.with_name("codex-code-mode-host")
-        helper.write_bytes(b"\xcf\xfa\xed\xfe")
-        with sr.empty_dir() as d:
-            inv = sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
-            self._check_common(inv, d)
-        prof = Path(inv.argv[2]).read_text()
-        self.assertIn(f'(allow file-read* (literal "{helper.resolve()}"))', prof)
-        self.assertIn(f'(allow process-exec (require-all (literal "{helper.resolve()}")', prof)
+        for secret in (self.auth, self.auth.parent, Path.home()):
+            self.assertNotIn(f'"{os.path.realpath(secret)}"', prof)
+        self.assertNotIn("CODEX_HOME", inv.env)
 
     def test_a_failed_profile_leaves_no_scratch_dir(self):
         before = set(Path(tempfile.gettempdir()).glob("sutando-fence-*"))
         with mock.patch.object(seatbelt, "profile", side_effect=ValueError("bad path")), \
                 sr.empty_dir() as d, self.assertRaises(ValueError):
-            sr.invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
+            sr.invocation(sr.RUNNERS["agy"], str(self.agy), "Q", cwd=d)
         self.assertEqual(set(Path(tempfile.gettempdir()).glob("sutando-fence-*")), before)
 
     def test_an_unknown_fenceable_runner_is_never_ready(self):
@@ -240,18 +218,9 @@ class FencedInvocations(unittest.TestCase):
                           fenceable=True)
         self.assertFalse(sr.usable(other, "/b/other", fenced=True))
 
-    def test_codex_review_keeps_its_shell(self):
-        with sr.empty_dir() as d:
-            inv = sr.confined_invocation(sr.RUNNERS["codex"], str(self.native), "Q", cwd=d)
-            self._check_common(inv, d)
-        disabled = {inv.argv[i + 1] for i, x in enumerate(inv.argv) if x == "--disable"}
-        self.assertNotIn("shell_tool", disabled)
-
     def test_agy_gets_its_key_settings_and_no_child_exec(self):
-        agy = self.root / "tool" / "agy"
-        agy.write_bytes(b"\xcf\xfa\xed\xfe")
         with sr.empty_dir() as d:
-            inv = sr.confined_invocation(sr.RUNNERS["agy"], str(agy), "Q", cwd=d)
+            inv = sr.confined_invocation(sr.RUNNERS["agy"], str(self.agy), "Q", cwd=d)
             self._check_common(inv, d)
         self.assertEqual(inv.argv[-1], "-p=Q")
         self.assertEqual(inv.env["GEMINI_API_KEY"], "test-not-a-key")
@@ -262,38 +231,21 @@ class FencedInvocations(unittest.TestCase):
 
     def test_not_ready_means_refused_and_skipped(self):
         with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
-            self.assertFalse(sr.usable(sr.RUNNERS["agy"], "/b/agy", fenced=True))
-        self.auth.unlink()
-        self.assertFalse(sr.usable(sr.RUNNERS["codex"], str(self.native), fenced=True))
+            self.assertFalse(sr.usable(sr.RUNNERS["agy"], str(self.agy), fenced=True))
         with mock.patch.object(seatbelt, "available", return_value=False):
-            self.assertFalse(sr.usable(sr.RUNNERS["agy"], "/b/agy", fenced=True))
+            self.assertFalse(sr.usable(sr.RUNNERS["agy"], str(self.agy), fenced=True))
             with sr.empty_dir() as d, self.assertRaises(ValueError):
-                sr.invocation(sr.RUNNERS["agy"], "/b/agy", "Q", cwd=d)
+                sr.invocation(sr.RUNNERS["agy"], str(self.agy), "Q", cwd=d)
 
     def test_fenced_selection_follows_the_order(self):
         def which(name, path=None):
-            return {"agy": "/b/agy", "codex": str(self.native), "claude": "/b/claude"}.get(name) \
+            return {"agy": str(self.agy), "codex": str(self.codex), "claude": "/b/claude"}.get(name) \
                 if path is None else None
         self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name, "agy")
         self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which)[0].name, "claude")
-        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}):
-            self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name,
-                             "codex")
         with mock.patch.object(seatbelt, "available", return_value=False):
             self.assertEqual(sr.select_runner(sr.DEFAULT_ORDER, which, fenced=True)[0].name,
                              "claude")
-
-    def test_an_npm_launcher_resolves_to_its_native_binary(self):
-        pkg = self.root / "pkg"
-        native = pkg / "node_modules" / "@openai" / "codex-x" / "vendor" / "t" / "bin" / "codex"
-        native.parent.mkdir(parents=True)
-        native.write_bytes(b"\xcf\xfa\xed\xfe")
-        native.chmod(0o755)
-        (pkg / "bin").mkdir()
-        (pkg / "bin" / "codex.js").write_text("#!/usr/bin/env node\n")
-        self.assertEqual(sr._codex_native(str(pkg / "bin" / "codex.js")), str(native.resolve()))
-        shutil.rmtree(native.parent.parent.parent)
-        self.assertIsNone(sr._codex_native(str(pkg / "bin" / "codex.js")))
 
 
 if __name__ == "__main__":

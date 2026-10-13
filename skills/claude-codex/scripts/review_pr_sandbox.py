@@ -4,10 +4,10 @@
 `review-pr.sh --non-owner` calls this. It copies the PR's diff and its changed
 files at the head commit into a fresh temp dir outside the repo and workspace,
 then runs the first usable runner from src/policy/sandbox_runner.py there, in the
-configured order: agy or codex only inside the macOS Seatbelt fence (which lets
-them read that dir and nothing of the owner's), else claude with read-only file
-tools confined to that dir. Codex's own read-only sandbox is never relied on: it
-still reads every file the user can.
+configured order: agy only inside the macOS Seatbelt fence (which lets it read
+that dir and nothing of the owner's), else claude with read-only file tools
+confined to that dir. Codex is never used: its own read-only sandbox reads every
+file the user can, and fenced, its in-process apply_patch can move its login.
 
     review_pr_sandbox.py --pr N [--repo owner/repo] --diff-file F --out F [--max S]
 
@@ -145,7 +145,7 @@ def run(pr: str, repo: str, diff: str, out: Path, max_s: int, gh: Gh = _gh) -> i
         populate(root, pr, repo, diff, gh)
         inv = build(root, diff)
         if inv is None:
-            print("review-pr: no safe sandbox runner installed (needs claude, or agy/codex "
+            print("review-pr: no safe sandbox runner installed (needs claude, or agy "
                   "on macOS)", file=sys.stderr)
             return NO_RUNNER
         try:

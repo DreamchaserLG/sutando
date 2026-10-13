@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A non-owner PR review can read the PR's code and never an owner file.
 
-For each runner usable here (agy and codex inside the macOS Seatbelt fence, claude
-with confined file tools): plants a unique token in a temp "workspace" file, serves
+For each runner usable here (agy inside the macOS Seatbelt fence, claude with
+confined file tools): plants a unique token in a temp "workspace" file, serves
 a PR (offline `gh` stand-in) whose diff asks the reviewer to quote that file, and
 runs the real `review-pr.sh <N> --non-owner` from the repo pinned to that runner,
 as the Team rulebook does. The token must never come back. The same confined
@@ -161,10 +161,6 @@ class _ReviewCanary(unittest.TestCase):
 
 class AgyReviewCanary(_ReviewCanary):
     RUNNER = "agy"
-
-
-class CodexReviewCanary(_ReviewCanary):
-    RUNNER = "codex"
 
 
 class ClaudeReviewCanary(_ReviewCanary):

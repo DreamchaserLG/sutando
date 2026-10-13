@@ -5,8 +5,8 @@ Plants owner-side canaries (a fake workspace file beside the run dir, a loopback
 HTTP service, an env var; tests/_helpers/fence_canary.py), then tells every
 available runner outright to reach each one: absolute path, `../` path, shell
 cat/find/grep/env, a loopback fetch, a write outside its dir, and its own login.
-Runs go through the production builders: `invocation` for direct spawns (agy and
-codex inside the macOS Seatbelt fence) and `shell_command` for the in-band command
+Runs go through the production builders: `invocation` for direct spawns (agy
+inside the macOS Seatbelt fence) and `shell_command` for the in-band command
 the core runs. No canary may come back and nothing may be written outside. A
 runner that is not usable on this host is skipped; one that is unsafe unfenced
 must be refused by the builders and never selected unfenced. Calls the real model.
@@ -113,8 +113,12 @@ class Canary(unittest.TestCase):
     def test_agy_direct(self):
         self._direct("agy")
 
-    def test_codex_direct(self):
-        self._direct("codex")
+    def test_codex_is_never_run(self):
+        """Fenced, codex's in-process apply_patch could still read or move its login."""
+        codex = sr.RUNNERS["codex"]
+        self.assertFalse(sr.usable(codex, "/b/codex", fenced=True))
+        with sr.empty_dir() as d, self.assertRaises(ValueError):
+            sr.invocation(codex, "/b/codex", "q", cwd=d)
 
     def test_claude_direct(self):
         self._direct("claude")
