@@ -490,7 +490,10 @@ def _sweep(a) -> int:
         clear = {w for w, o in tick["observations"].items()
                  if w in checked and o.get("session_alive") is True
                  and w not in tick.get("wedged", []) and w not in indeterminate}
-        now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
+        # A persisted kind this tick never actually re-evaluated (indeterminate,
+        # paused, resumed) is not current evidence of a kind change either.
+        now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()
+                   if w in checked and w not in indeterminate}
         # A readable, recognized frame compares directly even when other
         # evidence was lost. Paused is excluded: the owner's pause outranks it.
         frames = {w: o.get("pane_id") for w, o in tick["observations"].items()

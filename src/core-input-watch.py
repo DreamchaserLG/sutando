@@ -680,8 +680,9 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     This monitor's card always answers its dialog (allow/deny, authenticate);
     pool_wedge_cards.py's own CARD_HUMAN/CARD_LOGIN docstring says it is "a
     backstop only... defers to [this monitor's] active card" -- the design is
-    one-directional, so this side always creates and never defers to pool's
-    backstop (pool continues to defer to this one, via its own claim_session).
+    one-directional, so this side always creates AND atomically retires any
+    active pool backstop for the same session and effect, rather than
+    leaving the two to coexist for the whole episode.
 
     Returns the requirement, or None when manager is None.
     """
@@ -691,6 +692,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
               LOGIN_EFFECT if state == "logged-out" else None)
     try:
         from hitl import tui_gate
+        from hitl.session_ownership import supersede
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt),
                                        runtime=runtime)
@@ -700,7 +702,19 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
             req = _name_seat(req, session, seat)
         if effect:
             req.subject = {**(req.subject or {}), "effect": effect}
-        return manager.create(req)
+        if not effect:
+            return manager.create(req)
+        # Legacy pool-wedge shapes, pre-dating its own effect tag: its
+        # wedge kind literal, or (login only) card_cause+"needs-login".
+        legacy_wedge = {"blocked-human": "card_human", "logged-out": "card_login"}.get(state)
+
+        def legacy_match(subj, _wedge=legacy_wedge, _state=state):
+            if subj.get("wedge") == _wedge:
+                return True
+            return (_state == "logged-out" and subj.get("wedge") == "card_cause"
+                    and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
+        return supersede(manager, session, by_source=_TUI_SOURCE, effect=effect,
+                         build_requirement=lambda: req, legacy_match=legacy_match)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None

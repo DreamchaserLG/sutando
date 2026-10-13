@@ -236,6 +236,31 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual([c.id for c in self.active_cards()], [card.id])
 
+    def test_an_unevaluated_stale_persisted_kind_holds_a_pending_card(self):
+        # A kind written before this tick's own (indeterminate) evaluation
+        # is not current evidence of a kind change -- now_asks must exclude it.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_an_unevaluated_stale_persisted_kind_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
     def test_persistent_undecidable_queue_evidence_holds_across_many_ticks(self):
         # Holding must not be a one-tick grace period: as long as the queue
         # evidence stays undecidable, the card stays open, tick after tick.

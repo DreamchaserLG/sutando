@@ -36,9 +36,9 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.manager = HitlManager(HitlStore(default_store(Path(tmp.name))))
 
     def test_escalate_blocked_human_always_wins_over_an_active_pool_human_card(self):
-        # pool-wedge's CARD_HUMAN is a backstop only that defers to this
-        # monitor's card; this richer permission card must always get created.
-        self.manager.create(HumanRequirement(
+        # The richer permission card must always get created, AND the
+        # backstop must not coexist for the whole episode.
+        backstop = self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
@@ -46,27 +46,43 @@ class DuplicateCardArbitration(unittest.TestCase):
                            "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
         self.assertIsNotNone(req)
         self.assertEqual(req.kind, "permission")
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+        self.assertEqual([r.id for r in self.manager.active()], [req.id])
 
     def test_escalate_blocked_human_always_wins_over_a_legacy_effectless_pool_card(self):
         # Same, against a legacy pool-wedge card with no "effect" field.
-        self.manager.create(HumanRequirement(
+        backstop = self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
         self.assertIsNotNone(req)
         self.assertEqual(req.kind, "permission")
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
 
     def test_escalate_logged_out_always_wins_over_an_active_pool_login_card(self):
-        # The richer one-click auth card must never be suppressed by the
-        # weaker plain-jump card, whichever one existed first.
-        self.manager.create(HumanRequirement(
+        # The richer auth card must never be suppressed by the weaker
+        # plain-jump card, and the backstop must not coexist all episode.
+        backstop = self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool login card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_login",
                      "effect": "login"}))
         req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
         self.assertIsNotNone(req)
         self.assertEqual(req.kind, "auth")
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+        self.assertEqual([r.id for r in self.manager.active()], [req.id])
+
+    def test_escalate_logged_out_retires_a_legacy_card_cause_needs_login_backstop(self):
+        # An even older pool shape, pre-dating CARD_LOGIN as its own kind.
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="legacy cause card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_cause",
+                     "cause": ["needs-login", "api-error"]}))
+        req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+        self.assertEqual([r.id for r in self.manager.active()], [req.id])
 
     def test_escalate_logged_out_created_first_is_unaffected_by_arrival_order(self):
         req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
