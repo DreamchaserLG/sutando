@@ -313,6 +313,15 @@ class HumanCard(unittest.TestCase):
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
 
+    def test_a_tui_card_on_a_different_session_does_not_suppress(self):
+        # Matching on source alone, any session, must not suppress either.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
+                                  subject={"source": "tui", "session": "a-different-session"}))
+        out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+
     def test_a_pressed_card_still_closes_once_the_seat_clears(self):
         # Clicking the only action, open_terminal, must not leave the card
         # stuck in_progress forever.
@@ -452,6 +461,17 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
                 self.assertEqual(manager(ws).get(req.id).status, "pending", kind)
                 closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: other})
                 self.assertEqual(closed, [req.id], kind)
+
+    def test_a_pending_card_stays_pending_while_its_own_kind_remains_current(self):
+        # Same episode, nothing changed: closing it here would recreate the
+        # original silent-failure shape (carded, then resolved before anyone acts).
+        for kind, pane in OPEN_TERMINAL_CASES:
+            with self.subTest(kind=kind):
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={WID: kind})
+                self.assertEqual(closed, [], kind)
+                self.assertEqual(manager(ws).get(req.id).status, "pending", kind)
 
 
 class CodexCards(unittest.TestCase):
