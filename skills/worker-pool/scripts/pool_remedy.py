@@ -393,10 +393,12 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
-    holds the inbox. A wedge card is raised and never acts on the session: only a
-    dead session is ever respawned, and a logged-out one is carded for its /login
-    because a fresh session meets the same expired login. `escalate` is returned
-    untouched, because asking the owner is the core's, not a timer's."""
+    holds the inbox. A wedge card (cause, frozen, login, or a gate/limit only the
+    owner can answer) is raised and never acts on the session: only a dead
+    session is ever respawned, and a logged-out one is carded for its /login
+    because a fresh session meets the same expired login. `escalate` (the death
+    ladder's second rung, recovery issued and the worker still gone) is returned
+    untouched, because changing executor is never a timer's call."""
     done = {}
     rearms = {}
     cards = {}
@@ -409,7 +411,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN):
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
         elif decision == ps.REARM_WATCHER:

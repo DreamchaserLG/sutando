@@ -60,6 +60,7 @@ CODEX_ABNORMAL = "API Error: 500 internal server error\n› \n"
 CAUSE = getattr(ps, "CARD_CAUSE", "card_cause")
 FROZEN = getattr(ps, "CARD_FROZEN", "card_frozen")
 LOGIN = getattr(ps, "CARD_LOGIN", "card_login")
+HUMAN = getattr(ps, "CARD_HUMAN", "card_human")
 PANES["logged-out"] = f"❯ /startup\n  ⎿  Login expired · Please run /login\n\n❯ \n{FOOTER}\n"
 
 
@@ -138,12 +139,12 @@ class NoWedgeActsOnTheSession(unittest.TestCase):
                 st, d = ps.evaluate(st, {"w": o}, t)
                 seen.add(d["w"])
                 t += 300.0
-        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN}, set())
+        self.assertEqual(seen - {ps.NOTHING, ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN}, set())
         self.assertNotIn(ps.RECOVER, seen)
 
     def test_no_wedge_decision_reaches_kill_send_keys_or_spawn(self):
         self.assertIsNotNone(wc, "no wedge card module")
-        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN):
+        for which in (ps.ESCALATE, CAUSE, FROZEN, LOGIN, HUMAN):
             for label, pane in PANES.items():
                 ws, t = pool(), Tmux(pane)
                 rem.apply(ws, REPO, {WID: which}, runner=t, spawn=never_spawn)
@@ -225,6 +226,56 @@ class CauseCard(unittest.TestCase):
         self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
 
 
+# #5461's real dialog shape, not a paraphrase of it.
+USAGE_LIMIT_MENU = (
+    "⏺ Writing the result file.\n"
+    "▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔\n"
+    "   What do you want to do?\n"
+    "   ❯ 1. Stop and wait for limit to reset\n"
+    "     2. Wait here, then continue automatically at Sep 27 at 2am\n"
+    "     3. Switch to usage credits\n"
+    "   Enter to confirm · Esc to cancel\n"
+)
+
+
+class HumanCard(unittest.TestCase):
+    """A gate or limit dialog cards the owner; it is never left as a silent escalate."""
+
+    def setUp(self):
+        self.assertIsNotNone(wc, "no wedge card module")
+        self.ws = pool()
+
+    def test_the_real_usage_limit_menu_is_carded_not_silently_escalated(self):
+        out, t, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+        self.assertIn("What do you want to do?", req.message)
+        self.assertIn("Switch to usage credits", req.message)
+        self.assertIn("waiting on you", req.title)
+        self.assertEqual(req.kind, "core-blocked")
+        self.assertEqual([a.id for a in req.actions], ["open_terminal"])
+        self.assertEqual(req.subject["wedge"], HUMAN)
+        self.assertEqual(t.acted(), [], "a gate/limit dialog is never typed into")
+
+    def test_a_banner_style_limit_is_carded_too(self):
+        out, _, req = card(self.ws, HUMAN, PANES["limit"])
+        self.assertEqual(out["outcome"], "carded")
+        self.assertIn("hit your session limit", req.message)
+
+    def test_a_plain_permission_gate_is_carded_too(self):
+        out, _, req = card(self.ws, HUMAN, PANES["gate"])
+        self.assertEqual(out["outcome"], "carded")
+        self.assertIn("Do you want to proceed?", req.message)
+
+    def test_a_pane_no_longer_showing_a_gate_or_limit_is_cleared(self):
+        for pane in (PANES["abnormal"], PANES["frozen"], f"❯ \n{FOOTER}\n"):
+            out, _, req = card(self.ws, HUMAN, pane)
+            self.assertEqual((out["outcome"], req), ("cleared", None), pane)
+
+    def test_a_cleared_seat_closes_its_pending_human_card(self):
+        _, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
+
+
 class LoginCard(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(wc, "no wedge card module")
@@ -256,7 +307,7 @@ class LoginCard(unittest.TestCase):
         m = manager(self.ws)
         kept = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: LOGIN})
         self.assertEqual(kept, [], "the pane still shows the expired login")
-        for now_asks in (CAUSE, None):     # abnormal text, or a gate/limit that escalates
+        for now_asks in (CAUSE, HUMAN):     # abnormal text, or a gate/limit
             _, _, again = card(self.ws, LOGIN, PANES["logged-out"])
             self.assertEqual(wc.resolve_cleared(self.ws, set(), manager=manager(self.ws),
                                                 wedges={WID: now_asks}), [again.id], now_asks)

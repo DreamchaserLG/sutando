@@ -12,6 +12,9 @@ a card instead, through the engine's hitl store:
 - a frozen turn: the card offers "Send Escape". Nothing is typed unless the owner
   presses it, and `drive_escapes` re-reads the pane first: a pane that no longer
   shows the same frozen frame is refused and nothing is typed.
+- a gate or a limit dialog (PANE_GATE / PANE_LIMIT): the card quotes the pane's
+  tail and sends the owner to the terminal; no key is offered, since only the
+  owner can choose among the dialog's own options.
 """
 from __future__ import annotations
 
@@ -135,6 +138,19 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             guard=f"{SOURCE}:{session}:frozen:{frame}",
             actions=[Action(id=ESCAPE_ACTION, kind="confirmation", label="Send Escape"),
                      _jump(session)])
+    elif which == ps.CARD_HUMAN:
+        if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        lines = [ln for ln in text.splitlines() if ln.strip()][-6:]
+        body = [f"{seat} (tmux session {session}) owes work and its pane is waiting on you:",
+                "", *(f"  {ln.strip()}" for ln in lines), "",
+                "This needs your own decision there -- nothing here can answer it. "
+                "The session is not restarted: a fresh one meets the same dialog."]
+        subject.update(pane_lines=lines)
+        req = HumanRequirement(
+            kind="core-blocked", runtime=runtime, device=device, subject=subject,
+            title=f"{seat} · waiting on you", message="\n".join(body),
+            guard=f"{SOURCE}:{session}:human:{frame}", actions=[_jump(session)])
     else:
         abn = cw.frame_abnormal(text)
         if abn is None or (which == ps.CARD_LOGIN and pane != ps.PANE_LOGGED_OUT):
