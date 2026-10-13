@@ -188,7 +188,8 @@ class Invocations(unittest.TestCase):
     def test_preamble_is_the_vetted_faq(self):
         pre = sr.context_preamble()
         self.assertIn(sr.FAQ_PATH.read_text().strip(), pre)
-        self.assertIn("no tools and no files", pre)
+        self.assertIn("cannot read the owner's files", pre)
+        self.assertIn("public HTTPS endpoints", pre)
         self.assertEqual(sr.FAQ_PATH.parent.resolve(), (REPO / "src" / "policy").resolve())
 
     def test_preamble_renders_from_the_sparrow_zipapp(self):
@@ -205,7 +206,7 @@ class Invocations(unittest.TestCase):
 
     def test_faq_falls_back_to_the_module_loader(self):
         with mock.patch.object(Path, "read_text", side_effect=OSError("in a zip")):
-            self.assertIn("no tools and no files", sr.context_preamble())
+            self.assertIn("cannot read the owner's files", sr.context_preamble())
         self.assertIn(sr.FAQ_PATH.read_text().strip(), sr.context_preamble())
 
     def test_shell_command_shape(self):
@@ -369,7 +370,7 @@ class GuardrailNamesTheSelectedRunner(unittest.TestCase):
         self.assertNotIn("claude -p", block)
         self.assertNotIn("codex", block)
         # The surrounding policy wording survives the swap.
-        for phrase in ("NO NETWORK", "NO permitted fallback", "unrestricted core",
+        for phrase in ("limited to outbound HTTPS", "NO permitted fallback", "unrestricted core",
                        "no inspection was performed", "non-empty", "< /dev/null"):
             self.assertIn(phrase, block)
 

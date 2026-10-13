@@ -80,13 +80,14 @@ SANDBOXED_DELEGATION_TEMPLATE = (
     "Delegate it to {label}: `{command}`. The `< /dev/null` is REQUIRED — without it "
     "{name} waits on stdin and can hang to a timeout having produced nothing. Then assert the "
     "OUTPUT is non-empty before writing it: {name} exits 0 both when it refuses and on a usage "
-    "error, so the exit code is not evidence that an answer exists. The sandbox also has NO "
-    "NETWORK: if the task needs something the sandbox cannot reach, say so and decline — never "
-    "describe an artifact you could not read. And if {name} cannot answer at all — absent, "
-    "exiting non-zero, or exiting 0 having written nothing — there is NO permitted fallback: "
-    "do NOT answer with the owner's unrestricted core, and do not silently skip. Say that the "
-    "sandboxed path was unavailable and that no inspection was performed, so the requester can "
-    "tell a refusal from silence."
+    "error, so the exit code is not evidence that an answer exists. The sandbox cannot read the "
+    "owner's files, and its network access is limited to outbound HTTPS: if the task needs "
+    "something it still cannot reach, say so and decline — never describe an artifact you could "
+    "not read, and do not treat anything it says it fetched as verified. And if {name} cannot "
+    "answer at all — absent, exiting non-zero, or exiting 0 having written nothing — there is NO "
+    "permitted fallback: do NOT answer with the owner's unrestricted core, and do not silently "
+    "skip. Say that the sandboxed path was unavailable and that no inspection was performed, so "
+    "the requester can tell a refusal from silence."
 )
 
 _RUNNER_LABELS = {"agy": "Antigravity (agy)", "claude": "Claude Code"}

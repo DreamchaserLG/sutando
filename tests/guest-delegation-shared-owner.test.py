@@ -56,11 +56,11 @@ class TestOwnerContract(unittest.TestCase):
         """A delegate that cannot fetch the artifact writes a plausible summary
         anyway — the same shape as exit-0-on-refusal, which this block already
         covers. Raised on #3512 by two reviewers independently."""
-        self.assertIn("NO NETWORK", SANDBOXED_DELEGATION)
+        self.assertIn("limited to outbound HTTPS", SANDBOXED_DELEGATION)
         self.assertIn("decline", SANDBOXED_DELEGATION)
         lines = sandboxed_delegation_lines(
             "AG2 Space", "GUEST tier", "results/task-X.txt", "SCOPE-SENTINEL")
-        self.assertIn("NO NETWORK", "\n".join(lines))
+        self.assertIn("limited to outbound HTTPS", "\n".join(lines))
 
     def test_unavailable_sandbox_has_no_fallback(self):
         """`assert the OUTPUT is non-empty` had no next step, so the branch where
