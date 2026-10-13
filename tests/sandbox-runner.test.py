@@ -2,9 +2,10 @@
 """The non-owner sandbox runner has ONE owner: src/policy/sandbox_runner.py.
 
 Pins: the first safe, installed runner in the configured order is chosen; agy and
-codex are never chosen (neither can be confined so it reads no file); claude runs
-with no tools in a fresh empty temp dir; the guardrail text and the Discord bridge
-both take the runner from the module, so neither can drift.
+codex are never chosen unfenced (neither can be confined by its own flags so it
+reads no file; their Seatbelt-fenced runs are pinned in tests/seatbelt-fence.test.py);
+claude runs with no tools in a fresh empty temp dir; the guardrail text and the
+Discord bridge both take the runner from the module, so neither can drift.
 
 Run: python3 tests/sandbox-runner.test.py
 """
@@ -21,12 +22,12 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from policy import sandbox_runner as sr  # noqa: E402
-from policy import guardrail  # noqa: E402
+from policy import guardrail, sandbox_runner as sr, seatbelt  # noqa: E402
 
 
 
@@ -56,7 +57,8 @@ class OrderSelection(unittest.TestCase):
         self.assertFalse(sr.RUNNERS["agy"].safe)
         self.assertIn("no flag-only read-only, no-network mode", sr.RUNNERS["agy"].unsafe_reason)
         self.assertIsNone(sr.select_runner(("agy",), fake_which({"agy"})))
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
+        with mock.patch.object(seatbelt, "available", return_value=False), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
             sr.invocation(sr.RUNNERS["agy"], "/fake/bin/agy", "p", cwd=d)
 
     def test_codex_is_never_selected(self):
@@ -65,7 +67,8 @@ class OrderSelection(unittest.TestCase):
         self.assertIn("denies reads outside", sr.RUNNERS["codex"].unsafe_reason)
         self.assertIsNone(sr.select_runner(("codex",), fake_which({"codex"})))
         self.assertIsNone(sr.select_runner(None, fake_which({"codex"}), {sr.CONFIG_KEY: "codex"}))
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
+        with mock.patch.object(seatbelt, "available", return_value=False), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
             sr.invocation(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
         with self.assertRaises(ValueError):
             sr.shell_command(sr.RUNNERS["codex"], "P")

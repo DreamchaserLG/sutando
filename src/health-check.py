@@ -10359,8 +10359,9 @@ def _codex_delegation_consumer(tasks_dir=None, channels_dir=None, scan_cap: int 
 
 def check_codex_presence(which=shutil.which, consumer=None) -> dict:
     """Report a missing `codex` binary WHERE IT WOULD BE USED. Non-owner sandbox
-    answers and PR reviews do not use it (src/policy/sandbox_runner.py never selects
-    codex); keying only on PATH turned an absent optional capability into a fault."""
+    answers and PR reviews do not need it (src/policy/sandbox_runner.py runs codex only
+    fenced on macOS, else claude); keying only on PATH turned an absent optional
+    capability into a fault."""
     name = "codex-presence"
     resolved = which("codex")
     if resolved:

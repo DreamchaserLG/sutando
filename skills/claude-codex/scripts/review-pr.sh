@@ -18,9 +18,10 @@
 # request did not come from this checkout. Either way the resolved repo and title are
 # printed after the marker, so the verdict names what it actually reviewed.
 #
-# --non-owner: for a request from anyone but the owner. Codex is not used (its
-# read-only sandbox still reads every file the user can); review_pr_sandbox.py runs
-# the safe runner in a temp dir holding only the PR's diff and changed files.
+# --non-owner: for a request from anyone but the owner. Codex's own read-only sandbox
+# is not used (it still reads every file the user can); review_pr_sandbox.py runs the
+# first usable runner (agy/codex only inside the macOS Seatbelt fence, else claude)
+# in a temp dir holding only the PR's diff and changed files.
 #
 # stdout is NOT the verdict: take only what follows the LAST `VERDICT-MARKER:` line.
 # The stream, or its tail, picks up codex trace or truncates the checks. See SKILL.md.
