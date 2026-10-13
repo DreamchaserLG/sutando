@@ -10,6 +10,7 @@ Discord bridge both take the runner from the module, so neither can drift.
 Run: python3 tests/sandbox-runner.test.py
 """
 import asyncio
+import importlib.util
 import itertools
 import json
 import os
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from unittest import mock
 
@@ -121,8 +123,24 @@ class OrderConfig(unittest.TestCase):
     def test_the_repo_declares_the_key_in_a_manifest(self):
         self.assertEqual(sr.declared_order(), "agy,codex,claude")
 
+    def test_an_unreadable_manifest_is_skipped(self):
+        d = Path(tempfile.mkdtemp())
+        (d / "a").mkdir()
+        (d / "a" / "manifest.json").write_text("{not json")
+        (d / "b").mkdir()
+        (d / "b" / "manifest.json").write_text(json.dumps({"config": {sr.CONFIG_KEY: "claude"}}))
+        self.assertEqual(sr.declared_order([d]), "claude")
+
+    def test_outside_a_checkout_there_is_no_skills_dir(self):
+        with mock.patch.object(Path, "is_file", return_value=False):
+            self.assertEqual(sr._skills_dirs(), [])
+
 
 class Invocations(unittest.TestCase):
+    def test_a_runner_with_no_safe_flags_has_no_invocation(self):
+        with sr.empty_dir() as d, self.assertRaises(ValueError):
+            sr.invocation(sr.RUNNERS["agy"], "/b/agy", "PROMPT", cwd=d)
+
     def test_claude_argv_has_no_tools_and_no_mcp(self):
         with sr.empty_dir() as d:
             inv = sr.invocation(sr.RUNNERS["claude"], "/b/claude", "PROMPT", cwd=d)
@@ -171,6 +189,18 @@ class Invocations(unittest.TestCase):
             env=dict(os.environ, PYTHONPATH=str(pyz)), cwd="/", capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(sr.FAQ_PATH.read_text().strip(), out.stdout)
+
+    def test_faq_falls_back_to_the_module_loader(self):
+        with mock.patch.object(Path, "read_text", side_effect=OSError("in a zip")):
+            self.assertIn("no tools and no files", sr.context_preamble())
+        self.assertIn(sr.FAQ_PATH.read_text().strip(), sr.context_preamble())
+
+    def test_heredoc_tag_never_matches_a_line_of_the_text(self):
+        text = "a\nSUTANDO_SANDBOX_CONTEXT\nb"
+        out = sr._heredoc(text)
+        self.assertTrue(out.startswith("$(cat <<'SUTANDO_SANDBOX_CONTEXT_X'\n"))
+        self.assertEqual(subprocess.run(["bash", "-c", f'printf %s "{out}"'], capture_output=True,
+                                        text=True, check=True).stdout, text)
 
     def test_shell_command_shape(self):
         line = sr.shell_command(sr.RUNNERS["claude"], "P", out_path="/o")
@@ -259,7 +289,12 @@ os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
 
 def _load_bridge():
-    return discord_env.load_bridge("dbridge_sandbox_runner")
+    discord_env.install_discord_stub()
+    spec = importlib.util.spec_from_file_location("dbridge_sandbox_runner", REPO / "src" / "discord-bridge.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["dbridge_sandbox_runner"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class DiscordBridgeDelegates(unittest.TestCase):
