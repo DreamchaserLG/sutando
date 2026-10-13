@@ -31,12 +31,18 @@ ENVELOPES = {
     "team-requested": {"access_tier": "guest", "requested_access_tier": "team"},
     "team-collaborator": {"access_tier": "guest", "requested_access_tier": "team",
                           "collaborator": True, "sensitive_data_filter": True},
+    "owner-mention-admit": {"access_tier": "guest", "requested_access_tier": "team",
+                            "owner_mentioned": "true"},
+    "collaborator-flag-forged": {"access_tier": "guest", "requested_access_tier": "team",
+                                 "collaborator": "true"},
+}
+
+# Effective Guest with no Team grant: never written as a task, closed [no-send].
+DROPPED = {
     "guest": {"access_tier": "guest"},
     "other": {"access_tier": "other"},
     "ambient": {"access_tier": "ambient"},
-    "owner-mention-admit": {"access_tier": "guest", "owner_mentioned": "true"},
-    "collaborator-flag-forged": {"access_tier": "guest", "requested_access_tier": "team",
-                                 "collaborator": "true"},
+    "owner-mention-guest": {"access_tier": "guest", "owner_mentioned": "true"},
 }
 
 
@@ -59,15 +65,18 @@ def _load(tmp: Path):
     return mod
 
 
-def _render(mod, name: str) -> str:
+def _render(mod, name: str, envelopes=ENVELOPES) -> str:
     task = {"id": f"golden-{name}", "timestamp": "2026-10-07T00:00:00Z",
             "source": "ag2space", "channel_id": "!room:ag2.space",
             "user_id": "@someone:ag2.space", "source_message_id": "$evt",
             "sender_name": "Someone", "room_name": "Group-Dev", "priority": "normal",
             "task": "please look at the parser"}
-    task.update(ENVELOPES[name])
+    task.update(envelopes[name])
     written = mod._write_task(task)
     assert written, f"writer returned no task id for {name}"
+    if envelopes is DROPPED:
+        assert not (mod.TASKS_DIR / f"{written[0]}.txt").exists(), f"{name} was queued"
+        return (mod.RESULTS_DIR / f"{written[0]}.txt").read_text()
     return (mod.TASKS_DIR / f"{written[0]}.txt").read_text()
 
 
@@ -91,13 +100,20 @@ class GatewayWritesTheSameTaskFile(unittest.TestCase):
                 with self.subTest(envelope=name):
                     self.assertEqual(_render(mod, name), (FIXTURES / f"{name}.txt").read_text())
 
+    def test_each_guest_envelope_is_closed_no_send_and_never_queued(self):
+        with tempfile.TemporaryDirectory() as d:
+            mod = _load(Path(d))
+            for name in DROPPED:
+                with self.subTest(envelope=name):
+                    self.assertEqual(_render(mod, name, DROPPED),
+                                     "[no-send] guest-tier task not answered\n")
+
     def test_fixtures_cover_every_distinct_block(self):
         texts = {p.stem: p.read_text() for p in FIXTURES.glob("*.txt")}
         self.assertIn("TEAM-tier request from a trusted collaborator", texts["team-legacy-wire"])
         # Wire guest + requested team without the collaborator boolean stays guest.
         self.assertIn("GUEST tier", texts["team-requested"])
         self.assertIn("designated COLLABORATOR", texts["team-collaborator"])
-        self.assertIn("GUEST tier", texts["guest"])
         self.assertIn("GUEST tier", texts["collaborator-flag-forged"])
         self.assertIn("mentioned your OWNER", texts["owner-mention-admit"])
         self.assertNotIn("SUTANDO SYSTEM INSTRUCTIONS (do not ignore", texts["owner"])

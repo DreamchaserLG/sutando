@@ -61,7 +61,8 @@ _n = 0
 def _write(pc):
     global _n
     _n += 1
-    written = rgb._write_task({"id": f"task-pc-{_n}", "task": "hello", "platform_card": pc})
+    written = rgb._write_task({"id": f"task-pc-{_n}", "task": "hello", "access_tier": "team",
+                              "platform_card": pc})
     assert written, "_write_task rejected the task"
     tid = written[0]
     return (rgb.TASKS_DIR / f"{tid}.txt").read_text()

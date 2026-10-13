@@ -264,7 +264,8 @@ def main() -> int:
     check(_lrtc._valid_tid(_maxid), "max-length broker id is wire-valid (precondition)")
     _mt, _mt_durable = _grtc._write_task({"id": _maxid, "timestamp": "2026-08-02T00:00:00Z",
                                           "task": "MAXLEN", "source": "remote-gateway",
-                                          "channel_id": "!p:example.org", "user_id": "@q:example.org"})
+                                          "channel_id": "!p:example.org", "user_id": "@q:example.org",
+                                          "access_tier": "team"})
     check(_mt == f"task-dev~{_maxid}" and _mt_durable
           and (_grtc.TASKS_DIR / f"{_mt}.txt").exists(),
           "max-length broker id queues durably under the instance encoding")
@@ -291,7 +292,8 @@ def main() -> int:
     except FileNotFoundError: pass
     _collide = {"id": "task-COLLIDE", "timestamp": "2026-08-02T00:00:00Z",
                 "task": "PROD TASK", "source": "remote-gateway",
-                "channel_id": "!p:example.org", "user_id": "@qingyun:example.org"}
+                "channel_id": "!p:example.org", "user_id": "@qingyun:example.org",
+                "access_tier": "team"}
     _pt, _ = _lrtc._write_task(dict(_collide))
     _dt, _ = _grtc._write_task({**_collide, "task": "DEV TASK"})
     check(_pt == "task-COLLIDE" and _dt == "task-dev~task-COLLIDE",
@@ -472,10 +474,15 @@ def main() -> int:
         rtc._load_tier_map = _load_map
         rtc.LOCAL_TIER = _local_tier
     rtc._write_task({**TASK, "id": "task-GUEST", "access_tier": "guest"})
-    guest_body = (rtc.TASKS_DIR / "task-GUEST.txt").read_text()
+    check(not (rtc.TASKS_DIR / "task-GUEST.txt").exists()
+          and (rtc.RESULTS_DIR / "task-GUEST.txt").read_text().startswith("[no-send]"),
+          "guest task is not queued; it is closed with a [no-send] result")
+    rtc._write_task({**TASK, "id": "task-GUESTHOOK", "access_tier": "guest",
+                     "hook": {"hook_id": "hk_1", "fire_id": "f_1", "caused_by": "task-GUESTHOOK"}})
+    guest_body = (rtc.TASKS_DIR / "task-GUESTHOOK.txt").read_text()
     check("access_tier: guest" in guest_body
           and "codex exec --sandbox read-only" in guest_body,
-          "guest task retains the established read-only Codex delegation")
+          "guest hook fire retains the established read-only Codex delegation")
     # context enrichment: room_name / sender_name / reply_to_* serialize when
     # present, and a newline in a name can't forge an extra field line.
     rtc._write_task({**TASK, "id": "task-CTX", "room_name": "#design",

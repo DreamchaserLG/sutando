@@ -55,7 +55,7 @@ TAG = rgb.MEDIA_MARKER_TAG  # default "remote-media"
 
 
 def _write_and_parse(task):
-    written = rgb._write_task(task)
+    written = rgb._write_task({"access_tier": "team", **task})
     assert written, f"_write_task rejected {task!r}"
     tid = written[0]
     text = (rgb.TASKS_DIR / f"{tid}.txt").read_text()

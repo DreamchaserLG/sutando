@@ -64,7 +64,7 @@ def _bound_gateway_writer():
 
 
 def _drive_gateway_writer(rgb, tmp: pathlib.Path, task: dict) -> "str | None":
-    written = rgb._write_task(task)
+    written = rgb._write_task({"access_tier": "team", **task})
     if not written:
         return None
     tid = written[0]

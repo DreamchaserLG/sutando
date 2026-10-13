@@ -306,7 +306,8 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
-from .team_guardrail import ag2space_tier_lines, owner_mention_lines
+from .team_guardrail import (
+    GUEST_NO_SEND_RESULT, ag2space_guest_dropped, ag2space_tier_lines, owner_mention_lines)
 from . import team_result_guard
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
@@ -3581,6 +3582,12 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     # Resolved once and reused below so routing and owner-activity cannot diverge.
     sender_tier = _tier_for(task.get("user_id"), attested_tier)
     collaborator_enabled = broker_collaborator and sender_tier == "team"
+    team_grant = local_task_protocol.broker_team_grant(
+        task.get("access_tier"), task.get("requested_access_tier"))
+    if ag2space_guest_dropped(sender_tier, team_grant, task.get("hook")):
+        # No task file, so the core never sees it; the result POST closes the lease.
+        _log(f"guest-tier task {tid} not queued — closing it [no-send]")
+        return tid, _durable_write(RESULTS_DIR / f"{tid}.txt", GUEST_NO_SEND_RESULT)
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.

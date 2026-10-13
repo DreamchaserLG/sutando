@@ -117,7 +117,7 @@ class TeamGuardrailReachesTheBody(unittest.TestCase):
     def test_guest_keeps_its_own_distinct_block(self):
         with tempfile.TemporaryDirectory() as d:
             mod = _load(Path(d))
-            body, _ = _write(mod, access_tier="guest", id="inband3")
+            body, _ = _write(mod, access_tier="guest", requested_access_tier="team", id="inband3")
             self.assertIn("GUEST tier", body, "guest must keep its established read-only block")
             self.assertNotIn("TEAM-tier request from a trusted collaborator", body,
                              "guest must not receive the Team guardrail")

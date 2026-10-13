@@ -32,7 +32,7 @@ rgb.ARCHIVE_RESULTS_DIR = tmp / "results" / "archive"
 
 
 def _headers(task):
-    written = rgb._write_task(task)
+    written = rgb._write_task({"access_tier": "team", **task})
     assert written, f"_write_task rejected {task!r}"
     tid = written[0]
     body = (rgb.TASKS_DIR / f"{tid}.txt").read_text()

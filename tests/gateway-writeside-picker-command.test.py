@@ -62,7 +62,7 @@ _n = [0]
 def write(task):
     """Drive the real writer; return (file text, the reader's verdict)."""
     _n[0] += 1
-    written = rgb._write_task({"id": f"picker-{_n[0]}", **task})
+    written = rgb._write_task({"id": f"picker-{_n[0]}", "access_tier": "team", **task})
     assert written, f"_write_task rejected {task!r}"
     path = rgb.TASKS_DIR / f"{written[0]}.txt"
     return path.read_text(), wpc.parse_task_file(path)

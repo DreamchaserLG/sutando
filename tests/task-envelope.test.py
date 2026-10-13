@@ -373,7 +373,8 @@ class WriterWiring(unittest.TestCase):
                 written = gw._write_task({
                     "task": "hello from the wire",
                     "source": "ag2space", "channel_id": "!room:x",
-                    "user_id": "@qingyun:ag2.space", "id": "task-991"})
+                    "user_id": "@qingyun:ag2.space", "id": "task-991",
+                    "access_tier": "team"})
                 self.assertIsNotNone(written)
                 out = (tasks / f"{written[0]}.txt").read_text()
                 self.assertEqual(E.verify_text(out, ws)["verdict"],

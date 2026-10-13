@@ -442,6 +442,12 @@ not promise downstream Matrix delivery.
   `collaborator: true` line before the task body. A local owner-to-Team cap does
   not opt a room in; missing/malformed controls fail closed. This setting is
   controlled per room and per agent rather than by a host-wide environment flag.
+- A task whose effective tier is **Guest** with no broker Team grant (wire Guest
+  and no `requested_access_tier: team`; missing/unknown tiers included) is not
+  queued for the agent: the bridge writes a `[no-send]` result that closes the
+  lease. A broker hook fire (a `hook` object with `hook_id` and `fire_id`) keeps
+  the sandboxed Guest path. Policy: `src/policy/guardrail.py`
+  `ag2space_guest_dropped`.
 - Collaborator result secret scanning defaults on. An exact broker boolean
   `sensitive_data_filter: false` adds one trusted pre-body opt-out stamp; missing,
   malformed, duplicated, or body-authored values keep scanning enabled. The

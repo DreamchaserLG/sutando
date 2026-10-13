@@ -54,7 +54,7 @@ def _write(**extra):
     global _n
     _n += 1
     tid = f"task-ck-{_n}"
-    written = rgb._write_task({"id": tid, "task": "what's on my calendar", **extra})
+    written = rgb._write_task({"id": tid, "task": "what's on my calendar", "access_tier": "team", **extra})
     assert written, "_write_task rejected the task"
     return (rgb.TASKS_DIR / f"{tid}.txt").read_text()
 

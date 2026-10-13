@@ -150,13 +150,20 @@ def broker_attested_tier(access_tier, requested_access_tier, collaborator) -> tu
     boolean `collaborator: true` promotes it, so body text cannot opt itself in.
     Unknown tiers resolve to guest. Any local cap is the caller's, applied after.
     """
-    def known(value):
-        tier = canonical_access_tier(value)
-        return tier if tier in BROKER_WIRE_TIERS else "guest"
-
-    broker, requested = known(access_tier), known(requested_access_tier)
-    is_collaborator = collaborator is True and "team" in (broker, requested)
+    broker = _broker_wire_tier(access_tier)
+    is_collaborator = collaborator is True and broker_team_grant(access_tier, requested_access_tier)
     return ("team" if is_collaborator else broker), is_collaborator
+
+
+def _broker_wire_tier(value) -> str:
+    tier = canonical_access_tier(value)
+    return tier if tier in BROKER_WIRE_TIERS else "guest"
+
+
+def broker_team_grant(access_tier, requested_access_tier) -> bool:
+    """Whether the broker granted Team: on the wire, or as `requested_access_tier`
+    under the legacy Guest wire tier. A grant alone does not promote the tier."""
+    return "team" in (_broker_wire_tier(access_tier), _broker_wire_tier(requested_access_tier))
 
 # The header vocabulary: every key observed in the real archive corpus
 # (3,401 files, 2026-07-06) plus the live writers' full sets. This list is
