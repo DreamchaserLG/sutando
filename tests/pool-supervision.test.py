@@ -40,7 +40,8 @@ def dead(paused=False):
 
 
 def alive():
-    return ps.Observation(beat=ps.LIVE, session_alive=True)
+    return ps.Observation(beat=ps.LIVE, session_alive=True, work_outstanding=False,
+                          pane=ps.PANE_IDLE)
 
 
 def tick(state, obs, now, **kw):
@@ -117,7 +118,8 @@ check("a live beat clears the evidence", st.workers["w"], ps.WorkerEvidence())
 
 
 def back(beat=ps.ABSENT):
-    return ps.Observation(beat=beat, session_alive=True)
+    return ps.Observation(beat=beat, session_alive=True, work_outstanding=False,
+                          pane=ps.PANE_IDLE)
 
 
 st, d = run_ticks(ps.SupervisionState(), lambda t: {"w": dead()},

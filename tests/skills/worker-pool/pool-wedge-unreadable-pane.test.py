@@ -27,6 +27,7 @@ WID = "7c54b230a8d94ea9b86f52d70134ac68"
 FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 GATE = f"  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n{FOOTER}\n"
 FROZEN = f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n"
+FROZEN2 = f"✻ Thinking… (47s · esc to interrupt)\n❯ \n{FOOTER}\n"  # a genuinely different frame
 GARBLED = "zzz completely garbled unrecognized frame zzz\n"  # readable, classifies PANE_UNKNOWN
 
 
@@ -202,6 +203,16 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    def test_persistent_undecidable_queue_evidence_holds_across_many_ticks(self):
+        # Holding must not be a one-tick grace period: as long as the queue
+        # evidence stays undecidable, the card stays open, tick after tick.
+        card = self.raise_card_to_sustain()
+        self.force_work_outstanding = None
+        for _ in range(5):
+            result = self.sweep()
+            self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
 
 class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
     def setUp(self):
@@ -262,6 +273,18 @@ class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
         result = self.sweep()
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_state_loss_then_a_genuinely_different_frame_closes_the_old_card_not_a_duplicate(self):
+        # Same wedge kind ("stuck") before and after state loss, but a
+        # different actual frame — must close via frame identity, not linger.
+        old_card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        self.pane = FROZEN2
+        for _ in range(4):
+            result = self.sweep()
+        cards = self.active_cards()
+        self.assertNotIn(old_card.id, [c.id for c in cards], "the stale old-frame card lingered")
+        self.assertEqual(len(cards), 1, f"expected exactly one active card, got {cards}")
 
     def _touch_live_beat_for_next_sweep(self):
         # pb.touch() stamps real wall time; set mtime directly so pb.classify

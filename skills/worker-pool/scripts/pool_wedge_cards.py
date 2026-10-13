@@ -103,15 +103,9 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
-# core-input-watch.py's own HumanRequirement.subject source tag (its _TUI_SOURCE).
-INPUT_WATCH_SOURCE = "tui"
-
-
-def input_watch_has_card(session, manager) -> bool:
-    """The shared same-session ownership policy, not a private check: by
-    effect, not by whether its tmux session is merely alive."""
-    from hitl.session_ownership import session_already_carded
-    return session_already_carded(manager, session, by_source=SOURCE)
+# Shared ownership tag for the gate/limit situation core-input-watch can also
+# card — scopes arbitration so a FROZEN/CAUSE card never suppresses it.
+GATE_EFFECT = "gate"
 
 
 def _jump(session):
@@ -120,7 +114,7 @@ def _jump(session):
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               has_card=input_watch_has_card, manager=None) -> dict:
+               manager=None) -> dict:
     """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
     from hitl.schema import Action, HumanRequirement
     socket, session = sup._open_tmux(workspace, worker_id)
@@ -156,19 +150,26 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     elif which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
-        if has_card(session, manager):
-            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
-                    "owner": "input-watch"}
         lines = [ln for ln in text.splitlines() if ln.strip()][-6:]
         body = [f"{seat} (tmux session {session}) owes work and its pane is waiting on you:",
                 "", *(f"  {ln.strip()}" for ln in lines), "",
                 "This needs your own decision there -- nothing here can answer it. "
                 "The session is not restarted: a fresh one meets the same dialog."]
-        subject.update(pane_lines=lines)
-        req = HumanRequirement(
-            kind="core-blocked", runtime=runtime, device=device, subject=subject,
-            title=f"{seat} · waiting on you", message="\n".join(body),
-            guard=f"{SOURCE}:{session}:human:{frame}", actions=[_jump(session)])
+        subject.update(pane_lines=lines, effect=GATE_EFFECT)
+
+        def _build_human_card():
+            return HumanRequirement(
+                kind="core-blocked", runtime=runtime, device=device, subject=subject,
+                title=f"{seat} · waiting on you", message="\n".join(body),
+                guard=f"{SOURCE}:{session}:human:{frame}", actions=[_jump(session)])
+
+        from hitl.session_ownership import claim_session
+        made = claim_session(manager, session, by_source=SOURCE, effect=GATE_EFFECT,
+                             build_requirement=_build_human_card)
+        if made is None:
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
+                    "owner": "input-watch"}
+        return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
     else:
         abn = cw.frame_abnormal(text)
         if abn is None or (which == ps.CARD_LOGIN and pane != ps.PANE_LOGGED_OUT):
@@ -246,10 +247,19 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, frames=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
     that card).
+
+    `frames` (worker -> this tick's genuinely-read raw pane_id, when readable)
+    adds one more staleness test, for CARD_FROZEN specifically: "stuck" means
+    an EXACT frame, so two episodes that happen to share the kind label
+    "card_frozen" are not the same episode if the frame itself differs — the
+    kind-label comparison alone cannot tell a resumed-then-re-stuck turn from
+    the one a stale card still describes. Other kinds compare only by kind,
+    since their own pane text can legitimately vary within one episode (a
+    limit dialog's countdown, for instance) without the episode having moved on.
 
     A press is left alone only while it has a further step owed: `send_escape`
     waits on `drive_escapes`, which refuses it once the frame has moved. A press
@@ -261,6 +271,7 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
+    frames = frames or {}
     closed = []
     for r in manager.active():
         subj = r.subject or {}
@@ -268,8 +279,10 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list
         # The HITL guard can deduplicate a login request onto its older cause card.
         legacy_login = (wedges.get(w) == ps.CARD_LOGIN and subj.get("wedge") == ps.CARD_CAUSE
                         and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
-        stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w]
-                                   and not legacy_login)
+        kind_stale = w in wedges and subj.get("wedge") != wedges[w] and not legacy_login
+        frame_stale = (subj.get("wedge") == ps.CARD_FROZEN and w in frames
+                      and frames[w] != subj.get("frame"))
+        stale = w in worker_ids or kind_stale or frame_stale
         pressed_done = r.status == STATUS_IN_PROGRESS and r.chosen_action == "open_terminal"
         if subj.get("source") == SOURCE and stale and (r.status != STATUS_IN_PROGRESS or pressed_done):
             manager.resolve(r.id)

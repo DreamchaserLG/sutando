@@ -287,7 +287,7 @@ class HumanCard(unittest.TestCase):
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
-                                  subject={"source": "tui", "session": NAME}))
+                                  subject={"source": "tui", "session": NAME, "effect": "gate"}))
         t = Tmux(USAGE_LIMIT_MENU)
         out = wc.raise_card(self.ws, WID, HUMAN, runner=t, manager=m)
         self.assertEqual(out["outcome"], "cleared")
@@ -299,7 +299,7 @@ class HumanCard(unittest.TestCase):
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         made = m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
-                                         subject={"source": "tui", "session": NAME}))
+                                         subject={"source": "tui", "session": NAME, "effect": "gate"}))
         m.resolve(made.id)
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
@@ -309,7 +309,7 @@ class HumanCard(unittest.TestCase):
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="other",
-                                  subject={"source": "pool-wedge", "session": NAME}))
+                                  subject={"source": "pool-wedge", "session": NAME, "effect": "gate"}))
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
 
@@ -318,7 +318,19 @@ class HumanCard(unittest.TestCase):
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
-                                  subject={"source": "tui", "session": "a-different-session"}))
+                                  subject={"source": "tui", "session": "a-different-session",
+                                           "effect": "gate"}))
+        out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+
+    def test_a_tui_card_for_a_different_effect_on_the_same_session_does_not_suppress(self):
+        # A frozen-turn confirmation and a gate question are different
+        # concerns; sharing a session must not let one hide the other.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="confirmation", runtime="claude", message="frozen",
+                                  subject={"source": "pool-wedge", "session": NAME,
+                                           "wedge": CAUSE, "effect": "turn-frozen"}))
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
 

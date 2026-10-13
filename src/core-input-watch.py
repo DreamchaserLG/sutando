@@ -666,28 +666,29 @@ def _name_seat(req, session, seat):
     return req
 
 
-def already_carded_elsewhere(manager, session) -> bool:
-    """The shared same-session ownership policy (src/hitl/session_ownership.py),
-    not a private check: the Manager's own dedup only catches an identical
-    (runtime, kind, device, guard), never that another watcher of the same
-    pane already asked the owner."""
-    from hitl.session_ownership import session_already_carded
-    return session_already_carded(manager, session, by_source=_TUI_SOURCE)
+# Shared ownership tag with pool_wedge_cards.py's CARD_HUMAN; only
+# "blocked-human" gets it — "logged-out" is CARD_LOGIN's separate concern.
+GATE_EFFECT = "gate"
 
 
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
-    """Raise ONE requirement per episode. The Manager dedups on
-    (runtime, kind, device) + guard, so the prompt IS the episode key: the same
-    prompt returns the same record, a different one mints a new card.
+    """Raise ONE requirement per episode, atomically claiming the session (and,
+    for a gate, the specific effect) so a producer on the same schedule can't
+    also create one in the window between a check and a create. The Manager's
+    own dedup only catches an identical (runtime, kind, device, guard) — the
+    prompt IS that episode key, so the same prompt returns the same record,
+    a different one mints a new card; this is the cross-SOURCE question, not
+    that one.
 
-    Returns the requirement, or None when nothing could be raised.
+    Returns the requirement, or None when nothing could be raised (or another
+    source already owns this session for this effect).
     """
     if manager is None:
         return None
-    if already_carded_elsewhere(manager, session):
-        return None
+    effect = GATE_EFFECT if state == "blocked-human" else None
     try:
         from hitl import tui_gate
+        from hitl.session_ownership import claim_session
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt),
                                        runtime=runtime)
@@ -695,7 +696,10 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
             req = _name_seat(req, session, seat)
-        return manager.create(req)
+        if effect:
+            req.subject = {**(req.subject or {}), "effect": effect}
+        return claim_session(manager, session, by_source=_TUI_SOURCE, effect=effect,
+                             build_requirement=lambda: req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None

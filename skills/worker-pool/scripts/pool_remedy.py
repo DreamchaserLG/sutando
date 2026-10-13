@@ -481,15 +481,16 @@ def _sweep(a) -> int:
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
         acted["escapes"] = wc.drive_escapes(a.workspace)
-        # Missing/corrupt ladder state is not confirmed clearance: require a
-        # readable pane AND a ladder entry that predates this tick.
-        had_prior = tick.get("had_prior_evidence", {})
+        # A worker this tick's evidence couldn't confirm either way is never
+        # positive clearance, however the (possibly lost/fresh) ladder reads.
+        indeterminate = set(tick.get("wedge_indeterminate", []))
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])
-                 and o.get("pane") not in (None, ps.PANE_UNKNOWN)
-                 and had_prior.get(w, False)}
+                 and w not in indeterminate}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
-        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
+        frames = {w: o.get("pane_id") for w, o in tick["observations"].items()
+                 if w not in indeterminate and o.get("session_alive") is True}
+        acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks, frames=frames)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

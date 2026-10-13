@@ -39,7 +39,8 @@ class DuplicateCardArbitration(unittest.TestCase):
         # then starts core-input-watch for the first time.
         self.manager.create(HumanRequirement(
             kind="core-blocked", runtime="claude", message="pool-wedge card",
-            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human"}))
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?", SESSION)
         self.assertIsNone(req)
@@ -54,6 +55,17 @@ class DuplicateCardArbitration(unittest.TestCase):
         cards = [r for r in self.manager.active() if (r.subject or {}).get("session") == SESSION]
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0].subject["source"], "tui")
+
+    def test_escalate_is_unaffected_by_a_different_effect_on_the_same_session(self):
+        # A frozen-turn confirmation and a gate question are different
+        # concerns; sharing a session must not let one hide the other.
+        self.manager.create(HumanRequirement(
+            kind="confirmation", runtime="claude", message="pool-wedge frozen card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_frozen",
+                     "effect": "turn-frozen"}))
+        req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                           "permission", "Do you want to proceed?", SESSION)
+        self.assertIsNotNone(req)
 
     def test_escalate_is_unaffected_by_a_different_sessions_card(self):
         self.manager.create(HumanRequirement(

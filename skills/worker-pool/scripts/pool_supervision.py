@@ -33,6 +33,8 @@ FAST_SUSTAINED_TICKS = 2
 LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
+# _wedge_kind's third state: evidence insufficient to confirm wedged OR clear.
+INDETERMINATE = "indeterminate"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
 # offering an Escape, an expired login, or a gate/limit dialog only the owner
 # can answer. No card decision ends or types into a session.
@@ -93,6 +95,9 @@ class WorkerEvidence:
     # The kind this tick's wedge reads as; `wedge_escalated` is about this kind only.
     wedge_kind: str | None = None
     last_pane_id: str | None = None
+    # Was the LAST tick's wedge evidence insufficient to confirm wedged or
+    # clear? A worker flagged here must not be read as positively cleared.
+    wedge_indeterminate: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,22 +140,34 @@ def _is_watcher_loss(obs: Observation) -> bool:
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
     """"login" (the session is logged out), "human" (a gate or limit on screen),
     "abnormal" (cli_wedge text), "stuck" (a turn whose raw frame has not changed
-    since the last tick), else None. A logged-out session is wedged whether or
-    not it owes work: nothing routed to it can ever run. Otherwise only a worker
-    that owes work is wedged: an idle pane at rest is healthy, and one that owes
+    since the last tick), None (confirmed not wedged), or INDETERMINATE (the
+    evidence needed to confirm either is missing or has no established
+    baseline yet). A logged-out session is wedged whether or not it owes
+    work: nothing routed to it can ever run. Otherwise only a worker that
+    owes work is wedged: an idle pane at rest is healthy, and one that owes
     work but sits at its prompt is the watcher rung's case."""
+    if obs.session_alive is None:
+        return INDETERMINATE
     if obs.session_alive is not True:
         return None
     if obs.pane == PANE_LOGGED_OUT:
         return "login"
+    if obs.pane in (None, PANE_UNKNOWN):
+        return INDETERMINATE
+    if obs.work_outstanding is None:
+        return INDETERMINATE
     if obs.work_outstanding is not True:
         return None
     if obs.pane in _HUMAN_PANES:
         return "human"
     if obs.pane == PANE_ABNORMAL:
         return "abnormal"
-    if obs.pane == PANE_WORKING and obs.pane_id and obs.pane_id == ev.last_pane_id:
-        return "stuck"
+    if obs.pane == PANE_WORKING:
+        if ev.last_pane_id is None:
+            return INDETERMINATE  # no established baseline to compare against yet
+        if obs.pane_id and obs.pane_id == ev.last_pane_id:
+            return "stuck"
+        return None  # demonstrably a different frame than the established baseline
     return None
 
 
@@ -170,15 +187,15 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     straight into another is owed the new kind's decision, since the card already
     up names a condition the pane no longer shows."""
     kind = _wedge_kind(obs, ev)
+    # Establish/refresh the "stuck" baseline even on an indeterminate tick,
+    # or a lost baseline could never be re-established.
+    if obs.session_alive is True and obs.pane not in (None, PANE_UNKNOWN):
+        ev = replace(ev, last_pane_id=obs.pane_id)
+    if kind == INDETERMINATE:
+        return replace(ev, wedge_indeterminate=True), NOTHING
     if kind is None:
-        # Missing evidence (pane, queue, or an indeterminate probe) holds the
-        # ladder as-is rather than clearing a real episode.
-        if obs.session_alive is None or (obs.session_alive is True
-                                         and (obs.pane in (None, PANE_UNKNOWN)
-                                              or obs.work_outstanding is None)):
-            return ev, NOTHING
-        return _cleared_wedge(replace(ev, last_pane_id=obs.pane_id)), NOTHING
-    ev = replace(ev, last_pane_id=obs.pane_id)
+        return replace(_cleared_wedge(ev), wedge_indeterminate=False), NOTHING
+    ev = replace(ev, wedge_indeterminate=False)
     # A legacy acknowledgment cannot prove a login card exists; other kinds
     # retain their existing compatibility behavior.
     if ev.wedge_escalated and (ev.wedge_kind not in (None, kind)
