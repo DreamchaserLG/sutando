@@ -381,6 +381,31 @@ class LoginCard(unittest.TestCase):
                                                 wedges={WID: now_asks}), [again.id], now_asks)
         self.assertEqual(manager(self.ws).get(req.id).status, "resolved")
 
+    def _legacy_cause_card(self, m, guard):
+        from hitl.schema import HumanRequirement
+        req = HumanRequirement(kind="core-blocked", runtime="claude", message="legacy",
+                               guard=guard,
+                               subject={"source": wc.SOURCE, "worker_id": WID, "session": NAME,
+                                        "wedge": CAUSE, "cause": ["needs-login", "api-error"]},
+                               actions=[wc._jump(NAME)])
+        return m.create(req)
+
+    def test_a_compatible_legacy_card_still_closes_once_the_pane_moves_to_a_non_login_kind(self):
+        # The exemption is for the login transition only; a pane that moves
+        # anywhere else must still retire the old card. Unique guards keep subTests independent.
+        for new_kind in (FROZEN, HUMAN):
+            with self.subTest(new_kind=new_kind, pressed=False):
+                m = manager(self.ws)
+                req = self._legacy_cause_card(m, f"legacy:{new_kind}:pending")
+                closed = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: new_kind})
+                self.assertEqual(closed, [req.id], new_kind)
+            with self.subTest(new_kind=new_kind, pressed=True):
+                m = manager(self.ws)
+                req = self._legacy_cause_card(m, f"legacy:{new_kind}:pressed")
+                press(self.ws, req, "open_terminal")
+                closed = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: new_kind})
+                self.assertEqual(closed, [req.id], new_kind)
+
 
 # Every card kind that offers open_terminal, proving the shared path: press it,
 # go stale, the card resolves; a fresh identical recurrence gets its own card.

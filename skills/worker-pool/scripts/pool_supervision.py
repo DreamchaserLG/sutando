@@ -172,6 +172,10 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     kind = _wedge_kind(obs, ev)
     ev = replace(ev, last_pane_id=obs.pane_id)
     if kind is None:
+        # An unreadable capture is no evidence either way — hold the ladder
+        # rather than clearing a real episode out from under itself.
+        if obs.session_alive is True and obs.pane in (None, PANE_UNKNOWN):
+            return ev, NOTHING
         return _cleared_wedge(ev), NOTHING
     # A legacy acknowledgment cannot prove a login card exists; other kinds
     # retain their existing compatibility behavior.

@@ -167,6 +167,16 @@ got, _ = run([obs(LOGGED_OUT, work=False)] * 2 + [obs(ABN)] * 2 + [obs(LOGGED_OU
 check("returning to a kind already carded in the episode is a change of kind too",
       got, [LOGIN, N, CAUSE, N, LOGIN])
 
+got, st = run([obs(GATE)] * 3 + [obs(ps.PANE_UNKNOWN)] + [obs(GATE)])
+check("an unreadable pane after a card holds the episode rather than clearing it",
+      (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
+      ([N, N, HUMAN, N, N], True, "human"))
+
+got, st = run([obs(GATE)] * 3 + [obs(None, pane_id=None)])
+check("a (None, None) capture is read the same as PANE_UNKNOWN, not as a cleared pane",
+      (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
+      ([N, N, HUMAN, N], True, "human"))
+
 legacy = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
     wedge_first_detected_at=400.0, wedge_consecutive=3, wedge_escalated=True)})
 _, d = ps.evaluate(legacy, {"w": obs(ABN)}, 1300.0)
