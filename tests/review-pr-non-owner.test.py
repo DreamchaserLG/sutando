@@ -46,6 +46,8 @@ def _load_bridge():
     return mod
 
 
+# Unique per run: a leftover from an earlier run in the shared TMPDIR must not fail this one.
+ESCAPE = f"escape-{os.getpid()}-{os.urandom(4).hex()}.txt"
 SPEC = {
     "url": "https://github.com/example/demo/pull/7", "sha": "b" * 40,
     "diff": "diff --git a/src/a.py b/src/a.py\n+x = 1\n",
@@ -54,7 +56,7 @@ SPEC = {
         "docs/b.md": "# b\n",
         "link": {"type": "symlink", "target": "/etc/passwd"},
         "vendor/sub": {"type": "submodule"},
-        "../escape.txt": "nope\n",
+        f"../{ESCAPE}": "nope\n",
         "/abs.txt": "nope\n",
         "removed.py": None,
     },
@@ -91,7 +93,7 @@ class Populate(unittest.TestCase):
                          if p.is_file() or p.is_symlink())
         self.assertEqual(on_disk, ["PR.diff", "docs/b.md", "src/a.py"])
         self.assertFalse(any(p.is_symlink() for p in self.root.rglob("*")))
-        self.assertFalse((self.root.parent / "escape.txt").exists())
+        self.assertFalse((self.root.parent / ESCAPE).exists())
 
     def test_unreadable_metadata_leaves_the_diff_only(self):
         self.assertEqual(rps.populate(self.root, "7", "", "d", lambda a: None), ["PR.diff"])
