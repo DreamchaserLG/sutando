@@ -189,7 +189,7 @@ class Invocations(unittest.TestCase):
         pre = sr.context_preamble()
         self.assertIn(sr.FAQ_PATH.read_text().strip(), pre)
         self.assertIn("cannot read the owner's files", pre)
-        self.assertIn("public HTTPS endpoints", pre)
+        self.assertIn("outbound HTTPS only", pre)
         self.assertEqual(sr.FAQ_PATH.parent.resolve(), (REPO / "src" / "policy").resolve())
 
     def test_preamble_renders_from_the_sparrow_zipapp(self):
