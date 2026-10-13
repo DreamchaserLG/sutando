@@ -68,9 +68,13 @@ class OrderSelection(unittest.TestCase):
         self.assertIn("denies reads outside", sr.RUNNERS["codex"].unsafe_reason)
         self.assertIsNone(sr.select_runner(("codex",), fake_which({"codex"})))
         self.assertIsNone(sr.select_runner(None, fake_which({"codex"}), {sr.CONFIG_KEY: "codex"}))
-        with mock.patch.object(seatbelt, "available", return_value=False), \
-                sr.empty_dir() as d, self.assertRaises(ValueError):
-            sr.invocation(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
+        for fence in (False, True):  # with or without the macOS fence, codex never runs
+            with self.subTest(fence=fence), \
+                    mock.patch.object(seatbelt, "available", return_value=fence):
+                self.assertIsNone(sr.select_runner(("codex",), fake_which({"codex"}), fenced=True))
+                for build in (sr.invocation, sr.confined_invocation):
+                    with sr.empty_dir() as d, self.assertRaises(ValueError):
+                        build(sr.RUNNERS["codex"], "/fake/bin/codex", "p", cwd=d)
         with self.assertRaises(ValueError):
             sr.shell_command(sr.RUNNERS["codex"], "P")
 
