@@ -34,7 +34,8 @@ DISPATCH = REPO / "src/delivery/task_dispatch.py"
 IDLE_STATUS = IDLE_FOOTER.split("\n", 1)[1]
 
 
-class StandDownClearTests(FakeTmuxHarness):
+class StandDownFixtures(FakeTmuxHarness):
+    """Fixtures only; the test classes below add the cases."""
 
     def setUp(self):
         super().setUp()
@@ -104,6 +105,9 @@ class StandDownClearTests(FakeTmuxHarness):
             self.assertNotIn("blocking task delivery", got, "a stand-down is not a delivery block")
         else:
             self.assertEqual(got, "")
+
+
+class StandDownClearTests(StandDownFixtures):
 
     # -- the happy path -------------------------------------------------------
 
@@ -194,6 +198,25 @@ class StandDownClearTests(FakeTmuxHarness):
         self.assertIn("left a staged task prompt", self.alert_text(wait=5))
         self.assertTrue((self.staged_dir / "task-stuck.txt").exists(), "the record went with a failed clear")
 
+    def test_a_line_break_the_owner_added_is_left_before_any_keystroke(self):
+        # Whitespace-equal to the prompt, but row 1 ends where the next word would have fit.
+        prompt = self.expected_prompt("task-nl.txt")
+        head, tail = prompt[:30].rsplit(" ", 1)[0], None
+        tail = prompt[len(head):].lstrip()
+        self.stage("task-nl.txt", composer=f"{head}\n  {tail}")
+        self.session_watcher()
+        self.write_result("task-nl.txt")
+        before = self.pane_file.read_text()
+        self.assert_left(self.clear(), before, "line break the owner added")
+
+    def test_a_trailing_blank_line_the_owner_added_is_left(self):
+        prompt = self.expected_prompt("task-nl2.txt")
+        self.stage("task-nl2.txt", composer=f"{prompt}\n  ")
+        self.session_watcher()
+        self.write_result("task-nl2.txt")
+        before = self.pane_file.read_text()
+        self.assert_left(self.clear(), before, "line break the owner added")
+
     def test_records_from_an_earlier_incarnation_are_pruned(self):
         subprocess.run([sys.executable, str(DISPATCH), "partial-mark", str(self.staged_dir), "task-old.txt", "9999"],
                        input="old prompt", text=True, check=True)
@@ -209,6 +232,89 @@ class StandDownClearTests(FakeTmuxHarness):
         self.write_result("task-norec.txt")
         before = self.pane_file.read_text()
         self.assert_left(self.clear(), before, "did not stage", alerted=False)
+
+
+class WrappedStandDownTests(StandDownFixtures):
+    """C-a C-k kills one visual row of a wrapped composer (measured live: 5 rows, then 4, ...)."""
+    WRAP_COLS = 60
+    WRAP_STYLE = "word"
+
+    def stage_wrapped(self, name):
+        self.write_task(name)
+        self.swallow_enter_flag.write_text("1")
+        self.run_event(name, env_extra={"SUTANDO_NOTIFIER_COMPLETION_TIMEOUT": "1",
+                                        "SUTANDO_NOTIFIER_SUBMIT_RETRIES": "2"}, timeout=20)
+        self.assertTrue((self.staged_dir / name).is_file(), "the wrapped prompt was not recorded as staged")
+        return self.composer_rows()
+
+    def composer_rows(self):
+        lines = self.pane_file.read_text().splitlines()
+        idx = max(i for i, r in enumerate(lines) if r.startswith("❯"))
+        n = 1
+        while idx + n < len(lines) and lines[idx + n].startswith("  ") and "⏵⏵" not in lines[idx + n]:
+            n += 1
+        return n
+
+    def test_a_wrapped_prompt_is_cleared_one_visual_row_per_round(self):
+        rows = self.stage_wrapped("task-wrap.txt")
+        self.assertGreater(rows, 3, "the fixture prompt did not wrap")
+        self.session_watcher()
+        self.write_result("task-wrap.txt")
+        res = self.clear(timeout=40)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.sendkeys_log_text().count("CLEAR C-a C-k"), rows, "one round per visual row")
+        self.assertEqual(self.composer(), "")
+        self.assertIn(f"after {rows} clear round(s)", (self.logs_dir / "claude-task-notifier.log").read_text())
+
+    def test_a_box_taller_than_the_window_is_cleared_with_the_window_grown(self):
+        rows = self.stage_wrapped("task-tall.txt")
+        # Ungrown, the 29-row window shows only the box's last 3 rows: the prompt reads as partial.
+        self.composer_view_rows_flag.write_text("3")
+        self.session_watcher()
+        self.write_result("task-tall.txt")
+        self.resize_log.write_text("")
+        res = self.clear(timeout=40)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.composer(), "")
+        self.assertEqual(self.sendkeys_log_text().count("CLEAR C-a C-k"), rows)
+        resizes = [l for l in self.resize_log.read_text().splitlines() if l.startswith("RESIZE")]
+        self.assertEqual(len(resizes), 2, "the window was not grown and put back")
+        self.assertEqual(self.window_rows.read_text().strip(), "29", "the window was left grown")
+
+    def test_owner_text_appended_mid_clear_stops_the_clear(self):
+        self.stage_wrapped("task-race.txt")
+        self.session_watcher()
+        self.write_result("task-race.txt")
+        (self.root / "owner-types-mid-clear.flag").write_text("1")
+        res = self.clear(timeout=40)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(self.sendkeys_log_text().count("CLEAR"), 1, "a round ran over the owner's text")
+        self.assertIn("OWNERTEXT", self.pane_file.read_text(), "the owner's text was killed")
+        self.assertIn("text other than the rest of", res.stderr)
+        self.assertIn("left a staged task prompt", self.alert_text(wait=5))
+
+
+class LineBreakParseTests(unittest.TestCase):
+    """pane_gate.composer_has_line_break: the parse the stand-down's newline guard asks."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO / "src"))
+        from delivery import pane_gate
+        self.pg = pane_gate
+
+    def test_a_greedy_wrap_is_not_a_line_break(self):
+        import textwrap
+        rows = textwrap.wrap("❯ " + " ".join(f"word{i}" for i in range(60)), width=50, subsequent_indent="  ")
+        self.assertFalse(self.pg.composer_has_line_break("\n".join(rows + [IDLE_STATUS])))
+
+    def test_a_short_row_the_next_word_fits_is_a_line_break(self):
+        self.assertTrue(self.pg.composer_has_line_break(f"❯ short\n  next {'x' * 40}\n{IDLE_STATUS}"))
+
+    def test_a_blank_row_inside_the_box_is_a_line_break(self):
+        self.assertTrue(self.pg.composer_has_line_break(f"❯ one line\n  \n{IDLE_STATUS}"))
+
+    def test_no_prompt_line_is_unknown(self):
+        self.assertIsNone(self.pg.composer_has_line_break("nothing here"))
 
 
 if __name__ == "__main__":

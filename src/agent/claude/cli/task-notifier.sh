@@ -42,6 +42,8 @@ POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
 # One tmux write past ~1 KB reaches the CLI as only its tail (measured: 1022 bytes),
 # so a paste goes in chunks well below that, each read back before the next.
 PASTE_CHUNK=256
+# Claude Code's C-a C-k kills one visual (wrapped) row: a stand-down clear takes at most this many.
+CLEAR_ROUNDS=40
 COMPLETION_TIMEOUT="${SUTANDO_NOTIFIER_COMPLETION_TIMEOUT:-3600}"
 CORE_READY_TIMEOUT="${SUTANDO_NOTIFIER_CORE_READY_TIMEOUT:-300}"
 # Submit verification: re-press C-m while the prompt is still staged in the
@@ -312,6 +314,11 @@ composer_text() {
 }
 
 squeeze() { tr -d '[:space:]'; }
+
+# A typed newline in the composer: C-a C-k never crosses one, and the standby never stages one.
+composer_has_line_break() {
+  [ "$(printf '%s' "$1" | "$NOTIFIER_PY" "$PANE_GATE_PY" composer-line-break --runtime claude 2>/dev/null)" = "yes" ]
+}
 
 # The frame below the box (closing rule, footer) is off screen: the box is cut by the screen.
 pane_frame_is_cut() {
@@ -828,6 +835,18 @@ task_taken_over() {
     --deliveries-dir "$DELIVERIES_DIR" 2>/dev/null | grep -qxF -- "$filename"
 }
 
+# Rows the longest staged record needs beyond the window (rows_for's own rule); empty with none.
+staged_rows_needed() {
+  local f n max=0
+  while IFS= read -r f; do
+    n="$(wc -c < "$STAGED_DIR/$f" 2>/dev/null | tr -d ' ')"
+    case "$n" in ''|*[!0-9]*) continue ;; esac
+    [ "$n" -gt "$max" ] && max="$n"
+  done < <(ls -1 "$STAGED_DIR" 2>/dev/null)
+  [ "$max" -gt 0 ] && printf '%s' $(( max / 40 + 12 ))
+  return 0
+}
+
 # Left behind at stand-down: say why; when it is our prompt, the owner hears it the way a block is told.
 leave_staged() {
   log_notifier "stand-down: leaving the composer as it is: $2"
@@ -838,7 +857,7 @@ leave_staged() {
 # A prompt this standby staged and that never left the composer would stay in the owner's input
 # box after the session watcher took over. Erased only when every guard holds; else left, with why.
 clear_staged_on_stand_down() {
-  local ready raw esc incarnation found how filename state f waited=0
+  local ready raw esc incarnation found how filename state f prompt p c rounds=0 waited=0
   ready="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || ready="unknown"
   [ "$ready" = "yes" ] || { log_notifier "stand-down: no session-role watcher is ready for $TASKS_DIR ($ready); leaving the composer as it is"; return 1; }
   incarnation="$(core_incarnation)"
@@ -858,28 +877,45 @@ clear_staged_on_stand_down() {
     mixed) leave_staged "$filename" "it holds $filename's prompt with other text mixed in"; return 1 ;;
     partial) leave_staged "$filename" "it holds only part of $filename's prompt"; return 1 ;;
   esac
+  composer_has_line_break "$raw" \
+    && { leave_staged "$filename" "it holds $filename's prompt with a line break the owner added"; return 1; }
   state="$(printf '%s\n' "$esc" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime claude --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || state="unknown"
   if [ "$state" != "pending" ] || ! pane_text_ciw "$(printf '%s\n' "$esc" | strip_sgr)" _is_idle_ready; then
     leave_staged "$filename" "the session is not idle ($state), and $filename's prompt is still staged"; return 1
   fi
   task_taken_over "$filename" \
     || { leave_staged "$filename" "$filename has no result and the session watcher has not taken it over"; return 1; }
-  # The guards took time: the composer must still be exactly ours at the keystroke.
-  prompt_is_staged "$(capture_raw)" "$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$STAGED_DIR" "$filename" "$incarnation")" \
+  # The guards took time: the composer must still be exactly ours at the first keystroke.
+  prompt="$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$STAGED_DIR" "$filename" "$incarnation")" || prompt=""
+  prompt_is_staged "$(capture_raw)" "$prompt" \
     || { log_notifier "stand-down: the composer changed while checking $filename; leaving it as it is"; return 1; }
-  # Known residual: owner keystrokes landing between that read and this one are erased with it.
-  # No retry after it: a composer not empty below is left and alerted.
-  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-a C-k 2>/dev/null \
-    || { leave_staged "$filename" "the clear keystroke for $filename's prompt was not sent"; return 1; }
-  # Synchronous in the supervisor: at most SUBMIT_CONFIRM_TIMEOUT re-captures, POLL_INTERVAL apart.
-  while [ -n "$(composer_text "$(capture_raw)")" ]; do
-    waited=$((waited + 1))
-    [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] \
-      || { leave_staged "$filename" "the composer is not empty after clearing $filename's prompt"; return 1; }
-    sleep "$POLL_INTERVAL"
+  p="$(printf '%s' "$prompt" | squeeze)"
+  # Each round requires the composer to be a suffix of our prompt, else stops: owner text is never killed.
+  # Synchronous in the supervisor: CLEAR_ROUNDS rounds, each verified within SUBMIT_CONFIRM_TIMEOUT re-captures.
+  while :; do
+    raw="$(capture_raw)" || raw=""
+    composer_has_marker "$raw" || { leave_staged "$filename" "the composer could not be read while clearing $filename's prompt"; return 1; }
+    c="$(composer_text "$raw" | squeeze)"
+    [ -n "$c" ] || break
+    case "$p" in
+      *"$c") ;;
+      *) leave_staged "$filename" "text other than the rest of $filename's prompt appeared in the composer while clearing it"; return 1 ;;
+    esac
+    [ "$rounds" -lt "$CLEAR_ROUNDS" ] \
+      || { leave_staged "$filename" "the composer is not empty after clearing $filename's prompt for $CLEAR_ROUNDS rounds"; return 1; }
+    # Known residual: owner keystrokes landing between that read and this keystroke are erased with it.
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-a C-k 2>/dev/null \
+      || { leave_staged "$filename" "the clear keystroke for $filename's prompt was not sent"; return 1; }
+    rounds=$((rounds + 1)); waited=0
+    while [ "$(composer_text "$(capture_raw)" | squeeze)" = "$c" ]; do
+      waited=$((waited + 1))
+      [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] \
+        || { leave_staged "$filename" "the composer is not empty after clearing $filename's prompt (a clear round changed nothing)"; return 1; }
+      sleep "$POLL_INTERVAL"
+    done
   done
   clear_staged "$filename"
-  log_notifier "stand-down: cleared $filename's staged prompt from the composer (a session watcher holds $TASKS_DIR, the session is idle, the task is handled); composer verified empty"
+  log_notifier "stand-down: cleared $filename's staged prompt from the composer (a session watcher holds $TASKS_DIR, the session is idle, the task is handled); composer verified empty after $rounds clear round(s)"
 }
 
 submit_task() {
@@ -968,8 +1004,13 @@ fi
 # One-shot, run by the supervisor once it stood this standby down (0 cleared or nothing to do).
 if [ "${1:-}" = "--clear-staged" ]; then
   STANDBY_LOGGED=1
-  clear_staged_on_stand_down
-  exit $?
+  rows="$(staged_rows_needed)"
+  [ -z "$rows" ] || grow_window "$rows" \
+    || log_notifier "stand-down: could not grow the window; a staged prompt taller than the box reads as partial"
+  rc=0
+  clear_staged_on_stand_down || rc=$?
+  restore_window
+  exit "$rc"
 fi
 
 # A new notifier starts a new episode; a record left by the previous one is not its history.
