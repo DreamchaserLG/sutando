@@ -320,16 +320,27 @@ class Supersede(unittest.TestCase):
             kind="core-blocked", runtime="claude", message="pool card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
-        with mock.patch.object(HitlManager, "resolve", side_effect=OSError("disk full")):
+        build = lambda: HumanRequirement(kind="permission", runtime="claude", message="tui card",
+                                         subject={"source": "tui", "session": SESSION, "effect": "gate"})
+        with self.assertLogs("hitl.session_ownership", level="WARNING") as log, \
+                mock.patch.object(HitlManager, "resolve", side_effect=OSError("disk full")):
             made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
-                             effect="gate", build_requirement=lambda: HumanRequirement(
-                                 kind="permission", runtime="claude", message="tui card",
-                                 subject={"source": "tui", "session": SESSION, "effect": "gate"}),
+                             effect="gate", build_requirement=build,
                              legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        # Four observable parts of the partial-write contract, not just "it didn't raise":
+        # 1. the rich card itself, 2. both records' statuses, 3. the emitted signal.
         self.assertIsNotNone(made)
         self.assertEqual((made.subject or {}).get("source"), "tui")
         self.assertEqual(self.manager.get(made.id).status, "pending")
-        self.assertEqual(self.manager.get(backstop.id).status, "pending")  # retirement failed, stayed up
+        self.assertEqual(self.manager.get(backstop.id).status, "pending")
+        self.assertTrue(any("failed to retire backstop" in m for m in log.output))
+
+        # 4. a subsequent, unobstructed call retries retirement and dedupes onto the same rich card.
+        retried = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                            effect="gate", build_requirement=build,
+                            legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        self.assertEqual(retried.id, made.id)
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
 
     def test_no_manager_supersedes_nothing(self):
         self.assertIsNone(supersede(None, SESSION, by_source="tui", backstop_source="pool-wedge",
