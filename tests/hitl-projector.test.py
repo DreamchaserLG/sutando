@@ -412,6 +412,28 @@ class PerCardIsolationTests(unittest.TestCase):
                         "the reminder notice never went out")
         self.assertTrue(self.mgr.needs_projection(poison), "a non-terminal card stays retryable")
 
+    def test_a_notice_build_failure_is_logged_and_does_not_block_a_later_notice(self):
+        # A bug building the notice body/dedupe_key must be logged, not
+        # swallowed, and must not stop a later card's own due notice.
+        bad = self.mgr.create(make_req(guard="bad", device={"id": "d-bad"}))
+        good = self.mgr.create(make_req(guard="good", device={"id": "d-good"}))
+        project(self.mgr, RecordingSender(), ROOM, clock=lambda: 1000.0)
+        import hitl.renotify as renotify_mod
+        real_body = renotify_mod.body
+
+        def flaky_body(notice, req, now, **kw):
+            if req.id == bad.id:
+                raise RuntimeError("bad renotify body")
+            return real_body(notice, req, now, **kw)
+
+        logged = []
+        sender = RecordingSender()
+        with mock.patch.object(renotify_mod, "body", side_effect=flaky_body):
+            project(self.mgr, sender, ROOM, clock=lambda: 1000.0 + 31 * 60, log=logged.append)
+        self.assertTrue(any(bad.id in line and "bad renotify body" in line for line in logged), logged)
+        self.assertTrue(any(NOTICE_FIELD in p["extra_content"] for p in sender.sent),
+                        "the good card's own notice was blocked by the bad one")
+
     def test_a_failed_send_is_logged_with_its_card_id_and_response_body(self):
         req = self.mgr.create(make_req(kind="choice"))
         ok = self.mgr.create(make_req(kind="choice", guard="g2"))
@@ -426,8 +448,21 @@ class PerCardIsolationTests(unittest.TestCase):
         self.assertEqual([rid for rid, _ in done], [ok.id])
         self.assertTrue(any(req.id in line and "bad edit" in line for line in logged), logged)
 
-    def _resolved_card(self):
+    def test_a_long_error_body_is_truncated_to_200_chars_in_the_log(self):
         req = self.mgr.create(make_req(kind="choice"))
+        long_body = ("x" * 500).encode()
+        logged = []
+
+        def send(payload):
+            raise http_error(400, long_body)
+
+        with self.assertRaises(urllib.error.HTTPError):
+            project(self.mgr, send, ROOM, log=logged.append, error_body=read_body)
+        line = next(l for l in logged if req.id in l)
+        self.assertLessEqual(line.count("x"), 200, line)
+
+    def _resolved_card(self, guard="g1"):
+        req = self.mgr.create(make_req(kind="choice", guard=guard))
         project(self.mgr, RecordingSender(), ROOM)
         self.mgr.resolve(req.id)
         return req
@@ -460,6 +495,23 @@ class PerCardIsolationTests(unittest.TestCase):
         self._drive(ok)
         self.assertEqual([p["op"] for p in ok.sent], ["edit"])
         self.assertFalse(self.mgr.needs_projection(req.id))
+
+    def test_auth_timeout_and_ratelimit_on_a_terminal_card_stay_retryable(self):
+        # 401/403/408/429 are blips, not refusals that will never change --
+        # settling on them would archive a card whose edit never landed.
+        for code in (401, 403, 408, 429):
+            req = self._resolved_card(guard=f"g-{code}")
+
+            def send(payload, _code=code):
+                raise http_error(_code, b"blip")
+
+            with self.assertRaises(urllib.error.HTTPError):
+                self._drive(send)
+            self.assertTrue(self.mgr.needs_projection(req.id), code)
+            ok = RecordingSender()
+            self._drive(ok)
+            self.assertEqual([p["op"] for p in ok.sent], ["edit"], code)
+            self.assertFalse(self.mgr.needs_projection(req.id), code)
 
     def test_a_pass_where_every_send_fails_still_raises(self):
         self.mgr.create(make_req(kind="choice", guard="a"))

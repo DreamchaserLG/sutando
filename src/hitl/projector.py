@@ -146,9 +146,13 @@ def project(manager: HitlManager, send: Sender, room_id: str,
     return out
 
 
+# Genuinely final only; 401/403/408/429 are blips, not refusals that would
+# recur -- settling on them would archive a card whose edit never landed.
+_TERMINAL_CODES = frozenset({400, 404, 409, 410, 422})
+
+
 def _client_error(e: BaseException) -> bool:
-    code = getattr(e, "code", None)
-    return isinstance(code, int) and 400 <= code < 500
+    return getattr(e, "code", None) in _TERMINAL_CODES
 
 
 class _Pass:
@@ -166,7 +170,7 @@ class _Pass:
             answer = send(payload)
         except Exception as e:  # noqa: BLE001
             self.error = e
-            body = self._error_body(e) if self._error_body else ""
+            body = (self._error_body(e) if self._error_body else "")[:200]
             self._log(f"hitl: send for {req_id} failed: {e}" + (f" — {body}" if body else ""))
             raise
         if isinstance(answer, dict) and (answer.get("ok") or answer.get("event_id")):
@@ -176,6 +180,9 @@ class _Pass:
     def raise_if_all_failed(self) -> None:
         if self.error is not None and not self.accepted:
             raise self.error
+
+    def log(self, message: str) -> None:
+        self._log(message)
 
 
 def _send_notices(manager: HitlManager, send: Sender, room_id: str,
@@ -190,10 +197,15 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str,
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
         try:
+            body = renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued)
+            dedupe_key = renotify.dedupe_key(n.notice, n.req, ledger, n.reminders)
+        except Exception as e:  # noqa: BLE001 — logged, not swallowed; the next notice still goes
+            pass_.log(f"hitl: notice build for {n.req.id} failed: {e}")
+            continue
+        try:
             answer = pass_.send(send, {
                 "room_id": room_id, "op": "message",
-                "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
-                "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
+                "body": body, "dedupe_key": dedupe_key,
                 "extra_content": {NOTICE_FIELD: notice}}, n.req.id)
         except Exception:  # noqa: BLE001 — logged by the pass; the next notice still goes
             continue
