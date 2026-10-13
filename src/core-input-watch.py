@@ -610,6 +610,9 @@ AUTO_ANSWER_CARRY_S = 120.0
 _CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
 HITL_KIND = "core-blocked"
 _TUI_SOURCE = "tui"
+# pool_wedge_cards.py's SOURCE; its CARD_HUMAN/CARD_LOGIN are the backstop this
+# monitor's escalate() retires via supersede().
+_POOL_BACKSTOP_SOURCE = "pool-wedge"
 #: a driven click that has not moved the core by then expires as "did not take".
 DRIVE_SETTLE_S = 15.0
 
@@ -713,8 +716,9 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                 return True
             return (_state == "logged-out" and subj.get("wedge") == "card_cause"
                     and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
-        return supersede(manager, session, by_source=_TUI_SOURCE, backstop_source="pool-wedge",
-                         effect=effect, build_requirement=lambda: req, legacy_match=legacy_match)
+        return supersede(manager, session, by_source=_TUI_SOURCE,
+                         backstop_source=_POOL_BACKSTOP_SOURCE, effect=effect,
+                         build_requirement=lambda: req, legacy_match=legacy_match)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None
