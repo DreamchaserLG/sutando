@@ -473,6 +473,24 @@ class OpenTerminalClosesAcrossEveryCardKind(unittest.TestCase):
                 self.assertEqual(closed, [], kind)
                 self.assertEqual(manager(ws).get(req.id).status, "pending", kind)
 
+    def test_an_unobserved_worker_closes_neither_a_pending_nor_a_pressed_card(self):
+        # Absent from both worker_ids and wedges is "not observed this tick",
+        # not evidence of clearance: resolve_cleared must fail closed.
+        for kind, pane in OPEN_TERMINAL_CASES:
+            with self.subTest(kind=kind, pressed=False):
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={})
+                self.assertEqual(closed, [], kind)
+                self.assertEqual(manager(ws).get(req.id).status, "pending", kind)
+            with self.subTest(kind=kind, pressed=True):
+                ws = pool()
+                _, _, req = card(ws, kind, pane)
+                press(ws, req, "open_terminal")
+                closed = wc.resolve_cleared(ws, set(), manager=manager(ws), wedges={})
+                self.assertEqual(closed, [], kind)
+                self.assertEqual(manager(ws).get(req.id).status, "in_progress", kind)
+
 
 class CodexCards(unittest.TestCase):
     def setUp(self):
