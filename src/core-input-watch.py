@@ -666,6 +666,22 @@ def _name_seat(req, session, seat):
     return req
 
 
+def already_carded_elsewhere(manager, session) -> bool:
+    """Is there already an active requirement for this session from a
+    DIFFERENT source? The Manager's own dedup only catches an identical
+    (runtime, kind, device, guard) — it never learns that another watcher
+    of the same pane already asked the owner. Provider-agnostic on purpose:
+    this file does not need to know what that other source is."""
+    if manager is None:
+        return False
+    try:
+        return any((r.subject or {}).get("session") == session
+                  and (r.subject or {}).get("source") != _TUI_SOURCE
+                  for r in manager.active())
+    except Exception:  # noqa: BLE001 — an unreadable store is not proof of a duplicate
+        return False
+
+
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
     """Raise ONE requirement per episode. The Manager dedups on
     (runtime, kind, device) + guard, so the prompt IS the episode key: the same
@@ -674,6 +690,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     Returns the requirement, or None when nothing could be raised.
     """
     if manager is None:
+        return None
+    if already_carded_elsewhere(manager, session):
         return None
     try:
         from hitl import tui_gate

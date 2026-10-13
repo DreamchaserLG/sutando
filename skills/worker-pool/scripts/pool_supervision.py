@@ -171,10 +171,11 @@ def _wedge_rung(ev: WorkerEvidence, obs: Observation, now: float, *,
     up names a condition the pane no longer shows."""
     kind = _wedge_kind(obs, ev)
     if kind is None:
-        # Missing pane or queue evidence holds the ladder as-is (last_pane_id
-        # included) rather than clearing a real episode out from under itself.
-        if obs.session_alive is True and (obs.pane in (None, PANE_UNKNOWN)
-                                          or obs.work_outstanding is None):
+        # Missing evidence (pane, queue, or an indeterminate probe) holds the
+        # ladder as-is rather than clearing a real episode.
+        if obs.session_alive is None or (obs.session_alive is True
+                                         and (obs.pane in (None, PANE_UNKNOWN)
+                                              or obs.work_outstanding is None)):
             return ev, NOTHING
         return _cleared_wedge(replace(ev, last_pane_id=obs.pane_id)), NOTHING
     ev = replace(ev, last_pane_id=obs.pane_id)

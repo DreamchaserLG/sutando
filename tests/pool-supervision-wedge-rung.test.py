@@ -187,6 +187,13 @@ check("undecidable queue evidence holds the episode; it is not read as no-longer
       (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
       ([N, N, HUMAN, N], True, "human"))
 
+indeterminate_probe = ps.Observation(beat=ps.LIVE, session_alive=None, watcher_beat=ps.LIVE,
+                                     work_outstanding=True, pane=WORK, pane_id="same")
+got, st = run([obs(WORK, "same")] * 4 + [indeterminate_probe] + [obs(WORK, "same")])
+check("a live heartbeat with an indeterminate session probe holds, not clears, the episode",
+      (got, st.workers["w"].wedge_escalated, st.workers["w"].wedge_kind),
+      ([N, N, N, FROZEN, N, N], True, "stuck"))
+
 legacy = ps.SupervisionState(last_sample_at=1000.0, workers={"w": ps.WorkerEvidence(
     wedge_first_detected_at=400.0, wedge_consecutive=3, wedge_escalated=True)})
 _, d = ps.evaluate(legacy, {"w": obs(ABN)}, 1300.0)

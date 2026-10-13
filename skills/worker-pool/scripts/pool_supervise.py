@@ -354,6 +354,7 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     """
     state = load_state(workspace)
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
+    had_prior = {w: w in state.workers for w in obs}
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
     if persist:
@@ -366,6 +367,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
+            # Did this worker have a ladder entry before this tick's evaluate()?
+            # A card must not clear on a tick whose memory was just lost.
+            "had_prior_evidence": had_prior,
             "routing": routing_status(workspace),
             "not_supervised": [w for w in asked if w not in obs],
             "observations": {w: {"beat": o.beat, "session_alive": o.session_alive,

@@ -482,10 +482,12 @@ def _sweep(a) -> int:
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
         acted["escapes"] = wc.drive_escapes(a.workspace)
         # Missing/corrupt ladder state is not confirmed clearance: require a
-        # positively readable pane too, not just absence from `wedged`.
+        # readable pane AND a ladder entry that predates this tick.
+        had_prior = tick.get("had_prior_evidence", {})
         clear = {w for w, o in tick["observations"].items()
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])
-                 and o.get("pane") not in (None, ps.PANE_UNKNOWN)}
+                 and o.get("pane") not in (None, ps.PANE_UNKNOWN)
+                 and had_prior.get(w, False)}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
         acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],

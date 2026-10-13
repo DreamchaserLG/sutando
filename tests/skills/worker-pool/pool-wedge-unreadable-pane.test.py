@@ -58,6 +58,10 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1, "", "")
             return subprocess.CompletedProcess(argv, 0, self.pane, "")
         if "has-session" in argv:
+            if getattr(self, "session_probe_garbled", False):
+                # Neither success nor a recognized "gone" message: probe_session
+                # reads this as indeterminate (None), not confirmed dead.
+                return subprocess.CompletedProcess(argv, 1, "", "some other tmux error")
             return subprocess.CompletedProcess(argv, 0, "", "")
         if "inbox-holders" in argv:
             return subprocess.CompletedProcess(argv, 0, "4242 session\n", "")
@@ -157,6 +161,28 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    def test_a_card_outlives_missing_state_plus_a_readable_but_undecidable_queue(self):
+        # State loss PLUS a readable, unchanged pane: the pane alone is not
+        # enough to positively clear a card whose ladder memory was just lost.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_pressed_card_outlives_missing_state_plus_a_readable_but_undecidable_queue(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
     def test_undecidable_queue_evidence_holds_a_pending_card_on_an_unchanged_gate(self):
         # The pane is readable and unchanged; only the queue evidence is lost.
         card = self.raise_card_to_sustain()
@@ -214,6 +240,64 @@ class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
         self.pane = None
         self.sweep()
         self.pane = FROZEN
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_a_card_outlives_missing_state_plus_the_identical_readable_frame(self):
+        # State loss erases the frame identity "stuck" relies on; the SAME
+        # frame reappearing must not by itself read as changed (and cleared).
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        result = self.sweep()  # self.pane is still FROZEN, unchanged
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_pressed_card_outlives_missing_state_plus_the_identical_readable_frame(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def _touch_live_beat_for_next_sweep(self):
+        # pb.touch() stamps real wall time; set mtime directly so pb.classify
+        # reads LIVE against this harness's fictional clock instead.
+        path = sup.pb.beat_path(self.ws, "worker", WID)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ts = self.now + 300.0 - 10.0
+        path.touch()
+        import os
+        os.utime(path, (ts, ts))
+
+    def test_an_indeterminate_session_probe_holds_the_frame_identity_too(self):
+        # A LIVE heartbeat with an unanswerable probe takes the wedge-ladder
+        # branch, not the death-ladder's own hold — it must hold there too.
+        card = self.raise_card_to_sustain()
+        self._touch_live_beat_for_next_sweep()
+        self.session_probe_garbled = True
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.session_probe_garbled = False
+        self._touch_live_beat_for_next_sweep()
+        result = self.sweep()  # self.pane is still the identical FROZEN text
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_an_indeterminate_session_probe_holds_a_pressed_card_too(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        self._touch_live_beat_for_next_sweep()
+        self.session_probe_garbled = True
+        self.sweep()
+        self.session_probe_garbled = False
+        self._touch_live_beat_for_next_sweep()
         result = self.sweep()
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
