@@ -27,6 +27,7 @@ WID = "7c54b230a8d94ea9b86f52d70134ac68"
 FOOTER = "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
 GATE = f"  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n{FOOTER}\n"
 FROZEN = f"✻ Thinking… (12s · esc to interrupt)\n❯ \n{FOOTER}\n"
+GARBLED = "zzz completely garbled unrecognized frame zzz\n"  # readable, classifies PANE_UNKNOWN
 
 
 class UnreadablePaneHoldsTheWedge(unittest.TestCase):
@@ -37,6 +38,7 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         (self.ws / "state").mkdir()
         self.now = 1000.0
         self.pane = GATE
+        self.force_work_outstanding = "unset"  # sentinel: use the real computed value
         path = self.ws / "state" / "roster.json"
         path.write_text(json.dumps(
             {"workers": {WID: {"state": "live", "runtime": "claude", "label": WID}}}))
@@ -63,10 +65,18 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
 
     def sweep(self):
         self.now += 300.0
-        real_tick, real_raise = sup.tick, wc.raise_card
+        real_tick, real_raise, real_work = sup.tick, wc.raise_card, sup.work_outstanding
+        forced = self.force_work_outstanding
+
+        def work_outstanding(workspace, worker_id):
+            if forced != "unset" and worker_id == WID:
+                return forced
+            return real_work(workspace, worker_id)
+
         output = io.StringIO()
         with mock.patch.object(sup, "tick", side_effect=lambda ws, now, **kw:
                                real_tick(ws, now, runner=self.runner, **kw)), \
+                mock.patch.object(sup, "work_outstanding", side_effect=work_outstanding), \
                 mock.patch.object(wc, "raise_card", side_effect=lambda ws, wid, which, **kw:
                                   real_raise(ws, wid, which, runner=self.runner,
                                              routed=lambda *_: False)), \
@@ -136,6 +146,36 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual([c.id for c in self.active_cards()], [card.id])
 
+    def test_a_pressed_card_outlives_missing_ladder_state_plus_an_unreadable_capture(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        self.pane = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_undecidable_queue_evidence_holds_a_pending_card_on_an_unchanged_gate(self):
+        # The pane is readable and unchanged; only the queue evidence is lost.
+        card = self.raise_card_to_sustain()
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_undecidable_queue_evidence_holds_a_pressed_card_on_an_unchanged_gate(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
 
 class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
     def setUp(self):
@@ -177,6 +217,40 @@ class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
         result = self.sweep()
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_a_readable_but_unrecognized_frame_between_two_identical_ones_holds_the_card(self):
+        # A capture that succeeds but reads as PANE_UNKNOWN (garbled, not
+        # empty) must be held exactly like a failed capture, not trusted.
+        card = self.raise_card_to_sustain()
+        self.pane = GARBLED
+        result = self.sweep()
+        self.assertEqual(result["decisions"][WID], ps.NOTHING)
+        self.assertEqual(result["cards_closed"], [])
+        self.pane = FROZEN
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_readable_but_unrecognized_frame_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        self.pane = GARBLED
+        self.sweep()
+        self.pane = FROZEN
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_a_genuinely_changed_frame_still_clears_the_card_normally(self):
+        # Positive control: real recovery (the turn actually moved) must not
+        # be blocked by the hold meant only for missing/unreadable evidence.
+        card = self.raise_card_to_sustain()
+        self.pane = f"✻ Thinking… (47s · esc to interrupt)\n❯ \n{FOOTER}\n"
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [card.id])
+        self.assertEqual(self.active_cards(), [])
 
 
 if __name__ == "__main__":
