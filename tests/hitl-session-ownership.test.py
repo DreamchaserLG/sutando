@@ -194,6 +194,24 @@ class Supersede(unittest.TestCase):
         self.assertIsNone(made)
         self.assertEqual(self.manager.get(backstop.id).status, "pending")
 
+    def test_a_refused_collision_never_mutates_the_foreign_record(self):
+        # create()'s dedup for kind="auth" rewrites a matching record's
+        # guard/revision regardless of guard equality -- must check first.
+        foreign = self.manager.create(HumanRequirement(
+            kind="auth", runtime="claude", message="foreign auth",
+            device={"id": SESSION}, guard="FOREIGN_GUARD",
+            subject={"source": "pool-wedge", "session": SESSION, "effect": "login"}))
+        made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                         effect="login", build_requirement=lambda: HumanRequirement(
+                             kind="auth", runtime="claude", message="tui auth",
+                             device={"id": SESSION}, guard="TUI_GUARD",  # different guard
+                             subject={"source": "tui", "session": SESSION, "effect": "login"}),
+                         legacy_match=lambda subj: subj.get("wedge") == "card_login")
+        self.assertIsNone(made)
+        after = self.manager.get(foreign.id)
+        self.assertEqual(after.guard, "FOREIGN_GUARD")
+        self.assertEqual(after.revision, foreign.revision)
+
     def test_no_manager_supersedes_nothing(self):
         self.assertIsNone(supersede(None, SESSION, by_source="tui", backstop_source="pool-wedge",
                                     effect="gate", build_requirement=lambda: (_ for _ in ()).throw(

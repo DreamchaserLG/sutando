@@ -93,17 +93,28 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
     persists and never resolves it on its own. Retirement is bounded to
     `backstop_source`: an unrelated third producer sharing the session and
     effect is never touched, only the one counterpart this caller actually
-    knows the shape of. Returns the created record, or None when create()
-    deduplicated to an existing record from a source other than `by_source`
-    -- an identity collision this generic writer cannot safely resolve
-    (never its own backstop, and not safely claimable as this caller's own
-    rich payload either)."""
+    knows the shape of. Returns the created record, or None when a record
+    with the same (runtime, kind, device) identity already exists from a
+    source other than `by_source` -- an identity collision this generic
+    writer cannot safely resolve (never its own backstop, and not safely
+    claimable as this caller's own rich payload either). That check runs
+    BEFORE `manager.create()`, not after: create()'s own dedup can MUTATE
+    a matching foreign record in place (e.g. an auth-kind record has its
+    guard rewritten regardless of whether the guard itself matches), so
+    detecting the collision only after the fact is too late to avoid
+    touching a record this caller does not own."""
     if manager is None:
         return None
     with manager.store.locked():
-        made = manager.create(build_requirement())
-        if (made.subject or {}).get("source") != by_source:
-            return None
+        req = build_requirement()
+        req_device = str((req.device or {}).get("id") or "")
+        for r in manager.active():
+            if (r.subject or {}).get("source") in (None, by_source) or r.decided_by == "policy":
+                continue  # ours, or auto-answered/in-flight: not a collision candidate
+            if r.runtime == req.runtime and r.kind == req.kind \
+                    and str((r.device or {}).get("id") or "") == req_device:
+                return None
+        made = manager.create(req)
         for r in manager.active():
             if r.id == made.id:
                 continue
