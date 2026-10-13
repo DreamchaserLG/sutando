@@ -9,6 +9,7 @@ Real src/hitl store; no tmux, no subprocess.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -175,12 +176,14 @@ class DuplicateCardArbitration(unittest.TestCase):
                 raise RuntimeError("retirement enumeration failed")
             return real_active(mgr_self)
 
-        with mock.patch.object(HitlManager, "active", counting_active):
+        with self.assertLogs("hitl.session_ownership", level="WARNING") as log, \
+                mock.patch.object(HitlManager, "active", counting_active):
             req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                                "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
         self.assertIsNotNone(req)
         self.assertEqual(req.kind, "permission")
         self.assertEqual(self.manager.get(backstop.id).status, "pending")  # cleanup failed, stayed up
+        self.assertTrue(any("failed to enumerate active records" in m for m in log.output))
 
         # The next identical call (no failure injected) retries retirement
         # and dedupes onto the same rich card.
@@ -189,17 +192,46 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.assertEqual(retried.id, req.id)
         self.assertEqual(self.manager.get(backstop.id).status, "resolved")
 
+    def test_a_poison_backstop_never_starves_a_later_healthy_ones_retirement(self):
+        # One record's resolve() failure must not abort a LATER matching
+        # record's retirement. Records are sorted; force poison to sort first.
+        from hitl.schema import STATUS_RESOLVED
+        a = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard="pool-wedge:a", message="a",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        b = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard="pool-wedge:b", message="b",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        poison_id, good_id = sorted([a.id, b.id])[0], None
+        good_id = b.id if poison_id == a.id else a.id
+        raw = self.manager.store._load_raw(poison_id)
+        raw["requirement"]["status"] = "invalid-status"
+        (self.manager.store.root / f"{poison_id}.json").write_text(json.dumps(raw))
+
+        with self.assertLogs("hitl.session_ownership", level="WARNING"):
+            req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                               "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(self.manager.get(poison_id).status, "invalid-status")
+        self.assertEqual(self.manager.get(good_id).status, STATUS_RESOLVED)
+
     def test_escalate_delegates_arbitration_to_the_shared_supersede(self):
-        # A private inline reimplementation reproduces identical outcomes and
-        # stays undetected above -- only mocking the real call catches it.
+        # A copy used only for GATE or only for LOGIN leaves a single-branch
+        # spy green -- table across both effects to check each independently.
         from unittest import mock
         import hitl.session_ownership as so
-        with mock.patch.object(so, "supersede", wraps=so.supersede) as spy:
-            req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
-                               "permission", "Do you want to proceed?", SESSION)
-        self.assertIsNotNone(req)
-        self.assertTrue(spy.called)
-        self.assertEqual(spy.call_args.kwargs.get("effect"), civ.GATE_EFFECT)
+        rows = (("blocked-human", "permission", "Do you want to proceed?", civ.GATE_EFFECT),
+                ("logged-out", None, None, civ.LOGIN_EFFECT))
+        for state, kind, prompt, effect in rows:
+            with mock.patch.object(so, "supersede", wraps=so.supersede) as spy:
+                req = civ.escalate(self.manager, state, "detail", kind, prompt, SESSION)
+            self.assertIsNotNone(req, state)
+            self.assertTrue(spy.called, state)
+            self.assertEqual(spy.call_args.kwargs.get("effect"), effect, state)
 
     def test_escalate_still_ignores_its_own_prior_card_for_dedup_not_arbitration(self):
         # Its own earlier TUI card must not look like "someone else covers

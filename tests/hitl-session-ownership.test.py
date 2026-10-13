@@ -336,7 +336,7 @@ class Supersede(unittest.TestCase):
         self.assertEqual((made.subject or {}).get("source"), "tui")
         self.assertEqual(self.manager.get(made.id).status, "pending")
         self.assertEqual(self.manager.get(backstop.id).status, "pending")
-        self.assertTrue(any("failed to retire the backstop" in m for m in log.output))
+        self.assertTrue(any("failed to retire backstop" in m for m in log.output))
 
         # 4. a subsequent, unobstructed call retries retirement and dedupes onto the same rich card.
         retried = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",

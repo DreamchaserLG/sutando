@@ -87,6 +87,9 @@ class IdentityTests(unittest.TestCase):
         b = self.mgr.create(auth("second"))
         self.assertEqual(a.id, b.id)
         self.assertEqual(len(self.mgr.active()), 1)
+        # "returned as-is": the second payload is discarded, not merged in.
+        self.assertEqual(self.mgr.get(a.id).message, "first")
+        self.assertEqual(self.mgr.get(a.id).revision, a.revision)
 
     def test_two_equally_empty_guards_do_collapse_non_auth(self):
         req = lambda msg: HumanRequirement(kind="confirmation", runtime="claude", message=msg,
@@ -95,6 +98,8 @@ class IdentityTests(unittest.TestCase):
         b = self.mgr.create(req("second"))
         self.assertEqual(a.id, b.id)
         self.assertEqual(len(self.mgr.active()), 1)
+        self.assertEqual(self.mgr.get(a.id).message, "first")
+        self.assertEqual(self.mgr.get(a.id).revision, a.revision)
 
     def test_identity_is_scoped_to_runtime(self):
         # A Claude request and a Codex request sharing (kind, device, guard)
@@ -119,11 +124,15 @@ class IdentityTests(unittest.TestCase):
         self.assertIsNone(second.decided_by)
 
     def test_create_delegates_identity_matching_to_find_duplicate(self):
-        # An inline restatement of find_duplicate()'s own loop inside create()
-        # reproduces identical behavior -- only mocking the call catches it.
-        with mock.patch.object(HitlManager, "find_duplicate", wraps=self.mgr.find_duplicate) as spy:
-            self.mgr.create(perm("ls", "g"))
-        self.assertTrue(spy.called)
+        # A copy used only for AUTH_KIND (or only non-auth) leaves a single-
+        # branch spy green -- table across both kinds to check each one.
+        auth = lambda: HumanRequirement(kind="auth", runtime="claude", message="m",
+                                        device={"id": "core-1"},
+                                        actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
+        for label, build in (("non-auth", lambda: perm("ls", "g")), ("auth", auth)):
+            with mock.patch.object(HitlManager, "find_duplicate", wraps=self.mgr.find_duplicate) as spy:
+                self.mgr.create(build())
+            self.assertTrue(spy.called, label)
 
     def test_two_sessions_same_guard_stay_two_cards(self):
         a = self.mgr.create(perm("ls", "g", session="core-1"))
