@@ -300,6 +300,7 @@ def load_state(workspace) -> ps.SupervisionState:
                 wedge_escalated=bool(ev.get("wedge_escalated")),
                 wedge_kind=ev.get("wedge_kind"),
                 last_pane_id=ev.get("last_pane_id"),
+                wedge_indeterminate=bool(ev.get("wedge_indeterminate")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -324,7 +325,8 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "wedge_consecutive": e.wedge_consecutive,
                         "wedge_escalated": e.wedge_escalated,
                         "wedge_kind": e.wedge_kind,
-                        "last_pane_id": e.last_pane_id}
+                        "last_pane_id": e.last_pane_id,
+                        "wedge_indeterminate": e.wedge_indeterminate}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")

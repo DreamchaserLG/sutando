@@ -203,6 +203,27 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    def test_a_paused_worker_after_state_loss_holds_a_pending_card(self):
+        # Absence from both wedged AND indeterminate is not confirmed health
+        # when the worker's own evaluation was skipped (paused), not run.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        (wi.worker_dir(self.ws, WID) / sup.PAUSED_MARKER).touch()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_paused_worker_after_state_loss_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        (wi.worker_dir(self.ws, WID) / sup.PAUSED_MARKER).touch()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
     def test_persistent_undecidable_queue_evidence_holds_across_many_ticks(self):
         # Holding must not be a one-tick grace period: as long as the queue
         # evidence stays undecidable, the card stays open, tick after tick.
@@ -229,6 +250,28 @@ class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
         cards = self.active_cards()
         self.assertEqual(len(cards), 1)
         return cards[0]
+
+    def test_a_resumed_tick_never_treats_an_indeterminate_frozen_card_as_clear(self):
+        # A resume tick skips _wedge_rung entirely and just trusts
+        # whatever evidence was loaded.
+        card = self.raise_card_to_sustain()
+        self.pane = None  # unreadable -> indeterminate, saved to disk
+        self.sweep()
+        self.now += 1000.0  # jump past the resume threshold in one step
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_changed_recognized_frame_closes_on_the_first_tick_despite_unknown_queue_evidence(self):
+        # The stored frame compares against a readable current one even
+        # while other evidence (queue state) stays undecidable.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).unlink()
+        self.pane = FROZEN2
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [card.id])
+        self.assertEqual(self.active_cards(), [])
 
     def test_an_unreadable_capture_between_two_identical_frozen_frames_holds_the_card(self):
         # The gap must not erase the frame identity "stuck" relies on, or the

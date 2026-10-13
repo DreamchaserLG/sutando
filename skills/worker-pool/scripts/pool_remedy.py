@@ -481,15 +481,21 @@ def _sweep(a) -> int:
         acted["supervisors"] = ensure_supervisors(a.workspace, a.repo, tick["observations"])
         acted["input_watches"] = ensure_input_watches(a.workspace, a.repo, tick["observations"])
         acted["escapes"] = wc.drive_escapes(a.workspace)
-        # A worker this tick's evidence couldn't confirm either way is never
-        # positive clearance, however the (possibly lost/fresh) ladder reads.
+        # Absence from wedged/indeterminate is not evidence when a resumed or
+        # paused tick skipped the worker's own evaluation entirely.
+        checked = {w for w, o in tick["observations"].items()
+                  if not tick.get("resumed") and not o.get("paused")
+                  and (o.get("beat") == ps.LIVE or o.get("session_alive") is True)}
         indeterminate = set(tick.get("wedge_indeterminate", []))
         clear = {w for w, o in tick["observations"].items()
-                 if o.get("session_alive") is True and w not in tick.get("wedged", [])
-                 and w not in indeterminate}
+                 if w in checked and o.get("session_alive") is True
+                 and w not in tick.get("wedged", []) and w not in indeterminate}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
+        # A readable, recognized frame compares directly even when other
+        # evidence was lost. Paused is excluded: the owner's pause outranks it.
         frames = {w: o.get("pane_id") for w, o in tick["observations"].items()
-                 if w not in indeterminate and o.get("session_alive") is True}
+                 if not o.get("paused") and o.get("session_alive") is True
+                 and o.get("pane") not in (None, ps.PANE_UNKNOWN)}
         acted["cards_closed"] = wc.resolve_cleared(a.workspace, clear, wedges=now_asks, frames=frames)
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))

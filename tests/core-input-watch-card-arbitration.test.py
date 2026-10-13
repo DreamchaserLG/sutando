@@ -48,6 +48,19 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0].subject["source"], "pool-wedge")
 
+    def test_escalate_defers_to_a_legacy_effectless_pool_wedge_gate_card(self):
+        # A legacy pool-wedge card, no "effect" field, recognized by its
+        # own established shape (wedge=card_human) instead.
+        self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool-wedge card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human"}))
+        req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                           "permission", "Do you want to proceed?", SESSION)
+        self.assertIsNone(req)
+        cards = [r for r in self.manager.active() if (r.subject or {}).get("session") == SESSION]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].subject["source"], "pool-wedge")
+
     def test_escalate_still_cards_when_nothing_else_covers_this_session(self):
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?", SESSION)
@@ -61,8 +74,7 @@ class DuplicateCardArbitration(unittest.TestCase):
         # concerns; sharing a session must not let one hide the other.
         self.manager.create(HumanRequirement(
             kind="confirmation", runtime="claude", message="pool-wedge frozen card",
-            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_frozen",
-                     "effect": "turn-frozen"}))
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_frozen"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?", SESSION)
         self.assertIsNotNone(req)

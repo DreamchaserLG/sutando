@@ -666,9 +666,9 @@ def _name_seat(req, session, seat):
     return req
 
 
-# Shared ownership tag with pool_wedge_cards.py's CARD_HUMAN; only
-# "blocked-human" gets it — "logged-out" is CARD_LOGIN's separate concern.
+# Shared ownership tags with pool_wedge_cards.py's CARD_HUMAN and CARD_LOGIN.
 GATE_EFFECT = "gate"
+LOGIN_EFFECT = "login"
 
 
 def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0, runtime=None):
@@ -685,7 +685,8 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     """
     if manager is None:
         return None
-    effect = GATE_EFFECT if state == "blocked-human" else None
+    effect = (GATE_EFFECT if state == "blocked-human" else
+              LOGIN_EFFECT if state == "logged-out" else None)
     try:
         from hitl import tui_gate
         from hitl.session_ownership import claim_session
@@ -698,8 +699,13 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
             req = _name_seat(req, session, seat)
         if effect:
             req.subject = {**(req.subject or {}), "effect": effect}
+        # Legacy pool-wedge shape for this same effect, pre-dating its own
+        # effect tag (card_human/card_login are its literal wedge kinds).
+        legacy_wedge = {"blocked-human": "card_human", "logged-out": "card_login"}.get(state)
+        legacy_match = ((lambda subj: subj.get("wedge") == legacy_wedge)
+                       if legacy_wedge else None)
         return claim_session(manager, session, by_source=_TUI_SOURCE, effect=effect,
-                             build_requirement=lambda: req)
+                             build_requirement=lambda: req, legacy_match=legacy_match)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)
         return None

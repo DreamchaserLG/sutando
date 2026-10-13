@@ -103,9 +103,10 @@ def proxy_routed(socket, session) -> bool | None:
     return qa.points_at_credential_proxy(env.base_url) if env.observed else None
 
 
-# Shared ownership tag for the gate/limit situation core-input-watch can also
-# card — scopes arbitration so a FROZEN/CAUSE card never suppresses it.
+# Shared ownership tags for the situations core-input-watch can also card —
+# scope arbitration so an unrelated FROZEN/CAUSE card never suppresses them.
 GATE_EFFECT = "gate"
+LOGIN_EFFECT = "login"
 
 
 def _jump(session):
@@ -165,7 +166,8 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
 
         from hitl.session_ownership import claim_session
         made = claim_session(manager, session, by_source=SOURCE, effect=GATE_EFFECT,
-                             build_requirement=_build_human_card)
+                             build_requirement=_build_human_card,
+                             legacy_match=lambda subj: subj.get("supervisor_state") == "blocked-human")
         if made is None:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
                     "owner": "input-watch"}
@@ -194,13 +196,28 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             body += ["The worker's session is not restarted: a fresh session meets the same cause."]
         subject.update(cause=list(abn.names), cause_lines=lines,
                        remedy=PROXY_REMEDY if via_proxy else None)
+        if which == ps.CARD_LOGIN:
+            subject["effect"] = LOGIN_EFFECT
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]
                    if via_proxy else []) + [_jump(session)]
-        req = HumanRequirement(
-            kind="choice" if via_proxy else "core-blocked", runtime=runtime, device=device,
-            subject=subject, title=f"{seat} · {abn.kind}: {cause}", message="\n".join(body),
-            guard=f"{SOURCE}:{session}:cause:{cause}", actions=actions,
-            turn_on_action=via_proxy)
+
+        def _build_cause_card():
+            return HumanRequirement(
+                kind="choice" if via_proxy else "core-blocked", runtime=runtime, device=device,
+                subject=subject, title=f"{seat} · {abn.kind}: {cause}", message="\n".join(body),
+                guard=f"{SOURCE}:{session}:cause:{cause}", actions=actions,
+                turn_on_action=via_proxy)
+
+        if which == ps.CARD_LOGIN:
+            from hitl.session_ownership import claim_session
+            made = claim_session(manager, session, by_source=SOURCE, effect=LOGIN_EFFECT,
+                                 build_requirement=_build_cause_card,
+                                 legacy_match=lambda subj: subj.get("supervisor_state") == "logged-out")
+            if made is None:
+                return {"worker_id": worker_id, "outcome": "cleared", "pane": pane,
+                        "owner": "input-watch"}
+            return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
+        req = _build_cause_card()
     made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
 

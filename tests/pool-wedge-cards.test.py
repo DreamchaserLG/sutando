@@ -294,6 +294,20 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(out["owner"], "input-watch")
         self.assertEqual(t.acted(), [])
 
+    def test_a_legacy_effectless_input_watch_gate_card_is_not_duplicated(self):
+        # A legacy TUI gate card, no "effect" field, recognized by its
+        # own established shape (supervisor_state) instead.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="blocked",
+                                  subject={"source": "tui", "session": NAME,
+                                           "supervisor_state": "blocked-human"}))
+        t = Tmux(USAGE_LIMIT_MENU)
+        out = wc.raise_card(self.ws, WID, HUMAN, runner=t, manager=m)
+        self.assertEqual(out["outcome"], "cleared")
+        self.assertEqual(out["owner"], "input-watch")
+        self.assertEqual(t.acted(), [])
+
     def test_a_resolved_input_watch_card_does_not_suppress(self):
         # A resolved/expired card must not read as active.
         from hitl.schema import HumanRequirement
@@ -330,7 +344,7 @@ class HumanCard(unittest.TestCase):
         m = manager(self.ws)
         m.create(HumanRequirement(kind="confirmation", runtime="claude", message="frozen",
                                   subject={"source": "pool-wedge", "session": NAME,
-                                           "wedge": CAUSE, "effect": "turn-frozen"}))
+                                           "wedge": CAUSE}))
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
 

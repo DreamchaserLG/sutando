@@ -206,6 +206,15 @@ class TheLadderSurvivesBetweenTicks(Base):
         sup.save_state(self.ws, st)
         self.assertEqual(sup.load_state(self.ws), st)
 
+    def test_wedge_indeterminate_round_trips(self):
+        # A missing round trip here would silently reset an in-flight
+        # indeterminate hold to False on the very next process restart.
+        st = ps.SupervisionState(last_sample_at=5.0, workers={
+            "w": ps.WorkerEvidence(wedge_indeterminate=True, last_pane_id="f1")})
+        sup.save_state(self.ws, st)
+        self.assertEqual(sup.load_state(self.ws), st)
+        self.assertTrue(sup.load_state(self.ws).workers["w"].wedge_indeterminate)
+
     def test_a_missing_corrupt_or_wrong_shaped_file_is_a_fresh_ladder(self):
         self.assertEqual(sup.load_state(self.ws), ps.SupervisionState())
         sup.state_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
