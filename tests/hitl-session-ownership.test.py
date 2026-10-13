@@ -320,7 +320,10 @@ class Supersede(unittest.TestCase):
             kind="core-blocked", runtime="claude", message="pool card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
+        # A stable guard/device matching the real TUI path, so the retry
+        # dedupes on a deliberate guard match, not a double-empty collapse.
         build = lambda: HumanRequirement(kind="permission", runtime="claude", message="tui card",
+                                         guard=f"tui:{SESSION}:gate:deadbeef", device={"id": SESSION, "name": SESSION},
                                          subject={"source": "tui", "session": SESSION, "effect": "gate"})
         with self.assertLogs("hitl.session_ownership", level="WARNING") as log, \
                 mock.patch.object(HitlManager, "resolve", side_effect=OSError("disk full")):
@@ -333,7 +336,7 @@ class Supersede(unittest.TestCase):
         self.assertEqual((made.subject or {}).get("source"), "tui")
         self.assertEqual(self.manager.get(made.id).status, "pending")
         self.assertEqual(self.manager.get(backstop.id).status, "pending")
-        self.assertTrue(any("failed to retire backstop" in m for m in log.output))
+        self.assertTrue(any("failed to retire the backstop" in m for m in log.output))
 
         # 4. a subsequent, unobstructed call retries retirement and dedupes onto the same rich card.
         retried = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",

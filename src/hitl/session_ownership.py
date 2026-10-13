@@ -109,13 +109,14 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
     Once `made` exists, it is this call's one indispensable result: a caller
     (e.g. `core-input-watch.py`'s `escalate()`) that cannot answer its own
     dialog without it. Retiring the backstop is a best-effort cleanup on top,
-    so a retirement failure is caught and logged per-record rather than
-    raised -- an exception here must never read, to the one broad except a
+    so the ENTIRE cleanup phase -- enumerating active records, matching, and
+    resolving -- is caught and logged as one unit rather than raised -- an
+    exception anywhere in it must never read, to the one broad except a
     caller wraps this in, as "nothing happened" when a real card was in fact
-    already created and persisted. The worst case on a retirement failure is
+    already created and persisted. The worst case on a cleanup failure is
     a stale backstop that outlives this call, still visible and still
-    resolvable on its own schedule -- not a card the caller never learns it
-    has."""
+    resolvable on the next identical call -- not a card the caller never
+    learns it has."""
     if manager is None:
         return None
     with manager.store.locked():
@@ -124,15 +125,15 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
         if dup is not None and (dup.subject or {}).get("source") != by_source:
             return None
         made = manager.create(req)
-        for r in manager.active():
-            if r.id == made.id:
-                continue
-            subj = r.subject or {}
-            if (subj.get("session") == session and subj.get("source") == backstop_source
-                    and _effect_matches(subj, effect, legacy_match)):
-                try:
+        try:
+            for r in manager.active():
+                if r.id == made.id:
+                    continue
+                subj = r.subject or {}
+                if (subj.get("session") == session and subj.get("source") == backstop_source
+                        and _effect_matches(subj, effect, legacy_match)):
                     manager.resolve(r.id)
-                except Exception:  # noqa: BLE001 -- made is already live; see docstring
-                    _LOG.warning("hitl: failed to retire backstop %s for session %s",
-                                r.id, session, exc_info=True)
+        except Exception:  # noqa: BLE001 -- made is already live; see docstring
+            _LOG.warning("hitl: failed to retire the backstop for session %s", session,
+                        exc_info=True)
         return made

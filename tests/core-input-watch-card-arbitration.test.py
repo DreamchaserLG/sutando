@@ -156,6 +156,39 @@ class DuplicateCardArbitration(unittest.TestCase):
                 self.assertIsNotNone(req)
             self.assertFalse(spy.called)
 
+    def test_an_enumeration_failure_during_retirement_still_returns_the_rich_card(self):
+        # manager.active() raising on the retirement enumeration (the 3rd
+        # call) must not surface as "nothing happened" while a card is live.
+        from unittest import mock
+        from hitl.manager import HitlManager
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:human:deadbeef", message="pool-wedge card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        real_active = HitlManager.active
+        calls = {"n": 0}
+
+        def counting_active(mgr_self):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise RuntimeError("retirement enumeration failed")
+            return real_active(mgr_self)
+
+        with mock.patch.object(HitlManager, "active", counting_active):
+            req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                               "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "permission")
+        self.assertEqual(self.manager.get(backstop.id).status, "pending")  # cleanup failed, stayed up
+
+        # The next identical call (no failure injected) retries retirement
+        # and dedupes onto the same rich card.
+        retried = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                               "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
+        self.assertEqual(retried.id, req.id)
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+
     def test_escalate_delegates_arbitration_to_the_shared_supersede(self):
         # A private inline reimplementation reproduces identical outcomes and
         # stays undetected above -- only mocking the real call catches it.

@@ -311,6 +311,8 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    # Characterization coverage, not a checked/indeterminate pin: state loss
+    # here leaves no stale kind to compare; wedge_consecutive alone protects these.
     def test_missing_state_on_an_ordinary_tick_holds_a_pending_card(self):
         # Ordinary tick, state vanished entirely (not via pause/resume) -- the
         # unchanged pane's own fresh first-tick evidence keeps the card alive.

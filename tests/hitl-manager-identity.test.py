@@ -68,15 +68,33 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(a.id, b.id)
         self.assertEqual((self.mgr.get(a.id).guard, self.mgr.get(a.id).revision), ("probe:2", 2))
 
-    def test_auth_with_an_empty_incoming_guard_never_collapses(self):
-        # An unguarded auth request is a distinct, un-keyed interaction --
-        # it must not refresh (and so silently clear) an existing one's guard.
+    def test_auth_never_overwrites_a_real_guard_with_an_empty_incoming_one(self):
+        # An unguarded request must not refresh a DIFFERING real guard --
+        # about overwriting, not whether an empty guard can match at all.
         auth = lambda g: HumanRequirement(kind="auth", runtime="claude", message="Claude Code needs to sign in again",
                                           guard=g, device={"id": "core-1"}, actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
         a = self.mgr.create(auth("probe:1"))
         b = self.mgr.create(auth(""))
         self.assertNotEqual(a.id, b.id)
         self.assertEqual(self.mgr.get(a.id).guard, "probe:1")  # untouched by b
+
+    def test_two_equally_empty_guards_do_collapse_auth(self):
+        # The empty default IS a guard value like any other: EQUAL guards
+        # always collapse, auth included -- ordinary identity reuse, not overwriting.
+        auth = lambda msg: HumanRequirement(kind="auth", runtime="claude", message=msg,
+                                            device={"id": "core-1"}, actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
+        a = self.mgr.create(auth("first"))
+        b = self.mgr.create(auth("second"))
+        self.assertEqual(a.id, b.id)
+        self.assertEqual(len(self.mgr.active()), 1)
+
+    def test_two_equally_empty_guards_do_collapse_non_auth(self):
+        req = lambda msg: HumanRequirement(kind="confirmation", runtime="claude", message=msg,
+                                           device={"id": "core-1"}, actions=[])
+        a = self.mgr.create(req("first"))
+        b = self.mgr.create(req("second"))
+        self.assertEqual(a.id, b.id)
+        self.assertEqual(len(self.mgr.active()), 1)
 
     def test_identity_is_scoped_to_runtime(self):
         # A Claude request and a Codex request sharing (kind, device, guard)
