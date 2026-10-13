@@ -287,6 +287,27 @@ class HumanCard(unittest.TestCase):
         self.assertEqual(out["owner"], "input-watch")
         self.assertEqual(t.acted(), [])
 
+    def test_a_pressed_card_still_closes_once_the_seat_clears(self):
+        # keweichen (#5463 review): clicking the only action, open_terminal, must
+        # not leave the card stuck in_progress forever (#5465, shared by cause/login).
+        m = manager(self.ws)
+        _, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        press(self.ws, req, "open_terminal")
+        self.assertEqual(manager(self.ws).get(req.id).status, "in_progress")
+        self.assertEqual(wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws)), [req.id])
+
+    def test_a_pressed_cards_closed_episode_gets_a_fresh_card_on_recurrence(self):
+        # The consequence Kewei named: without the fix above, an identical
+        # recurrence deduplicates onto the stale pressed card and nobody is told.
+        m = manager(self.ws)
+        _, _, first = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        press(self.ws, first, "open_terminal")
+        wc.resolve_cleared(self.ws, {WID}, manager=manager(self.ws))
+        out, _, second = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "carded")
+        self.assertNotEqual(second.id, first.id)
+        self.assertEqual(manager(self.ws).get(second.id).status, "pending")
+
 
 class LoginCard(unittest.TestCase):
     def setUp(self):

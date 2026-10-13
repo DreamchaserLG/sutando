@@ -250,8 +250,15 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
 def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
-    that card, None for a gate or limit); a pressed one is left to `drive_escapes`,
-    which refuses it once the frame has moved."""
+    that card, None for a gate or limit).
+
+    A press is left alone only while it has a further step owed: `send_escape`
+    waits on `drive_escapes`, which refuses it once the frame has moved. A press
+    of `open_terminal` owes nothing more — it is the whole action — so it is
+    closed the same as an unpressed card once the seat is stale; otherwise an
+    owner who jumped to the terminal once leaves that card stuck forever, and a
+    later identical wedge dedups onto it instead of raising a fresh one (#5465).
+    """
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
@@ -264,7 +271,8 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None) -> list
                         and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
         stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w]
                                    and not legacy_login)
-        if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
+        pressed_done = r.status == STATUS_IN_PROGRESS and r.chosen_action == "open_terminal"
+        if subj.get("source") == SOURCE and stale and (r.status != STATUS_IN_PROGRESS or pressed_done):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed
