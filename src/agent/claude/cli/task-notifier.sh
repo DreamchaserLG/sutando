@@ -1004,7 +1004,9 @@ fi
 # One-shot, run by the supervisor once it stood this standby down (0 cleared or nothing to do).
 if [ "${1:-}" = "--clear-staged" ]; then
   STANDBY_LOGGED=1
-  rows="$(staged_rows_needed)"
+  # No grow for an empty composer; restore_window also runs from the EXIT trap (signals, set -e).
+  rows=""
+  [ -z "$(composer_text "$(capture_raw)")" ] || rows="$(staged_rows_needed)"
   [ -z "$rows" ] || grow_window "$rows" \
     || log_notifier "stand-down: could not grow the window; a staged prompt taller than the box reads as partial"
   rc=0

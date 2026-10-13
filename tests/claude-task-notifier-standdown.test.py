@@ -281,6 +281,41 @@ class WrappedStandDownTests(StandDownFixtures):
         self.assertEqual(len(resizes), 2, "the window was not grown and put back")
         self.assertEqual(self.window_rows.read_text().strip(), "29", "the window was left grown")
 
+    def test_an_empty_composer_never_grows_the_window(self):
+        self.stage_wrapped("task-gone.txt")
+        self.pane_file.write_text(IDLE_FOOTER + "\n")
+        self.session_watcher()
+        self.resize_log.write_text("")
+        res = self.clear()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("RESIZE", self.resize_log.read_text(), "the window was grown for an empty composer")
+
+    def test_a_signal_mid_clear_puts_the_window_back(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=sig.name):
+                name = f"task-sig-{sig.name}.txt"
+                self.sendkeys_log.write_text("")
+                self.pane_file.write_text(IDLE_FOOTER + "\n")
+                self.stage_wrapped(name)
+                self.session_watcher()
+                self.write_result(name)
+                self.resize_log.write_text("")
+                # The round changes nothing and the verify waits long: the clear is in flight at the signal.
+                (self.root / "clear-ignored.flag").write_text("1")
+                proc = subprocess.Popen(["/bin/bash", str(NOTIFIER), "--clear-staged"],
+                                        env=self._env({"SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT": "600"}),
+                                        cwd=str(self.root), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                deadline = time.time() + 20
+                while time.time() < deadline and "CLEAR" not in self.sendkeys_log_text():
+                    time.sleep(0.1)
+                self.assertIn("CLEAR", self.sendkeys_log_text(), "the clear never started")
+                self.assertNotEqual(self.window_rows.read_text().strip(), "29", "the window was not grown")
+                proc.send_signal(sig)
+                proc.communicate(timeout=15)
+                self.assertEqual(self.window_rows.read_text().strip(), "29", f"{sig.name} left the window grown")
+                self.assertIn("WINOPT", self.resize_log.read_text(), "the window-size option was not put back")
+                (self.root / "clear-ignored.flag").unlink()
+
     def test_owner_text_appended_mid_clear_stops_the_clear(self):
         self.stage_wrapped("task-race.txt")
         self.session_watcher()
