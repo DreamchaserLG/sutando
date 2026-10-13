@@ -6,11 +6,10 @@ executable `gh` on a PATH dir that logs its argv and delegates to `answer`.
 """
 import base64
 import json
-import sys
 import urllib.parse
 from pathlib import Path
 
-GH = """#!{python}
+GH = """#!/usr/bin/env python3
 import json, sys
 sys.path.insert(0, {here!r})
 from review_pr_fixture import answer
@@ -51,7 +50,7 @@ def install(bindir: Path, spec: dict) -> Path:
     spec_path.write_text(json.dumps(spec))
     log = bindir / "gh-argv.log"
     gh = bindir / "gh"
-    gh.write_text(GH.format(python=sys.executable, here=str(Path(__file__).parent),
+    gh.write_text(GH.format(here=str(Path(__file__).parent),
                             log=str(log), spec=str(spec_path)))
     gh.chmod(0o755)
     return log

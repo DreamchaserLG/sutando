@@ -31,6 +31,7 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 
 from policy import sandbox_runner as sr  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 DIFF_NAME = "PR.diff"
 MAX_FILES = 300
@@ -117,12 +118,14 @@ def populate(root: Path, pr: str, repo: str, diff: str, gh: Gh = _gh) -> list:
     return written
 
 
-def review_dir() -> Path:
-    """A fresh private temp dir, refused if it lands inside the repo."""
+def review_dir(workspace: Optional[Path] = None) -> Path:
+    """A fresh private temp dir, refused if it lands inside the repo or the workspace."""
     d = Path(tempfile.mkdtemp(prefix="sutando-review-")).resolve()
-    if d == REPO or REPO in d.parents:
-        shutil.rmtree(d, ignore_errors=True)
-        raise RuntimeError("review dir would sit inside the repo")
+    ws = (workspace or resolve_workspace(migrate=False)).resolve()
+    for name, root in (("repo", REPO), ("workspace", ws)):
+        if d == root or root in d.parents:
+            shutil.rmtree(d, ignore_errors=True)
+            raise RuntimeError(f"review dir would sit inside the {name}")
     return d
 
 

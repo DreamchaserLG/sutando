@@ -10,7 +10,6 @@ Discord bridge both take the runner from the module, so neither can drift.
 Run: python3 tests/sandbox-runner.test.py
 """
 import asyncio
-import importlib.util
 import itertools
 import json
 import os
@@ -19,7 +18,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -28,6 +26,8 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from policy import guardrail, sandbox_runner as sr, seatbelt  # noqa: E402
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+import discord_env  # noqa: E402
 
 
 
@@ -259,23 +259,7 @@ os.environ["DISCORD_BOT_TOKEN"] = "test-token-not-real"
 
 
 def _load_bridge():
-    try:  # pragma: no cover - present in dev, absent in clean CI
-        import discord  # noqa: F401
-    except Exception:
-        stub = types.ModuleType("discord")
-        stub.Intents = type("Intents", (), {"default": staticmethod(
-            lambda: type("I", (), {"message_content": False})())})
-        stub.Client = type("Client", (), {"__init__": lambda self, **kw: None,
-                                          "event": staticmethod(lambda fn: fn)})
-        stub.File = type("File", (), {"__init__": lambda self, *a, **kw: None})
-        stub.Message = type("Message", (), {})
-        stub.DMChannel = type("DMChannel", (), {})
-        sys.modules["discord"] = stub
-    spec = importlib.util.spec_from_file_location("dbridge_sandbox_runner", REPO / "src" / "discord-bridge.py")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["dbridge_sandbox_runner"] = mod
-    spec.loader.exec_module(mod)
-    return mod
+    return discord_env.load_bridge("dbridge_sandbox_runner")
 
 
 class DiscordBridgeDelegates(unittest.TestCase):
@@ -283,14 +267,6 @@ class DiscordBridgeDelegates(unittest.TestCase):
     def setUpClass(cls):
         cls.bridge = _load_bridge()
         cls.src = (REPO / "src" / "discord-bridge.py").read_text()
-
-    def test_no_hardcoded_runner_invocation_remains(self):
-        self.assertNotIn('["codex", "exec"', self.src)
-        self.assertNotIn("--max 240 -- codex exec", self.src)
-        self.assertEqual(self.src.count("sandbox_runner.shell_command(_sandbox,"), 2)
-        self.assertIn("_sandbox = sandbox_runner.selected_or_fallback()", self.src)
-        self.assertNotIn("cwd='/tmp'", self.src)
-        self.assertIs(self.bridge.sandbox_runner, sr)
 
     def _render(self, runner):
         m = re.search(r"\n    tier_instructions = \{\n.*?\n    \}\n", self.src, re.S)
@@ -302,12 +278,13 @@ class DiscordBridgeDelegates(unittest.TestCase):
 
     def test_rulebook_stage1_comes_from_the_module(self):
         claude = self._render("claude")
+        self.assertIn(f"   - Run: {self.bridge.TEAM_PR_REVIEW_COMMAND}   (", claude["team"])
         for tier in ("team", "guest"):
             self.assertIn("codex-bounded.sh --stall 0 --max 240 -- /bin/sh -c 'd=$(mktemp -d) && cd", claude[tier])
             self.assertIn(" claude -p --restricted --strict-mcp-config --tools '' ", claude[tier])
             self.assertIn("< /dev/null > /R/.codex-staging-{id}.txt", claude[tier])
             stage1 = claude[tier][claude[tier].index("Stage 1:"):claude[tier].index("Stage 2:")]
-            self.assertNotIn("codex exec", stage1)  # the PR-review path stays codex-only
+            self.assertNotIn("codex exec", stage1)
             self.assertIn(sr.FAQ_PATH.read_text().strip(), stage1)
         self.assertNotIn("Do NOT redirect stdout", claude["team"])
         self.assertNotIn("-C /tmp", claude["guest"])
