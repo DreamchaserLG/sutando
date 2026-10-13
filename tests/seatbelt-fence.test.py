@@ -38,8 +38,14 @@ def _dirs(test):
 class ProfileShape(unittest.TestCase):
     def setUp(self):
         self.root = _dirs(self)
+        # Linux layout (bin -> usr/bin): the profile must name the resolved binary.
+        (self.root / "usr" / "bin").mkdir(parents=True)
+        shutil.copy("/bin/cat", self.root / "usr" / "bin" / "cat")
+        (self.root / "bin").symlink_to(self.root / "usr" / "bin")
+        self.tool = self.root / "bin" / "cat"
+        self.cat = str(self.root / "usr" / "bin" / "cat")
         self.text = seatbelt.profile(cwd=self.root / "work", scratch=self.root / "scratch",
-                                     tool_binary="/bin/cat", tool_read=[self.root / "tool"])
+                                     tool_binary=str(self.tool), tool_read=[self.root / "tool"])
 
     def test_denies_by_default_and_opens_only_the_run_dirs_to_all(self):
         self.assertIn("(deny default)", self.text)
@@ -55,17 +61,17 @@ class ProfileShape(unittest.TestCase):
     def test_tool_only_rules_are_gated_on_its_path(self):
         for line in self.text.splitlines():
             if str(self.root / "tool") in line and "file-read-metadata" not in line:
-                self.assertIn('(process-path "/bin/cat")', line)
+                self.assertIn(f'(process-path "{self.cat}")', line)
 
     def test_no_child_exec_when_disabled(self):
         text = seatbelt.profile(cwd=self.root / "work", scratch=self.root / "scratch",
-                                tool_binary="/bin/cat", exec_children=False, loopback=True)
+                                tool_binary=str(self.tool), exec_children=False, loopback=True)
         execs = [l for l in text.splitlines() if "process-exec" in l]
         self.assertEqual(len(execs), 1)
         self.assertIn(f'(process-path "{seatbelt.SANDBOX_EXEC}")', execs[0])
         for l in text.splitlines():
             if "localhost" in l and l.startswith("(allow"):
-                self.assertIn('(process-path "/bin/cat")', l)
+                self.assertIn(f'(process-path "{self.cat}")', l)
                 self.assertNotIn("network-outbound", l)
         self.assertIn('(deny network-outbound (remote ip "localhost:*"))', text)
 
