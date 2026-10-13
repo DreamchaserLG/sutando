@@ -224,6 +224,18 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
 
+    def test_a_resumed_tick_with_only_one_workers_record_corrupted_holds_its_card(self):
+        # Isolates "resumed": alive, not paused, its OWN record corrupted
+        # while last_sample_at stays valid -- a genuine resume, not full loss.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID] = "corrupted-not-a-dict"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        self.now += 1000.0
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
     def test_persistent_undecidable_queue_evidence_holds_across_many_ticks(self):
         # Holding must not be a one-tick grace period: as long as the queue
         # evidence stays undecidable, the card stays open, tick after tick.
@@ -267,6 +279,28 @@ class UnreadablePaneHoldsTheFrozenFrameIdentity(UnreadablePaneHoldsTheWedge):
         # while other evidence (queue state) stays undecidable.
         card = self.raise_card_to_sustain()
         sup.state_path(self.ws).unlink()
+        self.pane = FROZEN2
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [card.id])
+        self.assertEqual(self.active_cards(), [])
+
+    def test_a_changed_recognized_frame_closes_a_pressed_card_on_the_first_tick(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        sup.state_path(self.ws).unlink()
+        self.pane = FROZEN2
+        self.force_work_outstanding = None
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [card.id])
+        self.assertEqual(self.active_cards(), [])
+
+    def test_a_changed_recognized_frame_closes_on_the_first_tick_after_corrupt_json_state(self):
+        # Corrupt JSON (not merely missing), same load_state fallback path.
+        card = self.raise_card_to_sustain()
+        sup.state_path(self.ws).write_text("{not valid json!!")
         self.pane = FROZEN2
         self.force_work_outstanding = None
         result = self.sweep()

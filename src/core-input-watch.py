@@ -699,6 +699,10 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
             req = _name_seat(req, session, seat)
         if effect:
             req.subject = {**(req.subject or {}), "effect": effect}
+        if state == "logged-out":
+            # The one-click sign-in card always wins over a plain terminal
+            # jump; Manager dedup still collapses repeat ticks into one card.
+            return manager.create(req)
         # Legacy pool-wedge shape for this same effect, pre-dating its own
         # effect tag (card_human/card_login are its literal wedge kinds).
         legacy_wedge = {"blocked-human": "card_human", "logged-out": "card_login"}.get(state)

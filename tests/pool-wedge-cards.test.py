@@ -343,8 +343,8 @@ class HumanCard(unittest.TestCase):
         from hitl.schema import HumanRequirement
         m = manager(self.ws)
         m.create(HumanRequirement(kind="confirmation", runtime="claude", message="frozen",
-                                  subject={"source": "pool-wedge", "session": NAME,
-                                           "wedge": CAUSE}))
+                                  subject={"source": "tui", "session": NAME,
+                                           "wedge": CAUSE, "effect": "turn-frozen"}))
         out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
         self.assertEqual(out["outcome"], "carded")
 
@@ -431,6 +431,30 @@ class LoginCard(unittest.TestCase):
                 press(self.ws, req, "open_terminal")
                 closed = wc.resolve_cleared(self.ws, set(), manager=m, wedges={WID: new_kind})
                 self.assertEqual(closed, [req.id], new_kind)
+
+
+class ClaimSessionDelegation(unittest.TestCase):
+    """CARD_HUMAN and CARD_LOGIN must genuinely call the shared
+    claim_session(), not a parallel reimplementation -- pinned by mocking
+    the shared function and asserting it was actually invoked."""
+    def setUp(self):
+        self.ws = pool()
+
+    def test_card_human_calls_the_shared_claim_session(self):
+        from unittest import mock
+        import hitl.session_ownership as so
+        with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
+            card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+            self.assertTrue(spy.called)
+            self.assertEqual(spy.call_args.kwargs.get("effect"), wc.GATE_EFFECT)
+
+    def test_card_login_calls_the_shared_claim_session(self):
+        from unittest import mock
+        import hitl.session_ownership as so
+        with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
+            card(self.ws, LOGIN, PANES["logged-out"])
+            self.assertTrue(spy.called)
+            self.assertEqual(spy.call_args.kwargs.get("effect"), wc.LOGIN_EFFECT)
 
 
 # Every card kind that offers open_terminal, proving the shared path: press it,

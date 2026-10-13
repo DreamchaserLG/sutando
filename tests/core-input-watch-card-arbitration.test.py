@@ -61,6 +61,22 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0].subject["source"], "pool-wedge")
 
+    def test_escalate_logged_out_always_wins_over_an_active_pool_login_card(self):
+        # The richer one-click auth card must never be suppressed by the
+        # weaker plain-jump card, whichever one existed first.
+        self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool login card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_login",
+                     "effect": "login"}))
+        req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "auth")
+
+    def test_escalate_logged_out_created_first_is_unaffected_by_arrival_order(self):
+        req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "auth")
+
     def test_escalate_still_cards_when_nothing_else_covers_this_session(self):
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?", SESSION)
@@ -95,6 +111,27 @@ class DuplicateCardArbitration(unittest.TestCase):
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?", SESSION)
         self.assertIsNotNone(req)
+
+    def test_escalate_blocked_human_calls_the_shared_claim_session(self):
+        # Must genuinely delegate, not reimplement the ownership check.
+        from unittest import mock
+        import hitl.session_ownership as so
+        with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
+            civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
+                        "permission", "Do you want to proceed?", SESSION)
+            self.assertTrue(spy.called)
+            self.assertEqual(spy.call_args.kwargs.get("effect"), civ.GATE_EFFECT)
+
+    def test_escalate_logged_out_bypasses_claim_session_entirely(self):
+        # The auth card always wins (see its own test above), by construction
+        # never going through the ownership-check gate at all.
+        from unittest import mock
+        import hitl.session_ownership as so
+        with mock.patch.object(so, "claim_session", wraps=so.claim_session) as spy:
+            req = civ.escalate(self.manager, "logged-out", "core not authenticated",
+                               None, None, SESSION)
+            self.assertIsNotNone(req)
+            self.assertFalse(spy.called)
 
     def test_escalate_still_ignores_its_own_prior_card_for_dedup_not_arbitration(self):
         # Its own earlier TUI card must not look like "someone else covers
