@@ -22,7 +22,6 @@ import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
-from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -137,8 +136,9 @@ class OrderConfig(unittest.TestCase):
 
 
 class Invocations(unittest.TestCase):
-    def test_a_runner_with_no_safe_flags_has_no_invocation(self):
-        with sr.empty_dir() as d, self.assertRaises(ValueError):
+    def test_a_runner_with_no_safe_flags_and_no_fence_has_no_invocation(self):
+        with mock.patch.object(seatbelt, "available", return_value=False), \
+                sr.empty_dir() as d, self.assertRaises(ValueError):
             sr.invocation(sr.RUNNERS["agy"], "/b/agy", "PROMPT", cwd=d)
 
     def test_claude_argv_has_no_tools_and_no_mcp(self):
