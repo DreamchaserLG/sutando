@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -997,6 +997,7 @@ async function main() {
 	});
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
+		captureOrigin: captureWorkOrigin,
 		store: voiceTaskStore,
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
@@ -1076,7 +1077,7 @@ async function main() {
 			callEnd.clientDisconnected();
 			// An origin belongs to the client that announced it; the next client announces its own.
 			if (getVoiceSessionOrigin()) console.log(`${ts()} [SessionOrigin] client gone — origin released`);
-			setVoiceSessionOrigin(null);
+			endVoiceClientSession();
 			clientFrames.disconnected();
 		},
 		// P7 Tranche B: feed the ledger the two provider facts it cannot infer —
