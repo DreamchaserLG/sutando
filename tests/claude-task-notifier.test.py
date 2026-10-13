@@ -390,6 +390,10 @@ case "$cmd" in
           append_owner_row "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
         fi
       fi
+    elif [ "${{1:-}}" = C-a ]; then
+      # C-a C-k: line start, then kill to its end -- the composer's whole one-line prompt.
+      printf 'CLEAR %s\n' "$*" >> "{self.sendkeys_log}"
+      backspace_composer 1000000
     elif [ "${{1:-}}" = -N ] && [ "${{3:-}}" = BSpace ]; then
       printf 'BSPACE %s\\n' "$2" >> "{self.sendkeys_log}"
       backspace_composer "$2"

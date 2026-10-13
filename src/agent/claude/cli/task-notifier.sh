@@ -28,6 +28,8 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # Same marker shape: which core incarnation this notifier left a cut-short paste in.
 PARTIAL_DIR="$WORKSPACE_DIR/state/task-notifier-partial-paste"
+# Same marker shape plus the exact prompt: what this notifier left staged, for the stand-down clear.
+STAGED_DIR="$WORKSPACE_DIR/state/task-notifier-staged"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve task priority and pane state")" || exit 1
@@ -432,6 +434,16 @@ clear_partial_paste() {
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$PARTIAL_DIR" "$1" || true
 }
 
+# $3 = the prompt the caller just verified staged; only that exact text may later be cleared.
+note_staged() {
+  printf '%s' "$3" | "$NOTIFIER_PY" "$DISPATCH_PY" partial-mark "$STAGED_DIR" "$1" "$2" \
+    || log_notifier "could not record $1's staged prompt; a stand-down will not clear it"
+}
+
+clear_staged() {
+  "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$STAGED_DIR" "$1" || true
+}
+
 # True only when the composer's CURRENT content is, whitespace aside, exactly the text
 # note_partial_paste recorded for this filename and incarnation -- i.e. this garbled,
 # non-boundary leftover is provably this notifier's own failed chunk, not a human draft,
@@ -578,7 +590,9 @@ deliver_prompt_grown() {
     clear_composer_block
     if type_prompt "$prompt" "$filename" "$resume"; then
       staged_raw="$(capture_raw)"
-      if prompt_is_staged "$staged_raw" "$prompt"; then clear_partial_paste "$filename"; staged=1; break; fi
+      if prompt_is_staged "$staged_raw" "$prompt"; then
+        clear_partial_paste "$filename"; note_staged "$filename" "$incarnation" "$prompt"; staged=1; break
+      fi
     else
       staged_raw="$(capture_raw)"
       log_notifier "a chunk of $filename's prompt did not read back; what landed is not staged (failing closed)"
@@ -644,6 +658,7 @@ press_enter_and_confirm() {
       # A failed capture says nothing about the composer; only a read that
       # shows the prompt gone confirms.
       if cap="$(capture_raw)" && ! composer_holds_prompt "$cap" "$prompt"; then
+        clear_staged "$filename"
         [ "$attempt" -gt 0 ] && log_notifier "submit confirmed for $filename after $((attempt + 1)) attempts"
         return 0
       fi
@@ -765,6 +780,90 @@ staged_prompt_is_ambiguous() {
   return 1
 }
 
+# Which staged record the composer holds, as "how filename": exact, mixed (owner text
+# around it) or partial (only part of a prompt this notifier staged or cut short).
+staged_record_in_composer() {
+  local raw="$1" incarnation="$2" dir f recorded c p mixed="" partial=""
+  c="$(composer_text "$raw" | squeeze)"
+  while IFS=$'\t' read -r dir f; do
+    [ -n "$f" ] || continue
+    if [ "$dir" = "$STAGED_DIR" ]; then
+      recorded="$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$STAGED_DIR" "$f" "$incarnation")" || continue
+      if prompt_is_staged "$raw" "$recorded"; then printf 'exact %s' "$f"; return 0; fi
+    else
+      "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$PARTIAL_DIR" "$f" "$incarnation" || continue
+      recorded="$(task_prompt "$f")"
+    fi
+    p="$(printf '%s' "$recorded" | squeeze)"
+    if [ "$c" != "$p" ] && composer_holds_prompt "$raw" "$recorded"; then mixed="$f"
+    elif [ "$c" != "$p" ]; then case "$p" in *"$c"*) partial="$f" ;; esac
+    fi
+  done < <(for dir in "$STAGED_DIR" "$PARTIAL_DIR"; do
+             ls -1 "$dir" 2>/dev/null | sed "s#^#$dir$(printf '\t')#"
+           done)
+  [ -n "$mixed" ] && { printf 'mixed %s' "$mixed"; return 0; }
+  [ -n "$partial" ] && { printf 'partial %s' "$partial"; return 0; }
+  return 1
+}
+
+# Handled = a result exists, the session archived it, or its sweep announces it: the standby
+# is gone (the session watcher sweeps only then) and the task is one that sweep would announce.
+task_taken_over() {
+  local filename="$1"
+  has_result "$filename" && return 0
+  [ -e "$TASKS_DIR/$filename" ] || return 0
+  [ "$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" standby-present --inbox "$TASKS_DIR" 2>/dev/null)" = "no" ] || return 1
+  "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" \
+    --deliveries-dir "$DELIVERIES_DIR" 2>/dev/null | grep -qxF -- "$filename"
+}
+
+# Left behind at stand-down: say why; when it is our prompt, the owner hears it the way a block is told.
+leave_staged() {
+  log_notifier "stand-down: leaving the composer as it is: $2"
+  [ -z "$1" ] || alert_composer_block "$1" 1
+  return 1
+}
+
+# A prompt this standby staged and that never left the composer would stay in the owner's input
+# box after the session watcher took over. Erased only when every guard holds; else left, with why.
+clear_staged_on_stand_down() {
+  local ready raw esc incarnation found how filename state waited=0
+  ready="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || ready="unknown"
+  [ "$ready" = "yes" ] || { log_notifier "stand-down: no session-role watcher is ready for $TASKS_DIR ($ready); leaving the composer as it is"; return 1; }
+  esc="$(capture_view_esc)" || esc=""
+  raw="$(capture_raw)" || raw=""
+  [ -n "$(composer_text "$raw")" ] || return 0
+  incarnation="$(core_incarnation)"
+  [ -n "$incarnation" ] || { log_notifier "stand-down: core incarnation unreadable; leaving the composer as it is"; return 1; }
+  pane_frame_is_cut "$raw" && { log_notifier "stand-down: the composer runs off the screen; leaving it as it is"; return 1; }
+  found="$(staged_record_in_composer "$raw" "$incarnation")" \
+    || { log_notifier "stand-down: the composer holds text this standby did not stage; leaving it as it is"; return 1; }
+  how="${found%% *}"; filename="${found#* }"
+  case "$how" in
+    mixed) leave_staged "$filename" "it holds $filename's prompt with other text mixed in"; return 1 ;;
+    partial) leave_staged "$filename" "it holds only part of $filename's prompt"; return 1 ;;
+  esac
+  state="$(printf '%s\n' "$esc" | "$NOTIFIER_PY" "$PANE_GATE_PY" classify --runtime claude --workspace "$WORKSPACE_DIR" --socket "$TMUX_SOCKET" --session "$SESSION" 2>/dev/null)" || state="unknown"
+  if [ "$state" != "pending" ] || ! pane_text_ciw "$(printf '%s\n' "$esc" | strip_sgr)" _is_idle_ready; then
+    leave_staged "$filename" "the session is not idle ($state), and $filename's prompt is still staged"; return 1
+  fi
+  task_taken_over "$filename" \
+    || { leave_staged "$filename" "$filename has no result and the session watcher has not taken it over"; return 1; }
+  # The guards took time: the composer must still be exactly ours at the keystroke.
+  prompt_is_staged "$(capture_raw)" "$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$STAGED_DIR" "$filename" "$incarnation")" \
+    || { log_notifier "stand-down: the composer changed while checking $filename; leaving it as it is"; return 1; }
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-a C-k 2>/dev/null \
+    || { leave_staged "$filename" "the clear keystroke for $filename's prompt was not sent"; return 1; }
+  while [ -n "$(composer_text "$(capture_raw)")" ]; do
+    waited=$((waited + 1))
+    [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] \
+      || { leave_staged "$filename" "the composer is not empty after clearing $filename's prompt"; return 1; }
+    sleep "$POLL_INTERVAL"
+  done
+  clear_staged "$filename"
+  log_notifier "stand-down: cleared $filename's staged prompt from the composer (a session watcher holds $TASKS_DIR, the session is idle, the task is handled); composer verified empty"
+}
+
 submit_task() {
   local rc=0
   submit_task_grown "$@" || rc=$?
@@ -809,6 +908,7 @@ submit_task_grown() {
       return 0
     fi
     log_notifier "prompt for $filename is staged but unsent; resuming its submission"
+    note_staged "$filename" "$incarnation" "$prompt"
     press_enter_and_confirm "$filename" "$prompt" "$incarnation" || return 0
   elif [ "$live_rc" -eq 0 ]; then
     log_notifier "prompt for $filename was already submitted to this core; awaiting its result, not re-typing"
@@ -844,6 +944,13 @@ fi
 # in place of arming when the pane is idle-ready and the session is live.
 if [ "${1:-}" = "--nudge" ]; then
   nudge_deliver
+  exit $?
+fi
+
+# One-shot, run by the supervisor once it stood this standby down (0 cleared or nothing to do).
+if [ "${1:-}" = "--clear-staged" ]; then
+  STANDBY_LOGGED=1
+  clear_staged_on_stand_down
   exit $?
 fi
 
