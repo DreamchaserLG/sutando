@@ -17,7 +17,7 @@ sys.path.insert(0, _SRC)
 from hitl.manager import HitlManager, HitlStore, default_store  # noqa: E402
 from hitl.schema import HumanRequirement  # noqa: E402
 
-from hitl.session_ownership import session_already_carded, claim_session  # noqa: E402
+from hitl.session_ownership import session_already_carded, claim_session, supersede  # noqa: E402
 
 SESSION = "sutando-worker-test"
 
@@ -141,6 +141,50 @@ class ClaimSession(unittest.TestCase):
         winners = [r for r in results if r is not None]
         self.assertEqual(len(winners), 1, f"expected exactly one winner, got {results}")
         self.assertEqual(len(self.manager.active()), 1)
+
+
+class Supersede(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="supersede-")
+        self.addCleanup(tmp.cleanup)
+        self.manager = HitlManager(HitlStore(default_store(Path(tmp.name))))
+
+    def test_creates_and_retires_the_backstop(self):
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        made = supersede(self.manager, SESSION, by_source="tui", effect="gate",
+                         build_requirement=lambda: HumanRequirement(
+                             kind="permission", runtime="claude", message="tui card",
+                             subject={"source": "tui", "session": SESSION, "effect": "gate"}),
+                         legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        self.assertEqual(made.status, "pending")
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+        self.assertEqual([r.id for r in self.manager.active()], [made.id])
+
+    def test_never_retires_the_record_create_actually_returns(self):
+        # create()'s dedup is keyed on (runtime, kind, device, guard), not
+        # source, so it can deduplicate to an existing other-source record.
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool card",
+            device={"id": SESSION}, guard="SAME_GUARD",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        made = supersede(self.manager, SESSION, by_source="tui", effect="gate",
+                         build_requirement=lambda: HumanRequirement(
+                             kind="core-blocked", runtime="claude", message="tui card",
+                             device={"id": SESSION}, guard="SAME_GUARD",  # same tuple
+                             subject={"source": "tui", "session": SESSION, "effect": "gate"}),
+                         legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        self.assertEqual(made.id, backstop.id)  # create() deduplicated to it
+        self.assertEqual(made.status, "pending")
+        self.assertEqual(len(self.manager.active()), 1)
+
+    def test_no_manager_supersedes_nothing(self):
+        self.assertIsNone(supersede(None, SESSION, by_source="tui", effect="gate",
+                                    build_requirement=lambda: (_ for _ in ()).throw(
+                                        AssertionError("must not be called"))))
 
 
 if __name__ == "__main__":

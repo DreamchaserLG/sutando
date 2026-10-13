@@ -96,6 +96,10 @@ def supersede(manager: Any, session: str, *, by_source: str, effect: "str | None
     with manager.store.locked():
         made = manager.create(build_requirement())
         for r in manager.active():
+            if r.id == made.id:
+                # create() can deduplicate to an EXISTING other-source record;
+                # whatever `made` IS is never its own backstop to retire.
+                continue
             subj = r.subject or {}
             if (subj.get("session") == session and subj.get("source") not in (None, by_source)
                     and _effect_matches(subj, effect, legacy_match)):
