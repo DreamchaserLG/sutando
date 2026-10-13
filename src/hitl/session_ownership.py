@@ -106,14 +106,18 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
     regardless of guard; for every other kind, the guard must ALSO match --
     a differing guard means create() makes a distinct new record with no
     mutation at all, which is exactly the normal case this writer exists
-    to let through (a rich payload alongside an existing backstop)."""
+    to let through (a rich payload alongside an existing backstop). Only a
+    record whose own source IS `by_source` is excluded from this check --
+    a source-LESS record (e.g. a third producer that never tags one) is
+    still a candidate: it is not ours either, and create() mutates it the
+    same as any other identity match."""
     if manager is None:
         return None
     with manager.store.locked():
         req = build_requirement()
         req_device = str((req.device or {}).get("id") or "")
         for r in manager.active():
-            if (r.subject or {}).get("source") in (None, by_source) or r.decided_by == POLICY_DECIDER:
+            if (r.subject or {}).get("source") == by_source or r.decided_by == POLICY_DECIDER:
                 continue  # ours, or auto-answered/in-flight: not a collision candidate
             if not (r.runtime == req.runtime and r.kind == req.kind
                     and str((r.device or {}).get("id") or "") == req_device):

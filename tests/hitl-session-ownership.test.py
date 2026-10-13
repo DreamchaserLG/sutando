@@ -212,6 +212,23 @@ class Supersede(unittest.TestCase):
         self.assertEqual(after.guard, "FOREIGN_GUARD")
         self.assertEqual(after.revision, foreign.revision)
 
+    def test_a_source_less_record_is_still_a_collision_candidate(self):
+        # A source-less third producer is not `by_source` either -- skipping
+        # it from the check would let create() mutate it in place.
+        foreign = self.manager.create(HumanRequirement(
+            kind="auth", runtime="claude", message="detector auth",
+            device={"id": SESSION}, guard="DETECTOR_GUARD", subject={"session": SESSION}))
+        made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                         effect="login", build_requirement=lambda: HumanRequirement(
+                             kind="auth", runtime="claude", message="tui auth",
+                             device={"id": SESSION}, guard="TUI_GUARD",
+                             subject={"source": "tui", "session": SESSION, "effect": "login"}),
+                         legacy_match=lambda subj: subj.get("wedge") == "card_login")
+        self.assertIsNone(made)
+        after = self.manager.get(foreign.id)
+        self.assertEqual(after.guard, "DETECTOR_GUARD")
+        self.assertEqual(after.revision, foreign.revision)
+
     def test_no_manager_supersedes_nothing(self):
         self.assertIsNone(supersede(None, SESSION, by_source="tui", backstop_source="pool-wedge",
                                     effect="gate", build_requirement=lambda: (_ for _ in ()).throw(
