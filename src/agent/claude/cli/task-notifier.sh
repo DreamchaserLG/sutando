@@ -142,10 +142,21 @@ clear_composer_block() {
 
 alert_composer_block() {
   log_notifier "delivery blocked: text in the ${SUTANDO_INSTANCE_ID:-core} composer has held $1 for $2 consecutive attempts; clear the composer to resume (Enter would submit it as it is)"
+  notify_owner "Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume."
+}
+
+# The stand-down's own wording: nothing is blocked, a prompt was left behind and why.
+alert_staged_left() {
+  notify_owner "The Sutando standby left a staged task prompt ($1) in the ${SUTANDO_INSTANCE_ID:-core} composer; it was not cleared because $2."
+}
+
+notify_owner() {
+  local text
+  text="$(printf '%s' "$1" | tr -d '"\\')"
   command -v osascript >/dev/null 2>&1 || return 0
   # Advisory only: backgrounded, then TERM->KILL so an osascript ignoring TERM cannot outlive it.
   (
-    osascript -e "display notification \"Text in the Sutando ${SUTANDO_INSTANCE_ID:-core} composer is blocking task delivery. Clear it to resume.\" with title \"Sutando\"" &
+    osascript -e "display notification \"$text\" with title \"Sutando\"" &
     op=$!
     (
       trap 'kill "$s" 2>/dev/null || true; exit 0' TERM
@@ -820,21 +831,25 @@ task_taken_over() {
 # Left behind at stand-down: say why; when it is our prompt, the owner hears it the way a block is told.
 leave_staged() {
   log_notifier "stand-down: leaving the composer as it is: $2"
-  [ -z "$1" ] || alert_composer_block "$1" 1
+  [ -z "$1" ] || alert_staged_left "$1" "$2"
   return 1
 }
 
 # A prompt this standby staged and that never left the composer would stay in the owner's input
 # box after the session watcher took over. Erased only when every guard holds; else left, with why.
 clear_staged_on_stand_down() {
-  local ready raw esc incarnation found how filename state waited=0
+  local ready raw esc incarnation found how filename state f waited=0
   ready="$("$NOTIFIER_PY" "$REPO/src/watcher_identity.py" role-present session --inbox "$TASKS_DIR" --ready "$WORKSPACE_DIR/state" 2>/dev/null)" || ready="unknown"
   [ "$ready" = "yes" ] || { log_notifier "stand-down: no session-role watcher is ready for $TASKS_DIR ($ready); leaving the composer as it is"; return 1; }
+  incarnation="$(core_incarnation)"
+  [ -n "$incarnation" ] || { log_notifier "stand-down: core incarnation unreadable; leaving the composer as it is"; return 1; }
+  # Best-effort prune: inflight-live removes a record that names an earlier incarnation.
+  while IFS= read -r f; do
+    [ -n "$f" ] && { "$NOTIFIER_PY" "$DISPATCH_PY" inflight-live "$STAGED_DIR" "$f" "$incarnation" >/dev/null 2>&1 || true; }
+  done < <(ls -1 "$STAGED_DIR" 2>/dev/null)
   esc="$(capture_view_esc)" || esc=""
   raw="$(capture_raw)" || raw=""
   [ -n "$(composer_text "$raw")" ] || return 0
-  incarnation="$(core_incarnation)"
-  [ -n "$incarnation" ] || { log_notifier "stand-down: core incarnation unreadable; leaving the composer as it is"; return 1; }
   pane_frame_is_cut "$raw" && { log_notifier "stand-down: the composer runs off the screen; leaving it as it is"; return 1; }
   found="$(staged_record_in_composer "$raw" "$incarnation")" \
     || { log_notifier "stand-down: the composer holds text this standby did not stage; leaving it as it is"; return 1; }
@@ -852,8 +867,11 @@ clear_staged_on_stand_down() {
   # The guards took time: the composer must still be exactly ours at the keystroke.
   prompt_is_staged "$(capture_raw)" "$("$NOTIFIER_PY" "$DISPATCH_PY" partial-leftover "$STAGED_DIR" "$filename" "$incarnation")" \
     || { log_notifier "stand-down: the composer changed while checking $filename; leaving it as it is"; return 1; }
+  # Known residual: owner keystrokes landing between that read and this one are erased with it.
+  # No retry after it: a composer not empty below is left and alerted.
   tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-a C-k 2>/dev/null \
     || { leave_staged "$filename" "the clear keystroke for $filename's prompt was not sent"; return 1; }
+  # Synchronous in the supervisor: at most SUBMIT_CONFIRM_TIMEOUT re-captures, POLL_INTERVAL apart.
   while [ -n "$(composer_text "$(capture_raw)")" ]; do
     waited=$((waited + 1))
     [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ] \

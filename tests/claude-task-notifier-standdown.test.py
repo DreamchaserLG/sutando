@@ -83,6 +83,13 @@ class StandDownClearTests(FakeTmuxHarness):
         rows = [r for r in self.pane_file.read_text().splitlines() if r.startswith("❯")]
         return rows[-1][1:].strip() if rows else None
 
+    def alert_text(self, wait):
+        """The backgrounded alert's recorded text, polled for up to `wait` seconds."""
+        deadline = time.time() + wait
+        while time.time() < deadline and not (self.alerts.exists() and self.alerts.read_text()):
+            time.sleep(0.1)
+        return self.alerts.read_text() if self.alerts.exists() else ""
+
     def assert_left(self, res, pane_before, why, alerted=True):
         self.assertNotIn("CLEAR", self.sendkeys_log_text(), "the composer was cleared")
         self.assertEqual(self.pane_file.read_text(), pane_before, "the composer changed")
@@ -90,10 +97,11 @@ class StandDownClearTests(FakeTmuxHarness):
         self.assertIn(why, res.stderr)
         log = (self.logs_dir / "claude-task-notifier.log").read_text()
         self.assertIn(why, log, "the reason was not logged")
-        time.sleep(0.5)  # the alert is backgrounded
-        got = self.alerts.read_text() if self.alerts.exists() else ""
+        got = self.alert_text(wait=5 if alerted else 1)
         if alerted:
-            self.assertIn("blocking task delivery", got, "the owner was not told through the composer-block alert")
+            self.assertIn("left a staged task prompt", got, "the owner was not told the standby left its prompt")
+            self.assertIn("not cleared because", got)
+            self.assertNotIn("blocking task delivery", got, "a stand-down is not a delivery block")
         else:
             self.assertEqual(got, "")
 
@@ -173,6 +181,27 @@ class StandDownClearTests(FakeTmuxHarness):
         res = self.clear()
         self.assertNotEqual(res.returncode, 0)
         self.assert_left(res, before, "no session-role watcher is ready", alerted=False)
+
+    def test_a_clear_that_does_not_empty_the_composer_is_alerted_not_retried(self):
+        self.stage("task-stuck.txt")
+        self.session_watcher()
+        self.write_result("task-stuck.txt")
+        (self.root / "clear-ignored.flag").write_text("1")
+        res = self.clear()
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(self.sendkeys_log_text().count("CLEAR"), 1, "the clear keystroke was retried")
+        self.assertIn("not empty after clearing", res.stderr)
+        self.assertIn("left a staged task prompt", self.alert_text(wait=5))
+        self.assertTrue((self.staged_dir / "task-stuck.txt").exists(), "the record went with a failed clear")
+
+    def test_records_from_an_earlier_incarnation_are_pruned(self):
+        subprocess.run([sys.executable, str(DISPATCH), "partial-mark", str(self.staged_dir), "task-old.txt", "9999"],
+                       input="old prompt", text=True, check=True)
+        self.stage("task-now.txt", status=BUSY_STATUS)
+        self.session_watcher()
+        self.clear()
+        self.assertFalse((self.staged_dir / "task-old.txt").exists(), "a dead incarnation's record was kept")
+        self.assertTrue((self.staged_dir / "task-now.txt").exists(), "the current incarnation's record was pruned")
 
     def test_an_exact_prompt_with_no_staged_record_is_left(self):
         self.stage("task-norec.txt", record=False)
