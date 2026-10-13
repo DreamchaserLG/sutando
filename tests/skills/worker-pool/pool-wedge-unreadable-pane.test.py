@@ -236,6 +236,56 @@ class UnreadablePaneHoldsTheWedge(unittest.TestCase):
         self.assertEqual(result["cards_closed"], [])
         self.assertEqual([c.id for c in self.active_cards()], [card.id])
 
+    def test_a_paused_worker_with_a_stale_persisted_kind_holds_a_pending_card(self):
+        # A paused worker's leftover persisted kind is not current evidence
+        # either; now_asks must exclude it like an indeterminate one.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        (wi.worker_dir(self.ws, WID) / sup.PAUSED_MARKER).touch()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_paused_worker_with_a_stale_persisted_kind_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        (wi.worker_dir(self.ws, WID) / sup.PAUSED_MARKER).touch()
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
+    def test_a_resumed_tick_with_a_stale_persisted_kind_holds_a_pending_card(self):
+        # A resumed tick skips evaluation for every worker globally -- the
+        # same staleness, not isolated to one worker's own record.
+        card = self.raise_card_to_sustain()
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        self.now += 1000.0
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual([c.id for c in self.active_cards()], [card.id])
+
+    def test_a_resumed_tick_with_a_stale_persisted_kind_holds_a_pressed_card(self):
+        card = self.raise_card_to_sustain()
+        m = wc.manager_for(self.ws)
+        m.apply_action(ActionReply(hitl_id=card.id, expected_revision=card.revision,
+                                   action_id="open_terminal", guard=card.guard))
+        raw = json.loads(sup.state_path(self.ws).read_text())
+        raw["workers"][WID]["wedge_kind"] = "abnormal"
+        sup.state_path(self.ws).write_text(json.dumps(raw))
+        self.now += 1000.0
+        result = self.sweep()
+        self.assertEqual(result["cards_closed"], [])
+        self.assertEqual(wc.manager_for(self.ws).get(card.id).status, "in_progress")
+
     def test_an_unevaluated_stale_persisted_kind_holds_a_pending_card(self):
         # A kind written before this tick's own (indeterminate) evaluation
         # is not current evidence of a kind change -- now_asks must exclude it.

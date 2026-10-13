@@ -179,7 +179,10 @@ class HitlManager:
     def find_duplicate(self, req: HumanRequirement) -> Optional[HumanRequirement]:
         """The existing active record `create()` would treat `req` as a
         duplicate of -- returned as-is (same guard) or refreshed in place
-        (AUTH_KIND, any guard) -- without creating or mutating anything.
+        (AUTH_KIND with a non-empty incoming guard) -- without creating or
+        mutating anything. An empty incoming guard never collapses onto an
+        existing one, auth included: an unguarded request is a distinct,
+        un-keyed interaction, not grounds to touch someone else's guard.
         The ONE shared predicate: `create()` uses it below, and any caller
         that needs to know about a collision BEFORE deciding whether to
         create (e.g. `hitl.session_ownership.supersede()`, which must not

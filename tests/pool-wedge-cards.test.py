@@ -456,6 +456,30 @@ class ClaimSessionDelegation(unittest.TestCase):
             self.assertTrue(spy.called)
             self.assertEqual(spy.call_args.kwargs.get("effect"), wc.LOGIN_EFFECT)
 
+    def test_card_human_honors_a_refused_claim_not_just_calls_it(self):
+        # Being called is not enough (a mutant discarding the result still
+        # satisfies spy.called): seed a refusal and assert it is honored.
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="tui card",
+                                  subject={"source": "tui", "session": NAME, "effect": wc.GATE_EFFECT}))
+        out, _, req = card(self.ws, HUMAN, USAGE_LIMIT_MENU)
+        self.assertEqual(out["outcome"], "cleared", out)
+        self.assertEqual(out.get("owner"), "input-watch")
+        self.assertIsNone(req)
+        self.assertEqual(len(m.active()), 1)  # no second card was minted
+
+    def test_card_login_honors_a_refused_claim_not_just_calls_it(self):
+        from hitl.schema import HumanRequirement
+        m = manager(self.ws)
+        m.create(HumanRequirement(kind="core-blocked", runtime="claude", message="tui card",
+                                  subject={"source": "tui", "session": NAME, "effect": wc.LOGIN_EFFECT}))
+        out, _, req = card(self.ws, LOGIN, PANES["logged-out"])
+        self.assertEqual(out["outcome"], "cleared", out)
+        self.assertEqual(out.get("owner"), "input-watch")
+        self.assertIsNone(req)
+        self.assertEqual(len(m.active()), 1)
+
 
 # Every card kind that offers open_terminal, proving the shared path: press it,
 # go stale, the card resolves; a fresh identical recurrence gets its own card.

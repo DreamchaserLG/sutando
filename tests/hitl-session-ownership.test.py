@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
 sys.path.insert(0, _SRC)
@@ -228,6 +229,107 @@ class Supersede(unittest.TestCase):
         after = self.manager.get(foreign.id)
         self.assertEqual(after.guard, "DETECTOR_GUARD")
         self.assertEqual(after.revision, foreign.revision)
+
+    def test_a_refusal_leaves_the_known_backstop_untouched_too(self):
+        # The refusal skips the retirement loop entirely, so a concurrently
+        # active, genuinely-named backstop must survive the refusal too.
+        detector = self.manager.create(HumanRequirement(
+            kind="auth", runtime="claude", message="detector auth",
+            device={"id": SESSION}, guard="DETECTOR_GUARD", subject={"session": SESSION}))
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool login backstop",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_login",
+                     "effect": "login"}))
+        made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                         effect="login", build_requirement=lambda: HumanRequirement(
+                             kind="auth", runtime="claude", message="tui auth",
+                             device={"id": SESSION}, guard="TUI_GUARD",
+                             subject={"source": "tui", "session": SESSION, "effect": "login"}),
+                         legacy_match=lambda subj: subj.get("wedge") == "card_login")
+        self.assertIsNone(made)
+        after_detector = self.manager.get(detector.id)
+        self.assertEqual(after_detector.guard, "DETECTOR_GUARD")
+        self.assertEqual(after_detector.revision, detector.revision)
+        self.assertEqual(self.manager.get(backstop.id).status, "pending")
+
+    def test_the_outer_lock_keeps_a_concurrent_foreign_insert_from_racing_the_check(self):
+        # supersede() holds ONE lock across check-then-create; delay the check
+        # just long enough for a second writer to prove it genuinely blocks.
+        store_dir = Path(self.manager.store.root)
+        manager_a = HitlManager(HitlStore(store_dir))
+        manager_b = HitlManager(HitlStore(store_dir))
+        gate = threading.Event()
+        proceed = threading.Event()
+        real_find_duplicate = HitlManager.find_duplicate
+
+        def slow_find_duplicate(mgr_self, req):
+            result = real_find_duplicate(mgr_self, req)
+            if mgr_self is manager_a:
+                gate.set()
+                proceed.wait(timeout=5)
+            return result
+
+        result = {}
+
+        def run_a():
+            with mock.patch.object(HitlManager, "find_duplicate", slow_find_duplicate):
+                result["a"] = supersede(
+                    manager_a, SESSION, by_source="tui", backstop_source="pool-wedge",
+                    effect="login", build_requirement=lambda: HumanRequirement(
+                        kind="auth", runtime="claude", message="tui auth",
+                        device={"id": SESSION}, guard="TUI_GUARD",
+                        subject={"source": "tui", "session": SESSION, "effect": "login"}))
+
+        t_a = threading.Thread(target=run_a)
+        t_a.start()
+        self.assertTrue(gate.wait(timeout=5), "a never reached its delayed check")
+
+        started_b = threading.Event()
+        finished_b = threading.Event()
+
+        def run_b():
+            started_b.set()
+            manager_b.create(HumanRequirement(
+                kind="auth", runtime="claude", message="foreign auth",
+                device={"id": SESSION}, guard="FOREIGN_GUARD",
+                subject={"source": "detector", "session": SESSION, "effect": "login"}))
+            finished_b.set()
+
+        t_b = threading.Thread(target=run_b)
+        t_b.start()
+        try:
+            self.assertTrue(started_b.wait(timeout=5))
+            import time as _time
+            _time.sleep(0.05)
+            self.assertFalse(finished_b.is_set(),
+                             "b ran to completion while a's supersede() still held the lock")
+        finally:
+            # Release a's delayed check on any outcome, or both threads block
+            # for their 5s timeouts, racing this test's own tmp-dir cleanup.
+            proceed.set()
+            t_a.join(timeout=5)
+            t_b.join(timeout=5)
+        made = result["a"]
+        self.assertIsNotNone(made)
+        self.assertEqual((made.subject or {}).get("source"), "tui")  # a's own record, not b's
+
+    def test_a_retirement_failure_never_hides_the_created_record(self):
+        # made is already persisted once create() returns; a later retirement
+        # failure must not turn into "nothing happened" for the caller.
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", message="pool card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        with mock.patch.object(HitlManager, "resolve", side_effect=OSError("disk full")):
+            made = supersede(self.manager, SESSION, by_source="tui", backstop_source="pool-wedge",
+                             effect="gate", build_requirement=lambda: HumanRequirement(
+                                 kind="permission", runtime="claude", message="tui card",
+                                 subject={"source": "tui", "session": SESSION, "effect": "gate"}),
+                             legacy_match=lambda subj: subj.get("wedge") == "card_human")
+        self.assertIsNotNone(made)
+        self.assertEqual((made.subject or {}).get("source"), "tui")
+        self.assertEqual(self.manager.get(made.id).status, "pending")
+        self.assertEqual(self.manager.get(backstop.id).status, "pending")  # retirement failed, stayed up
 
     def test_no_manager_supersedes_nothing(self):
         self.assertIsNone(supersede(None, SESSION, by_source="tui", backstop_source="pool-wedge",

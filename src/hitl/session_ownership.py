@@ -9,7 +9,10 @@ to ask "did you already card this." This is the one shared answer both ask.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+_LOG = logging.getLogger("hitl.session_ownership")
 
 
 def _effect_matches(subj: dict, effect: "str | None", legacy_match) -> bool:
@@ -101,7 +104,18 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
     backstop, and not safely claimable as this caller's own rich payload
     either). A source-less record (e.g. a third producer that never tags
     one) is still a candidate: it is not ours either, and create() mutates
-    it the same as any other duplicate."""
+    it the same as any other duplicate.
+
+    Once `made` exists, it is this call's one indispensable result: a caller
+    (e.g. `core-input-watch.py`'s `escalate()`) that cannot answer its own
+    dialog without it. Retiring the backstop is a best-effort cleanup on top,
+    so a retirement failure is caught and logged per-record rather than
+    raised -- an exception here must never read, to the one broad except a
+    caller wraps this in, as "nothing happened" when a real card was in fact
+    already created and persisted. The worst case on a retirement failure is
+    a stale backstop that outlives this call, still visible and still
+    resolvable on its own schedule -- not a card the caller never learns it
+    has."""
     if manager is None:
         return None
     with manager.store.locked():
@@ -116,5 +130,9 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
             subj = r.subject or {}
             if (subj.get("session") == session and subj.get("source") == backstop_source
                     and _effect_matches(subj, effect, legacy_match)):
-                manager.resolve(r.id)
+                try:
+                    manager.resolve(r.id)
+                except Exception:  # noqa: BLE001 -- made is already live; see docstring
+                    _LOG.warning("hitl: failed to retire backstop %s for session %s",
+                                r.id, session, exc_info=True)
         return made

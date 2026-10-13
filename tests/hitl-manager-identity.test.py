@@ -68,6 +68,38 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(a.id, b.id)
         self.assertEqual((self.mgr.get(a.id).guard, self.mgr.get(a.id).revision), ("probe:2", 2))
 
+    def test_auth_with_an_empty_incoming_guard_never_collapses(self):
+        # An unguarded auth request is a distinct, un-keyed interaction --
+        # it must not refresh (and so silently clear) an existing one's guard.
+        auth = lambda g: HumanRequirement(kind="auth", runtime="claude", message="Claude Code needs to sign in again",
+                                          guard=g, device={"id": "core-1"}, actions=[Action(id="reauth", kind="authenticate", label="Re-authenticate")])
+        a = self.mgr.create(auth("probe:1"))
+        b = self.mgr.create(auth(""))
+        self.assertNotEqual(a.id, b.id)
+        self.assertEqual(self.mgr.get(a.id).guard, "probe:1")  # untouched by b
+
+    def test_identity_is_scoped_to_runtime(self):
+        # A Claude request and a Codex request sharing (kind, device, guard)
+        # are two different runtimes' interactions, never one record.
+        a = self.mgr.create(perm("ls", "g", session="core-1"))
+        b = self.mgr.create(HumanRequirement(kind="permission", runtime="codex", message="Codex wants to run Bash: ls",
+                                             guard="g", device={"id": "core-1", "name": "core-1"}, actions=list(ACTS)))
+        self.assertNotEqual(a.id, b.id)
+        self.assertEqual(len(self.mgr.active()), 2)
+
+    def test_an_in_flight_policy_decided_record_is_never_a_dedup_target(self):
+        # A fresh request must mint its own record even when an auto-answered
+        # one of the same identity is still in flight, so it is never answered by a stale policy decision.
+        policy = mock.Mock()
+        policy.decide.return_value = "allow"
+        mgr = HitlManager(HitlStore(self.root), policy=policy)
+        first = mgr.create(perm("ls", "hook:policy"))
+        self.assertEqual(first.decided_by, "policy")
+        policy.decide.return_value = None  # the second request is NOT auto-answered
+        second = mgr.create(perm("ls", "hook:policy"))
+        self.assertNotEqual(first.id, second.id)
+        self.assertIsNone(second.decided_by)
+
     def test_two_sessions_same_guard_stay_two_cards(self):
         a = self.mgr.create(perm("ls", "g", session="core-1"))
         b = self.mgr.create(perm("ls", "g", session="core-2"))
