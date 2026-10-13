@@ -39,7 +39,8 @@ class DuplicateCardArbitration(unittest.TestCase):
         # The richer permission card must always get created, AND the
         # backstop must not coexist for the whole episode.
         backstop = self.manager.create(HumanRequirement(
-            kind="core-blocked", runtime="claude", message="pool-wedge card",
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:human:deadbeef", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
                      "effect": "gate"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
@@ -49,10 +50,26 @@ class DuplicateCardArbitration(unittest.TestCase):
         self.assertEqual(self.manager.get(backstop.id).status, "resolved")
         self.assertEqual([r.id for r in self.manager.active()], [req.id])
 
+    def test_escalate_blocked_human_always_wins_when_both_sides_share_the_fallback_kind(self):
+        # A non-semantic gate makes escalate()'s own kind="core-blocked"
+        # too, matching pool's -- same identity, different guard, must win.
+        backstop = self.manager.create(HumanRequirement(
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:human:deadbeef", message="pool-wedge card",
+            subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human",
+                     "effect": "gate"}))
+        req = civ.escalate(self.manager, "blocked-human", "awaiting user: usage limit", "trust",
+                           "You have hit your session usage limit.\n❯ 1. Stop\n2. Wait", SESSION)
+        self.assertIsNotNone(req)
+        self.assertEqual(req.kind, "core-blocked")
+        self.assertEqual(self.manager.get(backstop.id).status, "resolved")
+        self.assertEqual([r.id for r in self.manager.active()], [req.id])
+
     def test_escalate_blocked_human_always_wins_over_a_legacy_effectless_pool_card(self):
         # Same, against a legacy pool-wedge card with no "effect" field.
         backstop = self.manager.create(HumanRequirement(
-            kind="core-blocked", runtime="claude", message="pool-wedge card",
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:human:deadbeef", message="pool-wedge card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_human"}))
         req = civ.escalate(self.manager, "blocked-human", "awaiting user: permission",
                            "permission", "Do you want to proceed?\n❯ 1. Yes\n  2. No", SESSION)
@@ -64,7 +81,8 @@ class DuplicateCardArbitration(unittest.TestCase):
         # The richer auth card must never be suppressed by the weaker
         # plain-jump card, and the backstop must not coexist all episode.
         backstop = self.manager.create(HumanRequirement(
-            kind="core-blocked", runtime="claude", message="pool login card",
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:cause:needs-login", message="pool login card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_login",
                      "effect": "login"}))
         req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)
@@ -76,7 +94,8 @@ class DuplicateCardArbitration(unittest.TestCase):
     def test_escalate_logged_out_retires_a_legacy_card_cause_needs_login_backstop(self):
         # An even older pool shape, pre-dating CARD_LOGIN as its own kind.
         backstop = self.manager.create(HumanRequirement(
-            kind="core-blocked", runtime="claude", message="legacy cause card",
+            kind="core-blocked", runtime="claude", device={"id": SESSION},
+            guard=f"pool-wedge:{SESSION}:cause:needs-login,api-error", message="legacy cause card",
             subject={"source": "pool-wedge", "session": SESSION, "wedge": "card_cause",
                      "cause": ["needs-login", "api-error"]}))
         req = civ.escalate(self.manager, "logged-out", "core not authenticated", None, None, SESSION)

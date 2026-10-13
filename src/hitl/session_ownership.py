@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .manager import AUTH_KIND, POLICY_DECIDER
+
 
 def _effect_matches(subj: dict, effect: "str | None", legacy_match) -> bool:
     if effect is None:
@@ -93,26 +95,30 @@ def supersede(manager: Any, session: str, *, by_source: str, backstop_source: st
     persists and never resolves it on its own. Retirement is bounded to
     `backstop_source`: an unrelated third producer sharing the session and
     effect is never touched, only the one counterpart this caller actually
-    knows the shape of. Returns the created record, or None when a record
-    with the same (runtime, kind, device) identity already exists from a
-    source other than `by_source` -- an identity collision this generic
-    writer cannot safely resolve (never its own backstop, and not safely
-    claimable as this caller's own rich payload either). That check runs
-    BEFORE `manager.create()`, not after: create()'s own dedup can MUTATE
-    a matching foreign record in place (e.g. an auth-kind record has its
-    guard rewritten regardless of whether the guard itself matches), so
-    detecting the collision only after the fact is too late to avoid
-    touching a record this caller does not own."""
+    knows the shape of. Returns the created record, or None when
+    `manager.create()` would MUTATE an existing record from a source other
+    than `by_source` instead of making a genuinely new, distinct one -- an
+    identity collision this generic writer cannot safely resolve (never its
+    own backstop, and not safely claimable as this caller's own rich
+    payload either). Mirrors create()'s own matching rule exactly, since a
+    looser check refuses cases create() would have handled safely: for
+    AUTH_KIND, (runtime, kind, device) alone, since create() mutates
+    regardless of guard; for every other kind, the guard must ALSO match --
+    a differing guard means create() makes a distinct new record with no
+    mutation at all, which is exactly the normal case this writer exists
+    to let through (a rich payload alongside an existing backstop)."""
     if manager is None:
         return None
     with manager.store.locked():
         req = build_requirement()
         req_device = str((req.device or {}).get("id") or "")
         for r in manager.active():
-            if (r.subject or {}).get("source") in (None, by_source) or r.decided_by == "policy":
+            if (r.subject or {}).get("source") in (None, by_source) or r.decided_by == POLICY_DECIDER:
                 continue  # ours, or auto-answered/in-flight: not a collision candidate
-            if r.runtime == req.runtime and r.kind == req.kind \
-                    and str((r.device or {}).get("id") or "") == req_device:
+            if not (r.runtime == req.runtime and r.kind == req.kind
+                    and str((r.device or {}).get("id") or "") == req_device):
+                continue
+            if r.guard == req.guard or (req.kind == AUTH_KIND and req.guard):
                 return None
         made = manager.create(req)
         for r in manager.active():
