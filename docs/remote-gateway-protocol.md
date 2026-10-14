@@ -157,9 +157,12 @@ place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
 Periodic liveness + capability ping, sent every `REMOTE_HEARTBEAT_INTERVAL_S`
 seconds (default 5) by a timer thread of its own, so the cadence does not depend
 on the poll loop: a loop parked inside a 25 s long poll still heartbeats on time.
-The poll loop also posts at its boundaries (gated by the same interval), so a
-task just taken or just finished reports its `inflight` change at once. One post
-at a time: the two never overlap. The relay reads this agent's presence (alive,
+The poll loop also posts at its boundaries; that post is gated by the interval
+unless `inflight` or the health row changed, so a task just taken or just finished
+reports its `inflight` change at once. One post at a time: the two never overlap.
+On consecutive failures the timer doubles its wait up to 60 s and logs an error
+only when it differs from the last one; while the poll loop waits for a rotated
+token after a `401`/`403`, the timer sends nothing. The relay reads this agent's presence (alive,
 `inflight`, core status) from the heartbeat, so the interval is the ceiling on
 how stale the relay's view of the agent can be.
 

@@ -50,13 +50,15 @@ class TimerThread(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
                             ('_heartbeat_backoff', 0.0), ('_last_heartbeat_at', 0.0),
-                            ('_last_core_health', None), ('_log', lambda m: None),
+                            ('_last_core_health', None), ('_last_inflight_count', None),
+                            ('_heartbeat_failures', 0), ('_heartbeat_last_error', None), ('_log', lambda m: None),
                             ('HEARTBEAT_INTERVAL', 0.1)):
             p = patch.object(bridge, name, value, create=True)
             p.start()
             self.addCleanup(p.stop)
         bridge._OUTBOUND_STOP.clear()
         bridge._LOCK_LOST.clear()
+        bridge._AUTH_RECOVERING.clear()
         self.addCleanup(bridge._OUTBOUND_STOP.set)
         self.posts = []
         self.lock = threading.Lock()
@@ -133,12 +135,14 @@ class TickAndLoopOnTheMainThread(unittest.TestCase):
         self.logged = []
         for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
                             ('_heartbeat_backoff', 0.0), ('_last_heartbeat_at', 0.0),
-                            ('_last_core_health', None), ('_log', self.logged.append),
+                            ('_last_core_health', None), ('_last_inflight_count', None),
+                            ('_heartbeat_failures', 0), ('_heartbeat_last_error', None), ('_log', self.logged.append),
                             ('HEARTBEAT_INTERVAL', 0.01)):
             p = patch.object(bridge, name, value, create=True)
             p.start()
             self.addCleanup(p.stop)
         bridge._LOCK_LOST.clear()
+        bridge._AUTH_RECOVERING.clear()
 
     def test_tick_posts_and_reports_it(self):
         with patch.object(bridge, '_req', return_value={}) as req:
@@ -158,7 +162,7 @@ class TickAndLoopOnTheMainThread(unittest.TestCase):
                 patch.object(bridge, '_recover_auth', create=True) as recover:
             self.assertFalse(bridge._heartbeat_tick(set()))
         self.assertEqual(recover.call_count, 0)
-        self.assertTrue(any('HTTP 401' in m and 'auth recovery' in m for m in self.logged), self.logged)
+        self.assertEqual([m for m in self.logged if 'HTTP 401' in m and 'heartbeat failed' in m].__len__(), 1, self.logged)
 
     def test_tick_swallows_any_other_error(self):
         with patch.object(bridge, '_req', side_effect=RuntimeError('boom')):
@@ -185,7 +189,8 @@ class SingleFlight(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
                             ('_heartbeat_backoff', 0.0), ('_last_heartbeat_at', 0.0),
-                            ('_last_core_health', None), ('_log', lambda m: None)):
+                            ('_last_core_health', None), ('_last_inflight_count', None),
+                            ('_heartbeat_failures', 0), ('_heartbeat_last_error', None), ('_log', lambda m: None)):
             p = patch.object(bridge, name, value, create=True)
             p.start()
             self.addCleanup(p.stop)
@@ -216,6 +221,99 @@ class MainWiring(unittest.TestCase):
         self.assertLess(src.index('_start_outbound_worker(inflight)'), src.index('_start_heartbeat_timer(inflight)'))
         self.assertIn('_heartbeat_thread.join(', src)
         self.assertIn('_post_heartbeat(inflight)', src, 'the gated poll-boundary posts stay')
+
+
+class ReviewFollowUps(unittest.TestCase):
+    """#5534 review: inflight changes go out at once; errors back off and log once;
+    the timer is quiet while the poll loop waits in auth recovery."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.logged = []
+        for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
+                            ('_heartbeat_backoff', 0.0), ('_last_heartbeat_at', 0.0),
+                            ('_last_core_health', None), ('_last_inflight_count', None),
+                            ('_heartbeat_failures', 0), ('_heartbeat_last_error', None),
+                            ('_log', self.logged.append), ('HEARTBEAT_INTERVAL', 5.0)):
+            p = patch.object(bridge, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        bridge._LOCK_LOST.clear()
+        bridge._AUTH_RECOVERING.clear()
+
+    def test_a_task_taken_right_after_a_timer_post_goes_out_at_the_poll_boundary(self):
+        # The reviewer's probe: timer post, a task lands in inflight, the gated
+        # poll-boundary post one second later must send it (it used to return False).
+        now = [1_000_000.0]
+        inflight = set()
+        with patch.object(bridge.time, 'time', side_effect=lambda: now[0]), \
+                patch.object(bridge, '_req', return_value={}) as req:
+            self.assertTrue(bridge._heartbeat_tick(inflight))
+            inflight.add('task-1')
+            now[0] += 1
+            self.assertTrue(bridge._post_heartbeat(inflight))
+            self.assertEqual([c.args[2]['inflight'] for c in req.call_args_list], [0, 1])
+            now[0] += 1
+            self.assertFalse(bridge._post_heartbeat(inflight), 'nothing changed: still gated')
+            inflight.discard('task-1')
+            now[0] += 1
+            self.assertTrue(bridge._post_heartbeat(inflight), 'a finished task goes out at once too')
+            self.assertEqual(req.call_args_list[-1].args[2]['inflight'], 0)
+
+    def test_a_repeated_network_error_is_logged_once_and_the_recovery_once(self):
+        err = bridge._NETWORK_ERRORS[0]('relay down')
+        with patch.object(bridge, '_req', side_effect=err):
+            for _ in range(5):
+                self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertEqual(bridge._heartbeat_failures, 5)
+        self.assertEqual(len([m for m in self.logged if 'heartbeat network error' in m]), 1, self.logged)
+        with patch.object(bridge, '_req', return_value={}):
+            self.assertTrue(bridge._heartbeat_tick(set()))
+        self.assertEqual(bridge._heartbeat_failures, 0)
+        self.assertTrue(any('recovered after 5' in m for m in self.logged), self.logged)
+
+    def test_a_different_error_is_logged_again(self):
+        with patch.object(bridge, '_req', side_effect=_http_error(500)):
+            bridge._heartbeat_tick(set())
+            bridge._heartbeat_tick(set())
+        with patch.object(bridge, '_req', side_effect=_http_error(502)):
+            bridge._heartbeat_tick(set())
+        self.assertEqual([m.split(' — ')[0] for m in self.logged if 'heartbeat failed' in m],
+                         ['heartbeat failed: HTTP 500', 'heartbeat failed: HTTP 502'])
+
+    def test_the_timer_backs_off_on_consecutive_failures_up_to_60_s(self):
+        waits = []
+        for n in (0, 1, 2, 3, 4, 50):
+            with patch.object(bridge, '_heartbeat_failures', n):
+                waits.append(bridge._heartbeat_timer_wait())
+        self.assertEqual(waits, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0])
+        with patch.object(bridge, 'HEARTBEAT_INTERVAL', 120.0), patch.object(bridge, '_heartbeat_failures', 3):
+            self.assertEqual(bridge._heartbeat_timer_wait(), 120.0, 'never shorter than the interval')
+
+    def test_a_401_storm_costs_one_log_line_and_backs_off(self):
+        with patch.object(bridge, '_req', side_effect=_http_error(401)):
+            for _ in range(10):
+                self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertEqual(len([m for m in self.logged if 'HTTP 401' in m]), 1, self.logged)
+        self.assertEqual(bridge._heartbeat_timer_wait(), 60.0)
+
+    def test_the_timer_is_quiet_while_the_poll_loop_waits_in_auth_recovery(self):
+        bridge._AUTH_RECOVERING.set()
+        self.addCleanup(bridge._AUTH_RECOVERING.clear)
+        with patch.object(bridge, '_req', return_value={}) as req:
+            for _ in range(3):
+                self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertEqual(req.call_count, 0, 'the rejected bearer is not presented again')
+        bridge._AUTH_RECOVERING.clear()
+        with patch.object(bridge, '_req', return_value={}) as req:
+            self.assertTrue(bridge._heartbeat_tick(set()))
+
+    def test_main_marks_auth_recovery_around_recover_auth(self):
+        src = inspect.getsource(bridge.main)
+        i = src.index('recovered = _recover_auth(e.code)')
+        self.assertLess(src.rindex('_AUTH_RECOVERING.set()', 0, i), i)
+        self.assertIn('_AUTH_RECOVERING.clear()', src[i:i + 200], 'cleared in a finally right after')
 
 
 if __name__ == '__main__':

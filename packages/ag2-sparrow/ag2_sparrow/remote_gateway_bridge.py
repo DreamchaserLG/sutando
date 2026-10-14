@@ -2161,9 +2161,18 @@ _heartbeat_retry_at = 0.0  # 0 = enabled; else epoch before which heartbeats are
 _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
+_last_inflight_count: "int | None" = None
 # Single-flight across the poll loop and the heartbeat timer, which share the state
 # above: a caller that finds a post in flight skips (the timer fires again next tick).
 _HEARTBEAT_MUTEX = threading.Lock()
+# Consecutive failed posts and the last error logged: the timer backs off on the
+# count, and an error is logged when it changes, not on every repeat.
+_heartbeat_failures = 0
+_heartbeat_last_error: "str | None" = None
+HEARTBEAT_ERROR_MAX_BACKOFF = 60.0
+# Set by the poll loop while it waits in _recover_auth, so the timer does not keep
+# presenting the bearer the relay just rejected.
+_AUTH_RECOVERING = threading.Event()
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
@@ -3446,33 +3455,56 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
 
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
-    """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
-    the status/step feed the broker's presence sweep (agent working/available/…).
-
-    Called from two threads — the poll loop at its boundaries and the heartbeat
-    timer — so it is single-flight: a caller that finds a post in progress
-    returns False instead of waiting (the request timeout is 10 s, and the poll
-    loop must never sit behind it). Raises on 401/403 like every other call so
-    the poll loop's auth recovery sees it; the timer catches that itself."""
+    """Best-effort liveness + core-status ping, single-flight across the poll loop and
+    the timer (a caller finding a post in flight skips). Raises on 401/403."""
     if not _HEARTBEAT_MUTEX.acquire(blocking=False):
         return False
     try:
         return _post_heartbeat_locked(inflight, force)
+    except urllib.error.HTTPError as e:
+        _heartbeat_failed(f"failed: HTTP {e.code}")
+        raise
     finally:
         _HEARTBEAT_MUTEX.release()
 
 
+def _heartbeat_failed(what: str) -> None:
+    global _heartbeat_failures, _heartbeat_last_error
+    _heartbeat_failures += 1
+    if what != _heartbeat_last_error:
+        _log(f"heartbeat {what} — continuing; repeats of this error are not logged")
+    _heartbeat_last_error = what
+
+
+def _heartbeat_ok() -> None:
+    global _heartbeat_failures, _heartbeat_last_error
+    if _heartbeat_failures:
+        _log(f"heartbeat recovered after {_heartbeat_failures} failed post(s)")
+    _heartbeat_failures, _heartbeat_last_error = 0, None
+
+
+def _heartbeat_timer_wait() -> float:
+    """The timer's next wait: the interval, doubled per consecutive failure, capped at 60 s."""
+    if not _heartbeat_failures:
+        return HEARTBEAT_INTERVAL
+    cap = max(HEARTBEAT_ERROR_MAX_BACKOFF, HEARTBEAT_INTERVAL)
+    return min(HEARTBEAT_INTERVAL * 2 ** min(_heartbeat_failures, 16), cap)
+
+
 def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
+    global _last_inflight_count
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
     health = _core_health(_health_snapshot())
-    changed = health is not None and health != _last_core_health
+    count = len(inflight)
+    changed = (health is not None and health != _last_core_health) or count != _last_inflight_count
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
+    _last_inflight_count = count
     _status, _step = _reported_core_status(health)
     try:
         payload = {
@@ -3480,7 +3512,7 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
             "protocol_version": 1,
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
-            "inflight": len(inflight),
+            "inflight": count,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator"],
         }
@@ -3495,6 +3527,7 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
             payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
+        _heartbeat_ok()
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3505,36 +3538,30 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
             return False
         if e.code in (401, 403):
             raise
-        _log(f"heartbeat failed: HTTP {e.code} — continuing")
+        _heartbeat_failed(f"failed: HTTP {e.code}")
         return False
     except _NETWORK_ERRORS as e:
-        _log(f"heartbeat network error: {e} — continuing")
+        _heartbeat_failed(f"network error: {e}")
         return False
 
 
 def _heartbeat_timer(inflight: "set[str]") -> None:
-    """Post a heartbeat every HEARTBEAT_INTERVAL, off the poll loop.
-
-    The poll loop blocks up to POLL_WAIT (25 s) inside its long poll, so a
-    heartbeat that rides it can fire only at poll boundaries — with the old
-    60 s gate that was about every 75 s when idle. This thread has its own clock.
-    `inflight` is the poll loop's set; only its size is read here. Stops on the
-    same event as the outbound worker. A 401/403 is logged, not acted on: the
-    poll loop owns auth recovery and a second recovery from here would race it."""
-    while not _OUTBOUND_STOP.wait(HEARTBEAT_INTERVAL):
+    """Post a heartbeat every HEARTBEAT_INTERVAL off the poll loop (which sits up to 25 s
+    in a long poll); backs off on failures; stops on the outbound worker's stop event."""
+    while not _OUTBOUND_STOP.wait(_heartbeat_timer_wait()):
         _heartbeat_tick(inflight)
 
 
 def _heartbeat_tick(inflight: "set[str]") -> bool:
     """One beat of the timer; True when a heartbeat went out. Never raises."""
-    if _LOCK_LOST.is_set():
-        return False  # the poll loop is on its way out; do not speak for a reaped poller
+    if _LOCK_LOST.is_set() or _AUTH_RECOVERING.is_set():
+        return False  # a reaped poller, or a bearer the relay just rejected: stay quiet
     try:
         return _post_heartbeat(inflight, force=True)
-    except urllib.error.HTTPError as e:
-        _log(f"heartbeat timer: HTTP {e.code} — left to the poll loop's auth recovery")
+    except urllib.error.HTTPError:
+        pass  # recorded and logged once by _post_heartbeat; auth recovery is the poll loop's
     except Exception as e:  # noqa: BLE001 — the timer must outlive any one post
-        _log(f"heartbeat timer: {type(e).__name__}: {e} — continuing")
+        _heartbeat_failed(f"failed: {type(e).__name__}: {e}")
     return False
 
 
@@ -6445,7 +6472,12 @@ def main() -> None:
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                if _recover_auth(e.code):
+                _AUTH_RECOVERING.set()
+                try:
+                    recovered = _recover_auth(e.code)
+                finally:
+                    _AUTH_RECOVERING.clear()
+                if recovered:
                     backoff = 1
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")
