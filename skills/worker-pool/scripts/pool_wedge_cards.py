@@ -222,14 +222,15 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
     return out
 
 
-def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None) -> list:
+def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observations=None, recovered=None) -> list:
     """Close the pending cards of seats that are no longer wedged, and of seats still
     wedged whose card is not the one their pane asks for now (`wedges`: worker ->
-    that card); a pressed one is left to `drive_escapes`,
-    which refuses it once the frame has moved."""
+    that card). Pressed proxy cause cards require positive recovery evidence
+    (`recovered`, defaulting to `worker_ids`); Escape stays with `drive_escapes`."""
     from hitl.schema import STATUS_IN_PROGRESS
     manager = manager or manager_for(workspace)
     wedges = wedges or {}
+    recovered = worker_ids if recovered is None else recovered
     closed = []
     for r in manager.active():
         subj = r.subject or {}
@@ -246,7 +247,11 @@ def resolve_cleared(workspace, worker_ids, *, manager=None, wedges=None, observa
                         and isinstance(subj.get("cause"), list) and "needs-login" in subj["cause"])
         stale = w in worker_ids or (w in wedges and subj.get("wedge") != wedges[w]
                                    and not legacy_login)
-        if subj.get("source") == SOURCE and stale and r.status != STATUS_IN_PROGRESS:
+        cleared_proxy = (w in worker_ids and w in recovered
+                         and subj.get("wedge") == ps.CARD_CAUSE
+                         and r.chosen_action == PROXY_ACTION)
+        if (subj.get("source") == SOURCE and stale
+                and (r.status != STATUS_IN_PROGRESS or cleared_proxy)):
             manager.resolve(r.id)
             closed.append(r.id)
     return closed
