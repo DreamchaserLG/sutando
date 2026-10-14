@@ -3522,14 +3522,20 @@ def _heartbeat_timer(inflight: "set[str]") -> None:
     same event as the outbound worker. A 401/403 is logged, not acted on: the
     poll loop owns auth recovery and a second recovery from here would race it."""
     while not _OUTBOUND_STOP.wait(HEARTBEAT_INTERVAL):
-        if _LOCK_LOST.is_set():
-            continue  # the poll loop is on its way out; do not speak for a reaped poller
-        try:
-            _post_heartbeat(inflight, force=True)
-        except urllib.error.HTTPError as e:
-            _log(f"heartbeat timer: HTTP {e.code} — left to the poll loop's auth recovery")
-        except Exception as e:  # noqa: BLE001 — the timer must outlive any one post
-            _log(f"heartbeat timer: {type(e).__name__}: {e} — continuing")
+        _heartbeat_tick(inflight)
+
+
+def _heartbeat_tick(inflight: "set[str]") -> bool:
+    """One beat of the timer; True when a heartbeat went out. Never raises."""
+    if _LOCK_LOST.is_set():
+        return False  # the poll loop is on its way out; do not speak for a reaped poller
+    try:
+        return _post_heartbeat(inflight, force=True)
+    except urllib.error.HTTPError as e:
+        _log(f"heartbeat timer: HTTP {e.code} — left to the poll loop's auth recovery")
+    except Exception as e:  # noqa: BLE001 — the timer must outlive any one post
+        _log(f"heartbeat timer: {type(e).__name__}: {e} — continuing")
+    return False
 
 
 def _start_heartbeat_timer(inflight: "set[str]") -> threading.Thread:

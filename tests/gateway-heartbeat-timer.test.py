@@ -124,6 +124,61 @@ class TimerThread(unittest.TestCase):
             self.assertEqual(self.posts, [], 'a reaped poller must not keep announcing itself')
 
 
+class TickAndLoopOnTheMainThread(unittest.TestCase):
+    """The same body, run synchronously: the coverage gate does not trace threads."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.logged = []
+        for name, value in (('_STATE', Path(self.tmp.name)), ('_heartbeat_retry_at', 0.0),
+                            ('_heartbeat_backoff', 0.0), ('_last_heartbeat_at', 0.0),
+                            ('_last_core_health', None), ('_log', self.logged.append),
+                            ('HEARTBEAT_INTERVAL', 0.01)):
+            p = patch.object(bridge, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        bridge._LOCK_LOST.clear()
+
+    def test_tick_posts_and_reports_it(self):
+        with patch.object(bridge, '_req', return_value={}) as req:
+            self.assertTrue(bridge._heartbeat_tick({'a'}))
+        self.assertEqual(req.call_args.args[:2], ('POST', '/v1/heartbeat'))
+        self.assertEqual(req.call_args.args[2]['inflight'], 1)
+
+    def test_tick_holds_still_on_a_lost_lock(self):
+        bridge._LOCK_LOST.set()
+        self.addCleanup(bridge._LOCK_LOST.clear)
+        with patch.object(bridge, '_req', return_value={}) as req:
+            self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertEqual(req.call_count, 0)
+
+    def test_tick_swallows_a_401_with_a_log_line_and_no_recovery(self):
+        with patch.object(bridge, '_req', side_effect=_http_error(401)), \
+                patch.object(bridge, '_recover_auth', create=True) as recover:
+            self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertEqual(recover.call_count, 0)
+        self.assertTrue(any('HTTP 401' in m and 'auth recovery' in m for m in self.logged), self.logged)
+
+    def test_tick_swallows_any_other_error(self):
+        with patch.object(bridge, '_req', side_effect=RuntimeError('boom')):
+            self.assertFalse(bridge._heartbeat_tick(set()))
+        self.assertTrue(any('RuntimeError: boom' in m for m in self.logged), self.logged)
+
+    def test_loop_ticks_until_the_stop_event_is_set(self):
+        waits = []
+
+        class StopAfterTwo:
+            def wait(self, timeout):
+                waits.append(timeout)
+                return len(waits) > 2  # False, False, then True: stop
+        with patch.object(bridge, '_OUTBOUND_STOP', StopAfterTwo()), \
+                patch.object(bridge, '_req', return_value={}) as req:
+            bridge._heartbeat_timer({'a', 'b'})  # returns: the loop ended on the stop
+        self.assertEqual(waits, [0.01, 0.01, 0.01], 'one wait of HEARTBEAT_INTERVAL per beat')
+        self.assertEqual(req.call_count, 2, 'a post per completed wait, none after the stop')
+
+
 class SingleFlight(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
