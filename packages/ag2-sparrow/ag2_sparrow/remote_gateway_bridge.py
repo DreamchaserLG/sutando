@@ -3504,7 +3504,6 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _last_inflight_count = count
     _status, _step = _reported_core_status(health)
     try:
         payload = {
@@ -3527,6 +3526,7 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
             payload["capabilities"].append("worker_health.v1")
         _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
+        _last_inflight_count = count
         _heartbeat_ok()
         return True
     except urllib.error.HTTPError as e:
@@ -3543,6 +3543,15 @@ def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _heartbeat_failed(f"network error: {e}")
         return False
+
+
+def _recover_auth_quietly(code: int) -> bool:
+    """_recover_auth with the heartbeat timer held quiet for its whole wait."""
+    _AUTH_RECOVERING.set()
+    try:
+        return _recover_auth(code)
+    finally:
+        _AUTH_RECOVERING.clear()
 
 
 def _heartbeat_timer(inflight: "set[str]") -> None:
@@ -6472,12 +6481,7 @@ def main() -> None:
             _emit_gateway_status(True)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                _AUTH_RECOVERING.set()
-                try:
-                    recovered = _recover_auth(e.code)
-                finally:
-                    _AUTH_RECOVERING.clear()
-                if recovered:
+                if _recover_auth_quietly(e.code):
                     backoff = 1
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}")

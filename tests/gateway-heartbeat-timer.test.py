@@ -309,11 +309,50 @@ class ReviewFollowUps(unittest.TestCase):
         with patch.object(bridge, '_req', return_value={}) as req:
             self.assertTrue(bridge._heartbeat_tick(set()))
 
-    def test_main_marks_auth_recovery_around_recover_auth(self):
-        src = inspect.getsource(bridge.main)
-        i = src.index('recovered = _recover_auth(e.code)')
-        self.assertLess(src.rindex('_AUTH_RECOVERING.set()', 0, i), i)
-        self.assertIn('_AUTH_RECOVERING.clear()', src[i:i + 200], 'cleared in a finally right after')
+    def test_auth_recovery_holds_the_timer_quiet_for_its_whole_wait(self):
+        seen = []
+
+        def recover(code):
+            seen.append((code, bridge._AUTH_RECOVERING.is_set()))
+            return True
+        with patch.object(bridge, '_recover_auth', side_effect=recover):
+            self.assertTrue(bridge._recover_auth_quietly(401))
+        self.assertEqual(seen, [(401, True)], 'set while _recover_auth runs')
+        self.assertFalse(bridge._AUTH_RECOVERING.is_set(), 'cleared after')
+        with patch.object(bridge, '_recover_auth', side_effect=RuntimeError('x')):
+            with self.assertRaises(RuntimeError):
+                bridge._recover_auth_quietly(403)
+        self.assertFalse(bridge._AUTH_RECOVERING.is_set(), 'cleared on a raise too')
+        self.assertIn('if _recover_auth_quietly(e.code):', inspect.getsource(bridge.main))
+
+    def test_the_timer_loop_waits_what_heartbeat_timer_wait_says(self):
+        waits = []
+
+        class StopAfterTwo:
+            def wait(self, timeout):
+                waits.append(timeout)
+                return len(waits) > 2
+        with patch.object(bridge, '_OUTBOUND_STOP', StopAfterTwo()), \
+                patch.object(bridge, '_heartbeat_timer_wait', side_effect=[7.0, 11.0, 13.0]), \
+                patch.object(bridge, '_req', return_value={}):
+            bridge._heartbeat_timer(set())
+        self.assertEqual(waits, [7.0, 11.0, 13.0], 'the loop sleeps the backoff, not a fixed interval')
+
+    def test_a_failed_post_does_not_use_up_the_inflight_change(self):
+        now = [1_000_000.0]
+        inflight = set()
+        err = bridge._NETWORK_ERRORS[0]('blip')
+        with patch.object(bridge.time, 'time', side_effect=lambda: now[0]):
+            with patch.object(bridge, '_req', return_value={}):
+                self.assertTrue(bridge._heartbeat_tick(inflight))
+            inflight.add('task-1')
+            now[0] += 1
+            with patch.object(bridge, '_req', side_effect=err):
+                self.assertFalse(bridge._post_heartbeat(inflight))
+            now[0] += 1
+            with patch.object(bridge, '_req', return_value={}) as req:
+                self.assertTrue(bridge._post_heartbeat(inflight), 'the next boundary still sends the change')
+            self.assertEqual(req.call_args.args[2]['inflight'], 1)
 
 
 if __name__ == '__main__':
