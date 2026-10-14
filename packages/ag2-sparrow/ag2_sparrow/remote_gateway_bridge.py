@@ -42,7 +42,7 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
-  REMOTE_HEARTBEAT_INTERVAL_S  seconds between heartbeats (default 5, floor 1);
+  REMOTE_HEARTBEAT_INTERVAL_S  seconds between heartbeats (default 15, floor 1);
                         a timer thread posts them off the poll loop
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
                         file (argv split with shlex, no shell; file path appended;
@@ -2002,12 +2002,12 @@ def _start_results_watcher() -> "threading.Thread | None":
     return t
 
 
-HEARTBEAT_INTERVAL_DEFAULT_S = 5.0
+HEARTBEAT_INTERVAL_DEFAULT_S = 15.0
 HEARTBEAT_INTERVAL_MIN_S = 1.0
 
 
 def _heartbeat_interval_from_env(raw: "str | None") -> float:
-    """Seconds between heartbeats: REMOTE_HEARTBEAT_INTERVAL_S, else 5. Floored at
+    """Seconds between heartbeats: REMOTE_HEARTBEAT_INTERVAL_S, else 15. Floored at
     1 s so a typo cannot turn the heartbeat into a flood; unparseable → default."""
     try:
         value = float(raw) if raw not in (None, "") else HEARTBEAT_INTERVAL_DEFAULT_S

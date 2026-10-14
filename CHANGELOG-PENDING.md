@@ -46,7 +46,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
-- gateway: the relay heartbeat has its own timer thread and posts every `REMOTE_HEARTBEAT_INTERVAL_S` seconds (default 5, floor 1); it used to ride the poll loop with a 60 s gate, which meant about one heartbeat per 75 s on an idle bridge. The relay's view of the agent (alive, inflight, core status) is now at most 5 s old. ([#5534])
+- gateway: the relay heartbeat has its own timer thread and posts every `REMOTE_HEARTBEAT_INTERVAL_S` seconds (default 15, the broker's presence-sweep period; floor 1); it used to ride the poll loop with a 60 s gate, about one heartbeat per 75 s on an idle bridge. An `inflight` change is sent at once; failures back off to 60 s and log once. ([#5534])
 - voice: the built-in voice model default is `gemini-3.8-live` (was `gemini-2.5-flash-native-audio-preview-12-2025`), the model the seeded-install migration already moves to; search stays on. It applies where no config file sets a model (the packaged app seeds no template) and to new phone installs, whose template now carries it. Existing config files are unchanged. When Gemini refuses the configured model and no automatic revert applies (a config-less install never has one), the voice-offline notice now says to change the model in `config/voice-agent.json` in the Sutando workspace and restart; it said to update `VOICE_NATIVE_AUDIO_MODEL` in `.env`, which voice-agent does not read. ([#5442])
 
 ## Security

@@ -29,7 +29,7 @@ lower-precedence candidate.
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
-| `REMOTE_HEARTBEAT_INTERVAL_S` | no | `5` | Seconds between `/v1/heartbeat` posts, sent by a timer thread independent of the poll loop. Floored at `1`; an unparseable value falls back to the default. |
+| `REMOTE_HEARTBEAT_INTERVAL_S` | no | `15` | Seconds between `/v1/heartbeat` posts, sent by a timer thread independent of the poll loop. Floored at `1`; an unparseable value falls back to the default. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
@@ -155,7 +155,7 @@ place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
 ### `POST /v1/heartbeat`
 
 Periodic liveness + capability ping, sent every `REMOTE_HEARTBEAT_INTERVAL_S`
-seconds (default 5) by a timer thread of its own, so the cadence does not depend
+seconds (default 15, the broker's presence-sweep period) by a timer thread of its own, so the cadence does not depend
 on the poll loop: a loop parked inside a 25 s long poll still heartbeats on time.
 The poll loop also posts at its boundaries; that post is gated by the interval
 unless `inflight` or the health row changed, so a task just taken or just finished

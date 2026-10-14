@@ -29,14 +29,14 @@ def _http_error(code):
 class IntervalFromEnv(unittest.TestCase):
     def test_default_floor_and_bad_values(self):
         f = bridge._heartbeat_interval_from_env
-        self.assertEqual(f(None), 5.0)
-        self.assertEqual(f(''), 5.0)
+        self.assertEqual(f(None), 15.0)
+        self.assertEqual(f(''), 15.0)
         self.assertEqual(f('2.5'), 2.5)
         self.assertEqual(f('30'), 30.0)
         self.assertEqual(f('0.2'), 1.0, 'floored: a typo must not flood the relay')
         self.assertEqual(f('-3'), 1.0)
-        self.assertEqual(f('abc'), 5.0)
-        self.assertEqual(f('nan'), 5.0)
+        self.assertEqual(f('abc'), 15.0)
+        self.assertEqual(f('nan'), 15.0)
 
     def test_module_constant_reads_the_env_name_the_docstring_names(self):
         src = Path(bridge.__file__).read_text()
