@@ -29,6 +29,7 @@ lower-precedence candidate.
 | `REMOTE_TASK_TOKEN` | yes | — | Bearer token sent on every request. |
 | `REMOTE_TASK_PROVIDER` | no | `remote` | Label written as a task's `source:` when the task omits one. |
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
+| `REMOTE_HEARTBEAT_INTERVAL_S` | no | `5` | Seconds between `/v1/heartbeat` posts, sent by a timer thread independent of the poll loop. Floored at `1`; an unparseable value falls back to the default. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one; with no reading yet they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
@@ -153,7 +154,14 @@ place on the client: `RESULT_THREAD_FIELD` / `RESULT_THREAD_ASK` in
 
 ### `POST /v1/heartbeat`
 
-Periodic liveness + capability ping.
+Periodic liveness + capability ping, sent every `REMOTE_HEARTBEAT_INTERVAL_S`
+seconds (default 5) by a timer thread of its own, so the cadence does not depend
+on the poll loop: a loop parked inside a 25 s long poll still heartbeats on time.
+The poll loop also posts at its boundaries (gated by the same interval), so a
+task just taken or just finished reports its `inflight` change at once. One post
+at a time: the two never overlap. The relay reads this agent's presence (alive,
+`inflight`, core status) from the heartbeat, so the interval is the ceiling on
+how stale the relay's view of the agent can be.
 
 ```
 body: {
@@ -190,8 +198,8 @@ for nothing. `unknown` is sent rather than omitting the field because the broker
 keeps its last presence status when `status` is absent. A gateway with no
 Sutando checkout (no `health` row) forwards the self-report unchanged, or nothing.
 
-A relay that answers the heartbeat with `404` or `405` is retried after 60 s, doubling to at most
-30 minutes, so a relay that deploys the route is picked up without a restart.
+A relay that answers the heartbeat with `404` or `405` is retried after one heartbeat interval,
+doubling to at most 30 minutes, so a relay that deploys the route is picked up without a restart.
 
 `team-collaborator` tells the AG2 Space control plane that this gateway
 understands the per-agent Collaborator control layered over Team. Gateways

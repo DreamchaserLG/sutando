@@ -42,6 +42,8 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  REMOTE_HEARTBEAT_INTERVAL_S  seconds between heartbeats (default 5, floor 1);
+                        a timer thread posts them off the poll loop
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
                         file (argv split with shlex, no shell; file path appended;
                         the task's bytes on stdin, routing headers as SPARROW_* env)
@@ -2000,7 +2002,29 @@ def _start_results_watcher() -> "threading.Thread | None":
     return t
 
 
-HEARTBEAT_INTERVAL = 60
+HEARTBEAT_INTERVAL_DEFAULT_S = 5.0
+HEARTBEAT_INTERVAL_MIN_S = 1.0
+
+
+def _heartbeat_interval_from_env(raw: "str | None") -> float:
+    """Seconds between heartbeats: REMOTE_HEARTBEAT_INTERVAL_S, else 5. Floored at
+    1 s so a typo cannot turn the heartbeat into a flood; unparseable → default."""
+    try:
+        value = float(raw) if raw not in (None, "") else HEARTBEAT_INTERVAL_DEFAULT_S
+    except (TypeError, ValueError):
+        return HEARTBEAT_INTERVAL_DEFAULT_S
+    if value != value:  # NaN
+        return HEARTBEAT_INTERVAL_DEFAULT_S
+    return max(HEARTBEAT_INTERVAL_MIN_S, value)
+
+
+# The heartbeat's own clock. It used to be 60 and to ride the poll loop, which
+# checks it only between long polls (25 s), so an idle bridge heartbeated about
+# every 75 s. The relay reads presence (alive, inflight, core status) from the
+# heartbeat, so that staleness was the ceiling on how old the relay's view of
+# this agent could be. A timer thread (_heartbeat_timer) now posts every
+# HEARTBEAT_INTERVAL regardless of what the poll loop is doing.
+HEARTBEAT_INTERVAL = _heartbeat_interval_from_env(os.environ.get("REMOTE_HEARTBEAT_INTERVAL_S"))
 # A relay without /v1/heartbeat (404/405) is retried on a doubling backoff up to this cap,
 # so a broker that deploys or restores the route is picked up without a bridge restart.
 HEARTBEAT_UNSUPPORTED_MAX_BACKOFF = 1800.0
@@ -2141,6 +2165,10 @@ _heartbeat_retry_at = 0.0  # 0 = enabled; else epoch before which heartbeats are
 _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
+# Two posters share the state above and the wire: the poll loop (gated calls at
+# its boundaries) and the heartbeat timer thread. One post at a time; a caller
+# that finds a post in flight skips — the timer fires again within one interval.
+_HEARTBEAT_MUTEX = threading.Lock()
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
@@ -3424,7 +3452,22 @@ def _reported_core_status(core_health: "dict | None" = None) -> tuple[str | None
 
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
-    the status/step feed the broker's presence sweep (agent working/available/…)."""
+    the status/step feed the broker's presence sweep (agent working/available/…).
+
+    Called from two threads — the poll loop at its boundaries and the heartbeat
+    timer — so it is single-flight: a caller that finds a post in progress
+    returns False instead of waiting (the request timeout is 10 s, and the poll
+    loop must never sit behind it). Raises on 401/403 like every other call so
+    the poll loop's auth recovery sees it; the timer catches that itself."""
+    if not _HEARTBEAT_MUTEX.acquire(blocking=False):
+        return False
+    try:
+        return _post_heartbeat_locked(inflight, force)
+    finally:
+        _HEARTBEAT_MUTEX.release()
+
+
+def _post_heartbeat_locked(inflight: set[str], force: bool = False) -> bool:
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
@@ -3472,6 +3515,34 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     except _NETWORK_ERRORS as e:
         _log(f"heartbeat network error: {e} — continuing")
         return False
+
+
+def _heartbeat_timer(inflight: "set[str]") -> None:
+    """Post a heartbeat every HEARTBEAT_INTERVAL, off the poll loop.
+
+    The poll loop blocks up to POLL_WAIT (25 s) inside its long poll, so a
+    heartbeat that rides it can fire only at poll boundaries — with the old
+    60 s gate that was about every 75 s when idle. This thread has its own clock.
+    `inflight` is the poll loop's set; only its size is read here. Stops on the
+    same event as the outbound worker. A 401/403 is logged, not acted on: the
+    poll loop owns auth recovery and a second recovery from here would race it."""
+    while not _OUTBOUND_STOP.wait(HEARTBEAT_INTERVAL):
+        if _LOCK_LOST.is_set():
+            continue  # the poll loop is on its way out; do not speak for a reaped poller
+        try:
+            _post_heartbeat(inflight, force=True)
+        except urllib.error.HTTPError as e:
+            _log(f"heartbeat timer: HTTP {e.code} — left to the poll loop's auth recovery")
+        except Exception as e:  # noqa: BLE001 — the timer must outlive any one post
+            _log(f"heartbeat timer: {type(e).__name__}: {e} — continuing")
+
+
+def _start_heartbeat_timer(inflight: "set[str]") -> threading.Thread:
+    t = threading.Thread(target=_heartbeat_timer, args=(inflight,),
+                         name="heartbeat-timer", daemon=True)
+    t.start()
+    _log(f"heartbeat timer started (every {HEARTBEAT_INTERVAL:g}s, off the poll loop)")
+    return t
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
@@ -6296,6 +6367,7 @@ def main() -> None:
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
+    _heartbeat_thread = _start_heartbeat_timer(inflight)
     while True:
         _stamp_loop_progress()
         try:
@@ -6306,6 +6378,7 @@ def main() -> None:
                      "— exiting to avoid dual-poll")
                 _OUTBOUND_STOP.set(); _OUTBOUND_WAKE.set()
                 _outbound_thread.join(timeout=OUTBOUND_SCAN_S * 3 + 5)
+                _heartbeat_thread.join(timeout=HEARTBEAT_INTERVAL + 11)  # one tick + a post's timeout
                 if _results_watcher is not None:
                     _results_watcher.join(timeout=5)
                 return
