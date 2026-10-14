@@ -2018,12 +2018,8 @@ def _heartbeat_interval_from_env(raw: "str | None") -> float:
     return max(HEARTBEAT_INTERVAL_MIN_S, value)
 
 
-# The heartbeat's own clock. It used to be 60 and to ride the poll loop, which
-# checks it only between long polls (25 s), so an idle bridge heartbeated about
-# every 75 s. The relay reads presence (alive, inflight, core status) from the
-# heartbeat, so that staleness was the ceiling on how old the relay's view of
-# this agent could be. A timer thread (_heartbeat_timer) now posts every
-# HEARTBEAT_INTERVAL regardless of what the poll loop is doing.
+# The heartbeat's own clock (_heartbeat_timer), no longer the poll loop's: the relay's
+# view of this agent (alive, inflight, core status) is at most this many seconds old.
 HEARTBEAT_INTERVAL = _heartbeat_interval_from_env(os.environ.get("REMOTE_HEARTBEAT_INTERVAL_S"))
 # A relay without /v1/heartbeat (404/405) is retried on a doubling backoff up to this cap,
 # so a broker that deploys or restores the route is picked up without a bridge restart.
@@ -2165,9 +2161,8 @@ _heartbeat_retry_at = 0.0  # 0 = enabled; else epoch before which heartbeats are
 _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
-# Two posters share the state above and the wire: the poll loop (gated calls at
-# its boundaries) and the heartbeat timer thread. One post at a time; a caller
-# that finds a post in flight skips — the timer fires again within one interval.
+# Single-flight across the poll loop and the heartbeat timer, which share the state
+# above: a caller that finds a post in flight skips (the timer fires again next tick).
 _HEARTBEAT_MUTEX = threading.Lock()
 
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
