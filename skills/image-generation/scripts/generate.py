@@ -222,18 +222,18 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     wanted = out.suffix.lower()
     returned = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime, ".png")
     out.parent.mkdir(parents=True, exist_ok=True)
-    if wanted in (".png", ".jpg", ".jpeg", ".webp") and wanted != returned:
+    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif") and wanted != returned:
         try:
             from PIL import Image  # noqa: PLC0415
             import io  # noqa: PLC0415
             img = Image.open(io.BytesIO(data))
-            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP", ".png": "PNG"}[wanted]
+            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP", ".png": "PNG", ".gif": "GIF"}[wanted]
             if fmt == "JPEG":
                 img = img.convert("RGB")
-            if fmt == "PNG":
-                img.save(str(out), fmt)
-            else:
+            if fmt in ("JPEG", "WEBP"):
                 img.save(str(out), fmt, quality=quality)
+            else:
+                img.save(str(out), fmt)
             return out
         except ImportError:
             out = out.with_suffix(returned)

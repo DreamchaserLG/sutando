@@ -43,6 +43,20 @@ def png_1x1() -> bytes:
 PNG = png_1x1()
 NOT_A_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32  # the signature and nothing behind it
 
+# A real, decodable 1x1 grayscale JPEG — genuine magic/EOI, distinguishable from PNG, so a
+# "mislabel" assertion exercises the claimed format rather than just round-tripping bytes.
+JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb00430050373c463c32504641465a55505f78c882786e6e78f5"
+    "afb991c8ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc0000b08"
+    "0001000101011100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b51000"
+    "02010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f0"
+    "2433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768"
+    "696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c"
+    "4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f002bff"
+    "d9"
+)
+assert JPEG[:3] == b"\xff\xd8\xff" and JPEG[-2:] == b"\xff\xd9", "fixture must carry real JPEG magic"
+
 
 def response(parts=None, finish=None, block=None):
     body = {"candidates": [{"content": {"parts": parts or []}}]}
@@ -428,22 +442,47 @@ class InputsAndOutputs(Base):
     def test_a_jpeg_response_to_the_default_png_output_is_never_mislabelled(self):
         """gemini-nano-banana-2.1 (the default, no --model) returns image/jpeg; the default output
         path is always .png (output_path(None, ".png")). Without this, save_image's wanted/returned
-        branching skipped PNG entirely and wrote raw JPEG bytes under a .png name."""
+        branching skipped PNG entirely and wrote raw JPEG bytes under a .png name. Uses real JPEG
+        bytes (not the PNG fixture mislabelled) so the no-Pillow branch's byte check is meaningful,
+        and pins the literal model id in the captured request URL, not the mutable DEFAULT_IMAGE_MODEL
+        symbol, so this test still fails if the default is accidentally changed."""
         FakeImage.saved.clear()
-        parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(PNG).decode()}}]
+        parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(JPEG).decode()}}]
         with mock.patch.dict(sys.modules, fake_pil()):
             rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
         self.assertEqual(rc, 0)
-        self.assertEqual(line["model"], gen.DEFAULT_IMAGE_MODEL, "no --model: this is the default path")
+        self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"),
+                          "pin the literal default model id, not the DEFAULT_IMAGE_MODEL symbol")
         path = Path(line["path"])
         self.assertEqual(path.suffix, ".png")
         self.assertEqual(path.read_bytes(), b"FAKE-PNG", "converted to real PNG bytes, not raw JPEG under .png")
         self.assertEqual(FakeImage.saved, [("PNG", None)])
+        self.calls.clear()
         with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
             rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+        self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"))
         path = Path(line["path"])
         self.assertEqual(path.suffix, ".jpg", "no Pillow: suffix follows the returned bytes, never .png")
-        self.assertEqual(path.read_bytes(), PNG)
+        written = path.read_bytes()
+        self.assertEqual(written, JPEG)
+        self.assertTrue(written.startswith(b"\xff\xd8\xff"), "the bytes under .jpg are genuinely JPEG")
+
+    def test_an_unsupported_requested_suffix_never_mislabels_a_jpeg_response_either(self):
+        """The same mislabel class for an explicit, less-common requested suffix: .gif was already
+        excluded from the 'fall back to the returned extension' branch without being covered by
+        conversion either, so a JPEG response requested as .gif silently kept the .gif name."""
+        out = self.ws / "pic.gif"
+        with pillow_present():
+            saved = gen.save_image(JPEG, "image/jpeg", out, 90)
+        content = saved.read_bytes()
+        self.assertTrue(content.startswith(b"\xff\xd8\xff") or saved.suffix == ".gif",
+                         "either converted to a real GIF or kept the real JPEG bytes under .jpg — never JPEG bytes under .gif")
+        if saved.suffix == ".gif":
+            from PIL import Image
+            self.assertEqual(Image.open(saved).format, "GIF")
+        else:
+            self.assertEqual(saved.suffix, ".jpg")
+            self.assertEqual(content, JPEG)
 
 
 class FakeGenai:
