@@ -14,6 +14,7 @@ from pathlib import Path
 from ... import gateway_instance, local_task_protocol
 
 SNIPPET_MAX = 500
+REPLY_CONTEXT_MAX = 2000
 # Matrix user id: @localpart:server_name (DNS name, IPv4 or [IPv6], optional :port).
 # fullmatch only: `$` would also match before a trailing newline.
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -86,7 +87,10 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
     tier = local_task_protocol.canonical_access_tier(h.get("access_tier"))
     if tier not in local_task_protocol.BROKER_WIRE_TIERS:
         tier = "guest"  # absent or unknown: the most restricted tier
-    return {
+    # Only an attested reply gets a reply_context; a block a sender typed stays their text.
+    reply, message = (local_task_protocol.split_reply_context(parsed.body)
+                      if _field(h, "reply_to_event") else (None, parsed.body))
+    item = {
         "task_id": tid,
         "room_id": _field(h, "channel_id") or _field(h, "source_room_id"),
         "event_id": _field(h, "source_message_id"),
@@ -95,10 +99,16 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
         "sender_name": _field(h, "sender_name"),
         "access_tier": tier,
         "collaborator": tier == "team" and (h.get("collaborator") or "").strip() == "true",
-        "snippet": snippet(parsed.body),
+        "snippet": snippet(message),
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
+    if reply is not None:
+        label = reply["label"]
+        item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
+                                 "body": reply["body"][:REPLY_CONTEXT_MAX],
+                                 "label": label[:REPLY_CONTEXT_MAX] if label else None}
+    return item
 
 
 def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:

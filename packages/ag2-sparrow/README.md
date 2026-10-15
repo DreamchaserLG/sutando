@@ -212,7 +212,11 @@ it makes no network call of its own.
 
 Each wake carries, per message, `room_id`, `event_id`, `thread_root`, `sender`,
 `access_tier` and `collaborator` read with Sparrow's own task-header parser, a
-`snippet` (the message's first line, without a Matrix reply fallback), plus a
+`snippet` (the message's first line, without a Matrix reply fallback or the
+broker's quoted reply context), for a reply the task's attested `reply_to_event`
+vouches for a `reply_context` (`sender` and
+`body` of the message replied to, and `label`, the broker's own wording for that
+block, passed through verbatim), plus a
 `worker_note` with the rules: touch the activity marker first, answer from the
 snippet, and post each reply with `ag2-sparrow-hatch reply <result_file>`, the
 text on stdin, tagging anyone by full Matrix ID (`@name:server`), never a
