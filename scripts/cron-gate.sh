@@ -58,29 +58,22 @@ shift
 # A file with NO access_tier line still defers. That is deliberate and matches
 # CLAUDE.md: "Only access_tier: owner (or tasks without an access_tier field)
 # get full processing." Unknown tier fails CLOSED -- toward yielding.
-# An owner task a pool worker holds (worker_delivery.holder_of) is not the core's
-# to answer, so it does not defer; with no worker-pool skill nobody holds anything.
-POOL_SCRIPTS="$SCRIPT_PARENT/skills/worker-pool/scripts"
+# An owner task a pool worker holds is not the core's to answer, so it does not
+# defer; whether one is held is src/delivery/task_dispatch.py's worker-holds contract.
+DELIVERIES_DIR="$WORKSPACE/deliveries"
+if ! PYBIN="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" python-bin 2>/dev/null)" \
+   || [ -z "$PYBIN" ] || [ ! -x "$PYBIN" ]; then
+  PYBIN=""
+fi
 
-# Exit 10 = every id is held by a worker. Anything else (an unheld id, an
-# unreadable deliveries/, no python) defers, as before this check existed.
+# Exit 0 held, 1 not held, 2 cannot decide; only 0 counts, so no python or an
+# unreadable deliveries/ defers, as before this check existed.
 all_held_by_workers() {
-  python3 -I -c '
-import os, sys
-pool, ws, ids = sys.argv[1], sys.argv[2], sys.argv[3:]
-try:
-    try:
-        os.stat(os.path.join(pool, "worker_delivery.py"))
-    except FileNotFoundError:
-        sys.exit(0)
-    sys.path.insert(0, pool)
-    from worker_delivery import holder_of
-    sys.exit(10 if all(holder_of(ws, i) is not None for i in ids) else 0)
-except Exception as exc:
-    print(f"cron-gate: cannot tell who holds the queued tasks ({exc})", file=sys.stderr)
-    sys.exit(2)
-' "$POOL_SCRIPTS" "$WORKSPACE" "$@"
-  [ $? -eq 10 ]
+  local id
+  [ -n "$PYBIN" ] || return 1
+  for id in "$@"; do
+    "$PYBIN" "$SCRIPT_PARENT/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$id.txt" >/dev/null || return 1
+  done
 }
 
 owner_task_queued() {

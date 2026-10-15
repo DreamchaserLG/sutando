@@ -174,7 +174,7 @@ esac
 ok "a task with no access_tier still defers — unknown tier fails closed"
 rm -f "$TMPDIR/tasks/"task-*.txt
 
-# --- worker-held owner tasks: the holder is worker_delivery.holder_of --------
+# --- worker-held owner tasks: the holder is task_dispatch.py worker-holds ----
 # A sentinel in deliveries/<worker>/ means the router handed the task to that
 # worker, so the core is not busy with it and the cron must not wait on it.
 expect_runs() {  # <label> <marker>
@@ -217,5 +217,12 @@ expect_defers test-holder-error
 chmod 755 "$TMPDIR/deliveries"
 ok "an unreadable deliveries/ (holder check errors) defers"
 rm -rf "$TMPDIR/deliveries"; rm -f "$TMPDIR/tasks/"task-*.txt
+
+# The gate delegates to the core owner; it must never locate or import a skill itself.
+if grep -nE 'worker-pool|worker_delivery|holder_of' "$GATE"; then
+  fail "cron-gate.sh names the worker-pool skill; delegate to task_dispatch.py worker-holds"
+fi
+grep -q 'task_dispatch.py" worker-holds' "$GATE" || fail "cron-gate.sh does not call task_dispatch.py worker-holds"
+ok "cron-gate.sh delegates holding to task_dispatch.py, naming no skill"
 
 echo "OK — $PASSED/$PASSED cron-gate tests passed"
