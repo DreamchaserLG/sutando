@@ -510,15 +510,24 @@ class InputsAndOutputs(Base):
         self.assertEqual(saved2.suffix, ".jpg", "no Pillow: falls back to the sniffed extension, never .png")
         self.assertEqual(saved2.read_bytes(), JPEG)
 
-    def test_an_unidentifiable_response_never_claims_png_either(self):
-        """A format sniff_image_ext cannot recognize at all (e.g. BMP, which first_image()
-        still accepts as image/*) must get an honest fallback, not a hardcoded .png claim."""
+    def test_bmp_is_sniffed_and_recognized_not_left_under_png(self):
+        """BMP magic is now a recognized, convertible format in its own right."""
         bmp = b"BM" + b"\x00" * 10  # real BMP magic, not a full valid file
         out = self.ws / "chart.png"
         with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
             saved = gen.save_image(bmp, "image/bmp", out, 90)
         self.assertEqual(saved.suffix, ".bmp", "sniffed BMP magic, not left as .png")
         self.assertEqual(saved.read_bytes(), bmp)
+
+    def test_genuinely_unidentifiable_bytes_never_trust_a_misleading_mime_either(self):
+        """Bytes sniff_image_ext cannot recognize at all (not jpg/png/gif/webp/bmp magic) must
+        get a neutral extension even when the API's mime field claims a specific, wrong format
+        — the whole point of sniffing is to stop trusting that same untrusted channel."""
+        mystery = b"%PDF-1.4 not actually an image, just unidentifiable bytes"
+        out = self.ws / "chart.png"
+        saved = gen.save_image(mystery, "image/png", out, 90)  # mime lies; bytes aren't png
+        self.assertEqual(saved.suffix, ".bin", "unidentified bytes never borrow the mime's claimed format")
+        self.assertEqual(saved.read_bytes(), mystery)
 
 
 class FakeGenai:

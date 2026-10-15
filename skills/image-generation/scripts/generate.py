@@ -236,10 +236,9 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     """Write the bytes; convert to the requested extension only when Pillow can, else keep the
     returned format under its own extension so the file is never mislabelled."""
     wanted = out.suffix.lower()
-    # A guessed extension from the mime is still honest labelling; only a hardcoded ".png" would claim
-    # a format nothing actually observed. mimetypes has no bespoke webp/gif mapping on some platforms.
-    returned = (sniff_image_ext(data) or mimetypes.guess_extension(mime)
-                or {"image/webp": ".webp", "image/gif": ".gif"}.get(mime) or ".bin")
+    # Never fall back to the mime string for the format guess either — it's the same untrusted
+    # channel this function stopped trusting; truly unidentified bytes get a neutral extension.
+    returned = sniff_image_ext(data) or ".bin"
     out.parent.mkdir(parents=True, exist_ok=True)
     if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp") and wanted != returned:
         try:
