@@ -255,7 +255,12 @@ Paste this to the Hatch agent, with its MXID filled in:
 > background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env" ag2-sparrow`
 > and keep it running. Register the hook with `hooks.add` from the definition
 > file install names, check it with `hooks.dry_run`, start it with
-> `hooks.enable`, then run `ag2-sparrow-hatch verify` and show me its output.
+> `hooks.enable`. Install also adds two scheduled tasks, `sparrow-watchdog`
+> (every 5 minutes) and `keepalive-probe` (every 15 minutes), under
+> `~/workspace/cron.d/minutely/`; check that your scheduled tasks list both.
+> If install prints `NOTE keepalive:` about a task you made yourself with the
+> same name, tell me before re-running with `--force`. Then run
+> `ag2-sparrow-hatch verify` and show me its output.
 
 The token stays out of the hook, its config and the wake payload. Sparrow
 reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
@@ -269,9 +274,10 @@ relay rejects the token. Keep the `.env` file mode 600.
 | --- | --- |
 | `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a copy an earlier `install` wrote is replaced, so re-run `install` after upgrading ag2-sparrow; a locally modified copy is shown as a diff and kept unless you pass `--force`) |
 | `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
-| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND` (mode 600) |
+| `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND`, `CRON_DIR`, `KEEPALIVE_LOG` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
 | `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
+| `~/workspace/cron.d/minutely/sparrow-watchdog__interval@5m.md`, `~/workspace/cron.d/minutely/keepalive-probe__interval@15m.md` | the keepalive's Hatch scheduled tasks (see [Keepalive](#keepalive-watchdog-and-probe)), unless you pass `--no-keepalive` |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
 resolves them (`AGENT_CONNECT_TASK_DIR` / `AGENT_CONNECT_RESULT_DIR` /
@@ -286,7 +292,8 @@ instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
 reply command (the absolute path `install` recorded, still executable; `install`
-refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, plus a `service`
+refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, a `NOTE keepalive:`
+line with the probe's current line (not counted), plus a `service`
 line: `PASS` when `ag2-sparrow.service` is installed and enabled, `FAIL` when it
 is installed but not enabled, and a `NOTE` (not counted) when systemd is not
 available or the unit is not installed. It exits non-zero on any
@@ -396,6 +403,58 @@ when Sparrow is not running and 11 when it is running but not connected. The
   token needs a new relay token in `REMOTE_TASK_TOKEN`, then a restart.
 - Any other result (the check itself failed) logs `ag2-sparrow-hatch sparrow
   check failed` with its exit code and leaves the heartbeat as it is.
+
+### Keepalive: watchdog and probe
+
+The user service restarts a Sparrow that crashes, but not one left `failed` by
+its start limit, one hung with a stale status file, a stopped unit, or a
+Sparrow on a host with no systemd user manager. And nothing on the VM can show
+when the VM itself was not running. `install` therefore adds two Hatch scheduled
+tasks, each a short note telling the scheduled run to execute one command (the
+`ag2-sparrow-hatch` path install recorded) and nothing else:
+
+- `sparrow-watchdog`, every 5 minutes, runs `ag2-sparrow-hatch keepalive
+  watchdog`. It reads the same status file as `verify`. Running (connected or
+  not; a rejected token is not fixed by a restart): nothing. Not running: it
+  restarts Sparrow with `systemctl --user reset-failed` and `systemctl --user
+  restart ag2-sparrow` when the service `install` wrote is there, else it starts
+  `ag2-sparrow` in the background with the directories, `GATEWAY_INSTANCE` and
+  `AG2_DEVICE_ENV` from the config (its output goes to
+  `STATE_DIR/hatch-keepalive-sparrow.log`). A Sparrow that exits at once,
+  for example 75 because another Sparrow holds the lock, is not counted as a
+  restart. It records each run and restart in `STATE_DIR/hatch-keepalive.json`.
+- `keepalive-probe`, every 15 minutes, runs `ag2-sparrow-hatch keepalive
+  probe`, which appends one line to `~/keepalive-probe.log`:
+
+  ```
+  2026-10-15T02:47:51Z listener=up watchdog=up listener_restarts=0
+  2026-10-15T03:02:51Z listener=down watchdog=down listener_restarts=0 watchdog_restarted
+  ```
+
+  `listener` is observed only: the probe never restarts Sparrow. `watchdog` is
+  `down` when the watchdog has not run for 11 minutes (two missed runs);
+  `listener_restarts` is how many times the watchdog restarted Sparrow since
+  the previous probe line. When the watchdog is down the probe writes its task
+  file again and ends the line with `watchdog_restarted`.
+
+`ag2-sparrow-hatch keepalive status` prints the line the probe would write,
+without writing it or restarting anything. `ag2-sparrow-hatch keepalive report`
+reads the log and prints each gap between lines longer than 16 minutes
+(`--gap-minutes` changes it): a gap is a time the scheduler, or the VM, did not
+run, since the probe writes every 15 minutes whatever else is down. It also
+totals the `listener=down` lines, the watchdog's restarts and the
+`watchdog=down` lines. Lines holding only a timestamp are read too, so a log a
+hand-made probe started can be read in the same report.
+
+Re-running `install` is safe: an unchanged task is left as is, and a task
+`install` wrote earlier under another interval is replaced. A task of the same
+name that `install` did not write (a hand-made `sparrow-watchdog` or
+`keepalive-probe`) is reported with a `NOTE keepalive:` line and kept, and
+that one of the two is not installed; `--force` replaces it. `--cron-dir`
+names another scheduled-task directory and `--keepalive-log` another log; both
+are recorded in the config. Opt out with `--no-keepalive`; remove the two tasks
+with `ag2-sparrow-hatch uninstall --keepalive` (tasks install did not write are
+refused, and the log is kept), or delete both files by hand.
 
 ### Not from the single-file downloads
 
