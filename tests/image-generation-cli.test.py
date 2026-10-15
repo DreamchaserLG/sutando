@@ -425,6 +425,26 @@ class InputsAndOutputs(Base):
         rc, line = self.run_main("--prompt", "x", "--output", str(out3), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
 
+    def test_a_jpeg_response_to_the_default_png_output_is_never_mislabelled(self):
+        """gemini-nano-banana-2.1 (the default, no --model) returns image/jpeg; the default output
+        path is always .png (output_path(None, ".png")). Without this, save_image's wanted/returned
+        branching skipped PNG entirely and wrote raw JPEG bytes under a .png name."""
+        FakeImage.saved.clear()
+        parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(PNG).decode()}}]
+        with mock.patch.dict(sys.modules, fake_pil()):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(line["model"], gen.DEFAULT_IMAGE_MODEL, "no --model: this is the default path")
+        path = Path(line["path"])
+        self.assertEqual(path.suffix, ".png")
+        self.assertEqual(path.read_bytes(), b"FAKE-PNG", "converted to real PNG bytes, not raw JPEG under .png")
+        self.assertEqual(FakeImage.saved, [("PNG", None)])
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+        path = Path(line["path"])
+        self.assertEqual(path.suffix, ".jpg", "no Pillow: suffix follows the returned bytes, never .png")
+        self.assertEqual(path.read_bytes(), PNG)
+
 
 class FakeGenai:
     """The slice of google-genai the video path touches."""
