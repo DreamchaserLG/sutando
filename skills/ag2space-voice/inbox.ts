@@ -84,6 +84,15 @@ export async function fetchInbox(client: McpClient, args: { since: string; inclu
 	return { ok: true, items, more, rooms_skipped: skipped };
 }
 
+/** One inbox read as the owner where the server offers it, else (or when it refuses the owner here) as this agent. */
+export async function fetchInboxAs(client: McpClient, args: { since: string; include_replied: boolean; room_ids?: string[]; owner: boolean }, deps: Pick<ReadRoomDeps, 'log'>): Promise<({ ok: true; whose: InboxWhose; owner_error?: string } & InboxPage) | { ok: false; error: string }> {
+	const r = await fetchInbox(client, args, deps);
+	if (r.ok) return { ...r, whose: args.owner ? 'owner' : 'this agent' };
+	if (!args.owner || ['timeout', 'unavailable', 'bad_response'].includes(r.error)) return r;
+	const mine = await fetchInbox(client, { ...args, owner: false }, deps);
+	return mine.ok ? { ...mine, whose: 'this agent', owner_error: r.error } : mine;
+}
+
 export type ReadInboxResult =
 	| { ok: true; whose: InboxWhose; items: InboxItem[]; more: boolean; complete: boolean; rooms_skipped?: number; since?: string; owner_error?: string; ms: number }
 	| { ok: false; error: string };
@@ -105,14 +114,9 @@ export async function readInbox(args: { limit?: number; days?: number; include_a
 	let got: InboxPage | null = null;
 	let window = windows[0];
 	for (const w of windows) {
-		let r = await fetchInbox(client, { since: new Date(asked - w).toISOString(), include_replied: !!args.include_answered, owner }, deps);
-		// The server offers the owner's inbox but refuses it here (not enabled, revoked): read this agent's.
-		if (!r.ok && owner && !['timeout', 'unavailable', 'bad_response'].includes(r.error)) {
-			ownerError = r.error;
-			owner = false;
-			r = await fetchInbox(client, { since: new Date(asked - w).toISOString(), include_replied: !!args.include_answered }, deps);
-		}
+		const r = await fetchInboxAs(client, { since: new Date(asked - w).toISOString(), include_replied: !!args.include_answered, owner }, deps);
 		if (!r.ok) return r;
+		if (r.owner_error) { ownerError = r.owner_error; owner = false; }
 		got = r;
 		window = w;
 		if (!r.more) break;
