@@ -743,6 +743,8 @@ def _registry_owner(timeout: "int | None" = None) -> "tuple[str, str]":
     """(owner mxid, owner DM room id) from this agent's /v1/agents row, "" for a
     missing or malformed reading. Raises when the request itself fails."""
     identity = _reenroll_identity()
+    if not identity:
+        return "", ""  # no local identity to match; never fall through to a row keyed by ""
     answer = (_req("GET", "/v1/agents") if timeout is None
               else _req("GET", "/v1/agents", timeout=timeout))
     agents = answer.get("agents") if isinstance(answer, dict) else None
@@ -768,6 +770,7 @@ def _gateway_owner() -> str:
 HITL_OWNER_TTL_S = 300.0
 HITL_OWNER_RETRY_S = 30.0
 _HITL_OWNER = {"mxid": "", "at": 0.0, "bad_at": None}
+_HITL_OWNER_LOCK = threading.Lock()  # single-writer: a delayed refresh must never clobber a newer one
 _hitl_owner_clock = time.monotonic
 
 
@@ -783,16 +786,25 @@ def _hitl_owner() -> str:
     bad_at = _HITL_OWNER["bad_at"]
     if bad_at is not None and 0 <= now - bad_at < HITL_OWNER_RETRY_S:
         return ""
-    try:
-        owner = _registry_owner(timeout=10)[0]
-    except Exception as e:  # noqa: BLE001 - offline: unknown until the retry window passes
-        _log(f"hitl: owner lookup failed ({e})")
-        owner = ""
-    if not owner:
-        _HITL_OWNER.update(mxid="", bad_at=now)
-        return ""
-    _HITL_OWNER.update(mxid=owner, at=now, bad_at=None)
-    return owner
+    with _HITL_OWNER_LOCK:
+        # Re-check under the lock: a concurrent caller may have already refreshed
+        # the cache (or opened the backoff window) while this one waited for it.
+        now = _hitl_owner_clock()
+        if _HITL_OWNER["mxid"] and 0 <= now - _HITL_OWNER["at"] < HITL_OWNER_TTL_S:
+            return _HITL_OWNER["mxid"]
+        bad_at = _HITL_OWNER["bad_at"]
+        if bad_at is not None and 0 <= now - bad_at < HITL_OWNER_RETRY_S:
+            return ""
+        try:
+            owner = _registry_owner(timeout=10)[0]
+        except Exception as e:  # noqa: BLE001 - offline: unknown until the retry window passes
+            _log(f"hitl: owner lookup failed ({e})")
+            owner = ""
+        if not owner:
+            _HITL_OWNER.update(mxid="", bad_at=now)
+            return ""
+        _HITL_OWNER.update(mxid=owner, at=now, bad_at=None)
+        return owner
 
 
 _HITL_OWNER_UNKNOWN = "hitl: card click ignored, owner unknown"

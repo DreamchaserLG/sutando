@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -254,6 +255,72 @@ class TaskRelayClickTests(unittest.TestCase):
             later = self._new_req()
             self.assertIs(rgb._handle_hitl_action(self._click(later)), False, "an expired owner is not reused")
         self.assertIsNone(self.mgr.get(later.id).chosen_action)
+
+    def test_a_concurrent_refresh_never_lets_a_delayed_read_clobber_a_fresher_one(self):
+        """Two callers refresh past the TTL at the same time: a registry read that
+        started first but answers last must not re-authorize a former owner over
+        one a faster, later-started read already committed."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        OLD, NEW = OWNER, "@new-owner:ag2.space"
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def req(method, path, *a, **k):
+            idx = len(calls)
+            calls.append(idx)
+            if idx == 0:
+                entered.set()
+                self.assertTrue(release.wait(timeout=5), "test setup: never released")
+                return {"agents": [{"id": "@me:ag2.space", "owner": OLD}]}
+            return {"agents": [{"id": "@me:ag2.space", "owner": NEW}]}
+
+        results = {}
+        b_done = threading.Event()
+
+        def call_a():
+            results["a"] = rgb._hitl_owner()
+
+        def call_b():
+            results["b"] = rgb._hitl_owner()
+            b_done.set()
+
+        with mock.patch.object(rgb, "_req", req), \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"), \
+                mock.patch.object(rgb, "_log", lambda m: None):
+            ta = threading.Thread(target=call_a)
+            ta.start()
+            self.assertTrue(entered.wait(timeout=5), "the first read never started")
+            tb = threading.Thread(target=call_b)
+            tb.start()
+            self.assertFalse(b_done.wait(timeout=0.3),
+                              "a second refresh completed while the first was still in flight")
+            release.set()
+            ta.join(timeout=5)
+            tb.join(timeout=5)
+
+        self.assertEqual(len(calls), 1, "only one registry read happens across the race window")
+        self.assertEqual(results["a"], OLD)
+        self.assertEqual(results["b"], OLD, "the second caller reuses the first's fresh result, not a stale re-read")
+        self.assertEqual(rgb._HITL_OWNER["mxid"], OLD)
+
+        # The cache this produced is genuinely fresh: a click from NEW alone must not
+        # resolve until a real re-read happens (it was never the committed owner).
+        click = self._click(self._new_req(), actor=NEW)
+        self.assertEqual(rgb._handle_hitl_action(click), "ignored")
+
+    def test_registry_owner_never_matches_a_row_keyed_by_the_same_empty_string(self):
+        """A missing local identity (_reenroll_identity() == "") must not match a
+        malformed registry row whose own id also reads as ""."""
+        reads = []
+
+        def req(method, path, *a, **k):
+            reads.append(path)
+            return {"agents": [{"id": "", "owner": "@other:ag2.space"}]}
+
+        with mock.patch.object(rgb, "_req", req), mock.patch.object(rgb, "_reenroll_identity", lambda: ""):
+            self.assertEqual(rgb._registry_owner(), ("", ""))
+        self.assertEqual(reads, [], "no local identity to match: never even asks the registry")
 
     def test_no_hitl_store_on_this_host_leaves_the_click_a_task(self):
         with mock.patch.object(rgb, "_hitl_reply_handler", lambda *a, **k: None):
