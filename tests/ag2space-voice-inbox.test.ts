@@ -55,6 +55,7 @@ describe('read_inbox: what is addressed to this agent, newest first', () => {
 			assert.equal(r.items[0].room, 'Bodhi-migration');
 			assert.equal(r.items[0].from, 'Yixuan');
 			assert.equal(r.more, false);
+			assert.equal(r.complete, true);
 		}
 	});
 
@@ -78,6 +79,41 @@ describe('read_inbox: what is addressed to this agent, newest first', () => {
 		}
 	});
 
+	it('a window past the page cap is asked again over a day, then an hour, so the newest are the newest', async () => {
+		// The server pages oldest first: 7 pages of 100 for the week, 2 for the day, 1 for the hour.
+		const now = Date.UTC(2026, 9, 14, 21, 0);
+		const sinces: string[] = [];
+		const f = fake((_n, a) => {
+			const x = a.arguments as { since: string; cursor?: string };
+			if (!x.cursor) sinces.push(x.since);
+			const window = now - Date.parse(x.since);
+			const pages = window > 86_400_000 ? 7 : window > 3_600_000 ? 7 : 1;
+			const page = x.cursor ? Number(x.cursor) : 0;
+			const base = 700 - pages * 100 + page * 100;
+			return ok({ result: { mentions: Array.from({ length: 100 }, (_, i) => mention(base + i)), next_cursor: String(page + 1), has_more: page + 1 < pages, rooms_skipped: 0 } });
+		});
+		const r = await readInbox({ limit: 3 }, f.deps, () => now);
+		assert.deepEqual(sinces, [7 * 86_400_000, 86_400_000, 3_600_000].map(w => new Date(now - w).toISOString()));
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.deepEqual(r.items.map(i => i.event_id), ['$e699', '$e698', '$e697']);
+			assert.equal(r.complete, false);
+			assert.equal(r.more, true);
+			assert.ok(r.since);
+		}
+	});
+
+	it('rooms the server skipped make the list partial, never "nothing waiting"', async () => {
+		const f = fake(() => ok({ result: { mentions: [], next_cursor: null, has_more: false, rooms_skipped: 2 } }));
+		const r = await readInbox({}, f.deps);
+		assert.ok(r.ok);
+		if (r.ok) { assert.equal(r.items.length, 0); assert.equal(r.complete, false); assert.equal(r.rooms_skipped, 2); }
+	});
+
+	it('a response without a mentions list is an error, not an empty inbox', async () => {
+		assert.deepEqual(await readInbox({}, fake(() => ok({ result: { next_cursor: null } })).deps), { ok: false, error: 'bad_response' });
+	});
+
 	it('every failure is an answer', async () => {
 		assert.deepEqual(await readInbox({}, { ...fake(() => null).deps, client: () => null }), { ok: false, error: 'not_connected' });
 		assert.deepEqual(await readInbox({}, fake(() => err('FORBIDDEN')).deps), { ok: false, error: 'FORBIDDEN' });
@@ -96,6 +132,15 @@ describe('read_inbox: what is addressed to this agent, newest first', () => {
 		assert.equal(items[1].answered, true);
 		assert.equal(items[0].room, '!r:ag2.space');
 		assert.ok(items[0].text.endsWith('…') && items[0].text.length < 1000);
+	});
+
+	it('items: wrong field types are skipped or defaulted, never thrown', () => {
+		const items = toInboxItems([
+			mention(1, { sender: { user_id: 42, display_name: 7 } }),
+			mention(2, { sender: 'x', sent_at: 5, reason: 3, room_name: 9, room_id: 9 }),
+			mention(3, { event_id: 12 }),
+		]);
+		assert.deepEqual(items.map(i => [i.event_id, i.from, i.room, i.why, i.at]), [['$e2', '?', '?', 'mention', ''], ['$e1', '?', 'Bodhi-migration', 'mention', items[1].at]]);
 	});
 });
 
