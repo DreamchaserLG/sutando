@@ -86,10 +86,17 @@ class Base(unittest.TestCase):
                         mock.patch.object(gen, "resolve_key", lambda: ("k-test", "managed"))]
         for p in self.patches:
             p.start()
+        # Plain dict save/restore, not mock.patch.dict (a test that stops self.patches early
+        # would then double-stop it): isolates the default from the invoking shell's env.
+        self._env_backup = dict(os.environ)
+        os.environ.pop("IMAGE_MODEL", None)
+        os.environ.pop("VIDEO_MODEL", None)
 
     def tearDown(self):
         for p in self.patches:
             p.stop()
+        os.environ.clear()
+        os.environ.update(self._env_backup)
         self.tmp.cleanup()
 
     def opener(self, body=None, error=None):
@@ -479,10 +486,27 @@ class InputsAndOutputs(Base):
                          "either converted to a real GIF or kept the real JPEG bytes under .jpg — never JPEG bytes under .gif")
         if saved.suffix == ".gif":
             from PIL import Image
-            self.assertEqual(Image.open(saved).format, "GIF")
+            with Image.open(saved) as img:
+                self.assertEqual(img.format, "GIF")
         else:
             self.assertEqual(saved.suffix, ".jpg")
             self.assertEqual(content, JPEG)
+
+    def test_an_unrecognized_mime_never_hides_jpeg_bytes_behind_a_default_png(self):
+        """mime isn't trusted blindly: an unrecognized/nonstandard spelling (image/jpg, not
+        image/jpeg) must not make wanted == assumed-returned and skip conversion/fallback."""
+        out = self.ws / "default.png"
+        with pillow_present():
+            saved = gen.save_image(JPEG, "image/jpg", out, 90)  # nonstandard mime spelling
+        self.assertEqual(saved.suffix, ".png", "real bytes sniffed as JPEG, Pillow converts to real PNG")
+        from PIL import Image
+        with Image.open(saved) as img:
+            self.assertEqual(img.format, "PNG")
+        out2 = self.ws / "default2.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved2 = gen.save_image(JPEG, "image/jpg", out2, 90)
+        self.assertEqual(saved2.suffix, ".jpg", "no Pillow: falls back to the sniffed extension, never .png")
+        self.assertEqual(saved2.read_bytes(), JPEG)
 
 
 class FakeGenai:

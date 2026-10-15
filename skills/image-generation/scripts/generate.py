@@ -216,11 +216,25 @@ def first_image(response: dict) -> tuple[bytes | None, str, str, str]:
     return None, "", text.strip(), reason
 
 
+def sniff_image_ext(data: bytes) -> str:
+    """The real format from magic bytes, not the API's self-reported (and sometimes unrecognized
+    or nonstandard) mime string. Only truly unidentifiable bytes fall back to .png."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".png"
+
+
 def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     """Write the bytes; convert to the requested extension only when Pillow can, else keep the
     returned format under its own extension so the file is never mislabelled."""
     wanted = out.suffix.lower()
-    returned = {"image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime, ".png")
+    returned = sniff_image_ext(data)
     out.parent.mkdir(parents=True, exist_ok=True)
     if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif") and wanted != returned:
         try:
