@@ -1345,7 +1345,7 @@ class Keepalive(Base):
     """The watchdog and probe install schedules as Hatch tasks, and the commands they run."""
     cli, state, sparrow_status = Cli.cli, Cli.state, Cli.sparrow_status
     LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ listener=(up|down) watchdog=(up|down) "
-                      r"listener_restarts=\d+( watchdog_restarted)?$")
+                      r"listener_restarts=\d+( watchdog_restarted| watchdog_task_present)?$")
 
     @property
     def crons(self):
@@ -1475,6 +1475,23 @@ class Keepalive(Base):
         line = self.log.read_text().splitlines()[-1]
         self.assertIn(" watchdog=up ", line)
         self.assertNotIn("watchdog_restarted", line)
+
+    def test_probe_with_the_watchdog_task_still_present_reports_that_honestly(self):
+        """The likeliest real failure is the scheduler stopping on an intact task file,
+        not the file vanishing. _install_task returns True there too (cli.py's old == text
+        branch only chmods), so the probe must not call that a restart it didn't do."""
+        self.installed()
+        self.sparrow_status()
+        before = self.watchdog_task.stat().st_mtime
+        self.set_watchdog_seen(time.time() - keepalive.WATCHDOG_STALE_S - 5)
+        r = self.cli("keepalive", "probe")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        line = self.log.read_text().splitlines()[-1]
+        self.assertRegex(line, self.LINE)
+        self.assertIn(" watchdog=down ", line)
+        self.assertTrue(line.endswith(" watchdog_task_present"))
+        self.assertNotIn("watchdog_restarted", line)
+        self.assertEqual(self.watchdog_task.stat().st_mtime, before, "nothing was rewritten")
 
     def test_watchdog_leaves_a_running_listener_alone(self):
         self.installed()

@@ -274,9 +274,14 @@ def probe(cfg: dict, log: Path, now: float | None = None) -> int:
     if not wd_up:
         directory = cron_dir(cfg)
         name, minutes, sub, what = TASKS[0]
+        target = directory / task_file(name, minutes)
+        before = target.stat().st_mtime if target.exists() else None
         if _install_task(directory, name, minutes,
                          render_task(name, minutes, sub, what, _command(cfg)), force=False):
-            line += " watchdog_restarted"
+            after = target.stat().st_mtime if target.exists() else None
+            # _install_task returns True for an identical, untouched file too (cli.py's
+            # old == text branch only chmods) — only a changed mtime is a real rewrite.
+            line += " watchdog_restarted" if before != after else " watchdog_task_present"
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
