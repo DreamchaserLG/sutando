@@ -15,18 +15,32 @@ const PRESENT = existsSync(join(PLUGIN_DIR, 'inbox.ts'));
 if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 if (PRESENT) {
-const { readInbox, toInboxItems, createReadInboxTool, INBOX_PROMPT_RULE, INBOX_TURN_CHECK_RULE, INBOX_DEFAULT_LIMIT } = await import('../skills/ag2space-voice/inbox.ts');
+const { readInbox, toInboxItems, ownerInboxSupported, createReadInboxTool, INBOX_PROMPT_RULE, INBOX_TURN_CHECK_RULE, INBOX_DEFAULT_LIMIT, OWNER_SCOPE_TTL_MS } = await import('../skills/ag2space-voice/inbox.ts');
 
 type Call = { name: string; args: Record<string, unknown> };
 const ok = (v: unknown) => ({ structuredContent: v });
 const err = (code: string) => ({ isError: true, structuredContent: { code } });
 
-function fake(handler: (name: string, args: Record<string, unknown>) => unknown) {
+/** `owner`: what room.actions.describe says of mentions.inbox — a scope with "owner", none, or a failure. */
+function fake(handler: (name: string, args: Record<string, unknown>) => unknown, owner: 'yes' | 'no' | 'fails' = 'no') {
 	const calls: Call[] = [];
-	const client = { async callTool(name: string, args: Record<string, unknown>) { calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r as never; }, close() {} };
+	const described: Call[] = [];
+	const client = {
+		async callTool(name: string, args: Record<string, unknown>) {
+			if (name === 'room.actions.describe') {
+				described.push({ name, args });
+				if (owner === 'fails') throw new Error('room.actions.describe timed out after 15000ms');
+				const props: Record<string, unknown> = { limit: {}, since: {} };
+				if (owner === 'yes') props.scope = { enum: ['self', 'owner'] };
+				return ok({ action: 'mentions.inbox', input_schema: { properties: props } }) as never;
+			}
+			calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r as never;
+		},
+		close() {},
+	};
 	const index = { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 };
 	const deps = { client: () => client, currentRoom: () => ({ id: '!cur:ag2.space', name: 'Current' }), index, log: () => {} };
-	return { calls, client, deps };
+	return { calls, described, client, deps };
 }
 
 const mention = (i: number, extra: Record<string, unknown> = {}) => ({
@@ -144,6 +158,57 @@ describe('read_inbox: what is addressed to this agent, newest first', () => {
 	});
 });
 
+describe('the owner\'s own inbox, where the server offers it', () => {
+	const page = (items: unknown[]) => ok({ result: { mentions: items, next_cursor: null, has_more: false, rooms_skipped: 0 } });
+
+	it('the server lists scope "owner": read with it, and say it is the owner\'s', async () => {
+		const f = fake(() => page([mention(1)]), 'yes');
+		const r = await readInbox({}, f.deps);
+		assert.equal(f.described.length, 1);
+		assert.equal(f.described[0].args.target_kind, 'account');
+		assert.equal(f.described[0].args.action, 'mentions.inbox');
+		assert.equal((f.calls[0].args.arguments as Record<string, unknown>).scope, 'owner');
+		assert.ok(r.ok && r.whose === 'owner' && !('owner_error' in r));
+	});
+
+	it('the server does not list it, or cannot say: read this agent\'s, without scope', async () => {
+		for (const owner of ['no', 'fails'] as const) {
+			const f = fake(() => page([mention(1)]), owner);
+			const r = await readInbox({}, f.deps);
+			assert.equal((f.calls[0].args.arguments as Record<string, unknown>).scope, undefined, owner);
+			assert.ok(r.ok && r.whose === 'this agent', owner);
+		}
+	});
+
+	it('offered but refused here (not enabled): this agent\'s inbox, with the refusal', async () => {
+		const f = fake((_n, a) => (a.arguments as { scope?: string }).scope === 'owner' ? err('OWNER_SCOPE_NOT_GRANTED') : page([mention(2)]), 'yes');
+		const r = await readInbox({}, f.deps);
+		assert.equal(f.calls.length, 2);
+		assert.equal((f.calls[1].args.arguments as Record<string, unknown>).scope, undefined);
+		assert.ok(r.ok && r.whose === 'this agent' && r.owner_error === 'OWNER_SCOPE_NOT_GRANTED' && r.items[0].event_id === '$e2');
+	});
+
+	it('a transport failure on the owner read is that failure, not a silent switch', async () => {
+		const f = fake(() => new Error('tools/call timed out after 15000ms'), 'yes');
+		assert.deepEqual(await readInbox({}, f.deps), { ok: false, error: 'timeout' });
+		assert.equal(f.calls.length, 1);
+	});
+
+	it('the answer is kept for a while, per client, then asked again', async () => {
+		const f = fake(() => page([]), 'yes');
+		let t = 1_000;
+		assert.equal(await ownerInboxSupported(f.client as never, () => t), true);
+		t += OWNER_SCOPE_TTL_MS - 1;
+		assert.equal(await ownerInboxSupported(f.client as never, () => t), true);
+		assert.equal(f.described.length, 1);
+		t += 2;
+		await ownerInboxSupported(f.client as never, () => t);
+		assert.equal(f.described.length, 2);
+		const g = fake(() => page([]), 'no');
+		assert.equal(await ownerInboxSupported(g.client as never, () => t), false);
+	});
+});
+
 describe('read_inbox as the voice model sees it', () => {
 	it('answers through readInbox, and an outage is an answer', async () => {
 		const f = fake(() => ok({ result: { mentions: [], next_cursor: null, has_more: false } }));
@@ -155,9 +220,9 @@ describe('read_inbox as the voice model sees it', () => {
 	});
 
 	it('says whose inbox it is, and the rules name it', () => {
-		assert.match(createReadInboxTool(fake(() => null).deps).description, /not the user's own account/);
+		assert.match(createReadInboxTool(fake(() => null).deps).description, /`whose` says which it read/);
 		assert.match(INBOX_PROMPT_RULE, /read_inbox/);
-		assert.match(INBOX_PROMPT_RULE, /not the user\'s personal account/);
+		assert.match(INBOX_PROMPT_RULE, /`whose`/);
 		assert.match(INBOX_TURN_CHECK_RULE, /^- none:/);
 	});
 });
