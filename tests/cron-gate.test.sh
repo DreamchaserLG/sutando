@@ -8,7 +8,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd -P)"
 GATE="$REPO/scripts/cron-gate.sh"
 
 TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT
+trap 'chmod -R u+rwx "$TMPDIR" 2>/dev/null; rm -rf "$TMPDIR"' EXIT
 mkdir -p "$TMPDIR/tasks"
 
 # SUTANDO_TEST_MODE=1 lets resolve_workspace() honor SUTANDO_WORKSPACE silently
@@ -173,5 +173,49 @@ case "$out" in
 esac
 ok "a task with no access_tier still defers — unknown tier fails closed"
 rm -f "$TMPDIR/tasks/"task-*.txt
+
+# --- worker-held owner tasks: the holder is worker_delivery.holder_of --------
+# A sentinel in deliveries/<worker>/ means the router handed the task to that
+# worker, so the core is not busy with it and the cron must not wait on it.
+expect_runs() {  # <label> <marker>
+  out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" "$1" echo "$2" 2>&1)"
+  [ "$out" = "$2" ] || fail "$1: expected '$2', got '$out'"
+}
+expect_defers() {  # <label>
+  out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" "$1" echo 'should-not-run' 2>&1)"
+  case "$out" in *"deferring $1"*) : ;; *) fail "$1: expected deferral, got '$out'" ;; esac
+  case "$out" in *should-not-run*) fail "$1: wrapped command ran" ;; *) : ;; esac
+}
+
+printf 'id: task-held1\naccess_tier: owner\ntask: owner work\n' > "$TMPDIR/tasks/task-held1.txt"
+for suffix in .txt .accepted .claimed; do
+  rm -rf "$TMPDIR/deliveries"; mkdir -p "$TMPDIR/deliveries/w1"
+  touch "$TMPDIR/deliveries/w1/task-held1$suffix"
+  expect_runs "test-held$suffix" "ran-held$suffix"
+done
+ok "an owner task a worker holds (.txt / .accepted / .claimed) does not defer"
+
+printf 'id: t\ntask: no tier\n' > "$TMPDIR/tasks/task-held2.txt"
+mkdir -p "$TMPDIR/deliveries/w2"; touch "$TMPDIR/deliveries/w2/task-held2.accepted"
+printf 'id: t\naccess_tier: team\ntask: peer\n' > "$TMPDIR/tasks/task-team-2.txt"
+expect_runs test-held-plus-team ran-held-plus-team
+ok "worker-held owner + untiered tasks beside a team task do not defer"
+
+printf 'id: task-free1\naccess_tier: owner\ntask: owner work\n' > "$TMPDIR/tasks/task-free1.txt"
+expect_defers test-unheld-beside-held
+ok "an unheld owner task still defers beside worker-held ones"
+rm -f "$TMPDIR/tasks/task-free1.txt"
+
+rm -rf "$TMPDIR/deliveries"
+expect_defers test-no-deliveries
+ok "an owner task with no deliveries/ at all still defers"
+
+mkdir -p "$TMPDIR/deliveries/w1"; touch "$TMPDIR/deliveries/w1/task-held1.txt" "$TMPDIR/deliveries/w1/task-held2.txt"
+expect_runs test-held-sanity ran-held-sanity
+chmod 000 "$TMPDIR/deliveries"
+expect_defers test-holder-error
+chmod 755 "$TMPDIR/deliveries"
+ok "an unreadable deliveries/ (holder check errors) defers"
+rm -rf "$TMPDIR/deliveries"; rm -f "$TMPDIR/tasks/"task-*.txt
 
 echo "OK — $PASSED/$PASSED cron-gate tests passed"

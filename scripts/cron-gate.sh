@@ -58,19 +58,45 @@ shift
 # A file with NO access_tier line still defers. That is deliberate and matches
 # CLAUDE.md: "Only access_tier: owner (or tasks without an access_tier field)
 # get full processing." Unknown tier fails CLOSED -- toward yielding.
+# An owner task a pool worker holds (worker_delivery.holder_of) is not the core's
+# to answer, so it does not defer; with no worker-pool skill nobody holds anything.
+POOL_SCRIPTS="$SCRIPT_PARENT/skills/worker-pool/scripts"
+
+# Exit 10 = every id is held by a worker. Anything else (an unheld id, an
+# unreadable deliveries/, no python) defers, as before this check existed.
+all_held_by_workers() {
+  python3 -I -c '
+import os, sys
+pool, ws, ids = sys.argv[1], sys.argv[2], sys.argv[3:]
+try:
+    try:
+        os.stat(os.path.join(pool, "worker_delivery.py"))
+    except FileNotFoundError:
+        sys.exit(0)
+    sys.path.insert(0, pool)
+    from worker_delivery import holder_of
+    sys.exit(10 if all(holder_of(ws, i) is not None for i in ids) else 0)
+except Exception as exc:
+    print(f"cron-gate: cannot tell who holds the queued tasks ({exc})", file=sys.stderr)
+    sys.exit(2)
+' "$POOL_SCRIPTS" "$WORKSPACE" "$@"
+  [ $? -eq 10 ]
+}
+
 owner_task_queued() {
-  local f tier
+  local f tier ids=()
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     tier="$(sed -n 's/^access_tier:[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '[:space:]')"
     case "$tier" in
       team|other|guest|ambient) continue ;;   # explicitly not the owner -> ignore
-      *) return 0 ;;                    # owner, or unstated -> yield
+      *) ids+=("$(basename "$f" .txt)") ;;   # owner, or unstated -> yield unless worker-held
     esac
   done <<EOF
 $(find "$WORKSPACE/tasks" -maxdepth 1 -name 'task-*.txt' ! -name 'task-cron-*.txt' ! -name 'task-workstream-grouping-*.txt' ! -name 'task-project-grouping-*.txt' 2>/dev/null)
 EOF
-  return 1
+  [ ${#ids[@]} -gt 0 ] || return 1
+  ! all_held_by_workers "${ids[@]}"
 }
 
 if [ -d "$WORKSPACE/tasks" ] && owner_task_queued; then
