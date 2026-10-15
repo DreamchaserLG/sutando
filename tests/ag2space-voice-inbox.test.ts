@@ -124,6 +124,14 @@ describe('read_inbox: what is addressed to this agent, newest first', () => {
 		if (r.ok) { assert.equal(r.items.length, 0); assert.equal(r.complete, false); assert.equal(r.rooms_skipped, 2); }
 	});
 
+	it('past the caller\'s deadline no new page starts, and the read says there is more', async () => {
+		const { fetchInbox } = await import('../skills/ag2space-voice/inbox.ts');
+		const f = fake(() => ok({ result: { mentions: [mention(1)], next_cursor: 'c', has_more: true, rooms_skipped: 0 } }));
+		const r = await fetchInbox(f.client as never, { since: 'x', include_replied: false, deadline: Date.now() - 1 }, f.deps);
+		assert.equal(f.calls.length, 1);
+		assert.ok(r.ok && r.more && r.items.length === 1);
+	});
+
 	it('a response without a mentions list is an error, not an empty inbox', async () => {
 		assert.deepEqual(await readInbox({}, fake(() => ok({ result: { next_cursor: null } })).deps), { ok: false, error: 'bad_response' });
 	});

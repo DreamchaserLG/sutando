@@ -66,12 +66,14 @@ export async function ownerInboxSupported(client: McpClient, now: () => number =
 export interface InboxPage { items: unknown[]; more: boolean; rooms_skipped: number }
 
 /** mentions.inbox since a time, every page up to INBOX_MAX_PAGES, as the server gave them (oldest first). */
-export async function fetchInbox(client: McpClient, args: { since: string; include_replied: boolean; room_ids?: string[]; owner?: boolean }, deps: Pick<ReadRoomDeps, 'log'>): Promise<({ ok: true } & InboxPage) | { ok: false; error: string }> {
+export async function fetchInbox(client: McpClient, args: { since: string; include_replied: boolean; room_ids?: string[]; owner?: boolean; deadline?: number }, deps: Pick<ReadRoomDeps, 'log'>): Promise<({ ok: true } & InboxPage) | { ok: false; error: string }> {
 	const items: unknown[] = [];
 	let cursor: string | null = null;
 	let more = false;
 	let skipped = 0;
 	for (let page = 0; page < INBOX_MAX_PAGES; page++) {
+		// Past the caller's deadline no new page starts; what was read is returned as having more.
+		if (page > 0 && args.deadline !== undefined && Date.now() > args.deadline) return { ok: true, items, more: true, rooms_skipped: skipped };
 		const read = await roomRead(client, null, 'mentions.inbox', { limit: INBOX_PAGE, since: args.since, include_replied: args.include_replied, ...(args.owner ? { scope: 'owner' } : {}), ...(args.room_ids?.length ? { room_ids: args.room_ids } : {}), ...(cursor ? { cursor } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
 		if (!read.ok) return read;
 		if (!Array.isArray(read.result.mentions)) return { ok: false, error: 'bad_response' };
@@ -85,7 +87,7 @@ export async function fetchInbox(client: McpClient, args: { since: string; inclu
 }
 
 /** One inbox read as the owner where the server offers it, else (or when it refuses the owner here) as this agent. */
-export async function fetchInboxAs(client: McpClient, args: { since: string; include_replied: boolean; room_ids?: string[]; owner: boolean }, deps: Pick<ReadRoomDeps, 'log'>): Promise<({ ok: true; whose: InboxWhose; owner_error?: string } & InboxPage) | { ok: false; error: string }> {
+export async function fetchInboxAs(client: McpClient, args: { since: string; include_replied: boolean; room_ids?: string[]; owner: boolean; deadline?: number }, deps: Pick<ReadRoomDeps, 'log'>): Promise<({ ok: true; whose: InboxWhose; owner_error?: string } & InboxPage) | { ok: false; error: string }> {
 	const r = await fetchInbox(client, args, deps);
 	if (r.ok) return { ...r, whose: args.owner ? 'owner' : 'this agent' };
 	if (!args.owner || ['timeout', 'unavailable', 'bad_response'].includes(r.error)) return r;
