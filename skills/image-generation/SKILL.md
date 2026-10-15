@@ -25,7 +25,7 @@ Output lands at `<workspace>/results/media/generated-<ts>.png` (`.mp4` for video
 the attachment allowlist, so the file can be sent as-is. `--model` overrides `IMAGE_MODEL` /
 `VIDEO_MODEL` (env, then this skill's `manifest.json` `config`).
 
-**Higher quality tier.** The default (`gemini-3.1-flash-image`, "Nano Banana 2") is fast and cheap.
+**Higher quality tier.** The default (`gemini-nano-banana-2.1`, "Nano Banana 2.1") is fast and cheap.
 For a request where quality should win over speed/cost — a final hero image, a logo, anything
 going out the door — pass `--model gemini-3-pro-image` ("Nano Banana Pro"). It is not a newer
 default, just a pricier/slower tradeoff, so it's opt-in rather than the baseline.

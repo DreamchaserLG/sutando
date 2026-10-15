@@ -35,7 +35,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution:
 # makes); a copied install has no core tree, and every import below degrades to env-only.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
+DEFAULT_IMAGE_MODEL = "gemini-nano-banana-2.1"
 PRO_IMAGE_MODEL = "gemini-3-pro-image"  # higher quality/cost tier ("Nano Banana Pro"); select via --model/IMAGE_MODEL
 DEFAULT_VIDEO_MODEL = "veo-3.1-generate-preview"
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
