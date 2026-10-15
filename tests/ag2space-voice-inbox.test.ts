@@ -1,0 +1,119 @@
+/**
+ * read_inbox — what is addressed to this agent across its rooms (mentions.inbox).
+ *
+ * Pins: read as the account (target_kind account), never a room; over the last days, unanswered
+ * unless asked; paged to the newest, newest first, cut to the limit; the tool says it is this
+ * agent's inbox, not the owner's; every failure is an answer, never a throw.
+ */
+import { describe, it, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+const PLUGIN_DIR = join(process.cwd(), 'skills', 'ag2space-voice');
+const PRESENT = existsSync(join(PLUGIN_DIR, 'inbox.ts'));
+if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
+
+if (PRESENT) {
+const { readInbox, toInboxItems, createReadInboxTool, INBOX_PROMPT_RULE, INBOX_TURN_CHECK_RULE, INBOX_DEFAULT_LIMIT } = await import('../skills/ag2space-voice/inbox.ts');
+
+type Call = { name: string; args: Record<string, unknown> };
+const ok = (v: unknown) => ({ structuredContent: v });
+const err = (code: string) => ({ isError: true, structuredContent: { code } });
+
+function fake(handler: (name: string, args: Record<string, unknown>) => unknown) {
+	const calls: Call[] = [];
+	const client = { async callTool(name: string, args: Record<string, unknown>) { calls.push({ name, args }); const r = handler(name, args); if (r instanceof Error) throw r; return r as never; }, close() {} };
+	const index = { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 };
+	const deps = { client: () => client, currentRoom: () => ({ id: '!cur:ag2.space', name: 'Current' }), index, log: () => {} };
+	return { calls, client, deps };
+}
+
+const mention = (i: number, extra: Record<string, unknown> = {}) => ({
+	room_id: '!r:ag2.space', room_name: 'Bodhi-migration', event_id: `$e${i}`, sender: { user_id: '@yixuan:ag2.space', display_name: 'Yixuan' },
+	sent_at: new Date(Date.UTC(2026, 9, 14, 20, i)).toISOString(), body: `message ${i}`, reason: 'mention', in_reply_to: null, thread_root: null, replied: false, link: null, ...extra,
+});
+
+describe('read_inbox: what is addressed to this agent, newest first', () => {
+	it('reads mentions.inbox as the account, over the last days, unanswered only', async () => {
+		const f = fake(() => ok({ status: 'completed', result: { mentions: [mention(1), mention(2)], next_cursor: null, has_more: false } }));
+		const now = Date.UTC(2026, 9, 14, 21, 0);
+		const r = await readInbox({}, f.deps, () => now);
+		assert.equal(f.calls.length, 1);
+		const c = f.calls[0];
+		assert.equal(c.name, 'room.action.read');
+		assert.equal(c.args.target_kind, 'account');
+		assert.equal(c.args.room_id, undefined);
+		assert.equal(c.args.action, 'mentions.inbox');
+		const a = c.args.arguments as Record<string, unknown>;
+		assert.equal(a.include_replied, false);
+		assert.equal(a.since, new Date(now - 7 * 86_400_000).toISOString());
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.whose, 'this agent');
+			assert.deepEqual(r.items.map(i => i.event_id), ['$e2', '$e1']);
+			assert.equal(r.items[0].room, 'Bodhi-migration');
+			assert.equal(r.items[0].from, 'Yixuan');
+			assert.equal(r.more, false);
+		}
+	});
+
+	it('follows the cursor to the newest page and keeps only the newest `limit`', async () => {
+		let page = 0;
+		const f = fake((_n, args) => {
+			page++;
+			const cur = (args.arguments as { cursor?: string }).cursor;
+			if (page === 1) { assert.equal(cur, undefined); return ok({ result: { mentions: Array.from({ length: 12 }, (_, i) => mention(i)), next_cursor: 'c1', has_more: true } }); }
+			assert.equal(cur, 'c1');
+			return ok({ result: { mentions: [mention(30), mention(31)], next_cursor: 'c2', has_more: false } });
+		});
+		const r = await readInbox({ include_answered: true, days: 2 }, f.deps);
+		assert.equal(f.calls.length, 2);
+		assert.equal((f.calls[0].args.arguments as Record<string, unknown>).include_replied, true);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.items.length, INBOX_DEFAULT_LIMIT);
+			assert.equal(r.items[0].event_id, '$e31');
+			assert.equal(r.more, true);
+		}
+	});
+
+	it('every failure is an answer', async () => {
+		assert.deepEqual(await readInbox({}, { ...fake(() => null).deps, client: () => null }), { ok: false, error: 'not_connected' });
+		assert.deepEqual(await readInbox({}, fake(() => err('FORBIDDEN')).deps), { ok: false, error: 'FORBIDDEN' });
+		assert.deepEqual(await readInbox({}, fake(() => new Error('tools/call timed out after 15000ms')).deps), { ok: false, error: 'timeout' });
+	});
+
+	it('items: a sender without a display name, an empty body skipped, a long body cut, answered marked', () => {
+		const items = toInboxItems([
+			mention(1, { sender: { user_id: '@chi:ag2.space', display_name: null }, replied: true }),
+			mention(2, { body: '   ' }),
+			mention(3, { body: 'x'.repeat(1000), room_name: null }),
+			null,
+		]);
+		assert.equal(items.length, 2);
+		assert.equal(items[1].from, 'chi');
+		assert.equal(items[1].answered, true);
+		assert.equal(items[0].room, '!r:ag2.space');
+		assert.ok(items[0].text.endsWith('…') && items[0].text.length < 1000);
+	});
+});
+
+describe('read_inbox as the voice model sees it', () => {
+	it('answers through readInbox, and an outage is an answer', async () => {
+		const f = fake(() => ok({ result: { mentions: [], next_cursor: null, has_more: false } }));
+		const t = createReadInboxTool(f.deps);
+		assert.equal(t.name, 'read_inbox');
+		assert.equal(t.execution, 'inline');
+		assert.equal(((await t.execute({}, {} as never)) as { ok: boolean }).ok, true);
+		assert.equal(((await createReadInboxTool({ ...f.deps, client: () => null }).execute({}, {} as never)) as { ok: boolean }).ok, false);
+	});
+
+	it('says whose inbox it is, and the rules name it', () => {
+		assert.match(createReadInboxTool(fake(() => null).deps).description, /not the user's own account/);
+		assert.match(INBOX_PROMPT_RULE, /read_inbox/);
+		assert.match(INBOX_PROMPT_RULE, /not the user\'s personal account/);
+		assert.match(INBOX_TURN_CHECK_RULE, /^- none:/);
+	});
+});
+}
