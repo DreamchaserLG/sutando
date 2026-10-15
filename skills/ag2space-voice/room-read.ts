@@ -601,6 +601,7 @@ export function createSearchRoomTool(deps: ReadRoomDeps): ToolDefinition {
 		name: 'search_room',
 		description:
 			'Search an AG2 Space room\'s messages for words, however far back, right now (a second or two). ' +
+			'It finds a topic in one room; it is not how to find who mentioned, tagged or messaged the user — that is read_inbox. ' +
 			'Call it when the user asks what was said in a room about a particular PR, issue, topic or person ("what was the review of 5473 in Sutando Triage", "what did Chi say about the guest line"), or about something from earlier than the latest messages — never answer such a question from memory or from an earlier answer; search every time. ' +
 			'Pass `query` = the words to find (a PR number, a name, a phrase), `room` = the room name as spoken or as listed in ROOMS; leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, hits:[{at, from, text, event_id}]} newest first, each a snippet around the match — answer from them in a sentence or two; to read the whole discussion around a hit, call read_room with `around` = its event_id. ' +

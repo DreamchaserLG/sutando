@@ -138,7 +138,8 @@ export function createReadInboxTool(deps: ReadRoomDeps): ToolDefinition {
 		name: 'read_inbox',
 		description:
 			'Read the AG2 Space inbox, right now (a few seconds): messages across rooms that @-mention, reply to, or are sent directly to the user — or to you, this agent, where the server cannot read the user\'s own yet. ' +
-			'Call it when the user asks whether anyone is looking for them or for you, who mentioned or messaged them, or what is waiting for an answer. ' +
+			'Call it whenever the user asks whether anyone is looking for, mentioned, tagged, @-ed, replied to or messaged them or you, or what notifications or messages are waiting — in any wording, with or without a room. ' +
+			'This is how such a question is answered: never search room after room for the user\'s name, handle or id instead, and never answer it from an earlier answer. ' +
 			'`whose` says which it read: "owner" — the user\'s own inbox; "this agent" — yours, not the user\'s personal account, so a mention of the user is not in it — say so when it matters; with owner_error the server refused the user\'s own inbox (it may not be enabled for you) — say that too. ' +
 			'Unanswered items only, unless `include_answered`. Returns {ok:true, whose, items:[{at, room, from, text, why, event_id}], more, complete, rooms_skipped, since} newest first — answer in a sentence or two: who, where, about what; to read the discussion around one, call read_room with that room and `around` = its event_id. ' +
 			'complete:false means the list is partial: rooms_skipped rooms could not be read, or (with `since`) there were too many to list and only those since then are here — say so, and never say nothing is waiting unless complete is true and items is empty. ' +
@@ -159,6 +160,6 @@ export function createReadInboxTool(deps: ReadRoomDeps): ToolDefinition {
 	};
 }
 
-export const INBOX_PROMPT_RULE = '- AG2 SPACE INBOX: "is anyone looking for me / for you", "who mentioned me", "what is waiting for an answer" → read_inbox, every time, never from memory. Its `whose` says whether it read the user\'s own inbox or only yours — when only yours, say so. Never submit work for it.';
+export const INBOX_PROMPT_RULE = '- AG2 SPACE INBOX: whether anyone is looking for, mentioned, tagged, @-ed, replied to or messaged the user (or you), or what is waiting for an answer — in any wording, with or without a room → read_inbox, every time, never from memory. It comes before search_room: never search room after room for the user\'s name, handle or id to find mentions. Its `whose` says whether it read the user\'s own inbox or only yours — when only yours, say so. Never submit work for it.';
 
-export const INBOX_TURN_CHECK_RULE = '- none: the AG2 Space inbox ("anyone looking for me", "who mentioned you", "what is waiting for an answer") is the assistant\'s own to read, never work.';
+export const INBOX_TURN_CHECK_RULE = '- none: the AG2 Space inbox — whether anyone is looking for, mentioned, tagged or messaged the user or the assistant, or what is waiting for an answer — is the assistant\'s own to read, never work.';
