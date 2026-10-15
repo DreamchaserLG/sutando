@@ -216,9 +216,9 @@ def first_image(response: dict) -> tuple[bytes | None, str, str, str]:
     return None, "", text.strip(), reason
 
 
-def sniff_image_ext(data: bytes) -> str:
+def sniff_image_ext(data: bytes) -> str | None:
     """The real format from magic bytes, not the API's self-reported (and sometimes unrecognized
-    or nonstandard) mime string. Only truly unidentifiable bytes fall back to .png."""
+    or nonstandard) mime string. None when truly unidentified — never claim a format we didn't see."""
     if data[:3] == b"\xff\xd8\xff":
         return ".jpg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -227,21 +227,26 @@ def sniff_image_ext(data: bytes) -> str:
         return ".gif"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return ".webp"
-    return ".png"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return None
 
 
 def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     """Write the bytes; convert to the requested extension only when Pillow can, else keep the
     returned format under its own extension so the file is never mislabelled."""
     wanted = out.suffix.lower()
-    returned = sniff_image_ext(data)
+    # A guessed extension from the mime is still honest labelling; only a hardcoded ".png" would claim
+    # a format nothing actually observed. mimetypes has no bespoke webp/gif mapping on some platforms.
+    returned = (sniff_image_ext(data) or mimetypes.guess_extension(mime)
+                or {"image/webp": ".webp", "image/gif": ".gif"}.get(mime) or ".bin")
     out.parent.mkdir(parents=True, exist_ok=True)
-    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif") and wanted != returned:
+    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp") and wanted != returned:
         try:
             from PIL import Image  # noqa: PLC0415
             import io  # noqa: PLC0415
             img = Image.open(io.BytesIO(data))
-            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP", ".png": "PNG", ".gif": "GIF"}[wanted]
+            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP", ".png": "PNG", ".gif": "GIF", ".bmp": "BMP"}[wanted]
             if fmt == "JPEG":
                 img = img.convert("RGB")
             if fmt in ("JPEG", "WEBP"):
@@ -255,7 +260,7 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
         except OSError as err:
             out = out.with_suffix(returned)
             log(f"Pillow could not convert the returned {mime} ({err}): saved it as {out.name}")
-    elif wanted not in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+    elif wanted not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
         out = out.with_suffix(returned)
     tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
     tmp.write_bytes(data)

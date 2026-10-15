@@ -442,7 +442,7 @@ class InputsAndOutputs(Base):
             rc, line = self.run_main("--prompt", "x", "--output", str(out2), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "no Pillow: the returned png keeps its own extension")
         self.assertEqual(Path(line["path"]).read_bytes(), PNG)
-        out3 = self.ws / "pic3.bmp"
+        out3 = self.ws / "pic3.tiff"  # genuinely unsupported (unlike .bmp, which save_image now handles)
         rc, line = self.run_main("--prompt", "x", "--output", str(out3), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
 
@@ -494,19 +494,31 @@ class InputsAndOutputs(Base):
 
     def test_an_unrecognized_mime_never_hides_jpeg_bytes_behind_a_default_png(self):
         """mime isn't trusted blindly: an unrecognized/nonstandard spelling (image/jpg, not
-        image/jpeg) must not make wanted == assumed-returned and skip conversion/fallback."""
+        image/jpeg) must not make wanted == assumed-returned and skip conversion/fallback.
+        Uses fake_pil() (not pillow_present()), deterministic regardless of the host's real
+        Pillow — pillow_present() previously made this fail under -S (no site-packages)."""
+        FakeImage.saved.clear()
         out = self.ws / "default.png"
-        with pillow_present():
+        with mock.patch.dict(sys.modules, fake_pil()):
             saved = gen.save_image(JPEG, "image/jpg", out, 90)  # nonstandard mime spelling
         self.assertEqual(saved.suffix, ".png", "real bytes sniffed as JPEG, Pillow converts to real PNG")
-        from PIL import Image
-        with Image.open(saved) as img:
-            self.assertEqual(img.format, "PNG")
+        self.assertEqual(saved.read_bytes(), b"FAKE-PNG")
+        self.assertEqual(FakeImage.saved, [("PNG", None)])
         out2 = self.ws / "default2.png"
         with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
             saved2 = gen.save_image(JPEG, "image/jpg", out2, 90)
         self.assertEqual(saved2.suffix, ".jpg", "no Pillow: falls back to the sniffed extension, never .png")
         self.assertEqual(saved2.read_bytes(), JPEG)
+
+    def test_an_unidentifiable_response_never_claims_png_either(self):
+        """A format sniff_image_ext cannot recognize at all (e.g. BMP, which first_image()
+        still accepts as image/*) must get an honest fallback, not a hardcoded .png claim."""
+        bmp = b"BM" + b"\x00" * 10  # real BMP magic, not a full valid file
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(bmp, "image/bmp", out, 90)
+        self.assertEqual(saved.suffix, ".bmp", "sniffed BMP magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), bmp)
 
 
 class FakeGenai:
