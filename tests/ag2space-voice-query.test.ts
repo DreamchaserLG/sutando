@@ -12,7 +12,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	queryMessages, windowStart, resetLastChecked, recordCallEnded, createQueryMessagesTool, addressedTo, QUERY_PROMPT_RULE, QUERY_TURN_CHECK_RULE,
+	queryMessages, windowStart, resetLastChecked, resetSenderOwners, recordCallEnded, createQueryMessagesTool, addressedTo, QUERY_PROMPT_RULE, QUERY_TURN_CHECK_RULE,
 	QUERY_FIRST_WINDOW_MS, QUERY_ROOM_PAGE, QUERY_ROOM_MAX_PAGES, QUERY_SEARCH_MAX_PAGES, QUERY_BUDGET_MS,
 } = await import('../skills/ag2space-voice/query.ts');
 
@@ -53,7 +53,7 @@ const args = (c: Call) => c.args.arguments as Record<string, unknown>;
 const TMP = mkdtempSync(join(tmpdir(), 'voice-query-'));
 let heardFile = '';
 let n = 0;
-beforeEach(() => { heardFile = join(TMP, `heard-${++n}.json`); resetLastChecked(heardFile); });
+beforeEach(() => { heardFile = join(TMP, `heard-${++n}.json`); resetLastChecked(heardFile); resetSenderOwners(); });
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
 describe('the window', () => {
@@ -264,7 +264,7 @@ describe('to_me without the owner\'s inbox: what mentions or answers the owner i
 		}), ROOMS3, { ownerId: OWNER });
 		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
 		assert.ok(f.calls.some(c => c.name === 'room.list'));
-		assert.equal(f.calls.filter(c => c.name === 'room.action.read').length, 3);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.read' && (c.args as { action?: string }).action !== 'space.user.profile.read').length, 3);
 		assert.ok(!f.calls.some(c => (c.args as { action?: string }).action === 'mentions.inbox'));
 		assert.ok(r.ok);
 		if (r.ok) {
@@ -281,6 +281,37 @@ describe('to_me without the owner\'s inbox: what mentions or answers the owner i
 		const r = await queryMessages({}, f.deps, () => NOW);
 		assert.ok(r.ok && r.whose === 'owner' && r.source === 'inbox');
 		assert.ok(!f.calls.some(c => c.name === 'room.list'));
+	});
+
+	it('what the owner\'s own agents sent is left out of "to me"; people and unknown senders stay', async () => {
+		const MADDY = '@susan-maddy.agent:ag2.space';
+		const items = [item(1), item(2, { sender: { user_id: MADDY, display_name: 'Maddy' } }), item(3, { sender: { user_id: '@dot.agent:ag2.space', display_name: 'Dot' } }), item(4, { sender: { user_id: '@lost:ag2.space', display_name: 'Lost' } })];
+		const profiles: Record<string, unknown> = { '@chi:ag2.space': ok({ result: { owner: null, kind: 'human' } }), [MADDY]: ok({ result: { owner: OWNER, kind: 'agent' } }), '@dot.agent:ag2.space': ok({ result: { owner: '@someone-else:ag2.space', kind: 'agent' } }), '@lost:ag2.space': err('UPSTREAM_UNAVAILABLE') };
+		const handler = (_n: string, a: Record<string, unknown>) => a.action === 'space.user.profile.read'
+			? profiles[(a.arguments as { user_id: string }).user_id]
+			: ok({ result: { mentions: items, next_cursor: null, has_more: false, rooms_skipped: 0 } });
+		const f = fake(handler, ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.count, 3);
+			assert.deepEqual(r.latest.map(l => l.from).sort(), ['Chi Wang', 'Dot', 'Lost']);
+		}
+		// Each sender is looked up once; a second query asks only for the one that failed.
+		const lookups = () => f.calls.filter(c => (c.args as { action?: string }).action === 'space.user.profile.read').length;
+		assert.equal(lookups(), 4);
+		await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.equal(lookups(), 5);
+	});
+
+	it('the room scan leaves out the owner\'s agents too', async () => {
+		const MADDY = '@susan-maddy.agent:ag2.space';
+		const scan = rooms({ '!a:ag2.space': [m(1, '@chi:ag2.space', { mentions: [OWNER] }), m(2, MADDY, { mentions: [OWNER] })] });
+		const f = fake((n, a) => a.action === 'space.user.profile.read'
+			? ok({ result: { owner: (a.arguments as { user_id: string }).user_id === MADDY ? OWNER : null } })
+			: scan(n, a), ROOMS3, { ownerId: OWNER });
+		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok && r.source === 'rooms' && r.count === 1);
 	});
 
 	it('offered but refused: the scan, with the refusal', async () => {

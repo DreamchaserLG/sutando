@@ -166,6 +166,23 @@ export async function whoami(client: McpClient): Promise<{ self: string | null; 
 	} catch { return { self: null, owner: null }; }
 }
 
+/** Whose agent each sender is (space.user.profile.read's owner), cached; null for a person or an unknown answer. */
+const senderOwners = new Map<string, string | null>();
+export function resetSenderOwners(): void { senderOwners.clear(); }
+
+/** "To me" leaves out what the owner's own agents sent: a Maddy or a Sutando reporting to its owner is not someone looking for them.
+ *  A sender whose profile cannot be read is kept. */
+export async function withoutOwnersAgents(client: McpClient, msgs: Msg[], owner: string, deadline: number, deps: Pick<ReadRoomDeps, 'log'>): Promise<Msg[]> {
+	const ask = [...new Set(msgs.map(m => m.fromId))].filter(id => id && id !== owner && !senderOwners.has(id));
+	await pool(ask, QUERY_ROOM_CONCURRENCY, async (id) => {
+		if (Date.now() > deadline) return;
+		const r = await roomRead(client, null, 'space.user.profile.read', { user_id: id }, deps, ROOM_READ_CALL_TIMEOUT_MS);
+		if (!r.ok) return;
+		senderOwners.set(id, typeof r.result.owner === 'string' && r.result.owner ? r.result.owner : null);
+	});
+	return msgs.filter(m => senderOwners.get(m.fromId) !== owner);
+}
+
 /** Read rooms back to the window, n at a time; `unread` counts the rooms that could not be read. */
 async function readRooms(client: McpClient, rooms: RoomRef[], start: number, deadline: number, deps: ReadRoomDeps): Promise<{ msgs: Msg[]; full: boolean; unread: number }> {
 	const per = await pool(rooms, QUERY_ROOM_CONCURRENCY, r => roomSince(client, r, start, deadline, deps));
@@ -270,6 +287,7 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 		if (got.unread) extra.rooms_unread = got.unread;
 	}
 
+	if (scope === 'to_me' && ids.owner) msgs = await withoutOwnersAgents(client, msgs, ids.owner, deadline, deps);
 	if (from) msgs = msgs.filter(m => norm(m.from).includes(from) || norm(short(m.fromId)).includes(from));
 	if (word) msgs = msgs.filter(m => norm(m.body).includes(word));
 	msgs.sort((a, b) => b.ts - a.ts);
