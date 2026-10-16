@@ -586,7 +586,8 @@ describe('answers, never throws', () => {
 		assert.equal(((await createQueryMessagesTool({ ...f.deps, client: () => null }).execute({ scope: 'all', room: 'Alpha', from: 'x', contains: 'y', since: 'hour' }, {} as never)) as { ok: boolean }).ok, false);
 		assert.match(t.description, /no read\/unread marker/);
 		assert.match(QUERY_PROMPT_RULE, /query_messages/);
-		assert.match(QUERY_TURN_CHECK_RULE, /^- none:/);
+		assert.match(QUERY_TURN_CHECK_RULE, /^- fetch query_messages: .*"the quietest room".* fetch room_stats: how many rooms, or members in a room/);
+		assert.match(QUERY_TURN_CHECK_RULE, /Never work\. A follow-up about the result just given .* is none\./);
 	});
 });
 }
