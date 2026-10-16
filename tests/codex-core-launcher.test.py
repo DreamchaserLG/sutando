@@ -9,6 +9,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import pty
@@ -1290,6 +1291,70 @@ printf 'Queued message'
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.stdout.strip(), "rc=1", r.stderr)
         self.assertFalse((tmp / "send-calls").exists(), "no claim, no hand-off")
+
+    def test_an_unknown_outcome_keeps_the_claim_and_is_never_requeued(self):
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text(f'''#!/bin/bash
+shift
+if [ "$1" = thread ]; then printf 't1'; exit 0; fi
+printf 'send\\n' >> "{tmp}/send-calls"
+echo "codex queue still running after 30s; it may have queued" >&2
+exit 6
+''')
+        fake_py.chmod(0o755)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + _queue_prompt_source(self.root) +
+                   '\nqueue_prompt a.txt p; echo "rc1=$?"; queue_prompt a.txt p; echo "rc2=$?"\n')
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.split(), ["rc1=0", "rc2=0"], r.stderr)
+        self.assertTrue((tmp / "handoff" / "a").is_dir(), "an unknown outcome keeps the claim")
+        self.assertEqual((tmp / "send-calls").read_text().count("send"), 1)
+
+    def test_a_claimed_task_with_no_reply_gets_a_failure_result_and_the_queue_moves_on(self):
+        tmp = Path(self.tmp.name)
+        ws = tmp / "ws"
+        for d in ("results", "queue", "handoff/task-a"):
+            (ws / d).mkdir(parents=True)
+        for name in ("task-a.txt", "task-b.txt"):
+            (ws / "queue" / name).write_text("normal")
+            time.sleep(0.02)
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        fns = "\n".join(_extract_shell_fn(text, n) for n in (
+            "clear_queue_handoff", "give_up_queued_task", "wait_for_core_idle", "submit_task",
+            "queue_head", "process_announced_queue"))
+        # task-a holds a claim and never answers; task-b is answered as soon as it is queued.
+        stubs = textwrap.dedent('''\
+            set -euo pipefail
+            workstream_context_file=""
+            log_notifier() { printf '%s\\n' "$*" >> "$LOG"; }
+            has_result() { [ -s "$RESULTS_DIR/$1" ]; }
+            mark_worker_stage() { :; }
+            clear_workstream_context() { :; }
+            prepare_workstream_context() { :; }
+            task_payload() { printf '%s' "$1"; }
+            tmux() { return 0; }
+            deliver_prompt() { echo "TYPED $1" >> "$LOG"; }
+            queue_prompt() {
+              [ -d "$QUEUE_HANDOFF_DIR/${1%.txt}" ] && return 0
+              mkdir "$QUEUE_HANDOFF_DIR/${1%.txt}"; echo done > "$RESULTS_DIR/$1"
+            }
+        ''')
+        harness = stubs + fns + "\nprocess_announced_queue\necho FINISHED\n"
+        env = dict(os.environ, DELIVERY_MODE="queue", QUEUE_HANDOFF_DIR=str(ws / "handoff"),
+                   RESULTS_DIR=str(ws / "results"), queue_dir=str(ws / "queue"), PAYLOAD_DIR=str(ws / "queue"),
+                   LOG=str(tmp / "log"), COMPLETION_TIMEOUT="1", POLL_INTERVAL="0.05",
+                   TMUX_SOCKET="s", SESSION="sutando-core", WORKER_INSTANCE="")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("FINISHED", r.stdout, r.stderr)
+        self.assertIn("no reply came back", (ws / "results" / "task-a.txt").read_text())
+        self.assertEqual((ws / "results" / "task-b.txt").read_text().strip(), "done")
+        self.assertTrue((ws / "handoff" / "task-a" / "abandoned").exists(), "the claim is kept")
+        log = (tmp / "log").read_text()
+        self.assertIn("gave up on task-a.txt", log)
+        self.assertNotIn("TYPED", log)
+        self.assertEqual(list((ws / "queue").iterdir()), [])
 
     def test_a_claim_left_by_a_crash_is_never_typed_or_requeued(self):
         tmp = Path(self.tmp.name)

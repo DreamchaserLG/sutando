@@ -99,7 +99,8 @@ worker's notifier always uses send-keys. In queue mode the notifier:
 - resolves the core's thread for every task (so `/new` or `/resume` in the TUI is
   followed), from the rollout file the core pane's process tree holds open
   (`codex-observer.mjs --core-thread`). `core.codex.thread` is used only when that
-  lookup fails: if Codex's shared daemon, not the pane's process tree, holds the file,
+  lookup cannot find the core's thread at all (never when it found a thread with no
+  turn yet): if Codex's shared daemon, not the pane's process tree, holds the file,
   the lookup finds nothing (unverified on 0.157+), and without `core.codex.thread`
   every task falls back to send-keys;
 - takes one atomic claim per task (`state/codex-queue-handoff/<task-id>`) before
@@ -116,7 +117,11 @@ worker's notifier always uses send-keys. In queue mode the notifier:
   exited non-zero without acknowledging the queue. That fallback types through the
   usual composer check but skips the wait for an idle core;
 - treats a `codex queue` that times out, or acknowledges and then exits non-zero, as
-  an unknown outcome: it logs it and waits for the result, and never types the task.
+  an unknown outcome: it logs it and waits for the result, and never types the task;
+- gives up on a claimed task that has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT`
+  (3600 s): it writes a plain failure result ("handed to Codex but no reply came back;
+  not retried") that the bridge delivers like any reply, logs it, keeps the claim so the
+  task is never typed or queued again, and moves on to the next task.
 
 An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
 

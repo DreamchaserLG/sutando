@@ -142,6 +142,10 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(self._resolve(run, configured="named"), (0, "named"))
         self.assertEqual(len(run.calls), 1)
 
+    def test_a_found_thread_with_no_turn_never_uses_the_pin(self):
+        run = Recorder(Done(4, "", "thread has no persisted turn"))
+        self.assertEqual(self._resolve(run, configured="stale-pin"), (codex_queue.NO_TURN, "thread has no persisted turn"))
+
     def test_discovery_asks_the_observer(self):
         run = Recorder(Done(0, "0199-abc\n"))
         self.assertEqual(self._resolve(run), (0, "0199-abc"))

@@ -334,7 +334,23 @@ release_queue_handoff() {
 }
 
 clear_queue_handoff() {
+  [ -e "$QUEUE_HANDOFF_DIR/${1%.txt}/abandoned" ] && return 0
   rm -rf "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null || true
+}
+
+# A claimed task with no result by COMPLETION_TIMEOUT: answer it with a plain failure and keep
+# the claim (marked abandoned) so it is never typed or queued again; the queue moves on.
+give_up_queued_task() {
+  local filename="$1" tmp
+  : > "$QUEUE_HANDOFF_DIR/${filename%.txt}/abandoned" 2>/dev/null || true
+  if tmp="$(mktemp "$RESULTS_DIR/.${filename%.txt}.XXXXXX" 2>/dev/null)" \
+    && printf '%s\n' "This task was handed to Codex but no reply came back within ${COMPLETION_TIMEOUT}s. It was not retried, to avoid running it twice; please ask again if it is still needed." > "$tmp" \
+    && mv -f "$tmp" "$RESULTS_DIR/$filename"; then
+    log_notifier "gave up on $filename: handed to codex queue, no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying"
+  else
+    rm -f "${tmp:-}" 2>/dev/null || true
+    log_notifier "gave up on $filename but could NOT write its failure result; the claim keeps it from being retyped"
+  fi
 }
 
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
@@ -457,6 +473,9 @@ submit_task() {
       fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         echo "task-notifier: timed out waiting for result: $filename" >&2
+        if [ "${DELIVERY_MODE:-}" = queue ] && [ -d "${QUEUE_HANDOFF_DIR:-}/${filename%.txt}" ]; then
+          give_up_queued_task "$filename"
+        fi
         clear_workstream_context
         return 0
       fi

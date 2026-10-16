@@ -48,7 +48,7 @@ def resolve_thread(engine: str, socket: str, session: str, run=subprocess.run) -
     so a task sent right after /new or /resume still reaches the live one. A configured
     core.codex.thread is the fallback for a core whose rollout discovery can't read at
     all (daemon-held, not pane-tree-held) -- never an override once discovery works,
-    or a stale pin would silently misdeliver after the core's thread moves on."""
+    or a stale pin would misdeliver. Exit 4 (thread found, no turn yet) never uses the pin."""
     node = shutil.which("node")
     if node:
         try:
@@ -62,6 +62,8 @@ def resolve_thread(engine: str, socket: str, session: str, run=subprocess.run) -
         discovery_code = r.returncode if r is not None and r.returncode in (NO_THREAD, NO_TURN) else 1
     else:
         discovery_code, discovery_err = 1, "node not on PATH; cannot read the core's rollout"
+    if discovery_code == NO_TURN:
+        return discovery_code, discovery_err
     configured = delivery().get("thread", "")
     if configured:
         return 0, configured
