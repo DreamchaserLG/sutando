@@ -67,6 +67,42 @@ class NotifierLockTest(unittest.TestCase):
         first.kill()
         first.communicate(timeout=30)
 
+    def test_a_waiter_logs_to_its_file_and_publishes_then_clears_its_waiting_record(self):
+        ready, logs = self.dir / "ready", self.dir / "logs"
+        logs.mkdir()
+        waiting = Path(self.lock + ".waiting")
+        first = self._holder("bash", "-c", f'touch "{ready}"; sleep 2')
+        self._wait_for(ready)
+        second = subprocess.Popen([sys.executable, str(HELPER), "--lock", self.lock, "--log-every", "0.5",
+                                   "--log-file", str(logs / "task-notifier.log"), "--", "true"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self._wait_for(waiting)
+        pid, since = waiting.read_text().split()
+        self.assertEqual(int(pid), second.pid)
+        self.assertLessEqual(abs(int(since) - time.time()), 5)
+        first.communicate(timeout=30)
+        second.communicate(timeout=30)
+        self.assertEqual(second.returncode, 0)
+        self.assertFalse(waiting.exists(), "cleared once the lock is taken")
+        self.assertIn("another notifier holds it", (logs / "task-notifier.log").read_text())
+
+    def test_a_log_file_whose_directory_is_missing_or_unwritable_is_skipped(self):
+        log = notifier_lock.stderr_and_file(str(self.dir / "missing" / "x.log"))
+        with redirect_stderr(io.StringIO()) as err:
+            log("hello")
+        self.assertIn("hello", err.getvalue())
+        with redirect_stderr(io.StringIO()):
+            notifier_lock.stderr_and_file(str(self.dir / "ok.log"))("hello")
+        self.assertTrue((self.dir / "ok.log").read_text().endswith(" hello\n"))
+        (self.dir / "ro").mkdir()
+        (self.dir / "ro").chmod(0o500)
+        try:
+            with redirect_stderr(io.StringIO()):
+                notifier_lock.stderr_and_file(str(self.dir / "ro" / "x.log"))("hello")
+                notifier_lock._write_waiting(str(self.dir / "ro" / "w"))
+        finally:
+            (self.dir / "ro").chmod(0o700)
+
     def test_the_command_inherits_the_lock_on_fd_9(self):
         r = subprocess.run([sys.executable, str(HELPER), "--lock", self.lock, "--", "bash", "-c",
                             'echo "$SUTANDO_NOTIFIER_LOCK_FD"; [ -e /dev/fd/9 ] && echo open'],

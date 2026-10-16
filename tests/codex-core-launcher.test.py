@@ -1448,6 +1448,41 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         self.assertTrue((claim / "alerted").exists())
         self.assertEqual(self._lines("typed") + self._lines("sent"), [])
 
+    def test_two_real_notifiers_on_one_workspace_never_overlap(self):
+        # The shipped task-notifier.sh, run twice: the second waits on the first's lock.
+        tmp = Path(self.tmp.name)
+        go = tmp / "go"
+        self._write_exe("tmux", f'''#!/bin/bash
+printf '%s LOCKFD=%s\\n' "$*" "${{SUTANDO_NOTIFIER_LOCK_FD:-}}" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && {{ printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }}; done
+case "$*" in *"-l -- Sutando task ready: task-1.txt"*)
+  for _ in $(seq 200); do [ -e "{go}" ] && break; sleep 0.05; done ;; esac
+exit 0
+''')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_SUBMIT_RETRIES="1", SUTANDO_NOTIFIER_POLL_INTERVAL="0.05")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        run = lambda task: subprocess.Popen(["/bin/bash", str(script), "--event", task], env=env,  # noqa: E731
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first = run("task-1.txt")
+        deadline = time.monotonic() + 15
+        while "task-1.txt" not in (self.log.read_text() if self.log.exists() else ""):
+            self.assertLess(time.monotonic(), deadline, "the first notifier never typed")
+            time.sleep(0.05)
+        second = run("task-2.txt")
+        time.sleep(1.5)
+        self.assertNotIn("task-2.txt", self.log.read_text(), "the second notifier ran while the first held the lock")
+        go.touch()
+        out1, err1 = first.communicate(timeout=30)
+        out2, err2 = second.communicate(timeout=30)
+        self.assertEqual((first.returncode, second.returncode), (0, 0), err1 + err2)
+        calls = self.log.read_text().splitlines()
+        self.assertTrue(any("-l -- Sutando task ready: task-2.txt" in c for c in calls), err2)
+        self.assertTrue(calls and all(c.endswith("LOCKFD=9") for c in calls), calls)
+
     def test_the_notifier_runs_under_the_inbox_lock_and_keeps_it_from_its_watcher(self):
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         self.assertIn('exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock '

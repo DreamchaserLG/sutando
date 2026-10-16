@@ -27,13 +27,13 @@ DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
-# One core notifier per inbox: re-exec under a kernel lock that dies with this process, so claims
-# only ever have one live owner. A busy lock makes a one-shot --event give up quickly.
+# One core notifier per workspace: re-exec under a kernel lock that dies with this process, so
+# claims only ever have one live owner. A busy lock makes a one-shot --event give up quickly.
 if [ -z "$WORKER_INSTANCE" ] && [ -z "${SUTANDO_NOTIFIER_LOCK_FD:-}" ]; then
   _lock_timeout="${SUTANDO_NOTIFIER_LOCK_TIMEOUT:-600}"
   [ "${1:-}" = "--event" ] && _lock_timeout=5
   exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock "$WORKSPACE_DIR/state/codex-notifier.lock" \
-    --timeout "$_lock_timeout" -- /bin/bash "${BASH_SOURCE[0]}" "$@"
+    --timeout "$_lock_timeout" --log-file "$WORKSPACE_DIR/logs/task-notifier.log" -- /bin/bash "${BASH_SOURCE[0]}" "$@"
 fi
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"

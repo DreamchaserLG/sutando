@@ -96,14 +96,21 @@ Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core
 for a change to take effect. Queue mode applies to the core's notifier only; a pool
 worker's notifier always uses send-keys.
 
-Only one core notifier runs per inbox. The notifier re-executes itself under
-`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on
+Only one core notifier runs per workspace. The notifier re-executes itself under
+`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
 `state/codex-notifier.lock` for exactly as long as the notifier process lives. The kernel
 drops the lock when the process dies, `kill -9` included, so no lock is ever left behind.
+The lock is kept out of the long-lived watcher the notifier starts. Pool workers have
+their own inboxes and are unchanged.
+
 A second notifier (for example, start-cli replacing a stale one) waits for the first to
-exit, logging while it waits; a one-shot `--event` gives up after 5 s. The lock is kept
-out of the long-lived watcher it starts. Pool workers have their own inboxes and are
-unchanged.
+exit. While it waits, it logs to stderr and `logs/task-notifier.log`, and records itself
+in `state/codex-notifier.lock.waiting`; `health-check.py`'s `codex-task-notifier` check
+warns once a live notifier has waited 180 s or more, so a stuck holder cannot stall
+delivery unseen. A managed notifier gives up after 600 s
+(`SUTANDO_NOTIFIER_LOCK_TIMEOUT`) and its supervisor starts it again. A one-shot
+`task-notifier.sh --event <task>` waits only 5 s, so while the managed notifier runs it
+always gives up and drops its event; nothing in production calls it.
 
 In both modes the core's notifier delivers each task at most once through one gate: it
 takes an atomic per-task claim (`state/codex-delivery-claims/<task-id>`, created on
