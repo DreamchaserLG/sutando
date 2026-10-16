@@ -96,6 +96,15 @@ Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core
 for a change to take effect. Queue mode applies to the core's notifier only; a pool
 worker's notifier always uses send-keys.
 
+Only one core notifier runs per inbox. The notifier re-executes itself under
+`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on
+`state/codex-notifier.lock` for exactly as long as the notifier process lives. The kernel
+drops the lock when the process dies, `kill -9` included, so no lock is ever left behind.
+A second notifier (for example, start-cli replacing a stale one) waits for the first to
+exit, logging while it waits; a one-shot `--event` gives up after 5 s. The lock is kept
+out of the long-lived watcher it starts. Pool workers have their own inboxes and are
+unchanged.
+
 In both modes the core's notifier delivers each task at most once through one gate: it
 takes an atomic per-task claim (`state/codex-delivery-claims/<task-id>`, created on
 demand) and then re-checks for a ready result, live or archived, before either
@@ -103,14 +112,11 @@ transport. A task that already has a result is skipped; one already claimed by a
 notifier, a crash, or an earlier run in the other mode is not delivered again; and a
 claim that cannot be taken defers the task to the next cycle, never typing it. The
 claim is released only when nothing was delivered, and removed once the task has a
-result. Each claim records the core it was taken for (the pane's pid and start time)
-and the notifier that took it. After a core restart, a task that was only typed into
-the old core is retyped, as before; one that may have been queued is never retyped
-(the daemon may still hold it) but is abandoned at once, with the owner alert below.
-Replacing a claim from a restarted core, or releasing a timed-out one, happens only
-under the task's takeover lock (`<task-id>.takeover`) after re-reading the claim, so
-two notifiers cannot both take a task over; a timed-out typed-only claim is released
-only by its own notifier, or once that notifier has exited. On start the notifier prunes the
+result. Each claim records the core it was handed to (the pane's pid and start time,
+stamped just before the hand-off). Because one notifier owns every claim, a claim only
+has to survive restarts in sequence: after a core restart, a task that was only typed
+into the old core is retyped, as before; one that may have been queued is never retyped
+(the daemon may still hold it) but is abandoned at once, with the owner alert below. On start the notifier prunes the
 claims of tasks with no task file left in `tasks/` that have a ready result, or that
 were abandoned and their owner alert written.
 

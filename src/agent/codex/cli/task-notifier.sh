@@ -22,11 +22,19 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-# Per-task delivery claims, one per task across transports; they survive retries, restarts, mode changes.
+# Per-task delivery claims, one per task across transports; they outlive a notifier or core restart.
 DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
+# One core notifier per inbox: re-exec under a kernel lock that dies with this process, so claims
+# only ever have one live owner. A busy lock makes a one-shot --event give up quickly.
+if [ -z "$WORKER_INSTANCE" ] && [ -z "${SUTANDO_NOTIFIER_LOCK_FD:-}" ]; then
+  _lock_timeout="${SUTANDO_NOTIFIER_LOCK_TIMEOUT:-600}"
+  [ "${1:-}" = "--event" ] && _lock_timeout=5
+  exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock "$WORKSPACE_DIR/state/codex-notifier.lock" \
+    --timeout "$_lock_timeout" -- /bin/bash "${BASH_SOURCE[0]}" "$@"
+fi
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"
 POLL_INTERVAL="${SUTANDO_NOTIFIER_POLL_INTERVAL:-0.5}"
@@ -352,38 +360,19 @@ claim_core_gone() {
   [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]
 }
 
-# Who holds a fresh claim: the core it was taken for, and this notifier's pid.
+# The core a claim was taken for, re-stamped just before each hand-off.
 stamp_claim() {
   core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
-  printf '%s' "$$" > "$DELIVERY_CLAIM_DIR/${1%.txt}/owner" 2>/dev/null || true
 }
 
-# Replacing or releasing a claim this notifier did not just take happens only under the task's
-# takeover lock, after re-reading the claim; a busy lock means someone else is deciding.
-take_over_stale_claim() {  # 0 the claim is now ours; 1 left alone
-  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}" rc=1
-  mkdir "$claim.takeover" 2>/dev/null || return 1
-  if [ -d "$claim" ] && [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && claim_core_gone "$1"; then
-    rm -rf "$claim" 2>/dev/null || true
-    if mkdir "$claim" 2>/dev/null; then
-      stamp_claim "$1"
-      rc=0
-    fi
-  fi
-  rmdir "$claim.takeover" 2>/dev/null || true
-  return "$rc"
-}
-
-# A typed-only claim at timeout is released only by its owner, or once its owner has exited.
-release_timed_out_claim() {
-  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}" owner
-  mkdir "$claim.takeover" 2>/dev/null || return 0
-  owner="$(cat "$claim/owner" 2>/dev/null)" || owner=""
-  if [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && [ -n "$owner" ] \
-    && { [ "$owner" = "$$" ] || ! kill -0 "$owner" 2>/dev/null; }; then
-    rm -rf "$claim" 2>/dev/null || true
-  fi
-  rmdir "$claim.takeover" 2>/dev/null || true
+# A typed-only claim from a restarted core is replaced by a fresh one. The lock above makes this
+# notifier the claims' only live owner, so no other notifier can be deciding at the same time.
+replace_stale_claim() {  # 0 the claim is now ours; 1 left alone
+  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}"
+  [ -d "$claim" ] && [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && claim_core_gone "$1" || return 1
+  rm -rf "$claim" 2>/dev/null || true
+  mkdir "$claim" 2>/dev/null || return 1
+  stamp_claim "$1"
 }
 
 release_delivery() {
@@ -392,7 +381,7 @@ release_delivery() {
 
 clear_delivery_claim() {
   [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ] && return 0
-  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" "$DELIVERY_CLAIM_DIR/${1%.txt}.takeover" 2>/dev/null || true
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
 claim_abandoned() {
@@ -407,7 +396,6 @@ prune_delivery_claims() {
   for claim in "$DELIVERY_CLAIM_DIR"/*/; do
     [ -d "$claim" ] || continue
     id="$(basename "$claim")"
-    case "$id" in *.takeover|*.alerting) continue ;; esac
     [ -e "$TASKS_DIR/$id.txt" ] && continue
     if ! has_result "$id.txt"; then
       [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
@@ -428,19 +416,15 @@ abandon_claimed_task() {
   fi
   why="$(cat "$claim/abandoned" 2>/dev/null)" || why=""
   [ -n "$why" ] || why="${2:-no reply came back}"
-  mkdir "$claim.alerting" 2>/dev/null || return 0
-  if [ ! -e "$claim/alerted" ]; then
-    if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
-      && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
-      && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
-      : > "$claim/alerted" 2>/dev/null || log_notifier "alerted the owner about $filename but could not record it"
-      log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
-    else
-      rm -f "${tmp:-}" 2>/dev/null || true
-      log_notifier "abandoned $filename ($why); could NOT write the owner alert, will retry next cycle"
-    fi
+  if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
+    && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
+    && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
+    : > "$claim/alerted" 2>/dev/null || log_notifier "alerted the owner about $filename but could not record it"
+    log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
+  else
+    rm -f "${tmp:-}" 2>/dev/null || true
+    log_notifier "abandoned $filename ($why); could NOT write the owner alert, will retry next cycle"
   fi
-  rmdir "$claim.alerting" 2>/dev/null || true
 }
 
 # Every cycle: write the owner alert for any abandoned claim whose alert did not get out.
@@ -448,7 +432,6 @@ retry_owner_alerts() {
   local claim
   [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
   for claim in "$DELIVERY_CLAIM_DIR"/*/; do
-    case "$claim" in *.takeover/|*.alerting/) continue ;; esac
     [ -e "${claim}abandoned" ] && [ ! -e "${claim}alerted" ] || continue
     abandon_claimed_task "$(basename "$claim").txt" ""
   done
@@ -458,7 +441,7 @@ retry_owner_alerts() {
 # one that may have been queued is abandoned.
 time_out_claimed_task() {
   if [ ! -e "$DELIVERY_CLAIM_DIR/${1%.txt}/queue" ]; then
-    release_timed_out_claim "$1"
+    release_delivery "$1"
     return 0
   fi
   abandon_claimed_task "$1" "no reply came back in $(( (COMPLETION_TIMEOUT + 59) / 60 )) min"
@@ -507,7 +490,7 @@ deliver_task() {
       abandon_claimed_task "$filename" "the core restarted before it replied"
       return 0
     fi
-    if take_over_stale_claim "$filename"; then
+    if replace_stale_claim "$filename"; then
       log_notifier "$filename was typed into a core that has since restarted; typing it again"
       rc=0
     fi
@@ -520,6 +503,7 @@ deliver_task() {
     release_delivery "$filename"
     return 0
   fi
+  stamp_claim "$filename"
   if [ "${DELIVERY_MODE:-}" = queue ]; then
     # The marker goes down first, so a crash mid-queue still reads as "possibly queued".
     if : > "$claim/queue" 2>/dev/null; then
@@ -647,7 +631,7 @@ mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 prune_delivery_claims
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" 9>&- &
 watcher_pid=$!
 
 # A narrower net than the watcher's own routing, for a worker claim that
