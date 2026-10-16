@@ -30,6 +30,7 @@ import subprocess
 import os
 import sys
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -1165,9 +1166,21 @@ class PublishUnlessAnsweredTest(unittest.TestCase):
         self.assertEqual(self.live.read_text(), self.MSG + "\n")
         self.assertEqual(self._leftovers(), [])
 
+    def _placeholder(self, text, age):
+        self.live.write_text(text)
+        t = time.time() - age
+        os.utime(self.live, (t, t))
+
+    def test_a_fresh_placeholder_is_left_for_its_writer(self):
+        for placeholder in ("", "  \n"):
+            self._placeholder(placeholder, 1)
+            self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "deferred", repr(placeholder))
+            self.assertEqual(self.live.read_text(), placeholder)
+            self.assertEqual(self._leftovers(), [])
+
     def test_an_empty_or_whitespace_placeholder_is_replaced(self):
         for placeholder in ("", "  \n\t\n"):
-            self.live.write_text(placeholder)
+            self._placeholder(placeholder, 60)
             self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "published", repr(placeholder))
             self.assertEqual(self.live.read_text(), self.MSG + "\n")
             self.assertTrue(has_ready_result(self.results, F))
@@ -1217,6 +1230,9 @@ class PublishUnlessAnsweredTest(unittest.TestCase):
         self.assertEqual(run(self.MSG), (0, "published"))
         self.assertEqual(run(self.MSG), (1, "answered"))
         self.assertEqual(run(" "), (3, "failed"))
+        self.live.unlink()
+        self._placeholder("", 1)
+        self.assertEqual(run(self.MSG), (4, "deferred"))
         self.assertEqual(run(self.MSG, "extra"), (2, ""))
 
     def test_a_link_error_other_than_exists_fails_cleanly(self):

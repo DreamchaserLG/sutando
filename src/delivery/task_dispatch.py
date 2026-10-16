@@ -33,7 +33,7 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
     task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
-    task_dispatch.py publish-unless-answered <results_dir> <filename>  # text on stdin; exit 0 published, 1 answered, 3 failed
+    task_dispatch.py publish-unless-answered <results_dir> <filename>  # text on stdin; exit 0 published, 1 answered, 3 failed, 4 deferred
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
 `tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
@@ -58,6 +58,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -164,6 +165,9 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
     return ready
 
 
+PLACEHOLDER_SETTLE_S = 10
+
+
 def _identity(path: Path):
     try:
         st = os.stat(path)
@@ -177,8 +181,9 @@ def publish_unless_answered(results_dir: "Path | str", filename: str, text: str,
     """Publish `text` as `filename`'s live result only while no ready result exists, live or archived.
 
     Returns "published", "answered" (a ready result exists, or appeared during publication and the
-    text was withdrawn), or "failed". Never replaces a ready file; an empty or whitespace live
-    placeholder is not an answer and is replaced. `_before_place` is a test seam.
+    text was withdrawn), "deferred" (an empty or whitespace live placeholder changed within
+    PLACEHOLDER_SETTLE_S, so a writer may still hold it open), or "failed". Never replaces a ready
+    file; an older placeholder is not an answer and is replaced. `_before_place` is a test seam.
     """
     results = Path(results_dir)
     task_id = _task_id_for_filename(filename)
@@ -202,6 +207,8 @@ def publish_unless_answered(results_dir: "Path | str", filename: str, text: str,
         except FileExistsError:
             if read_ready_result(live) is not None:
                 return "answered"
+            if time.time() - live.stat().st_mtime < PLACEHOLDER_SETTLE_S:
+                return "deferred"
             os.replace(tmp, live)
         # A reply that reached any layout meanwhile wins: withdraw ours if it is still the live file.
         ours = (mine.st_dev, mine.st_ino)
@@ -469,7 +476,7 @@ _USAGE = (
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
     "       task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional\n"
     "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1\n"
-    "       task_dispatch.py publish-unless-answered <results_dir> <filename>   # text on stdin; prints outcome, exit 0 published / 1 answered / 3 failed"
+    "       task_dispatch.py publish-unless-answered <results_dir> <filename>   # text on stdin; prints outcome, exit 0 published / 1 answered / 3 failed / 4 deferred"
 )
 
 
@@ -522,7 +529,7 @@ def _main(argv: list[str]) -> int:
             return 2
         outcome = publish_unless_answered(first, second, sys.stdin.read())
         print(outcome)
-        return {"published": 0, "answered": 1}.get(outcome, 3)
+        return {"published": 0, "answered": 1, "deferred": 4}.get(outcome, 3)
     if cmd == "find-ready":
         if rest:
             print(_USAGE, file=sys.stderr)

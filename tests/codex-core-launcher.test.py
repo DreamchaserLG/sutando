@@ -1312,7 +1312,9 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         for d in ("results", "queue", "claims/task-a"):
             (ws / d).mkdir(parents=True)
         if task_a_live is not None:
-            (ws / "results" / "task-a.txt").write_text(task_a_live)
+            placeholder = ws / "results" / "task-a.txt"
+            placeholder.write_text(task_a_live)
+            os.utime(placeholder, (time.time() - 60, time.time() - 60))
         for name in ("task-a.txt", "task-b.txt"):
             (ws / "queue" / name).write_text("normal")
             time.sleep(0.02)
@@ -1352,6 +1354,22 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         self.assertTrue((ws / "claims" / "task-a" / "abandoned").exists(), "the claim is kept")
         self.assertIn("gave up on task-a.txt", log)
         self.assertEqual(list((ws / "queue").iterdir()), [])
+
+    def test_a_fresh_placeholder_defers_the_give_up_and_keeps_the_task_queued(self):
+        tmp = Path(self.tmp.name)
+        ws = tmp / "ws"
+        for d in ("results", "claims/task-a"):
+            (ws / d).mkdir(parents=True)
+        (ws / "results" / "task-a.txt").write_text("")
+        fn = _extract_shell_fn((self.root / "src/agent/codex/cli/task-notifier.sh").read_text(), "give_up_claimed_task")
+        harness = ('log_notifier() { printf "%s\\n" "$*" >> "$LOG"; }\n' + fn + "\ngive_up_claimed_task task-a.txt\n")
+        env = dict(os.environ, DELIVERY_CLAIM_DIR=str(ws / "claims"), RESULTS_DIR=str(ws / "results"),
+                   LOG=str(tmp / "log"), COMPLETION_TIMEOUT="1", NOTIFIER_PY=sys.executable,
+                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"))
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((ws / "results" / "task-a.txt").read_text(), "")
+        self.assertIn("deferring the give-up for task-a.txt", (tmp / "log").read_text())
 
     def test_an_empty_or_whitespace_placeholder_does_not_strand_the_queue(self):
         for placeholder in ("", " \n\t\n"):

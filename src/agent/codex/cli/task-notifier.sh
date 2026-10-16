@@ -356,6 +356,7 @@ give_up_claimed_task() {
   case "$rc" in
     0) log_notifier "gave up on $filename: no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying" ;;
     1) log_notifier "$filename was answered just as its wait ran out; no failure result written" ;;
+    4) log_notifier "deferring the give-up for $filename: its live result file was just written to; retrying next cycle" ;;
     *) log_notifier "gave up on $filename but could NOT write its failure result (rc $rc: $outcome); the claim keeps it from being retyped" ;;
   esac
 }
