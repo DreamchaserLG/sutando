@@ -320,6 +320,14 @@ describe('readRoom: every outcome is something the model can say', () => {
 		assert.deepEqual(await readRoom({ room: 'Sutando Triaging' }, { client: () => down.client, currentRoom: () => null, index: stale }), { ok: false, error: 'not_found', rooms: ['Sutando Triage'] });
 	});
 
+	it('a room named while the credential is missing or refused says reconnect, not not_found, even from an empty index', async () => {
+		const noBearer = fake(() => new Error('room.list: no registry bearer in lane env'));
+		const cold = createRoomIndex({ client: () => noBearer.client as never });
+		assert.deepEqual(await readRoom({ room: 'Qingyun Group' }, { client: () => noBearer.client, currentRoom: () => null, index: cold }), { ok: false, error: 'no_credential' });
+		const revoked = fake(() => new Error('room.list: AG2 MCP authentication failed after re-mint'));
+		assert.deepEqual(await readRoom({ room: 'Qingyun Group' }, { client: () => revoked.client, currentRoom: () => null, index: createRoomIndex({ client: () => revoked.client as never }) }), { ok: false, error: 'credential_refused' });
+	});
+
 	it('around a search hit: the read is placed at that message, not the latest', async () => {
 		const f = fake(() => read([{ sender: '@a:x', body: 'before', ts: 1 }, { sender: '@b:x', body: 'the hit', ts: 2 }]));
 		const index = idx([{ room_id: '!a:x', name: 'Sutando Triage' }], f.client);
@@ -574,6 +582,17 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		assert.equal(unknown.ok, false);
 		assert.equal((unknown as { error: string }).error, 'outcome_unknown');
 		assert.equal(slow.calls.length, 1);
+	});
+
+	it('a write refused for a missing or rejected credential ran nothing: reconnect, with no operation_id; any other throw stays outcome_unknown', async () => {
+		const noBearer = fake(() => new Error('room.action.execute: no registry bearer in lane env'));
+		assert.deepEqual(await writePage({ room: '!a:x', title: 't', text: 'n' }, deps(noBearer.client, [])), { ok: false, error: 'no_credential' });
+		const revoked = fake(() => new Error('room.action.execute: mint: bearer rejected (AGENT_CREDENTIAL_REVOKED, not recoverable)'));
+		assert.deepEqual(await sendMessage({ room: '!a:x', text: 'hi' }, deps(revoked.client, [])), { ok: false, error: 'credential_refused' });
+		const broke = fake(() => new Error('ag2-space MCP exited (1)'));
+		const r = await sendMessage({ room: '!a:x', text: 'hi' }, deps(broke.client, []));
+		assert.equal((r as { error: string }).error, 'outcome_unknown');
+		assert.equal(typeof (r as { operation_id?: string }).operation_id, 'string');
 	});
 
 	it('the tool is inline; its description and the rules make the read-back and the user\'s yes the condition, and keep the turn check out', async () => {

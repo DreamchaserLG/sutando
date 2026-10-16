@@ -318,11 +318,19 @@ export type ReadRoomResult =
 	/** not_found carries every room the agent can read, so the model can say the right name next. */
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
-/** A spoken name against the index; a miss refreshes it once (the room may be newly joined) before giving up. */
-async function resolveRoom(query: string, index: RoomIndex): Promise<RoomResolution & { rooms?: string[] }> {
+/** A spoken name against the index; a miss refreshes it once (the room may be newly joined) before giving up.
+ *  A refresh refused for a missing or rejected credential is that error, not a miss: the owner must reconnect. */
+async function resolveRoom(query: string, index: RoomIndex): Promise<{ ok: true; room: RoomRef } | { ok: false; error: string; candidates?: string[]; rooms?: string[] }> {
 	const first = pickRoom(query, index.rooms());
 	if (first.ok || first.error === 'ambiguous') return first;
-	const fresh = await index.refresh().catch(() => index.rooms());
+	let fresh: RoomRef[];
+	try {
+		fresh = await index.refresh();
+	} catch (err) {
+		const failure = mcpFailure(err instanceof Error ? err.message : String(err));
+		if (failure === 'no_credential' || failure === 'credential_refused') return { ok: false, error: failure };
+		fresh = index.rooms();
+	}
 	const again = pickRoom(query, fresh);
 	return again.ok ? again : { ...again, rooms: fresh.map(r => r.name) };
 }
