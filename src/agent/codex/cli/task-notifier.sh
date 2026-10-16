@@ -22,8 +22,7 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-# A durable per-task-id "already handed off to codex queue" receipt; survives
-# both the retry loop's re-entry and a notifier restart.
+# Per-task queue-mode claims; one survives retries and restarts until the task is done.
 QUEUE_HANDOFF_DIR="$WORKSPACE_DIR/state/codex-queue-handoff"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
@@ -322,52 +321,57 @@ deliver_prompt() {
   done
 }
 
-# A receipt that queue_prompt already handed $1 off (success or UNKNOWN): present
-# means never resubmit it, whatever called us or how many times.
-queue_handoff_recorded() {
-  [ -e "$QUEUE_HANDOFF_DIR/${1%.txt}" ]
+# One atomic claim per task (mkdir), taken BEFORE any hand-off and kept unless the hand-off
+# certainly did not happen: a claim left by a crash means "possibly queued", so never type.
+claim_queue_handoff() {  # 0 claimed; 1 already claimed; 2 could not claim
+  mkdir -p "$QUEUE_HANDOFF_DIR" 2>/dev/null && mkdir "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null && return 0
+  [ -d "$QUEUE_HANDOFF_DIR/${1%.txt}" ] && return 1
+  return 2
 }
 
-record_queue_handoff() {
-  mkdir -p "$QUEUE_HANDOFF_DIR" 2>/dev/null && : > "$QUEUE_HANDOFF_DIR/${1%.txt}"
+release_queue_handoff() {
+  rmdir "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null || true
 }
 
 clear_queue_handoff() {
-  rm -f "$QUEUE_HANDOFF_DIR/${1%.txt}"
+  rm -rf "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null || true
 }
 
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
 # caller types it. The thread is resolved per task: /new or /resume in the TUI changes it.
 queue_prompt() {
   local filename="$1" prompt="$2" out thread rc=0 thread_err
-  if queue_handoff_recorded "$filename"; then
-    log_notifier "queue mode: $filename already handed off to codex queue; not resubmitting, waiting on its result"
+  claim_queue_handoff "$filename" || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    log_notifier "queue mode: $filename already claimed for codex queue; not resubmitting, waiting on its result"
     return 0
+  elif [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: could not claim $filename in $QUEUE_HANDOFF_DIR; not queueing, falling back to send-keys"
+    return 1
   fi
-  # Stderr captured separately: 2>&1 would let a config warning corrupt $thread
-  # even on a successful lookup.
-  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
+  # Stderr captured separately: 2>&1 would let a config warning corrupt $thread.
+  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { release_queue_handoff "$filename"; log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
   thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>"$thread_err")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log_notifier "queue mode: no usable core thread for $filename (rc $rc: $(cat "$thread_err" 2>/dev/null)); falling back to send-keys"
     rm -f "$thread_err"
+    release_queue_handoff "$filename"
     return 1
   fi
   rm -f "$thread_err"
   out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
-  # Only codex_queue.py's own QUEUE_FAILED (rc 5) proves the send never reached
-  # `codex queue`; any other rc (UNKNOWN, a signal, a crash) is treated as UNKNOWN too.
+  # Only codex_queue.py's QUEUE_FAILED (5) proves nothing reached `codex queue`; any other
+  # non-zero (unknown, a signal, a crash) keeps the claim and never types.
   if [ "$rc" -eq 5 ]; then
     log_notifier "queue mode: codex queue failed for $filename on thread $thread (rc $rc: $out); falling back to send-keys"
+    release_queue_handoff "$filename"
     return 1
   fi
   if [ "$rc" -ne 0 ]; then
     log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread (rc $rc: $out); not typing it, waiting on its result"
-    record_queue_handoff "$filename"
     return 0
   fi
   log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
-  record_queue_handoff "$filename"
 }
 
 # What the prompt tells the session to read: the payload a resolver-backed

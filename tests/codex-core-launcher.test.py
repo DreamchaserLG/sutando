@@ -24,11 +24,10 @@ def _extract_shell_fn(text, name):
 
 
 def _queue_prompt_source(root):
-    # queue_prompt now calls three small helpers for its durable handoff receipt;
-    # a harness extracting queue_prompt alone would leave them undefined.
+    # queue_prompt with the production claim helpers it calls.
     text = (root / "src/agent/codex/cli/task-notifier.sh").read_text()
     return "\n".join(_extract_shell_fn(text, n) for n in
-                     ("queue_handoff_recorded", "record_queue_handoff",
+                     ("claim_queue_handoff", "release_queue_handoff",
                       "clear_queue_handoff", "queue_prompt"))
 
 
@@ -1250,7 +1249,55 @@ exit 5
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("rc=1", r.stdout)
-        self.assertFalse((tmp / "handoff").exists())
+        self.assertFalse((tmp / "handoff" / "a").exists(), "a certain failure releases the claim")
+
+    def _claim_harness(self, tmp, body, handoff):
+        fake_py = tmp / "fake-py"
+        fake_py.write_text(f'''#!/bin/bash
+shift
+if [ "$1" = thread ]; then printf 't1'; exit 0; fi
+printf 'send\\n' >> "{tmp}/send-calls"
+printf 'Queued message'
+''')
+        fake_py.chmod(0o755)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" +
+                   _queue_prompt_source(self.root) + "\n" + body)
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(handoff))
+        return harness, env
+
+    def test_two_concurrent_notifiers_queue_a_task_exactly_once(self):
+        tmp = Path(self.tmp.name)
+        harness, env = self._claim_harness(
+            tmp, f'while [ ! -e "{tmp}/go" ]; do sleep 0.01; done\nqueue_prompt "$1" p; echo "rc=$?"\n',
+            tmp / "handoff")
+        for n in range(5):
+            name = f"task-{n}.txt"
+            procs = [subprocess.Popen(["bash", "-c", harness, "h", name], env=env, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True) for _ in range(2)]
+            time.sleep(0.2)
+            (tmp / "go").touch()
+            outs = [p.communicate(timeout=30) for p in procs]
+            (tmp / "go").unlink()
+            self.assertEqual([o[0].strip() for o in outs], ["rc=0", "rc=0"], outs)
+            self.assertEqual((tmp / "send-calls").read_text().count("send"), n + 1, f"round {n}")
+
+    def test_an_unclaimable_task_is_never_handed_off(self):
+        tmp = Path(self.tmp.name)
+        blocker = tmp / "not-a-dir"
+        blocker.write_text("")
+        harness, env = self._claim_harness(tmp, 'queue_prompt a.txt p; echo "rc=$?"\n', blocker / "handoff")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), "rc=1", r.stderr)
+        self.assertFalse((tmp / "send-calls").exists(), "no claim, no hand-off")
+
+    def test_a_claim_left_by_a_crash_is_never_typed_or_requeued(self):
+        tmp = Path(self.tmp.name)
+        (tmp / "handoff" / "a").mkdir(parents=True)
+        harness, env = self._claim_harness(tmp, 'queue_prompt a.txt p; echo "rc=$?"\n', tmp / "handoff")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertFalse((tmp / "send-calls").exists())
 
     def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
         result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)

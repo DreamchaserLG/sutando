@@ -98,10 +98,15 @@ worker's notifier always uses send-keys. In queue mode the notifier:
 
 - resolves the core's thread for every task (so `/new` or `/resume` in the TUI is
   followed), from the rollout file the core pane's process tree holds open
-  (`codex-observer.mjs --core-thread`), or from `core.codex.thread` when set. If
-  Codex's shared daemon, not the pane's process tree, holds that file, the lookup
-  finds nothing and every task falls back to send-keys; this is unverified on 0.157+,
-  and `core.codex.thread` is the workaround;
+  (`codex-observer.mjs --core-thread`). `core.codex.thread` is used only when that
+  lookup fails: if Codex's shared daemon, not the pane's process tree, holds the file,
+  the lookup finds nothing (unverified on 0.157+), and without `core.codex.thread`
+  every task falls back to send-keys;
+- takes one atomic claim per task (`state/codex-queue-handoff/<task-id>`) before
+  handing it off, so two notifiers cannot both queue it. The claim is released only
+  when the hand-off certainly did not happen, and removed once the task has a result.
+  A claim left by a crash means "possibly queued", so that task is never typed; if no
+  claim can be taken, nothing is queued and the task is typed;
 - sends exactly the prompt the send-keys path would type, as one argument;
 - does not wait for the pane to go idle and never clears or types into it while
   queueing; pane state is logged as health only;
