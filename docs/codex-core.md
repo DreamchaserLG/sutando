@@ -69,6 +69,32 @@ The Codex implementation:
   observation record (`docs/health-snapshot.md`, "Runtime observation");
 - restarts the core and notifier together, preventing duplicate task consumers.
 
+## Task delivery: send-keys or queue
+
+By default the notifier types each task into the core's pane with `tmux send-keys`.
+With Codex 0.157 or later you can opt in to `codex queue`, which hands the task to
+the TUI's shared app-server daemon; the TUI runs it at its next idle point, so no
+keystroke can be lost or merged with a draft:
+
+```json
+{
+  "core": { "runtime": "codex", "codex": { "delivery": "queue" } }
+}
+```
+
+Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core)
+for a change to take effect. In queue mode the notifier:
+
+- resolves the core's thread once, from the rollout file the core's process holds
+  open (`codex-observer.mjs --core-thread`), or from `core.codex.thread` when set;
+- sends exactly the prompt the send-keys path would type, as one argument;
+- reads the pane only as health, and never clears or types into it while queueing;
+- falls back to send-keys, with a line in `logs/task-notifier.log`, when no thread
+  is found, the thread has no persisted turn yet (a fresh core's first task always
+  goes by send-keys), or `codex queue` fails.
+
+An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
+
 ## Externally managed monitor and heartbeat
 
 An embedder that owns both helpers can opt out of the launcher's helper lifecycle:

@@ -112,6 +112,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/quota_availability.py",
             "src/delivery/readiness.py",
             "src/delivery/task_dispatch.py",
+            "src/delivery/codex_queue.py",
             "src/local_task_protocol.py",
             "src/result_markers.py",
             "src/task_priority.py",
@@ -1038,6 +1039,75 @@ exit 0
         self.assertNotIn("Related prior workstream context", calls)
         self.assertIn("/tasks/task-123.txt", calls)
         self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
+
+    # A live core pane: idle composer, session present. Records every tmux call.
+    _LIVE_PANE_TMUX = '''#!/bin/bash
+printf '%s\\n' "$*" >> "$TMUX_LOG"
+for _a in "$@"; do [ "$_a" = capture-pane ] && { printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }; done
+exit 0
+'''
+
+    def _run_event(self, delivery=None, codex_rc=0, node_rc=None, thread="core-thread-1"):
+        """Run `--event task-123.txt` with a logging fake codex (and node); returns (result, codex argv log)."""
+        codex_log = Path(self.tmp.name) / "codex.log"
+        if delivery is not None:
+            codex_cfg = {"delivery": delivery}
+            if thread:
+                codex_cfg["thread"] = thread
+            (self.root / "sutando.config.local.json").write_text(json.dumps({"core": {"codex": codex_cfg}}))
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        self._write_exe("codex", f'''#!/bin/bash
+for a in "$@"; do printf '%s\\0' "$a"; done >> "{codex_log}"
+printf '\\n' >> "{codex_log}"
+[ "$1" = queue ] || exit 0
+[ {codex_rc} = 0 ] && {{ echo "Queued message m1 for thread $3."; exit 0; }}
+echo "Error: failed to queue session message" >&2; exit {codex_rc}
+''')
+        if node_rc is not None:
+            self._write_exe("node", f'#!/bin/bash\necho "thread has no persisted turn" >&2\nexit {node_rc}\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_SUBMIT_RETRIES="1", SUTANDO_NOTIFIER_POLL_INTERVAL="0.05")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        result = subprocess.run(["/bin/bash", str(script), "--event", "task-123.txt"],
+                                env=env, capture_output=True, text=True, timeout=120)
+        calls = [line.split("\0")[:-1] for line in codex_log.read_text().splitlines()] if codex_log.exists() else []
+        return result, calls
+
+    def test_default_delivery_types_and_never_queues(self):
+        result, codex_calls = self._run_event()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in codex_calls if c[:1] == ["queue"]], [])
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
+
+    def test_queue_delivery_queues_the_exact_prompt_without_typing(self):
+        result, codex_calls = self._run_event(delivery="queue")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        queued = [c for c in codex_calls if c[:1] == ["queue"]]
+        self.assertEqual(len(queued), 1, codex_calls)
+        workspace = (self.root / "workspace").resolve()
+        prompt = (f"Sutando task ready: task-123.txt. Read {workspace}/tasks/task-123.txt, follow AGENTS.md, "
+                  f"complete the task, and write the result to {workspace}/results/task-123.txt.")
+        self.assertEqual(queued[0], ["queue", "--thread", "core-thread-1", "--message", prompt])
+        self.assertNotIn("send-keys", self._tmux_calls())
+        self.assertIn("queued task-123.txt into thread core-thread-1", result.stderr)
+
+    def test_queue_failure_falls_back_to_send_keys_with_a_reason(self):
+        result, codex_calls = self._run_event(delivery="queue", codex_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len([c for c in codex_calls if c[:1] == ["queue"]]), 1)
+        self.assertIn("codex queue failed for task-123.txt", result.stderr)
+        self.assertIn("falling back to send-keys", result.stderr)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
+
+    def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
+        result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c for c in codex_calls if c[:1] == ["queue"]], [])
+        self.assertIn("no usable core thread for task-123.txt (rc 4: thread has no persisted turn)", result.stderr)
+        self.assertIn("send-keys -t =sutando-core:0 -l -- Sutando task ready: task-123.txt", self._tmux_calls())
 
     def test_notifier_does_not_replay_completed_task(self):
         workspace = self.root / "workspace"

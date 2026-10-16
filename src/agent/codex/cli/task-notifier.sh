@@ -43,6 +43,10 @@ COMPOSER_POLL="${SUTANDO_NOTIFIER_COMPOSER_POLL:-$POLL_INTERVAL}"
 WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstreams.py"
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
+CODEX_QUEUE_PY="$REPO/src/delivery/codex_queue.py"
+# Read once per notifier run; codex_queue.py owns the mode and falls back to send-keys.
+DELIVERY_MODE="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" mode 2>/dev/null)" || DELIVERY_MODE=send-keys
+QUEUE_THREAD=""
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -176,6 +180,8 @@ clear_automation_leftover() {
 
 wait_for_core_idle() {
   local started cleared=0
+  # Queue mode never types into the pane, so a busy core or a draft does not hold the task back.
+  [ "$DELIVERY_MODE" = queue ] && return 0
   started="$(date +%s)"
   while ! core_is_idle; do
     if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
@@ -313,6 +319,27 @@ deliver_prompt() {
   done
 }
 
+# Hand the prompt to `codex queue`; non-zero means the caller types it instead. The pane
+# state is logged as health only. The thread is resolved once, and again after a failure.
+queue_prompt() {
+  local filename="$1" prompt="$2" out rc=0
+  if [ -z "$QUEUE_THREAD" ]; then
+    out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      log_notifier "queue mode: no usable core thread for $filename (rc $rc: $out); falling back to send-keys"
+      return 1
+    fi
+    QUEUE_THREAD="$out"
+  fi
+  out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$QUEUE_THREAD" --message "$prompt" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: codex queue failed for $filename on thread $QUEUE_THREAD (rc $rc: $out); falling back to send-keys"
+    QUEUE_THREAD=""
+    return 1
+  fi
+  log_notifier "queued $filename into thread $QUEUE_THREAD (pane: $(pane_state || echo unreadable))"
+}
+
 # What the prompt tells the session to read: the payload a resolver-backed
 # announcement named, else the inbox entry itself (the core's tasks/ case).
 task_payload() {
@@ -367,7 +394,9 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if ! deliver_prompt "$filename" "$prompt"; then
+  if [ "$DELIVERY_MODE" = queue ] && queue_prompt "$filename" "$prompt"; then
+    :
+  elif ! deliver_prompt "$filename" "$prompt"; then
     clear_workstream_context
     if [ "$wait_for_result" = "1" ]; then
       log_notifier "deferring $filename: composer was not idle-ready, will retry on the next idle cycle"
