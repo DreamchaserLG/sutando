@@ -181,7 +181,7 @@ clear_automation_leftover() {
 wait_for_core_idle() {
   local started cleared=0
   # Queue mode never types into the pane, so a busy core or a draft does not hold the task back.
-  [ "$DELIVERY_MODE" = queue ] && return 0
+  [ "${DELIVERY_MODE:-}" = queue ] && return 0
   started="$(date +%s)"
   while ! core_is_idle; do
     if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
@@ -394,7 +394,7 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if [ "$DELIVERY_MODE" = queue ] && queue_prompt "$filename" "$prompt"; then
+  if [ "${DELIVERY_MODE:-}" = queue ] && queue_prompt "$filename" "$prompt"; then
     :
   elif ! deliver_prompt "$filename" "$prompt"; then
     clear_workstream_context

@@ -3,6 +3,8 @@
 
 `codex` and the observer are fakes; no real Codex, node or tmux is run.
 """
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -146,6 +148,60 @@ class ThreadTests(unittest.TestCase):
         self.assertEqual(self._resolve(Recorder(Done(4, "", "thread has no persisted turn")))[0], codex_queue.NO_TURN)
         self.assertEqual(self._resolve(Recorder(Done(3, "", "no core pane")))[0], codex_queue.NO_THREAD)
         self.assertEqual(self._resolve(Recorder(Done(1, "", "boom")))[0], 1)
+
+    def test_lookup_without_node_or_with_a_failing_observer_is_code_1(self):
+        orig_delivery, orig_which = codex_queue.delivery, codex_queue.shutil.which
+        codex_queue.delivery = lambda repo_root=None: {"delivery": "queue", "thread": ""}
+        codex_queue.shutil.which = lambda name: None
+        try:
+            code, reason = codex_queue.resolve_thread("/e", "/s", "c", run=Recorder(Done(0, "x")))
+        finally:
+            codex_queue.delivery, codex_queue.shutil.which = orig_delivery, orig_which
+        self.assertEqual((code, "node not on PATH" in reason), (1, True))
+        for exc in (OSError("gone"), subprocess.TimeoutExpired("node", 30)):
+            code, reason = self._resolve(Recorder(exc))
+            self.assertEqual((code, "thread lookup failed" in reason), (1, True))
+
+
+class CliTests(unittest.TestCase):
+    """main() in-process, with the policy functions stubbed."""
+
+    def _main(self, argv, **stubs):
+        saved = {k: getattr(codex_queue, k) for k in stubs}
+        for k, v in stubs.items():
+            setattr(codex_queue, k, v)
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = codex_queue.main(argv)
+        finally:
+            for k, v in saved.items():
+                setattr(codex_queue, k, v)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_mode_prints_the_resolved_mode(self):
+        got = self._main(["mode"], delivery=lambda repo_root=None: {"delivery": "queue", "thread": ""})
+        self.assertEqual(got, (0, "queue", ""))
+
+    def test_thread_prints_the_id_or_reports_the_code(self):
+        calls = []
+        ok = self._main(["thread", "--socket", "/s", "--session", "c"],
+                        resolve_thread=lambda e, so, se: calls.append((e, so, se)) or (0, "t1"))
+        self.assertEqual(ok, (0, "t1", ""))
+        self.assertEqual(calls, [(str(codex_queue.REPO), "/s", "c")])
+        no_turn = self._main(["thread", "--engine", "/e", "--socket", "/s", "--session", "c"],
+                             resolve_thread=lambda e, so, se: (4, "thread has no persisted turn"))
+        self.assertEqual(no_turn, (4, "", "thread has no persisted turn"))
+
+    def test_send_returns_the_send_code(self):
+        got = self._main(["send", "--thread", "t", "--message", "m"], send=lambda t, m: (6, "maybe queued"))
+        self.assertEqual(got, (6, "", "maybe queued"))
+
+    def test_empty_thread_or_message_is_refused_before_running_codex(self):
+        run = Recorder(Done(0))
+        self.assertEqual(codex_queue.send("", "m", run=run)[0], codex_queue.QUEUE_FAILED)
+        self.assertEqual(codex_queue.send("t", "", run=run)[0], codex_queue.QUEUE_FAILED)
+        self.assertEqual(run.calls, [])
 
 
 if __name__ == "__main__":
