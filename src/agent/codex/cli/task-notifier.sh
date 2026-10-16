@@ -22,8 +22,8 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-# Per-task queue-mode claims; one survives retries and restarts until the task is done.
-QUEUE_HANDOFF_DIR="$WORKSPACE_DIR/state/codex-queue-handoff"
+# Per-task delivery claims taken in queue mode; one survives retries, restarts and a mode change.
+DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
@@ -321,73 +321,63 @@ deliver_prompt() {
   done
 }
 
-# One atomic claim per task (mkdir), taken BEFORE any hand-off and kept unless the hand-off
-# certainly did not happen: a claim left by a crash means "possibly queued", so never type.
-claim_queue_handoff() {  # 0 claimed; 1 already claimed; 2 could not claim
-  mkdir -p "$QUEUE_HANDOFF_DIR" 2>/dev/null && mkdir "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null && return 0
-  [ -d "$QUEUE_HANDOFF_DIR/${1%.txt}" ] && return 1
+# One atomic claim per task (mkdir), taken before any transport and kept once anything may
+# have been delivered. A failed claim never authorizes typing: the task is deferred.
+claim_delivery() {  # 0 claimed; 1 already claimed; 2 could not claim (defer)
+  mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null && return 0
+  [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 1
   return 2
 }
 
-release_queue_handoff() {
-  rmdir "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null || true
+# Read-only check for send-keys mode: 0 claimed, 1 not claimed, 2 claim state unreadable.
+delivery_claimed() {
+  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 0
+  [ ! -e "$DELIVERY_CLAIM_DIR" ] && return 1
+  [ -d "$DELIVERY_CLAIM_DIR" ] && [ -r "$DELIVERY_CLAIM_DIR" ] && [ -x "$DELIVERY_CLAIM_DIR" ] && return 1
+  return 2
 }
 
-clear_queue_handoff() {
-  [ -e "$QUEUE_HANDOFF_DIR/${1%.txt}/abandoned" ] && return 0
-  rm -rf "$QUEUE_HANDOFF_DIR/${1%.txt}" 2>/dev/null || true
+release_delivery() {
+  rmdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
-# A claimed task with no result by COMPLETION_TIMEOUT: answer it with a plain failure and keep
-# the claim (marked abandoned) so it is never typed or queued again; the queue moves on.
-give_up_queued_task() {
-  local filename="$1" tmp
-  : > "$QUEUE_HANDOFF_DIR/${filename%.txt}/abandoned" 2>/dev/null || true
-  if has_result "$filename"; then
-    log_notifier "$filename was answered just as its wait ran out; no failure result written"
-    return 0
-  fi
-  # ln never replaces a file, so a real reply landing after the check above survives.
-  if tmp="$(mktemp "$RESULTS_DIR/.${filename%.txt}.XXXXXX" 2>/dev/null)" \
-    && printf '%s\n' "This task was handed to Codex but no reply came back within ${COMPLETION_TIMEOUT}s. It was not retried, to avoid running it twice; please ask again if it is still needed." > "$tmp" \
-    && ln "$tmp" "$RESULTS_DIR/$filename" 2>/dev/null; then
-    rm -f "$tmp"
-    log_notifier "gave up on $filename: handed to codex queue, no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying"
-  elif rm -f "${tmp:-}" 2>/dev/null; [ -e "$RESULTS_DIR/$filename" ]; then
-    log_notifier "$filename was answered just as its wait ran out; no failure result written"
-  else
-    log_notifier "gave up on $filename but could NOT write its failure result; the claim keeps it from being retyped"
-  fi
+clear_delivery_claim() {
+  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ] && return 0
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
-# Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
-# caller types it. The thread is resolved per task: /new or /resume in the TUI changes it.
+# A claimed task with no result by COMPLETION_TIMEOUT gets a plain failure result unless it was
+# answered (task_dispatch.py decides); the claim is kept, marked abandoned, so it is never retried.
+give_up_claimed_task() {
+  local filename="$1" outcome rc=0
+  : > "$DELIVERY_CLAIM_DIR/${filename%.txt}/abandoned" 2>/dev/null || true
+  outcome="$(printf '%s\n' "This task was handed to Codex but no reply came back within ${COMPLETION_TIMEOUT}s. It was not retried, to avoid running it twice; please ask again if it is still needed." \
+    | "$NOTIFIER_PY" "$DISPATCH_PY" publish-unless-answered "$RESULTS_DIR" "$filename" 2>&1)" || rc=$?
+  case "$rc" in
+    0) log_notifier "gave up on $filename: no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying" ;;
+    1) log_notifier "$filename was answered just as its wait ran out; no failure result written" ;;
+    *) log_notifier "gave up on $filename but could NOT write its failure result (rc $rc: $outcome); the claim keeps it from being retyped" ;;
+  esac
+}
+
+# Hand the prompt to `codex queue`; non-zero means it certainly was not handed off.
+# The thread is resolved per task: /new or /resume in the TUI changes it.
 queue_prompt() {
   local filename="$1" prompt="$2" out thread rc=0 thread_err
-  claim_queue_handoff "$filename" || rc=$?
-  if [ "$rc" -eq 1 ]; then
-    log_notifier "queue mode: $filename already claimed for codex queue; not resubmitting, waiting on its result"
-    return 0
-  elif [ "$rc" -ne 0 ]; then
-    log_notifier "queue mode: could not claim $filename in $QUEUE_HANDOFF_DIR; not queueing, falling back to send-keys"
-    return 1
-  fi
   # Stderr captured separately: 2>&1 would let a config warning corrupt $thread.
-  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { release_queue_handoff "$filename"; log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
+  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
   thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>"$thread_err")" || rc=$?
   if [ "$rc" -ne 0 ]; then
     log_notifier "queue mode: no usable core thread for $filename (rc $rc: $(cat "$thread_err" 2>/dev/null)); falling back to send-keys"
     rm -f "$thread_err"
-    release_queue_handoff "$filename"
     return 1
   fi
   rm -f "$thread_err"
   out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
   # Only codex_queue.py's QUEUE_FAILED (5) proves nothing reached `codex queue`; any other
-  # non-zero (unknown, a signal, a crash) keeps the claim and never types.
+  # non-zero (unknown, a signal, a crash) counts as handed off and is never typed.
   if [ "$rc" -eq 5 ]; then
     log_notifier "queue mode: codex queue failed for $filename on thread $thread (rc $rc: $out); falling back to send-keys"
-    release_queue_handoff "$filename"
     return 1
   fi
   if [ "$rc" -ne 0 ]; then
@@ -395,6 +385,30 @@ queue_prompt() {
     return 0
   fi
   log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
+}
+
+# Deliver once, whatever the mode: 0 delivered or already claimed (wait on the result), 1 nothing
+# delivered (defer). Send-keys mode only honours claims; queue mode takes one before either transport.
+deliver_task() {
+  local filename="$1" prompt="$2" rc=0
+  if [ "${DELIVERY_MODE:-}" != queue ]; then
+    delivery_claimed "$filename" || rc=$?
+    case "$rc" in
+      0) log_notifier "$filename holds a delivery claim from an earlier run; not typing it, waiting on its result"; return 0 ;;
+      2) log_notifier "deferring $filename: delivery claims in $DELIVERY_CLAIM_DIR are unreadable"; return 1 ;;
+    esac
+    deliver_prompt "$filename" "$prompt"
+    return
+  fi
+  claim_delivery "$filename" || rc=$?
+  case "$rc" in
+    1) log_notifier "queue mode: $filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
+    2) log_notifier "deferring $filename: could not take its delivery claim in $DELIVERY_CLAIM_DIR"; return 1 ;;
+  esac
+  queue_prompt "$filename" "$prompt" && return 0
+  deliver_prompt "$filename" "$prompt" && return 0
+  release_delivery "$filename"
+  return 1
 }
 
 # What the prompt tells the session to read: the payload a resolver-backed
@@ -419,7 +433,7 @@ submit_task() {
   # replay any task whose bridge result already exists.
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
-    clear_queue_handoff "$filename"
+    clear_delivery_claim "$filename"
     return 0
   fi
   prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
@@ -452,9 +466,7 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  if [ "${DELIVERY_MODE:-}" = queue ] && queue_prompt "$filename" "$prompt"; then
-    :
-  elif ! deliver_prompt "$filename" "$prompt"; then
+  if ! deliver_task "$filename" "$prompt"; then
     clear_workstream_context
     if [ "$wait_for_result" = "1" ]; then
       log_notifier "deferring $filename: composer was not idle-ready, will retry on the next idle cycle"
@@ -480,8 +492,8 @@ submit_task() {
       fi
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         echo "task-notifier: timed out waiting for result: $filename" >&2
-        if [ "${DELIVERY_MODE:-}" = queue ] && [ -d "${QUEUE_HANDOFF_DIR:-}/${filename%.txt}" ]; then
-          give_up_queued_task "$filename"
+        if [ -n "${DELIVERY_CLAIM_DIR:-}" ] && [ -d "$DELIVERY_CLAIM_DIR/${filename%.txt}" ]; then
+          give_up_claimed_task "$filename"
         fi
         clear_workstream_context
         return 0
@@ -489,7 +501,7 @@ submit_task() {
       sleep "$POLL_INTERVAL"
     done
     mark_worker_stage "$filename" done
-    clear_queue_handoff "$filename"
+    clear_delivery_claim "$filename"
     clear_workstream_context
   fi
 }
@@ -550,7 +562,7 @@ enqueue_announced_task() {
   filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
-    clear_queue_handoff "$filename"
+    clear_delivery_claim "$filename"
     return 0
   fi
   [ -e "$queue_dir/$filename" ] && return 0
@@ -607,7 +619,7 @@ process_announced_queue() {
     [ -n "$filename" ] || return 0
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
-      clear_queue_handoff "$filename"
+      clear_delivery_claim "$filename"
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
@@ -615,7 +627,7 @@ process_announced_queue() {
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
-      clear_queue_handoff "$filename"
+      clear_delivery_claim "$filename"
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi

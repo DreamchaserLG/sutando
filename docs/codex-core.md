@@ -103,11 +103,14 @@ worker's notifier always uses send-keys. In queue mode the notifier:
   turn yet): if Codex's shared daemon, not the pane's process tree, holds the file,
   the lookup finds nothing (unverified on 0.157+), and without `core.codex.thread`
   every task falls back to send-keys;
-- takes one atomic claim per task (`state/codex-queue-handoff/<task-id>`) before
-  handing it off, so two notifiers cannot both queue it. The claim is released only
-  when the hand-off certainly did not happen, and removed once the task has a result.
-  A claim left by a crash means "possibly queued", so that task is never typed; if no
-  claim can be taken, nothing is queued and the task is typed;
+- takes one atomic claim per task (`state/codex-delivery-claims/<task-id>`) before
+  either transport, so two notifiers cannot both deliver it. The claim is kept once
+  the task may have been queued or typed, released only when nothing was delivered,
+  and removed once the task has a result. A claim left by a crash means "possibly
+  delivered", so that task is never typed or queued again. If the claim cannot be
+  taken, the task is deferred to the next cycle, never typed. A notifier back in
+  send-keys mode (by choice, or because the mode could not be read) still honours an
+  existing claim and does not type that task;
 - sends exactly the prompt the send-keys path would type, as one argument;
 - does not wait for the pane to go idle and never clears or types into it while
   queueing; pane state is logged as health only;
@@ -119,9 +122,11 @@ worker's notifier always uses send-keys. In queue mode the notifier:
 - treats a `codex queue` that times out, or acknowledges and then exits non-zero, as
   an unknown outcome: it logs it and waits for the result, and never types the task;
 - gives up on a claimed task that has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT`
-  (3600 s): it writes a plain failure result ("handed to Codex but no reply came back;
-  not retried") that the bridge delivers like any reply, logs it, keeps the claim so the
-  task is never typed or queued again, and moves on to the next task.
+  (3600 s): `task_dispatch.py publish-unless-answered` writes a plain failure result
+  ("handed to Codex but no reply came back; not retried") only if no ready result exists
+  live or archived, never over one, and withdraws it if a reply lands meanwhile. The bridge
+  delivers it like any reply; the claim is kept so the task is never typed or queued
+  again, and the queue moves on to the next task.
 
 An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
 

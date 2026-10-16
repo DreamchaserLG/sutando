@@ -49,6 +49,7 @@ from delivery.task_dispatch import (  # noqa: E402
     owned_task_ids,
     _WORKER_HOLD_SUFFIXES,
     pending_candidates,
+    publish_unless_answered,
     worker_holds,
     WorkerHoldUnreadable,
 )
@@ -1141,6 +1142,80 @@ class OwnedTaskIdsTest(unittest.TestCase):
         self.assertEqual(r2.returncode, 2)
         self.assertIn("owned-by", r2.stderr)
 
+
+
+class PublishUnlessAnsweredTest(unittest.TestCase):
+    """A give-up result is published only while no ready result exists, and never over one."""
+
+    MSG = "no reply came back"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.results = Path(self.tmp.name) / "results"
+        self.results.mkdir()
+        self.live = self.results / F
+
+    def _leftovers(self):
+        return sorted(p.name for p in self.results.iterdir() if p.name.startswith("."))
+
+    def test_publishes_when_nothing_exists(self):
+        self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "published")
+        self.assertEqual(self.live.read_text(), self.MSG + "\n")
+        self.assertEqual(self._leftovers(), [])
+
+    def test_an_empty_or_whitespace_placeholder_is_replaced(self):
+        for placeholder in ("", "  \n\t\n"):
+            self.live.write_text(placeholder)
+            self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "published", repr(placeholder))
+            self.assertEqual(self.live.read_text(), self.MSG + "\n")
+            self.assertTrue(has_ready_result(self.results, F))
+
+    def test_a_ready_live_or_archived_result_is_never_touched(self):
+        _write(self.live, "real reply\n")
+        self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "answered")
+        self.assertEqual(self.live.read_text(), "real reply\n")
+        self.live.unlink()
+        archived = _write(self.results / "archive" / F, "real reply\n")
+        self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "answered")
+        self.assertFalse(self.live.exists())
+        self.assertEqual(archived.read_text(), "real reply\n")
+
+    def test_a_reply_landing_live_mid_publication_survives(self):
+        land = lambda: _write(self.live, "real reply\n")  # noqa: E731
+        self.assertEqual(publish_unless_answered(self.results, F, self.MSG, _before_place=land), "answered")
+        self.assertEqual(self.live.read_text(), "real reply\n")
+        self.assertEqual(self._leftovers(), [])
+
+    def test_a_reply_moving_to_the_archive_mid_publication_withdraws_the_give_up(self):
+        (self.results / "archive").mkdir()
+
+        def reply_then_drain():
+            # After the readiness check: the reply lands live and the bridge archives it.
+            _write(self.live, "real reply\n")
+            os.replace(self.live, self.results / "archive" / F)
+
+        got = publish_unless_answered(self.results, F, self.MSG, _before_place=reply_then_drain)
+        self.assertEqual(got, "answered")
+        self.assertFalse(self.live.exists(), "the false timeout was withdrawn")
+        self.assertEqual((self.results / "archive" / F).read_text(), "real reply\n")
+        self.assertEqual(self._leftovers(), [])
+
+    def test_bad_input_or_an_unwritable_dir_fails(self):
+        self.assertEqual(publish_unless_answered(self.results, "../x.txt", self.MSG), "failed")
+        self.assertEqual(publish_unless_answered(self.results, F, "  "), "failed")
+        self.assertEqual(publish_unless_answered(self.results / "missing", F, self.MSG), "failed")
+
+    def test_cli_exit_codes(self):
+        def run(text):
+            return subprocess.run([sys.executable, str(CLI), "publish-unless-answered", str(self.results), F],
+                                  input=text, capture_output=True, text=True)
+        r = run(self.MSG)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "published"))
+        r = run(self.MSG)
+        self.assertEqual((r.returncode, r.stdout.strip()), (1, "answered"))
+        r = run(" ")
+        self.assertEqual((r.returncode, r.stdout.strip()), (3, "failed"))
 
 
 if __name__ == "__main__":
