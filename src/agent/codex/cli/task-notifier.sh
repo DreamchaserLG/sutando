@@ -24,6 +24,8 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # Per-task delivery claims, one per task across transports; they outlive a notifier or core restart.
 DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
+# The running notifier's watcher: pid, start time, inbox. Written and read only under the lock.
+WATCHER_RECORD="$WORKSPACE_DIR/state/codex-notifier.watcher"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
@@ -75,6 +77,7 @@ stop_watcher() {
 
 cleanup_notifier() {
   stop_watcher
+  [ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ] && rm -f "$WATCHER_RECORD"
   clear_workstream_context
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -346,10 +349,16 @@ core_identity() {
   target="$(core_target)" || return 1
   pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$target" '#{pane_pid}' 2>/dev/null)" || return 1
   [ -n "$pid" ] || return 1
-  # C locale and UTC: lstart is rendered per TZ and locale, and two notifiers may differ in both.
-  start="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  start="$(process_start "$pid")" || return 1
+  printf '%s %s' "$pid" "$start"
+}
+
+# C locale and UTC: lstart is rendered per TZ and locale, and two notifiers may differ in both.
+process_start() {
+  local start
+  start="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || return 1
   [ -n "$start" ] || return 1
-  printf '%s %s' "$pid" "$(printf '%s' "$start" | tr -s ' ')"
+  printf '%s' "$start" | tr -s ' '
 }
 
 # True only when the claim names a core and a different core is running now; unknown is not gone.
@@ -363,6 +372,26 @@ claim_core_gone() {
 # The core a claim was taken for, re-stamped just before each hand-off.
 stamp_claim() {
   core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
+}
+
+# The watcher a notifier killed by -9 left running (it leads its own session) holds the inbox, so
+# the next watcher refuses to start. Holding the lock, that notifier is gone: stop its watcher.
+reap_orphaned_watcher() {
+  local pid start inbox waited=0
+  [ -f "$WATCHER_RECORD" ] || return 0
+  pid="$(sed -n 1p "$WATCHER_RECORD" 2>/dev/null)" || pid=""
+  start="$(sed -n 2p "$WATCHER_RECORD" 2>/dev/null)" || start=""
+  inbox="$(sed -n 3p "$WATCHER_RECORD" 2>/dev/null)" || inbox=""
+  rm -f "$WATCHER_RECORD"
+  [ -n "$pid" ] && [ -n "$start" ] && [ "$inbox" = "$TASKS_DIR" ] || return 0
+  [ "$(process_start "$pid" || true)" = "$start" ] || return 0
+  case "$(ps -o command= -p "$pid" 2>/dev/null || true)" in *watch-tasks-stream.sh*) ;; *) return 0 ;; esac
+  log_notifier "stopping watcher pid $pid, left running by a notifier that died"
+  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
 }
 
 # A typed-only claim from a restarted core is replaced by a fresh one. The lock above makes this
@@ -388,17 +417,16 @@ claim_abandoned() {
   [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ]
 }
 
-# Drop claims whose task is finished: no task file left in tasks/, and a ready result (live or
-# archived) or, for an abandoned claim, an owner alert already written.
+# Drop claims whose task is finished: a ready result (live or archived), or, for an abandoned
+# claim, an owner alert written and no task file left in tasks/.
 prune_delivery_claims() {
   local claim id
   [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
   for claim in "$DELIVERY_CLAIM_DIR"/*/; do
     [ -d "$claim" ] || continue
     id="$(basename "$claim")"
-    [ -e "$TASKS_DIR/$id.txt" ] && continue
     if ! has_result "$id.txt"; then
-      [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
+      [ ! -e "$TASKS_DIR/$id.txt" ] && [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
     fi
     rm -rf "$claim" 2>/dev/null || true
   done
@@ -629,10 +657,14 @@ queue_dir="$event_dir/queue"
 PAYLOAD_DIR="$event_dir/payload"
 mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 prune_delivery_claims
+[ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ] && reap_orphaned_watcher
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" 9>&- &
 watcher_pid=$!
+if [ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ]; then
+  printf '%s\n%s\n%s\n' "$watcher_pid" "$(process_start "$watcher_pid" || true)" "$TASKS_DIR" > "$WATCHER_RECORD" 2>/dev/null || true
+fi
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).

@@ -1483,6 +1483,106 @@ exit 0
         self.assertTrue(any("-l -- Sutando task ready: task-2.txt" in c for c in calls), err2)
         self.assertTrue(calls and all(c.endswith("LOCKFD=9") for c in calls), calls)
 
+    def test_after_a_notifier_is_killed_the_next_one_serves_the_inbox_at_once(self):
+        # Its watcher leads its own session, so it outlives a kill -9 and keeps holding the inbox.
+        tmp = Path(self.tmp.name)
+        workspace = self.root / "workspace"
+        tasks = workspace / "tasks"
+        tasks.mkdir(exist_ok=True)
+        (workspace / "results").mkdir(exist_ok=True)
+        (workspace / "logs").mkdir(exist_ok=True)
+        holder = tmp / "watcher-holder"
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text(f'''#!/bin/bash
+h="$(cat "{holder}" 2>/dev/null)"
+if [ -n "$h" ] && kill -0 "$h" 2>/dev/null; then echo "already watched by pid $h; exiting 0" >&2; exit 0; fi
+echo $$ > "{holder}"
+for f in "$1"/*.txt; do [ -e "$f" ] && echo "TASK_FILE: $(basename "$f")"; done
+while :; do sleep 1; done
+''')
+        watcher.chmod(0o755)
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1",
+                   SUTANDO_NOTIFIER_COMPLETION_TIMEOUT="30")
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        run = lambda: subprocess.Popen(["/bin/bash", str(script)], env=env, stdout=subprocess.DEVNULL,  # noqa: E731
+                                       stderr=subprocess.DEVNULL, start_new_session=True)
+        record = workspace / "state" / "codex-notifier.watcher"
+        first = run()
+        self._wait_for(record)
+        self._wait_for(holder)
+        orphan = int(holder.read_text())
+        second = None
+        try:
+            first.kill()
+            first.wait(timeout=30)
+            os.kill(orphan, 0)  # the watcher outlived its notifier
+            (tasks / "task-777.txt").write_text("task: x\n")
+            second = run()
+            deadline = time.monotonic() + 10
+            while "task-777.txt" not in (self.log.read_text() if self.log.exists() else ""):
+                self.assertLess(time.monotonic(), deadline, "the restarted notifier never served the inbox")
+                time.sleep(0.05)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(orphan, 0)
+            self.assertIn("left running by a notifier that died",
+                          (workspace / "logs" / "task-notifier.log").read_text())
+        finally:
+            for proc in (second, first):
+                if proc is not None and proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=30)
+            # Each watcher leads its own session; a killed notifier never stops it.
+            for pid in {orphan, int(holder.read_text() or 0)} - {0}:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def test_a_watcher_record_that_no_longer_names_the_watcher_kills_nothing(self):
+        tmp = Path(self.tmp.name)
+        fake = tmp / "watch-tasks-stream.sh"
+        fake.write_text("#!/bin/bash\nwhile :; do sleep 1; done\n")
+        fake.chmod(0o755)
+        other = tmp / "other.sh"
+        other.write_text("#!/bin/bash\nwhile :; do sleep 1; done\n")
+        other.chmod(0o755)
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        fns = "\n".join(_extract_shell_fn(text, n) for n in ("process_start", "reap_orphaned_watcher"))
+        procs = {name: subprocess.Popen(["bash", str(path)], start_new_session=True)
+                 for name, path in (("watcher", fake), ("other", other))}
+        try:
+            time.sleep(0.3)
+            start = lambda pid: subprocess.run(  # noqa: E731
+                ["bash", "-c", fns + f"\nprocess_start {pid}"], capture_output=True, text=True).stdout
+            cases = (  # (pid, start, inbox) -> must survive
+                (procs["watcher"].pid, "Mon Jan  1 00:00:00 2001", "/inbox"),
+                (procs["watcher"].pid, start(procs["watcher"].pid), "/another-inbox"),
+                (procs["other"].pid, start(procs["other"].pid), "/inbox"),
+            )
+            record = tmp / "record"
+            for pid, st, inbox in cases:
+                record.write_text(f"{pid}\n{st}\n{inbox}\n")
+                r = subprocess.run(["bash", "-c", "set -euo pipefail\nlog_notifier() { :; }\n" + fns +
+                                    "\nreap_orphaned_watcher\necho FINISHED\n"],
+                                   env=dict(os.environ, WATCHER_RECORD=str(record), TASKS_DIR="/inbox"),
+                                   capture_output=True, text=True, timeout=30)
+                self.assertIn("FINISHED", r.stdout, r.stderr)
+                self.assertIsNone(procs["watcher"].poll())
+                self.assertIsNone(procs["other"].poll())
+            r = subprocess.run(["bash", "-c", "set -euo pipefail\nlog_notifier() { :; }\n" + fns +
+                                "\nreap_orphaned_watcher\necho FINISHED\n"],
+                               env=dict(os.environ, WATCHER_RECORD=str(tmp / "missing"), TASKS_DIR="/inbox"),
+                               capture_output=True, text=True, timeout=30)
+            self.assertIn("FINISHED", r.stdout, r.stderr)
+        finally:
+            for proc in procs.values():
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+
     def test_the_notifier_runs_under_the_inbox_lock_and_keeps_it_from_its_watcher(self):
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         self.assertIn('exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock '
@@ -1502,6 +1602,7 @@ exit 0
     def test_core_identity_ignores_the_callers_time_zone_and_locale(self):
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         harness = (f'core_target() {{ printf "=sutando-core:0"; }}\ntmux() {{ echo {os.getpid()}; }}\n'
+                   + _extract_shell_fn(text, "process_start") + "\n"
                    + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
         ids = set()
         for tz, lc in (("UTC", "C"), ("Asia/Tokyo", "de_DE.UTF-8"), ("America/Los_Angeles", "ja_JP.UTF-8")):
@@ -1516,6 +1617,7 @@ exit 0
         harness = ('core_target() { printf "=sutando-core:0"; }\n'
                    'tmux() { [ "$3" = display-message ] && echo 4242; }\n'
                    'ps() { [ "$4" = 4242 ] && echo "Fri Oct 16  10:00:00 2026"; }\n'
+                   + _extract_shell_fn(text, "process_start") + "\n"
                    + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
         r = subprocess.run(["bash", "-c", harness], env=dict(os.environ, TMUX_SOCKET="s"),
                            capture_output=True, text=True, timeout=30)
@@ -1644,7 +1746,7 @@ exit 0
                            env=env, capture_output=True, text=True, timeout=60)
         self.assertIn("FINISHED", r.stdout, r.stderr)
         self.assertEqual(sorted(p.name for p in (ws / "claims").iterdir()),
-                         ["abandoned-alerted-in-tasks", "abandoned-unpublished", "no-result", "still-in-tasks"])
+                         ["abandoned-alerted-in-tasks", "abandoned-unpublished", "no-result"])
 
     def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
         result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)

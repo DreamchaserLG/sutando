@@ -100,8 +100,11 @@ Only one core notifier runs per workspace. The notifier re-executes itself under
 `src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
 `state/codex-notifier.lock` for exactly as long as the notifier process lives. The kernel
 drops the lock when the process dies, `kill -9` included, so no lock is ever left behind.
-The lock is kept out of the long-lived watcher the notifier starts. Pool workers have
-their own inboxes and are unchanged.
+The lock is kept out of the long-lived watcher the notifier starts. That watcher leads its
+own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
+The notifier records the watcher's pid, start time and inbox in
+`state/codex-notifier.watcher`, and the next notifier, holding the lock, stops that exact
+watcher before starting its own. Pool workers have their own inboxes and are unchanged.
 
 A second notifier (for example, start-cli replacing a stale one) waits for the first to
 exit. While it waits, it logs to stderr and `logs/task-notifier.log`, and records itself
@@ -124,8 +127,9 @@ stamped just before the hand-off). Because one notifier owns every claim, a clai
 has to survive restarts in sequence: after a core restart, a task that was only typed
 into the old core is retyped, as before; one that may have been queued is never retyped
 (the daemon may still hold it) but is abandoned at once, with the owner alert below. On start the notifier prunes the
-claims of tasks with no task file left in `tasks/` that have a ready result, or that
-were abandoned and their owner alert written.
+claim of every task that has a ready result, live or archived, whether or not its task
+file is still in `tasks/`, and of an abandoned task whose owner alert was written once
+its task file has left `tasks/`.
 
 In queue mode the notifier also:
 
