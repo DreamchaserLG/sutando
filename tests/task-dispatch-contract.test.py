@@ -50,6 +50,7 @@ from delivery.task_dispatch import (  # noqa: E402
     _WORKER_HOLD_SUFFIXES,
     pending_candidates,
     publish_unless_answered,
+    _identity,
     worker_holds,
     WorkerHoldUnreadable,
 )
@@ -1207,15 +1208,36 @@ class PublishUnlessAnsweredTest(unittest.TestCase):
         self.assertEqual(publish_unless_answered(self.results / "missing", F, self.MSG), "failed")
 
     def test_cli_exit_codes(self):
-        def run(text):
-            return subprocess.run([sys.executable, str(CLI), "publish-unless-answered", str(self.results), F],
-                                  input=text, capture_output=True, text=True)
-        r = run(self.MSG)
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "published"))
-        r = run(self.MSG)
-        self.assertEqual((r.returncode, r.stdout.strip()), (1, "answered"))
-        r = run(" ")
-        self.assertEqual((r.returncode, r.stdout.strip()), (3, "failed"))
+        def run(text, *extra):
+            out = StringIO()
+            with mock.patch("sys.stdin", StringIO(text)), mock.patch("sys.stdout", out), \
+                    mock.patch("sys.stderr", StringIO()):
+                code = _main(["publish-unless-answered", str(self.results), F, *extra])
+            return code, out.getvalue().strip()
+        self.assertEqual(run(self.MSG), (0, "published"))
+        self.assertEqual(run(self.MSG), (1, "answered"))
+        self.assertEqual(run(" "), (3, "failed"))
+        self.assertEqual(run(self.MSG, "extra"), (2, ""))
+
+    def test_a_link_error_other_than_exists_fails_cleanly(self):
+        with mock.patch("delivery.task_dispatch.os.link", side_effect=PermissionError("denied")):
+            self.assertEqual(publish_unless_answered(self.results, F, self.MSG), "failed")
+        self.assertFalse(self.live.exists())
+        self.assertEqual(self._leftovers(), [])
+
+    def test_a_withdrawal_that_cannot_unlink_still_reports_answered(self):
+        (self.results / "archive").mkdir()
+
+        def reply_then_drain():
+            _write(self.live, "real reply\n")
+            os.replace(self.live, self.results / "archive" / F)
+
+        with mock.patch.object(Path, "unlink", side_effect=OSError("busy")):
+            got = publish_unless_answered(self.results, F, self.MSG, _before_place=reply_then_drain)
+        self.assertEqual(got, "answered")
+
+    def test_identity_of_a_missing_file_is_none(self):
+        self.assertIsNone(_identity(self.results / "missing.txt"))
 
 
 if __name__ == "__main__":
