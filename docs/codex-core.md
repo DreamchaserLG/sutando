@@ -106,7 +106,8 @@ worker's notifier always uses send-keys. In queue mode the notifier:
 - takes one atomic claim per task (`state/codex-delivery-claims/<task-id>`) before
   either transport, so two notifiers cannot both deliver it. The claim is kept once
   the task may have been queued or typed, released only when nothing was delivered,
-  and removed once the task has a result. A claim left by a crash means "possibly
+  and removed once the task has a result. On start the notifier also prunes any claim
+  whose task has a ready result and no task file left in `tasks/`. A claim left by a crash means "possibly
   delivered", so that task is never typed or queued again. If the claim cannot be
   taken, the task is deferred to the next cycle, never typed. A notifier back in
   send-keys mode (by choice, or because the mode could not be read) still honours an

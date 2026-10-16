@@ -1369,7 +1369,43 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((ws / "results" / "task-a.txt").read_text(), "")
-        self.assertIn("deferring the give-up for task-a.txt", (tmp / "log").read_text())
+        log = (tmp / "log").read_text()
+        self.assertIn("deferring the give-up for task-a.txt", log)
+        self.assertIn("the next try comes after another 1s wait, unless a reply lands first", log)
+        self.assertNotIn("retrying next cycle", log)
+
+    def test_only_claims_of_finished_tasks_are_pruned(self):
+        tmp = Path(self.tmp.name)
+        ws = tmp / "ws"
+        for d in ("tasks", "results/archive", "claims"):
+            (ws / d).mkdir(parents=True)
+        cases = {  # id -> (task file still in tasks/, result, abandoned)
+            "done-archived": (False, "archive", False),
+            "done-live": (False, "live", False),
+            "still-in-tasks": (True, "archive", False),
+            "no-result": (False, None, False),
+            "abandoned-unpublished": (False, None, True),
+            "abandoned-published": (False, "live", True),
+        }
+        for tid, (in_tasks, result, abandoned) in cases.items():
+            (ws / "claims" / tid).mkdir()
+            if abandoned:
+                (ws / "claims" / tid / "abandoned").touch()
+            if in_tasks:
+                (ws / "tasks" / f"{tid}.txt").write_text("task: x\n")
+            if result:
+                (ws / "results" / ("archive" if result == "archive" else "") / f"{tid}.txt").write_text("reply\n")
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        self.assertRegex(text, r"\nprune_delivery_claims\n", "the notifier prunes on start")
+        fns = "\n".join(_extract_shell_fn(text, n) for n in ("has_result", "prune_delivery_claims"))
+        env = dict(os.environ, DELIVERY_CLAIM_DIR=str(ws / "claims"), TASKS_DIR=str(ws / "tasks"),
+                   RESULTS_DIR=str(ws / "results"), NOTIFIER_PY=sys.executable,
+                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"))
+        r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + fns + "\nprune_delivery_claims\necho FINISHED\n"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertIn("FINISHED", r.stdout, r.stderr)
+        self.assertEqual(sorted(p.name for p in (ws / "claims").iterdir()),
+                         ["abandoned-unpublished", "no-result", "still-in-tasks"])
 
     def test_an_empty_or_whitespace_placeholder_does_not_strand_the_queue(self):
         for placeholder in ("", " \n\t\n"):

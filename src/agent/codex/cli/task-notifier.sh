@@ -346,6 +346,20 @@ clear_delivery_claim() {
   rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
+# Drop claims whose task is finished: a ready result (live or archived) and no task file left in
+# tasks/. An abandoned claim whose failure result was never published has no result, so it stays.
+prune_delivery_claims() {
+  local claim id
+  [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
+  for claim in "$DELIVERY_CLAIM_DIR"/*/; do
+    [ -d "$claim" ] || continue
+    id="$(basename "$claim")"
+    [ -e "$TASKS_DIR/$id.txt" ] && continue
+    has_result "$id.txt" || continue
+    rm -rf "$claim" 2>/dev/null || true
+  done
+}
+
 # A claimed task with no result by COMPLETION_TIMEOUT gets a plain failure result unless it was
 # answered (task_dispatch.py decides); the claim is kept, marked abandoned, so it is never retried.
 give_up_claimed_task() {
@@ -356,7 +370,7 @@ give_up_claimed_task() {
   case "$rc" in
     0) log_notifier "gave up on $filename: no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying" ;;
     1) log_notifier "$filename was answered just as its wait ran out; no failure result written" ;;
-    4) log_notifier "deferring the give-up for $filename: its live result file was just written to; retrying next cycle" ;;
+    4) log_notifier "deferring the give-up for $filename: its live result file was just written to; the next try comes after another ${COMPLETION_TIMEOUT}s wait, unless a reply lands first" ;;
     *) log_notifier "gave up on $filename but could NOT write its failure result (rc $rc: $outcome); the claim keeps it from being retyped" ;;
   esac
 }
@@ -518,6 +532,7 @@ mkfifo "$event_dir/events"
 queue_dir="$event_dir/queue"
 PAYLOAD_DIR="$event_dir/payload"
 mkdir -p "$queue_dir" "$PAYLOAD_DIR"
+prune_delivery_claims
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
