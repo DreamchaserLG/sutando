@@ -1356,6 +1356,25 @@ exit 6
         self.assertNotIn("TYPED", log)
         self.assertEqual(list((ws / "queue").iterdir()), [])
 
+    def test_a_real_reply_landing_during_the_give_up_write_survives(self):
+        tmp = Path(self.tmp.name)
+        results = tmp / "results"
+        (tmp / "handoff" / "task-a").mkdir(parents=True)
+        results.mkdir()
+        fn = _extract_shell_fn((self.root / "src/agent/codex/cli/task-notifier.sh").read_text(), "give_up_queued_task")
+        # The reply lands after has_result was checked and the temp file was made.
+        harness = ('set -euo pipefail\nlog_notifier() { printf "%s\\n" "$*" >> "$LOG"; }\n'
+                   'has_result() { [ -s "$RESULTS_DIR/$1" ]; }\n'
+                   'mktemp() { command mktemp "$@"; echo "real reply" > "$RESULTS_DIR/task-a.txt"; }\n'
+                   + fn + '\ngive_up_queued_task task-a.txt\necho FINISHED\n')
+        env = dict(os.environ, QUEUE_HANDOFF_DIR=str(tmp / "handoff"), RESULTS_DIR=str(results),
+                   LOG=str(tmp / "log"), COMPLETION_TIMEOUT="1")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertIn("FINISHED", r.stdout, r.stderr)
+        self.assertEqual((results / "task-a.txt").read_text(), "real reply\n")
+        self.assertEqual(sorted(p.name for p in results.iterdir()), ["task-a.txt"], "no temp file left")
+        self.assertIn("answered just as its wait ran out", (tmp / "log").read_text())
+
     def test_a_claim_left_by_a_crash_is_never_typed_or_requeued(self):
         tmp = Path(self.tmp.name)
         (tmp / "handoff" / "a").mkdir(parents=True)

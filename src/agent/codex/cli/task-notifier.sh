@@ -343,12 +343,19 @@ clear_queue_handoff() {
 give_up_queued_task() {
   local filename="$1" tmp
   : > "$QUEUE_HANDOFF_DIR/${filename%.txt}/abandoned" 2>/dev/null || true
+  if has_result "$filename"; then
+    log_notifier "$filename was answered just as its wait ran out; no failure result written"
+    return 0
+  fi
+  # ln never replaces a file, so a real reply landing after the check above survives.
   if tmp="$(mktemp "$RESULTS_DIR/.${filename%.txt}.XXXXXX" 2>/dev/null)" \
     && printf '%s\n' "This task was handed to Codex but no reply came back within ${COMPLETION_TIMEOUT}s. It was not retried, to avoid running it twice; please ask again if it is still needed." > "$tmp" \
-    && mv -f "$tmp" "$RESULTS_DIR/$filename"; then
+    && ln "$tmp" "$RESULTS_DIR/$filename" 2>/dev/null; then
+    rm -f "$tmp"
     log_notifier "gave up on $filename: handed to codex queue, no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying"
+  elif rm -f "${tmp:-}" 2>/dev/null; [ -e "$RESULTS_DIR/$filename" ]; then
+    log_notifier "$filename was answered just as its wait ran out; no failure result written"
   else
-    rm -f "${tmp:-}" 2>/dev/null || true
     log_notifier "gave up on $filename but could NOT write its failure result; the claim keeps it from being retyped"
   fi
 }
