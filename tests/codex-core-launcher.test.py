@@ -19,6 +19,19 @@ REAL_REPO = Path(os.environ.get(
 )).resolve()
 
 
+def _extract_shell_fn(text, name):
+    return re.search(r"^%s\(\) \{.*?^\}" % re.escape(name), text, re.S | re.M).group(0)
+
+
+def _queue_prompt_source(root):
+    # queue_prompt now calls three small helpers for its durable handoff receipt;
+    # a harness extracting queue_prompt alone would leave them undefined.
+    text = (root / "src/agent/codex/cli/task-notifier.sh").read_text()
+    return "\n".join(_extract_shell_fn(text, n) for n in
+                     ("queue_handoff_recorded", "record_queue_handoff",
+                      "clear_queue_handoff", "queue_prompt"))
+
+
 def _read_count(path):
     """Read the supervisor's counter file, tolerating a mid-write empty read.
 
@@ -1144,12 +1157,11 @@ if [ "$1" = thread ]; then n=$(($(cat "{tmp}/n" 2>/dev/null || echo 0) + 1)); ec
 printf '%s\\n' "$3" >> "{tmp}/sent"
 ''')
         fake_py.chmod(0o755)
-        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
-        fn = re.search(r"^queue_prompt\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        fn = _queue_prompt_source(self.root)
         harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
                    '\nqueue_prompt a.txt "p1" && queue_prompt b.txt "p2"\n')
         env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
-                   TMUX_SOCKET="s", SESSION="sutando-core")
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((tmp / "sent").read_text().split(), ["t1", "t2"])
@@ -1169,15 +1181,76 @@ fi
 printf '%s\\n' "$3" >> "{tmp}/sent"
 ''')
         fake_py.chmod(0o755)
-        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
-        fn = re.search(r"^queue_prompt\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        fn = _queue_prompt_source(self.root)
         harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
                    '\nqueue_prompt a.txt "p1"\n')
         env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
-                   TMUX_SOCKET="s", SESSION="sutando-core")
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((tmp / "sent").read_text().strip(), "clean-thread")
+
+    def test_queue_prompt_never_resubmits_a_filename_once_handed_off(self):
+        # A retry pass (COMPLETION_TIMEOUT re-entry, or a fresh notifier after a
+        # restart) must not call `codex queue` again once a handoff receipt exists.
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text(f'''#!/bin/bash
+shift
+if [ "$1" = thread ]; then printf 't1'; exit 0; fi
+printf 'send\\n' >> "{tmp}/send-calls"
+printf 'Queued message a.txt'
+''')
+        fake_py.chmod(0o755)
+        fn = _queue_prompt_source(self.root)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
+                   '\nqueue_prompt a.txt "p1"; queue_prompt a.txt "p1"\n')
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((tmp / "send-calls").read_text().count("send"), 1)
+
+    def test_queue_prompt_treats_a_signaled_helper_as_unknown_not_a_failure(self):
+        # Exiting 143/137 after a possible handoff is not proof `codex queue` never
+        # received it -- only the helper's own QUEUE_FAILED (rc 5) is safe to retype.
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text('''#!/bin/bash
+shift
+if [ "$1" = thread ]; then printf 't1'; exit 0; fi
+exit 143
+''')
+        fake_py.chmod(0o755)
+        fn = _queue_prompt_source(self.root)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
+                   '\nqueue_prompt a.txt "p1"; echo "rc=$?"\n')
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("rc=0", r.stdout)
+
+    def test_queue_prompt_falls_back_only_on_the_helpers_own_queue_failed_code(self):
+        # codex_queue.py's QUEUE_FAILED is rc 5 -- the one code proven safe to retype.
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text('''#!/bin/bash
+shift
+if [ "$1" = thread ]; then printf 't1'; exit 0; fi
+printf 'codex queue did not start' >&2
+exit 5
+''')
+        fake_py.chmod(0o755)
+        fn = _queue_prompt_source(self.root)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
+                   '\nqueue_prompt a.txt "p1"; echo "rc=$?"\n')
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core", QUEUE_HANDOFF_DIR=str(tmp / "handoff"))
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("rc=1", r.stdout)
+        self.assertFalse((tmp / "handoff").exists())
 
     def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
         result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)

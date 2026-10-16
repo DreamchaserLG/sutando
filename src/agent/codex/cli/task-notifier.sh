@@ -22,6 +22,9 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+# A durable per-task-id "already handed off to codex queue" receipt; survives
+# both the retry loop's re-entry and a notifier restart.
+QUEUE_HANDOFF_DIR="$WORKSPACE_DIR/state/codex-queue-handoff"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
@@ -319,12 +322,29 @@ deliver_prompt() {
   done
 }
 
+# A receipt that queue_prompt already handed $1 off (success or UNKNOWN): present
+# means never resubmit it, whatever called us or how many times.
+queue_handoff_recorded() {
+  [ -e "$QUEUE_HANDOFF_DIR/${1%.txt}" ]
+}
+
+record_queue_handoff() {
+  mkdir -p "$QUEUE_HANDOFF_DIR" 2>/dev/null && : > "$QUEUE_HANDOFF_DIR/${1%.txt}"
+}
+
+clear_queue_handoff() {
+  rm -f "$QUEUE_HANDOFF_DIR/${1%.txt}"
+}
+
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
 # caller types it. The thread is resolved per task: /new or /resume in the TUI changes it.
 queue_prompt() {
   local filename="$1" prompt="$2" out thread rc=0 thread_err
-  # Stderr captured separately: merging it into $thread (2>&1) would let a config
-  # warning (e.g. an unrecognized core.codex.delivery) corrupt the parsed thread id
+  if queue_handoff_recorded "$filename"; then
+    log_notifier "queue mode: $filename already handed off to codex queue; not resubmitting, waiting on its result"
+    return 0
+  fi
+  # Stderr captured separately: 2>&1 would let a config warning corrupt $thread
   # even on a successful lookup.
   thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
   thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>"$thread_err")" || rc=$?
@@ -335,15 +355,19 @@ queue_prompt() {
   fi
   rm -f "$thread_err"
   out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
-  if [ "$rc" -eq 6 ]; then
-    log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread ($out); not typing it, waiting on its result"
-    return 0
-  fi
-  if [ "$rc" -ne 0 ]; then
+  # Only codex_queue.py's own QUEUE_FAILED (rc 5) proves the send never reached
+  # `codex queue`; any other rc (UNKNOWN, a signal, a crash) is treated as UNKNOWN too.
+  if [ "$rc" -eq 5 ]; then
     log_notifier "queue mode: codex queue failed for $filename on thread $thread (rc $rc: $out); falling back to send-keys"
     return 1
   fi
+  if [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread (rc $rc: $out); not typing it, waiting on its result"
+    record_queue_handoff "$filename"
+    return 0
+  fi
   log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
+  record_queue_handoff "$filename"
 }
 
 # What the prompt tells the session to read: the payload a resolver-backed
@@ -368,6 +392,7 @@ submit_task() {
   # replay any task whose bridge result already exists.
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
+    clear_queue_handoff "$filename"
     return 0
   fi
   prompt="Sutando task ready: $filename. Read $(task_payload "$filename"), follow AGENTS.md, complete the task, and write the result to $RESULTS_DIR/$filename."
@@ -434,6 +459,7 @@ submit_task() {
       sleep "$POLL_INTERVAL"
     done
     mark_worker_stage "$filename" done
+    clear_queue_handoff "$filename"
     clear_workstream_context
   fi
 }
@@ -494,6 +520,7 @@ enqueue_announced_task() {
   filename="${entry%%$'\t'*}"; payload="${entry#*$'\t'}"
   if has_result "$filename"; then
     mark_worker_stage "$filename" done
+    clear_queue_handoff "$filename"
     return 0
   fi
   [ -e "$queue_dir/$filename" ] && return 0
@@ -550,6 +577,7 @@ process_announced_queue() {
     [ -n "$filename" ] || return 0
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
+      clear_queue_handoff "$filename"
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
@@ -557,6 +585,7 @@ process_announced_queue() {
     submit_task "$filename" 1
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
+      clear_queue_handoff "$filename"
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
