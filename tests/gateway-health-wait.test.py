@@ -7,6 +7,7 @@ Run: python3 tests/gateway-health-wait.test.py
 """
 from __future__ import annotations
 
+import itertools
 import os
 import sys
 import tempfile
@@ -47,7 +48,7 @@ def http_error(code):
 
 
 class Channel(unittest.TestCase):
-    def run_loop(self, answers, inflight=frozenset(), loop_idle=0.0):
+    def run_loop(self, answers, inflight=frozenset(), loop_idle=0.0, clock=None):
         """Feed the GETs from `answers` (a value, or an exception to raise); stop when they run out."""
         stop, calls, script = Stop(), [], list(answers)
 
@@ -56,9 +57,9 @@ class Channel(unittest.TestCase):
             if method == "POST":
                 return {}
             if not script:
-                # Stop with an answer that takes no pause, so `waits` holds only the script's own.
+                # Stop with a read timeout, which takes no pause, so `waits` holds only the script's own.
                 stop.set()
-                return {"check_id": "/"}
+                raise TimeoutError
             a = script.pop(0)
             if isinstance(a, BaseException):
                 raise a
@@ -69,7 +70,7 @@ class Channel(unittest.TestCase):
                 mock.patch.object(rgb, "_LOCK_LOST", mock.Mock(is_set=lambda: False)), \
                 mock.patch.object(rgb, "_req", side_effect=req), \
                 mock.patch.object(rgb, "_LOOP_TICK", tick), \
-                mock.patch.object(rgb.time, "monotonic", return_value=1000.0), \
+                mock.patch.object(rgb.time, "monotonic", **({"side_effect": clock} if clock else {"return_value": 1000.0})), \
                 mock.patch.object(rgb, "_health_snapshot", return_value=None), \
                 mock.patch.object(rgb, "_reported_core_status", return_value=("working", "Reviewing #5624")), \
                 mock.patch.object(rgb, "_log"):
@@ -77,7 +78,7 @@ class Channel(unittest.TestCase):
         return calls, stop.waits
 
     def test_a_check_is_answered_at_once_with_the_heartbeat_fields_and_the_task_loop_idle_time(self):
-        calls, _ = self.run_loop([{"check_id": "chk-1"}], inflight={"t1", "t2"}, loop_idle=95)
+        calls, waits = self.run_loop([{"check_id": "chk-1"}], inflight={"t1", "t2"}, loop_idle=95)
         method, path, _, timeout = calls[0]
         self.assertEqual((method, path), ("GET", f"/v1/health/wait?wait={rgb.HEALTH_WAIT_S}"))
         self.assertEqual(timeout, rgb.HEALTH_WAIT_S + 10)
@@ -89,22 +90,32 @@ class Channel(unittest.TestCase):
         # A wedged task loop still answers here, and says how long it has been stuck.
         self.assertEqual(body["task_loop_idle_s"], 95)
         self.assertIn("health-wait", body["capabilities"])
+        # The check came back at once, so the next wait is a second off.
+        self.assertEqual(waits, [1])
 
     def test_an_empty_or_invalid_answer_reports_nothing(self):
         calls, waits = self.run_loop([{}, {"check_id": "../x"}, {"check_id": 7}, ["junk"]])
         self.assertFalse([c for c in calls if c[0] == "POST"])
-        # Each empty answer came back at once, so the loop paused instead of spinning.
-        self.assertEqual(waits, [1, 1])
+        # Every answer came back at once, empty or malformed, so the loop paused each time instead of spinning.
+        self.assertEqual(waits, [1, 1, 1, 1])
+
+    def test_a_relay_answering_every_wait_at_once_is_paced_and_a_held_wait_is_not(self):
+        _, waits = self.run_loop([{"check_id": "a"}, {"check_id": "b"}, {"check_id": "c"}])
+        self.assertEqual(waits, [1, 1, 1])
+        # Held for 30 s each, as a relay normally does: no pause on top.
+        calls, waits = self.run_loop([{}, {"check_id": "a"}], clock=itertools.count(1000.0, 30.0))
+        self.assertEqual(waits, [])
+        self.assertEqual([c[1] for c in calls if c[0] == "POST"], ["/v1/health/a"])
 
     def test_a_relay_without_the_route_is_retried_on_a_doubling_backoff_and_picked_up_later(self):
         calls, waits = self.run_loop([http_error(404), http_error(405), http_error(404), {"check_id": "c"}])
-        self.assertEqual(waits, [rgb.HEARTBEAT_INTERVAL, 2 * rgb.HEARTBEAT_INTERVAL, 4 * rgb.HEARTBEAT_INTERVAL])
+        self.assertEqual(waits, [rgb.HEARTBEAT_INTERVAL, 2 * rgb.HEARTBEAT_INTERVAL, 4 * rgb.HEARTBEAT_INTERVAL, 1])
         self.assertEqual([c[1] for c in calls if c[0] == "POST"], ["/v1/health/c"])
 
     def test_errors_never_end_the_thread_and_a_read_timeout_is_just_another_wait(self):
         calls, waits = self.run_loop([TimeoutError(), http_error(503), urllib.error.URLError("down"),
                                       RuntimeError("bad json"), http_error(401), {"check_id": "c"}])
-        self.assertEqual(waits, [1, 2, 4, 8])
+        self.assertEqual(waits, [1, 2, 4, 8, 1])
         self.assertEqual([c[1] for c in calls if c[0] == "POST"], ["/v1/health/c"])
 
     def test_a_failed_report_is_logged_and_the_channel_keeps_waiting(self):

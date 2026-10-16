@@ -3522,17 +3522,17 @@ def _health_wait_loop(inflight: set[str]) -> None:
             continue
         check_id = resp.get("check_id") if isinstance(resp, dict) else None
         if not check_id:
-            # An empty answer that came back at once must not spin the loop.
-            if time.monotonic() - started < 1:
-                _HEALTH_STOP.wait(1)
-            continue
-        if not isinstance(check_id, str) or not _HEALTH_CHECK_ID.match(check_id):
+            pass
+        elif not isinstance(check_id, str) or not _HEALTH_CHECK_ID.match(check_id):
             _log("health-wait returned an invalid check_id — ignored")
-            continue
-        try:
-            _answer_health_check(check_id, inflight)
-        except Exception as e:  # noqa: BLE001 — a lost report is the broker's timeout to judge
-            _log(f"health report {check_id} failed: {type(e).__name__}: {e}")
+        else:
+            try:
+                _answer_health_check(check_id, inflight)
+            except Exception as e:  # noqa: BLE001 — a lost report is the broker's timeout to judge
+                _log(f"health report {check_id} failed: {type(e).__name__}: {e}")
+        # Any answer that came back at once, empty, invalid or a real check, must not spin the loop.
+        if time.monotonic() - started < 1:
+            _HEALTH_STOP.wait(1)
 
 
 def _start_health_wait(inflight: set[str]) -> threading.Thread:
