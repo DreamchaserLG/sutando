@@ -389,7 +389,7 @@ function openQuickLink(event, link){
 <div style="display:flex;align-items:center;gap:14px">
 <img id="stand-avatar" src="/avatar" style="width:56px;height:56px;border-radius:50%;border:2px solid #4ecca3;display:none;object-fit:cover">
 <div><h1 id="stand-name">Sutando</h1>
-<p class="sub" id="stand-sub">Operational view of use cases, health, activity, and quota</p></div></div>
+<p class="sub" id="stand-sub">Operational view of use cases, health, and quota</p></div></div>
 <script>
 fetch('/stand-identity').then(r=>r.json()).then(s=>{
   if(s.name){document.getElementById('stand-name').textContent='Sutando — '+s.name;
@@ -398,7 +398,7 @@ fetch('/stand-identity').then(r=>r.json()).then(s=>{
 }).catch(()=>{});
 </script>
 </div>
-<p class="intro">Tracks current system status alongside the latest capability matrix, recent activity, local endpoints, and quota pressure.</p>
+<p class="intro">Tracks current system status alongside the latest capability matrix, local endpoints, and quota pressure.</p>
 <div class="grid" id="content">__CONTENT__</div>
 <p class="refresh">Auto-refreshes every 15s</p>
 <script>
@@ -657,7 +657,6 @@ for(const[k,el]of[['5h','qs-5h'],['7d','qs-7d']]){
 
 def render_dashboard() -> str:
     health = get_health()
-    activity = get_activity(5)
     pending = get_pending_count()
     score = get_score()
     stats = get_system_stats()
@@ -666,20 +665,13 @@ def render_dashboard() -> str:
     ok_count = sum(1 for c in services_only if c.get("status") in ("ok", "warn"))
     total_count = len(services_only)
 
-    # Score card. A missing/unparseable score used to render as a bare "?" —
-    # glyph soup for new installs whose build_log.md has no **Score:** marker
-    # yet. Show a real empty state instead of pretending "?" is a value.
-    if score == "?":
-        score_html = ('<p style="font-size:12px;color:#667;line-height:1.5;margin-top:4px">'
-                      'Nothing scored yet. Use cases appear here once the build log '
-                      'records one (a <code style="color:#889">**Score: …**</code> line in '
-                      '<code style="color:#889">build_log.md</code>).</p>')
-    else:
-        score_html = f'<div class="score">{score}</div>'
-    cards = [f"""<div class="card">
+    # Score card only when build_log.md records a **Score:** line; fresh installs have none.
+    cards = []
+    if score != "?":
+        cards.append(f"""<div class="card">
 <h2>Use Cases</h2>
-{score_html}
-</div>"""]
+<div class="score">{score}</div>
+</div>""")
 
     # System stats
     charge = " ⚡" if stats["charging"] else ""
@@ -710,12 +702,6 @@ def render_dashboard() -> str:
             icon = '<span class="bad">✗</span>'
         services_html += f'<div class="check">{icon} {c.get("name", "?")} <span style="color:#333;margin-left:auto">{c.get("detail", "")}</span></div>\n'
     cards.append(f'<div class="card"><h2>Services</h2>{services_html}</div>')
-
-    # Activity
-    activity_html = ""
-    for a in activity:
-        activity_html += f'<div class="activity-item"><span class="activity-time">{a["time"]}</span> <span class="activity-title">{a["title"]}</span></div>\n'
-    cards.append(f'<div class="card"><h2>Recent Activity</h2>{activity_html or "<span style=color:#333>No activity</span>"}</div>')
 
     # Capabilities matrix
     matrix_html = get_use_case_matrix()
