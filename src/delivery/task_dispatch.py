@@ -33,7 +33,6 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
     task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
     task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]  # prints key<TAB>payload, exit 0/1
-    task_dispatch.py publish-unless-answered <results_dir> <filename>  # text on stdin; exit 0 published, 1 answered, 3 failed, 4 deferred
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
 `tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
@@ -58,7 +57,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Iterator
 
@@ -66,9 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import (  # noqa: E402
-    index_result_candidates, iter_result_candidates, valid_archive_lookup_id,
-)
+from local_task_protocol import index_result_candidates, iter_result_candidates  # noqa: E402
 
 from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
@@ -77,7 +73,7 @@ __all__ = [
     "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
     "mark_partial_paste", "partial_paste_leftover",
-    "announced_entry", "publish_unless_answered",
+    "announced_entry",
 ]
 
 
@@ -163,71 +159,6 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
         if any(reader(c) is not None for c in candidates):
             ready.update(by_id[task_id])
     return ready
-
-
-PLACEHOLDER_SETTLE_S = 10
-
-
-def _identity(path: Path):
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino)
-
-
-def publish_unless_answered(results_dir: "Path | str", filename: str, text: str, *,
-                            _before_place=None) -> str:
-    """Publish `text` as `filename`'s live result only while no ready result exists, live or archived.
-
-    Returns "published", "answered" (a ready result exists, or appeared during publication and the
-    text was withdrawn), "deferred" (an empty or whitespace live placeholder changed within
-    PLACEHOLDER_SETTLE_S, so a writer may still hold it open), or "failed". Never replaces a ready
-    file; an older placeholder is not an answer and is replaced. `_before_place` is a test seam.
-    """
-    results = Path(results_dir)
-    task_id = _task_id_for_filename(filename)
-    if not valid_archive_lookup_id(task_id) or not text.strip():
-        return "failed"
-    if has_ready_result(results, filename):
-        return "answered"
-    live = results / f"{task_id}.txt"
-    try:
-        fd, tmp = tempfile.mkstemp(dir=results, prefix=f".{task_id}.", suffix=".publish")
-    except OSError:
-        return "failed"
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text.rstrip("\n") + "\n")
-        mine = os.stat(tmp)
-        if _before_place:
-            _before_place()
-        try:
-            os.link(tmp, live)
-        except FileExistsError:
-            if read_ready_result(live) is not None:
-                return "answered"
-            if time.time() - live.stat().st_mtime < PLACEHOLDER_SETTLE_S:
-                return "deferred"
-            os.replace(tmp, live)
-        # A reply that reached any layout meanwhile wins: withdraw ours if it is still the live file.
-        ours = (mine.st_dev, mine.st_ino)
-        for candidate in iter_result_candidates(results, task_id):
-            if _identity(candidate) != ours and read_ready_result(candidate) is not None:
-                if _identity(live) == ours:
-                    try:
-                        live.unlink()
-                    except OSError:
-                        pass
-                return "answered"
-        return "published"
-    except OSError:
-        return "failed"
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
@@ -475,8 +406,7 @@ _USAGE = (
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
     "       task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional\n"
-    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1\n"
-    "       task_dispatch.py publish-unless-answered <results_dir> <filename>   # text on stdin; prints outcome, exit 0 published / 1 answered / 3 failed / 4 deferred"
+    "       task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1"
 )
 
 
@@ -523,13 +453,6 @@ def _main(argv: list[str]) -> int:
             print(_USAGE, file=sys.stderr)
             return 2
         return 0 if has_ready_result(first, second) else 1
-    if cmd == "publish-unless-answered":
-        if rest:
-            print(_USAGE, file=sys.stderr)
-            return 2
-        outcome = publish_unless_answered(first, second, sys.stdin.read())
-        print(outcome)
-        return {"published": 0, "answered": 1, "deferred": 4}.get(outcome, 3)
     if cmd == "find-ready":
         if rest:
             print(_USAGE, file=sys.stderr)

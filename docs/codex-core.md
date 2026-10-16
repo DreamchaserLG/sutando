@@ -94,7 +94,19 @@ keystroke can be lost or merged with a draft:
 
 Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core)
 for a change to take effect. Queue mode applies to the core's notifier only; a pool
-worker's notifier always uses send-keys. In queue mode the notifier:
+worker's notifier always uses send-keys.
+
+In both modes the core's notifier delivers each task at most once through one gate: it
+takes an atomic per-task claim (`state/codex-delivery-claims/<task-id>`, created on
+demand) and then re-checks for a ready result, live or archived, before either
+transport. A task that already has a result is skipped; one already claimed by another
+notifier, a crash, or an earlier run in the other mode is not delivered again; and a
+claim that cannot be taken defers the task to the next cycle, never typing it. The
+claim is released only when nothing was delivered, and removed once the task has a
+result. On start the notifier also prunes any claim whose task has a ready result and
+no task file left in `tasks/`.
+
+In queue mode the notifier also:
 
 - resolves the core's thread for every task (so `/new` or `/resume` in the TUI is
   followed), from the rollout file the core pane's process tree holds open
@@ -103,31 +115,29 @@ worker's notifier always uses send-keys. In queue mode the notifier:
   turn yet): if Codex's shared daemon, not the pane's process tree, holds the file,
   the lookup finds nothing (unverified on 0.157+), and without `core.codex.thread`
   every task falls back to send-keys;
-- takes one atomic claim per task (`state/codex-delivery-claims/<task-id>`) before
-  either transport, so two notifiers cannot both deliver it. The claim is kept once
-  the task may have been queued or typed, released only when nothing was delivered,
-  and removed once the task has a result. On start the notifier also prunes any claim
-  whose task has a ready result and no task file left in `tasks/`. A claim left by a crash means "possibly
-  delivered", so that task is never typed or queued again. If the claim cannot be
-  taken, the task is deferred to the next cycle, never typed. A notifier back in
-  send-keys mode (by choice, or because the mode could not be read) still honours an
-  existing claim and does not type that task;
-- sends exactly the prompt the send-keys path would type, as one argument;
+- delivers the **first task after every core restart by send-keys**: a fresh thread
+  has no rollout file until its first turn, so the lookup finds none open and reports
+  no thread (`rc 3`, "0 open"). Queue mode takes over from the second task. This was
+  seen on a live scratch Codex core;
+- marks the claim "queue" before calling `codex queue`, and sends exactly the prompt
+  the send-keys path would type, as one argument;
 - does not wait for the pane to go idle and never clears or types into it while
   queueing; pane state is logged as health only;
 - falls back to send-keys, with a line in `logs/task-notifier.log`, only when the task
-  certainly was not handed off: no thread found, the thread has no persisted turn yet
-  (a fresh core's first task always goes by send-keys), `codex` could not start, or it
-  exited non-zero without acknowledging the queue. That fallback types through the
-  usual composer check but skips the wait for an idle core;
+  certainly was not handed off: no thread found, the thread has no persisted turn yet,
+  `codex` could not start, or it exited non-zero without acknowledging the queue. That
+  fallback types through the usual composer check but skips the wait for an idle core;
 - treats a `codex queue` that times out, or acknowledges and then exits non-zero, as
-  an unknown outcome: it logs it and waits for the result, and never types the task;
-- gives up on a claimed task that has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT`
-  (3600 s): `task_dispatch.py publish-unless-answered` writes a plain failure result
-  ("handed to Codex but no reply came back; not retried") only if no ready result exists
-  live or archived, never over one, and withdraws it if a reply lands meanwhile. The bridge
-  delivers it like any reply; the claim is kept so the task is never typed or queued
-  again, and the queue moves on to the next task.
+  an unknown outcome: it logs it and waits for the result, and never types the task.
+
+When a claimed task has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT` (3600 s):
+
+- if it may have been queued (its claim is marked "queue"), the claim is marked
+  abandoned, so the task is never typed or queued again; `results/` is left untouched;
+  the owner is told out of band by a proactive message (`results/proactive-<ts>-<id>.txt`:
+  "task <id> was handed to Codex but no reply came back in <N> min; not retried, to
+  avoid running it twice"); and the queue moves on;
+- if it was only typed, the claim is released and the task is retried as before.
 
 An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
 

@@ -22,7 +22,7 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
-# Per-task delivery claims taken in queue mode; one survives retries, restarts and a mode change.
+# Per-task delivery claims, one per task across transports; they survive retries, restarts, mode changes.
 DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
@@ -321,24 +321,16 @@ deliver_prompt() {
   done
 }
 
-# One atomic claim per task (mkdir), taken before any transport and kept once anything may
-# have been delivered. A failed claim never authorizes typing: the task is deferred.
+# One atomic claim per task (mkdir): the only ownership point for every transport. It is kept
+# until the task has a result; a failed claim never authorizes typing, the task is deferred.
 claim_delivery() {  # 0 claimed; 1 already claimed; 2 could not claim (defer)
   mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null && return 0
   [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 1
   return 2
 }
 
-# Read-only check for send-keys mode: 0 claimed, 1 not claimed, 2 claim state unreadable.
-delivery_claimed() {
-  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 0
-  [ ! -e "$DELIVERY_CLAIM_DIR" ] && return 1
-  [ -d "$DELIVERY_CLAIM_DIR" ] && [ -r "$DELIVERY_CLAIM_DIR" ] && [ -x "$DELIVERY_CLAIM_DIR" ] && return 1
-  return 2
-}
-
 release_delivery() {
-  rmdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
 clear_delivery_claim() {
@@ -346,8 +338,12 @@ clear_delivery_claim() {
   rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
+claim_abandoned() {
+  [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ]
+}
+
 # Drop claims whose task is finished: a ready result (live or archived) and no task file left in
-# tasks/. An abandoned claim whose failure result was never published has no result, so it stays.
+# tasks/. An abandoned claim has no result, so it stays.
 prune_delivery_claims() {
   local claim id
   [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
@@ -360,19 +356,26 @@ prune_delivery_claims() {
   done
 }
 
-# A claimed task with no result by COMPLETION_TIMEOUT gets a plain failure result unless it was
-# answered (task_dispatch.py decides); the claim is kept, marked abandoned, so it is never retried.
-give_up_claimed_task() {
-  local filename="$1" outcome rc=0
-  : > "$DELIVERY_CLAIM_DIR/${filename%.txt}/abandoned" 2>/dev/null || true
-  outcome="$(printf '%s\n' "This task was handed to Codex but no reply came back within ${COMPLETION_TIMEOUT}s. It was not retried, to avoid running it twice; please ask again if it is still needed." \
-    | "$NOTIFIER_PY" "$DISPATCH_PY" publish-unless-answered "$RESULTS_DIR" "$filename" 2>&1)" || rc=$?
-  case "$rc" in
-    0) log_notifier "gave up on $filename: no result within ${COMPLETION_TIMEOUT}s; wrote a failure result, not retrying" ;;
-    1) log_notifier "$filename was answered just as its wait ran out; no failure result written" ;;
-    4) log_notifier "deferring the give-up for $filename: its live result file was just written to; the next try comes after another ${COMPLETION_TIMEOUT}s wait, unless a reply lands first" ;;
-    *) log_notifier "gave up on $filename but could NOT write its failure result (rc $rc: $outcome); the claim keeps it from being retyped" ;;
-  esac
+# No result by COMPLETION_TIMEOUT. A typed-only claim is released, so the task is retried as before.
+# One that may have been queued is abandoned: never retried, results/ untouched, the owner alerted.
+time_out_claimed_task() {
+  local filename="$1" id="${1%.txt}" claim tmp mins
+  claim="$DELIVERY_CLAIM_DIR/$id"
+  if [ ! -e "$claim/queue" ]; then
+    release_delivery "$filename"
+    return 0
+  fi
+  claim_abandoned "$filename" && return 0
+  : > "$claim/abandoned" 2>/dev/null || log_notifier "could not mark $filename abandoned; its claim still keeps it from being retried"
+  mins=$(( (COMPLETION_TIMEOUT + 59) / 60 ))
+  if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
+    && printf '%s\n' "task $id was handed to Codex but no reply came back in $mins min; not retried, to avoid running it twice" > "$tmp" \
+    && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
+    log_notifier "abandoned $filename: queued, no result within ${COMPLETION_TIMEOUT}s; alerted the owner, not retrying"
+  else
+    rm -f "${tmp:-}" 2>/dev/null || true
+    log_notifier "abandoned $filename: queued, no result within ${COMPLETION_TIMEOUT}s; could NOT write the owner alert"
+  fi
 }
 
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off.
@@ -402,25 +405,32 @@ queue_prompt() {
   log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
 }
 
-# Deliver once, whatever the mode: 0 delivered or already claimed (wait on the result), 1 nothing
-# delivered (defer). Send-keys mode only honours claims; queue mode takes one before either transport.
+# Deliver once: 0 delivered, already claimed, or already answered (wait on the result); 1 nothing
+# delivered (defer). The claim, then a fresh result check, come before either transport.
 deliver_task() {
-  local filename="$1" prompt="$2" rc=0
-  if [ "${DELIVERY_MODE:-}" != queue ]; then
-    delivery_claimed "$filename" || rc=$?
-    case "$rc" in
-      0) log_notifier "$filename holds a delivery claim from an earlier run; not typing it, waiting on its result"; return 0 ;;
-      2) log_notifier "deferring $filename: delivery claims in $DELIVERY_CLAIM_DIR are unreadable"; return 1 ;;
-    esac
+  local filename="$1" prompt="$2" rc=0 claim="$DELIVERY_CLAIM_DIR/${1%.txt}"
+  if [ -n "${WORKER_INSTANCE:-}" ]; then
     deliver_prompt "$filename" "$prompt"
     return
   fi
   claim_delivery "$filename" || rc=$?
   case "$rc" in
-    1) log_notifier "queue mode: $filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
+    1) log_notifier "$filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
     2) log_notifier "deferring $filename: could not take its delivery claim in $DELIVERY_CLAIM_DIR"; return 1 ;;
   esac
-  queue_prompt "$filename" "$prompt" && return 0
+  if has_result "$filename"; then
+    release_delivery "$filename"
+    return 0
+  fi
+  if [ "${DELIVERY_MODE:-}" = queue ]; then
+    # The marker goes down first, so a crash mid-queue still reads as "possibly queued".
+    if : > "$claim/queue" 2>/dev/null; then
+      queue_prompt "$filename" "$prompt" && return 0
+      rm -f "$claim/queue"
+    else
+      log_notifier "queue mode: could not mark $filename as queueing; typing it instead"
+    fi
+  fi
   deliver_prompt "$filename" "$prompt" && return 0
   release_delivery "$filename"
   return 1
@@ -508,7 +518,7 @@ submit_task() {
       if [ $(( $(date +%s) - started )) -ge "$COMPLETION_TIMEOUT" ]; then
         echo "task-notifier: timed out waiting for result: $filename" >&2
         if [ -n "${DELIVERY_CLAIM_DIR:-}" ] && [ -d "$DELIVERY_CLAIM_DIR/${filename%.txt}" ]; then
-          give_up_claimed_task "$filename"
+          time_out_claimed_task "$filename"
         fi
         clear_workstream_context
         return 0
@@ -582,6 +592,7 @@ enqueue_announced_task() {
     return 0
   fi
   [ -e "$queue_dir/$filename" ] && return 0
+  claim_abandoned "$filename" && return 0
   if [ "${SUTANDO_INBOX_KIND:-}" != "deliveries" ] && filename_is_worker_held "$filename"; then
     log_notifier "$filename is worker-held per deliveries/; not queuing, not typing into the core"
     return 0
@@ -639,11 +650,18 @@ process_announced_queue() {
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
-    wait_for_core_idle || exit 1
-    submit_task "$filename" 1
+    if ! claim_abandoned "$filename"; then
+      wait_for_core_idle || exit 1
+      submit_task "$filename" 1
+    fi
     if has_result "$filename"; then
       mark_worker_stage "$filename" done
       clear_delivery_claim "$filename"
+      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
+      continue
+    fi
+    # An abandoned task leaves the queue unanswered; its claim keeps it from ever being retried.
+    if claim_abandoned "$filename"; then
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
