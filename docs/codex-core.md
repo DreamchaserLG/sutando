@@ -103,8 +103,12 @@ transport. A task that already has a result is skipped; one already claimed by a
 notifier, a crash, or an earlier run in the other mode is not delivered again; and a
 claim that cannot be taken defers the task to the next cycle, never typing it. The
 claim is released only when nothing was delivered, and removed once the task has a
-result. On start the notifier also prunes any claim whose task has a ready result and
-no task file left in `tasks/`.
+result. Each claim records the core it was taken for (the pane's pid and start time).
+After a core restart, a task that was only typed into the old core is retyped, as
+before; one that may have been queued is never retyped (the daemon may still hold it)
+but is abandoned at once, with the owner alert below. On start the notifier prunes the
+claims of tasks with no task file left in `tasks/` that have a ready result, or that
+were abandoned and their owner alert written.
 
 In queue mode the notifier also:
 

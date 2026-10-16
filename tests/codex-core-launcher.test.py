@@ -28,8 +28,9 @@ def _delivery_source(root):
     # The production delivery functions, extracted together so a harness runs the shipped code.
     text = (root / "src/agent/codex/cli/task-notifier.sh").read_text()
     return "\n".join(_extract_shell_fn(text, n) for n in
-                     ("has_result", "claim_delivery", "release_delivery", "clear_delivery_claim",
-                      "claim_abandoned", "queue_prompt", "deliver_task"))
+                     ("has_result", "claim_delivery", "claim_core_gone", "release_delivery",
+                      "clear_delivery_claim", "claim_abandoned", "abandon_claimed_task", "queue_prompt",
+                      "deliver_task"))
 
 
 def _read_count(path):
@@ -1160,6 +1161,7 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         fake_py.chmod(0o755)
         stubs = ("log_notifier() { printf '%s\\n' \"$*\" >> \"$LOG\"; }\n"
                  "pane_state() { echo idle-ready; }\n"
+                 "core_identity() { [ -s \"$CORE_ID\" ] && cat \"$CORE_ID\"; }\n"
                  "deliver_prompt() { [ -z \"${HOLD:-}\" ] || while [ ! -e \"$HOLD\" ]; do sleep 0.02; done\n"
                  "  printf 'SEND_KEYS:%s\\n' \"$1\" >> \"$TYPED\"; return ${DELIVER_RC:-0}; }\n")
         harness = stubs + _delivery_source(self.root) + "\n" + body
@@ -1167,7 +1169,8 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
                    TMUX_SOCKET="s", SESSION="sutando-core", DELIVERY_MODE=mode,
                    DELIVERY_CLAIM_DIR=str(claims if claims is not None else tmp / "claims"),
                    LOG=str(tmp / "log"), TYPED=str(tmp / "typed"), RESULTS_DIR=str(tmp / "results"),
-                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"), WORKER_INSTANCE="")
+                   DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"), WORKER_INSTANCE="",
+                   CORE_ID=str(tmp / "core-id"))
         (tmp / "results").mkdir(exist_ok=True)
         return harness, env
 
@@ -1305,6 +1308,55 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         self.assertEqual(self._lines("sent"), [])
         self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
 
+    def _old_claim(self, core="111 Mon Oct 12 09:00:00 2026", queued=False):
+        tmp = Path(self.tmp.name)
+        claim = tmp / "claims" / "a"
+        claim.mkdir(parents=True)
+        (claim / "core").write_text(core)
+        if queued:
+            (claim / "queue").touch()
+        (tmp / "core-id").write_text("222 Fri Oct 16 10:00:00 2026")
+        return claim
+
+    def test_a_typed_task_is_retyped_once_after_a_core_restart(self):
+        claim = self._old_claim()
+        r = self._run_harness('deliver_task a.txt p; echo "rc1=$?"; deliver_task a.txt p; echo "rc2=$?"\n',
+                              mode="send-keys")
+        self.assertEqual(r.stdout.split(), ["rc1=0", "rc2=0"], r.stderr)
+        self.assertEqual(self._lines("typed"), ["SEND_KEYS:a.txt"])
+        self.assertEqual((claim / "core").read_text(), "222 Fri Oct 16 10:00:00 2026", "re-claimed by the new core")
+
+    def test_a_queued_task_is_abandoned_not_retyped_after_a_core_restart(self):
+        claim = self._old_claim(queued=True)
+        r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n')
+        self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+        self.assertEqual(self._lines("typed") + self._lines("sent"), [])
+        self.assertTrue((claim / "abandoned").exists() and (claim / "alerted").exists())
+        alerts = list((Path(self.tmp.name) / "results").glob("proactive-*-a.txt"))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0].read_text(), "task a was handed to Codex but the core restarted before it "
+                                                "replied; not retried, to avoid running it twice\n")
+
+    def test_a_claim_from_the_same_or_an_unknown_core_is_waited_on(self):
+        for recorded, current in (("222 Fri Oct 16 10:00:00 2026", "222 Fri Oct 16 10:00:00 2026"),
+                                  ("", "222 Fri Oct 16 10:00:00 2026"), ("111 x", "")):
+            shutil.rmtree(Path(self.tmp.name) / "claims", ignore_errors=True)
+            self._old_claim(core=recorded)
+            (Path(self.tmp.name) / "core-id").write_text(current)
+            r = self._run_harness('deliver_task a.txt p; echo "rc=$?"\n', mode="send-keys")
+            self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
+            self.assertEqual(self._lines("typed"), [], (recorded, current))
+
+    def test_core_identity_is_the_pane_pid_and_its_start_time(self):
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        harness = ('core_target() { printf "=sutando-core:0"; }\n'
+                   'tmux() { [ "$3" = display-message ] && echo 4242; }\n'
+                   'ps() { [ "$4" = 4242 ] && echo "Fri Oct 16  10:00:00 2026"; }\n'
+                   + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
+        r = subprocess.run(["bash", "-c", harness], env=dict(os.environ, TMUX_SOCKET="s"),
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.stdout, "4242 Fri Oct 16 10:00:00 2026")
+
     def test_a_task_whose_reply_landed_before_the_claim_is_never_delivered(self):
         # Kewei's second interleaving: the reply lands and its claim is cleared before this notifier claims.
         (Path(self.tmp.name) / "results").mkdir(exist_ok=True)
@@ -1346,7 +1398,8 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
             time.sleep(0.02)
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         fns = "\n".join(_extract_shell_fn(text, n) for n in (
-            "has_result", "release_delivery", "clear_delivery_claim", "claim_abandoned", "time_out_claimed_task",
+            "has_result", "release_delivery", "clear_delivery_claim", "claim_abandoned", "abandon_claimed_task",
+            "time_out_claimed_task",
             "wait_for_core_idle", "submit_task", "queue_head", "process_announced_queue"))
         # task-a holds a claim and never answers; task-b is answered as soon as it is delivered.
         stubs = textwrap.dedent('''\
@@ -1404,11 +1457,15 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
             "no-result": (False, None, False),
             "abandoned-unpublished": (False, None, True),
             "abandoned-published": (False, "live", True),
+            "abandoned-alerted": (False, None, "alerted"),
+            "abandoned-alerted-in-tasks": (True, None, "alerted"),
         }
         for tid, (in_tasks, result, abandoned) in cases.items():
             (ws / "claims" / tid).mkdir()
             if abandoned:
                 (ws / "claims" / tid / "abandoned").touch()
+            if abandoned == "alerted":
+                (ws / "claims" / tid / "alerted").touch()
             if in_tasks:
                 (ws / "tasks" / f"{tid}.txt").write_text("task: x\n")
             if result:
@@ -1423,7 +1480,7 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
                            env=env, capture_output=True, text=True, timeout=60)
         self.assertIn("FINISHED", r.stdout, r.stderr)
         self.assertEqual(sorted(p.name for p in (ws / "claims").iterdir()),
-                         ["abandoned-unpublished", "no-result", "still-in-tasks"])
+                         ["abandoned-alerted-in-tasks", "abandoned-unpublished", "no-result", "still-in-tasks"])
 
     def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
         result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)

@@ -324,9 +324,31 @@ deliver_prompt() {
 # One atomic claim per task (mkdir): the only ownership point for every transport. It is kept
 # until the task has a result; a failed claim never authorizes typing, the task is deferred.
 claim_delivery() {  # 0 claimed; 1 already claimed; 2 could not claim (defer)
-  mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null && return 0
+  if mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null; then
+    core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
+    return 0
+  fi
   [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 1
   return 2
+}
+
+# The live core process as "<pane pid> <start time>": a restarted core is a different one.
+core_identity() {
+  local target pid start
+  target="$(core_target)" || return 1
+  pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$target" '#{pane_pid}' 2>/dev/null)" || return 1
+  [ -n "$pid" ] || return 1
+  start="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  [ -n "$start" ] || return 1
+  printf '%s %s' "$pid" "$(printf '%s' "$start" | tr -s ' ')"
+}
+
+# True only when the claim names a core and a different core is running now; unknown is not gone.
+claim_core_gone() {
+  local recorded current
+  recorded="$(cat "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null)" || return 1
+  current="$(core_identity)" || return 1
+  [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]
 }
 
 release_delivery() {
@@ -342,8 +364,8 @@ claim_abandoned() {
   [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ]
 }
 
-# Drop claims whose task is finished: a ready result (live or archived) and no task file left in
-# tasks/. An abandoned claim has no result, so it stays.
+# Drop claims whose task is finished: no task file left in tasks/, and a ready result (live or
+# archived) or, for an abandoned claim, an owner alert already written.
 prune_delivery_claims() {
   local claim id
   [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
@@ -351,31 +373,38 @@ prune_delivery_claims() {
     [ -d "$claim" ] || continue
     id="$(basename "$claim")"
     [ -e "$TASKS_DIR/$id.txt" ] && continue
-    has_result "$id.txt" || continue
+    if ! has_result "$id.txt"; then
+      [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
+    fi
     rm -rf "$claim" 2>/dev/null || true
   done
 }
 
-# No result by COMPLETION_TIMEOUT. A typed-only claim is released, so the task is retried as before.
-# One that may have been queued is abandoned: never retried, results/ untouched, the owner alerted.
-time_out_claimed_task() {
-  local filename="$1" id="${1%.txt}" claim tmp mins
+# Never retried again; results/ untouched; the owner alerted once, out of band. $2 says why.
+abandon_claimed_task() {
+  local filename="$1" why="$2" id="${1%.txt}" claim tmp
   claim="$DELIVERY_CLAIM_DIR/$id"
-  if [ ! -e "$claim/queue" ]; then
-    release_delivery "$filename"
-    return 0
-  fi
   claim_abandoned "$filename" && return 0
   : > "$claim/abandoned" 2>/dev/null || log_notifier "could not mark $filename abandoned; its claim still keeps it from being retried"
-  mins=$(( (COMPLETION_TIMEOUT + 59) / 60 ))
   if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
-    && printf '%s\n' "task $id was handed to Codex but no reply came back in $mins min; not retried, to avoid running it twice" > "$tmp" \
+    && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
     && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
-    log_notifier "abandoned $filename: queued, no result within ${COMPLETION_TIMEOUT}s; alerted the owner, not retrying"
+    : > "$claim/alerted" 2>/dev/null || true
+    log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
   else
     rm -f "${tmp:-}" 2>/dev/null || true
-    log_notifier "abandoned $filename: queued, no result within ${COMPLETION_TIMEOUT}s; could NOT write the owner alert"
+    log_notifier "abandoned $filename ($why); could NOT write the owner alert"
   fi
+}
+
+# No result by COMPLETION_TIMEOUT. A typed-only claim is released, so the task is retried as before;
+# one that may have been queued is abandoned.
+time_out_claimed_task() {
+  if [ ! -e "$DELIVERY_CLAIM_DIR/${1%.txt}/queue" ]; then
+    release_delivery "$1"
+    return 0
+  fi
+  abandon_claimed_task "$1" "no reply came back in $(( (COMPLETION_TIMEOUT + 59) / 60 )) min"
 }
 
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off.
@@ -414,6 +443,18 @@ deliver_task() {
     return
   fi
   claim_delivery "$filename" || rc=$?
+  # A claim from a core that has since restarted: a typed task died with it and is retyped, as on
+  # main; one that may have been queued is never retyped (the daemon may hold it) but abandoned now.
+  if [ "$rc" -eq 1 ] && ! claim_abandoned "$filename" && claim_core_gone "$filename"; then
+    if [ -e "$claim/queue" ]; then
+      abandon_claimed_task "$filename" "the core restarted before it replied"
+      return 0
+    fi
+    log_notifier "$filename was typed into a core that has since restarted; typing it again"
+    release_delivery "$filename"
+    rc=0
+    claim_delivery "$filename" || rc=$?
+  fi
   case "$rc" in
     1) log_notifier "$filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
     2) log_notifier "deferring $filename: could not take its delivery claim in $DELIVERY_CLAIM_DIR"; return 1 ;;
@@ -509,6 +550,10 @@ submit_task() {
   if [ "$wait_for_result" = "1" ]; then
     started="$(date +%s)"
     while ! has_result "$filename"; do
+      if [ -n "${DELIVERY_CLAIM_DIR:-}" ] && claim_abandoned "$filename"; then
+        clear_workstream_context
+        return 0
+      fi
       session_exists=0
       tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null && session_exists=1
       if [ "$session_exists" != "1" ]; then
@@ -654,14 +699,12 @@ process_announced_queue() {
       wait_for_core_idle || exit 1
       submit_task "$filename" 1
     fi
-    if has_result "$filename"; then
-      mark_worker_stage "$filename" done
-      clear_delivery_claim "$filename"
-      rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
-      continue
-    fi
     # An abandoned task leaves the queue unanswered; its claim keeps it from ever being retried.
-    if claim_abandoned "$filename"; then
+    if has_result "$filename" || claim_abandoned "$filename"; then
+      if has_result "$filename"; then
+        mark_worker_stage "$filename" done
+        clear_delivery_claim "$filename"
+      fi
       rm -f "$queue_dir/$filename" "$PAYLOAD_DIR/$filename"
       continue
     fi
