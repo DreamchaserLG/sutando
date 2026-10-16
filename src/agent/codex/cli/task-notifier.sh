@@ -325,7 +325,7 @@ deliver_prompt() {
 # until the task has a result; a failed claim never authorizes typing, the task is deferred.
 claim_delivery() {  # 0 claimed; 1 already claimed; 2 could not claim (defer)
   if mkdir -p "$DELIVERY_CLAIM_DIR" 2>/dev/null && mkdir "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null; then
-    core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
+    stamp_claim "$1"
     return 0
   fi
   [ -d "$DELIVERY_CLAIM_DIR/${1%.txt}" ] && return 1
@@ -352,13 +352,47 @@ claim_core_gone() {
   [ -n "$recorded" ] && [ -n "$current" ] && [ "$recorded" != "$current" ]
 }
 
+# Who holds a fresh claim: the core it was taken for, and this notifier's pid.
+stamp_claim() {
+  core_identity > "$DELIVERY_CLAIM_DIR/${1%.txt}/core" 2>/dev/null || true
+  printf '%s' "$$" > "$DELIVERY_CLAIM_DIR/${1%.txt}/owner" 2>/dev/null || true
+}
+
+# Replacing or releasing a claim this notifier did not just take happens only under the task's
+# takeover lock, after re-reading the claim; a busy lock means someone else is deciding.
+take_over_stale_claim() {  # 0 the claim is now ours; 1 left alone
+  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}" rc=1
+  mkdir "$claim.takeover" 2>/dev/null || return 1
+  if [ -d "$claim" ] && [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && claim_core_gone "$1"; then
+    rm -rf "$claim" 2>/dev/null || true
+    if mkdir "$claim" 2>/dev/null; then
+      stamp_claim "$1"
+      rc=0
+    fi
+  fi
+  rmdir "$claim.takeover" 2>/dev/null || true
+  return "$rc"
+}
+
+# A typed-only claim at timeout is released only by its owner, or once its owner has exited.
+release_timed_out_claim() {
+  local claim="$DELIVERY_CLAIM_DIR/${1%.txt}" owner
+  mkdir "$claim.takeover" 2>/dev/null || return 0
+  owner="$(cat "$claim/owner" 2>/dev/null)" || owner=""
+  if [ ! -e "$claim/queue" ] && ! claim_abandoned "$1" && [ -n "$owner" ] \
+    && { [ "$owner" = "$$" ] || ! kill -0 "$owner" 2>/dev/null; }; then
+    rm -rf "$claim" 2>/dev/null || true
+  fi
+  rmdir "$claim.takeover" 2>/dev/null || true
+}
+
 release_delivery() {
   rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
 }
 
 clear_delivery_claim() {
   [ -e "$DELIVERY_CLAIM_DIR/${1%.txt}/abandoned" ] && return 0
-  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" 2>/dev/null || true
+  rm -rf "$DELIVERY_CLAIM_DIR/${1%.txt}" "$DELIVERY_CLAIM_DIR/${1%.txt}.takeover" 2>/dev/null || true
 }
 
 claim_abandoned() {
@@ -373,6 +407,7 @@ prune_delivery_claims() {
   for claim in "$DELIVERY_CLAIM_DIR"/*/; do
     [ -d "$claim" ] || continue
     id="$(basename "$claim")"
+    case "$id" in *.takeover|*.alerting) continue ;; esac
     [ -e "$TASKS_DIR/$id.txt" ] && continue
     if ! has_result "$id.txt"; then
       [ -e "$claim/abandoned" ] && [ -e "$claim/alerted" ] || continue
@@ -381,28 +416,49 @@ prune_delivery_claims() {
   done
 }
 
-# Never retried again; results/ untouched; the owner alerted once, out of band. $2 says why.
+# Never retried again; results/ untouched. "abandoned" (holding the reason) is written first, so
+# the task stays fail-closed; "alerted" only once the owner alert is on disk. $2 says why.
 abandon_claimed_task() {
-  local filename="$1" why="$2" id="${1%.txt}" claim tmp
+  local filename="$1" id="${1%.txt}" claim why tmp
   claim="$DELIVERY_CLAIM_DIR/$id"
-  claim_abandoned "$filename" && return 0
-  : > "$claim/abandoned" 2>/dev/null || log_notifier "could not mark $filename abandoned; its claim still keeps it from being retried"
-  if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
-    && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
-    && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
-    : > "$claim/alerted" 2>/dev/null || true
-    log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
-  else
-    rm -f "${tmp:-}" 2>/dev/null || true
-    log_notifier "abandoned $filename ($why); could NOT write the owner alert"
+  [ -e "$claim/alerted" ] && return 0
+  if [ ! -e "$claim/abandoned" ]; then
+    printf '%s' "$2" > "$claim/abandoned" 2>/dev/null \
+      || log_notifier "could not mark $filename abandoned; its claim still keeps it from being retried"
   fi
+  why="$(cat "$claim/abandoned" 2>/dev/null)" || why=""
+  [ -n "$why" ] || why="${2:-no reply came back}"
+  mkdir "$claim.alerting" 2>/dev/null || return 0
+  if [ ! -e "$claim/alerted" ]; then
+    if tmp="$(mktemp "$RESULTS_DIR/.proactive-$id.XXXXXX" 2>/dev/null)" \
+      && printf '%s\n' "task $id was handed to Codex but $why; not retried, to avoid running it twice" > "$tmp" \
+      && mv -f "$tmp" "$RESULTS_DIR/proactive-$(date +%s)-$id.txt"; then
+      : > "$claim/alerted" 2>/dev/null || log_notifier "alerted the owner about $filename but could not record it"
+      log_notifier "abandoned $filename ($why); alerted the owner, not retrying"
+    else
+      rm -f "${tmp:-}" 2>/dev/null || true
+      log_notifier "abandoned $filename ($why); could NOT write the owner alert, will retry next cycle"
+    fi
+  fi
+  rmdir "$claim.alerting" 2>/dev/null || true
+}
+
+# Every cycle: write the owner alert for any abandoned claim whose alert did not get out.
+retry_owner_alerts() {
+  local claim
+  [ -d "$DELIVERY_CLAIM_DIR" ] || return 0
+  for claim in "$DELIVERY_CLAIM_DIR"/*/; do
+    case "$claim" in *.takeover/|*.alerting/) continue ;; esac
+    [ -e "${claim}abandoned" ] && [ ! -e "${claim}alerted" ] || continue
+    abandon_claimed_task "$(basename "$claim").txt" ""
+  done
 }
 
 # No result by COMPLETION_TIMEOUT. A typed-only claim is released, so the task is retried as before;
 # one that may have been queued is abandoned.
 time_out_claimed_task() {
   if [ ! -e "$DELIVERY_CLAIM_DIR/${1%.txt}/queue" ]; then
-    release_delivery "$1"
+    release_timed_out_claim "$1"
     return 0
   fi
   abandon_claimed_task "$1" "no reply came back in $(( (COMPLETION_TIMEOUT + 59) / 60 )) min"
@@ -451,10 +507,10 @@ deliver_task() {
       abandon_claimed_task "$filename" "the core restarted before it replied"
       return 0
     fi
-    log_notifier "$filename was typed into a core that has since restarted; typing it again"
-    release_delivery "$filename"
-    rc=0
-    claim_delivery "$filename" || rc=$?
+    if take_over_stale_claim "$filename"; then
+      log_notifier "$filename was typed into a core that has since restarted; typing it again"
+      rc=0
+    fi
   fi
   case "$rc" in
     1) log_notifier "$filename is already claimed; not delivering it again, waiting on its result"; return 0 ;;
@@ -687,6 +743,7 @@ queue_head() {
 # it queued rather than typing into Codex's non-durable input.
 process_announced_queue() {
   local filename
+  retry_owner_alerts
   while :; do
     filename="$(queue_head)"
     [ -n "$filename" ] || return 0

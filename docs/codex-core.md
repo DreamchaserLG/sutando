@@ -103,10 +103,14 @@ transport. A task that already has a result is skipped; one already claimed by a
 notifier, a crash, or an earlier run in the other mode is not delivered again; and a
 claim that cannot be taken defers the task to the next cycle, never typing it. The
 claim is released only when nothing was delivered, and removed once the task has a
-result. Each claim records the core it was taken for (the pane's pid and start time).
-After a core restart, a task that was only typed into the old core is retyped, as
-before; one that may have been queued is never retyped (the daemon may still hold it)
-but is abandoned at once, with the owner alert below. On start the notifier prunes the
+result. Each claim records the core it was taken for (the pane's pid and start time)
+and the notifier that took it. After a core restart, a task that was only typed into
+the old core is retyped, as before; one that may have been queued is never retyped
+(the daemon may still hold it) but is abandoned at once, with the owner alert below.
+Replacing a claim from a restarted core, or releasing a timed-out one, happens only
+under the task's takeover lock (`<task-id>.takeover`) after re-reading the claim, so
+two notifiers cannot both take a task over; a timed-out typed-only claim is released
+only by its own notifier, or once that notifier has exited. On start the notifier prunes the
 claims of tasks with no task file left in `tasks/` that have a ready result, or that
 were abandoned and their owner alert written.
 
@@ -138,7 +142,7 @@ When a claimed task has no result after `SUTANDO_NOTIFIER_COMPLETION_TIMEOUT` (3
 
 - if it may have been queued (its claim is marked "queue"), the claim is marked
   abandoned, so the task is never typed or queued again; `results/` is left untouched;
-  the owner is told out of band by a proactive message (`results/proactive-<ts>-<id>.txt`:
+  the owner is told out of band, retried every cycle until it is on disk, by a proactive message (`results/proactive-<ts>-<id>.txt`:
   "task <id> was handed to Codex but no reply came back in <N> min; not retried, to
   avoid running it twice"); and the queue moves on;
 - if it was only typed, the claim is released and the task is retried as before.
