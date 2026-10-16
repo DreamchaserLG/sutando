@@ -338,7 +338,8 @@ core_identity() {
   target="$(core_target)" || return 1
   pid="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$target" '#{pane_pid}' 2>/dev/null)" || return 1
   [ -n "$pid" ] || return 1
-  start="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  # C locale and UTC: lstart is rendered per TZ and locale, and two notifiers may differ in both.
+  start="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
   [ -n "$start" ] || return 1
   printf '%s %s' "$pid" "$(printf '%s' "$start" | tr -s ' ')"
 }

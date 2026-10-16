@@ -1347,6 +1347,18 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
             self.assertEqual(r.stdout.strip(), "rc=0", r.stderr)
             self.assertEqual(self._lines("typed"), [], (recorded, current))
 
+    def test_core_identity_ignores_the_callers_time_zone_and_locale(self):
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        harness = (f'core_target() {{ printf "=sutando-core:0"; }}\ntmux() {{ echo {os.getpid()}; }}\n'
+                   + _extract_shell_fn(text, "core_identity") + "\ncore_identity\n")
+        ids = set()
+        for tz, lc in (("UTC", "C"), ("Asia/Tokyo", "de_DE.UTF-8"), ("America/Los_Angeles", "ja_JP.UTF-8")):
+            r = subprocess.run(["bash", "-c", harness], env=dict(os.environ, TMUX_SOCKET="s", TZ=tz, LC_ALL=lc),
+                               capture_output=True, text=True, timeout=30)
+            self.assertTrue(r.stdout.startswith(f"{os.getpid()} "), r.stderr)
+            ids.add(r.stdout)
+        self.assertEqual(len(ids), 1, ids)
+
     def test_core_identity_is_the_pane_pid_and_its_start_time(self):
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         harness = ('core_target() { printf "=sutando-core:0"; }\n'
