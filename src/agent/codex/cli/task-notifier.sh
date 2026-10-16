@@ -322,12 +322,18 @@ deliver_prompt() {
 # Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
 # caller types it. The thread is resolved per task: /new or /resume in the TUI changes it.
 queue_prompt() {
-  local filename="$1" prompt="$2" out thread rc=0
-  thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>&1)" || rc=$?
+  local filename="$1" prompt="$2" out thread rc=0 thread_err
+  # Stderr captured separately: merging it into $thread (2>&1) would let a config
+  # warning (e.g. an unrecognized core.codex.delivery) corrupt the parsed thread id
+  # even on a successful lookup.
+  thread_err="$(mktemp "${TMPDIR:-/tmp}/sutando-codex-thread-err.XXXXXX")" || { log_notifier "queue mode: could not create temp file for $filename; falling back to send-keys"; return 1; }
+  thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>"$thread_err")" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    log_notifier "queue mode: no usable core thread for $filename (rc $rc: $thread); falling back to send-keys"
+    log_notifier "queue mode: no usable core thread for $filename (rc $rc: $(cat "$thread_err" 2>/dev/null)); falling back to send-keys"
+    rm -f "$thread_err"
     return 1
   fi
+  rm -f "$thread_err"
   out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
   if [ "$rc" -eq 6 ]; then
     log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread ($out); not typing it, waiting on its result"

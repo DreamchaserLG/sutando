@@ -130,10 +130,17 @@ class ThreadTests(unittest.TestCase):
         finally:
             codex_queue.delivery, codex_queue.shutil.which = orig_delivery, orig_which
 
-    def test_configured_thread_wins_without_discovery(self):
-        run = Recorder(Done(0, "discovered"))
+    def test_discovery_wins_even_when_a_thread_is_configured(self):
+        # A stale pin must never shadow a live discovery result, or a task sent right
+        # after /new or /resume would silently go to the old thread.
+        run = Recorder(Done(0, "live-thread\n"))
+        self.assertEqual(self._resolve(run, configured="stale-pin"), (0, "live-thread"))
+        self.assertEqual(len(run.calls), 1)
+
+    def test_configured_thread_is_the_fallback_when_discovery_fails(self):
+        run = Recorder(Done(3, "", "no core pane"))
         self.assertEqual(self._resolve(run, configured="named"), (0, "named"))
-        self.assertEqual(run.calls, [])
+        self.assertEqual(len(run.calls), 1)
 
     def test_discovery_asks_the_observer(self):
         run = Recorder(Done(0, "0199-abc\n"))

@@ -1154,6 +1154,31 @@ printf '%s\\n' "$3" >> "{tmp}/sent"
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((tmp / "sent").read_text().split(), ["t1", "t2"])
 
+    def test_queue_prompt_thread_lookup_ignores_a_stderr_warning_on_success(self):
+        # A benign warning on stderr (e.g. an unrecognized core.codex.delivery) must
+        # never leak into the parsed thread id used for the queue send.
+        tmp = Path(self.tmp.name)
+        fake_py = tmp / "fake-py"
+        fake_py.write_text(f'''#!/bin/bash
+shift
+if [ "$1" = thread ]; then
+  echo "sutando config: unsupported core.codex.delivery='x'; using send-keys" >&2
+  printf 'clean-thread'
+  exit 0
+fi
+printf '%s\\n' "$3" >> "{tmp}/sent"
+''')
+        fake_py.chmod(0o755)
+        text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
+        fn = re.search(r"^queue_prompt\(\) \{.*?^\}", text, re.S | re.M).group(0)
+        harness = ("log_notifier() { :; }\npane_state() { echo idle-ready; }\n" + fn +
+                   '\nqueue_prompt a.txt "p1"\n')
+        env = dict(os.environ, NOTIFIER_PY=str(fake_py), CODEX_QUEUE_PY="x", REPO="r",
+                   TMUX_SOCKET="s", SESSION="sutando-core")
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((tmp / "sent").read_text().strip(), "clean-thread")
+
     def test_thread_without_a_persisted_turn_falls_back_without_queueing(self):
         result, codex_calls = self._run_event(delivery="queue", thread=None, node_rc=4)
         self.assertEqual(result.returncode, 0, result.stderr)

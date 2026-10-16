@@ -44,21 +44,28 @@ def observer_argv(engine: str, socket: str, session: str, node: str) -> list[str
 
 
 def resolve_thread(engine: str, socket: str, session: str, run=subprocess.run) -> tuple[int, str]:
-    """(0, id) or (code, reason). A configured core.codex.thread wins over discovery."""
+    """(0, id) or (code, reason). Discovery wins: it reflects the core's current thread,
+    so a task sent right after /new or /resume still reaches the live one. A configured
+    core.codex.thread is the fallback for a core whose rollout discovery can't read at
+    all (daemon-held, not pane-tree-held) -- never an override once discovery works,
+    or a stale pin would silently misdeliver after the core's thread moves on."""
+    node = shutil.which("node")
+    if node:
+        try:
+            r = run(observer_argv(engine, socket, session, node), capture_output=True, text=True, timeout=TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            r, discovery_err = None, f"thread lookup failed: {exc}"
+        else:
+            if r.returncode == 0 and r.stdout.strip():
+                return 0, r.stdout.strip()
+            discovery_err = (r.stderr or r.stdout).strip() or f"thread lookup exited {r.returncode}"
+        discovery_code = r.returncode if r is not None and r.returncode in (NO_THREAD, NO_TURN) else 1
+    else:
+        discovery_code, discovery_err = 1, "node not on PATH; cannot read the core's rollout"
     configured = delivery().get("thread", "")
     if configured:
         return 0, configured
-    node = shutil.which("node")
-    if not node:
-        return 1, "node not on PATH; cannot read the core's rollout"
-    try:
-        r = run(observer_argv(engine, socket, session, node), capture_output=True, text=True, timeout=TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return 1, f"thread lookup failed: {exc}"
-    if r.returncode == 0 and r.stdout.strip():
-        return 0, r.stdout.strip()
-    code = r.returncode if r.returncode in (NO_THREAD, NO_TURN) else 1
-    return code, (r.stderr or r.stdout).strip() or f"thread lookup exited {r.returncode}"
+    return discovery_code, discovery_err
 
 
 def send(thread: str, message: str, run=subprocess.run) -> tuple[int, str]:
