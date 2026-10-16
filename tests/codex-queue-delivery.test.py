@@ -73,9 +73,32 @@ class SendTests(unittest.TestCase):
         self.assertEqual(code, codex_queue.QUEUE_FAILED)
         self.assertIn("no rollout found", reason)
 
-    def test_missing_codex_or_timeout_is_a_failure(self):
-        for exc in (FileNotFoundError("codex"), subprocess.TimeoutExpired("codex", 30)):
-            self.assertEqual(codex_queue.send("t", "m", run=Recorder(exc))[0], codex_queue.QUEUE_FAILED)
+    def test_a_codex_that_never_started_is_a_failure(self):
+        code, reason = codex_queue.send("t", "m", run=Recorder(FileNotFoundError("codex")))
+        self.assertEqual(code, codex_queue.QUEUE_FAILED)
+        self.assertIn("did not start", reason)
+
+    def test_a_timeout_is_unknown_never_a_failure(self):
+        code, reason = codex_queue.send("t", "m", run=Recorder(subprocess.TimeoutExpired("codex", 30)))
+        self.assertEqual(code, codex_queue.QUEUE_UNKNOWN)
+        self.assertIn("may have queued", reason)
+
+    def test_an_acknowledgement_then_nonzero_exit_is_unknown(self):
+        for out, err in (("Queued message m1 for thread t.", "warning"), ("", "Queued message m1 for thread t.")):
+            run = Recorder(Done(1, out, err))
+            self.assertEqual(codex_queue.send("t", "m", run=run)[0], codex_queue.QUEUE_UNKNOWN)
+
+    def test_a_slow_fake_codex_past_the_timeout_is_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "codex"
+            fake.write_text("#!/bin/bash\nsleep 3\n")
+            fake.chmod(0o755)
+            orig_timeout, orig_path = codex_queue.TIMEOUT_S, os.environ["PATH"]
+            codex_queue.TIMEOUT_S, os.environ["PATH"] = 1, f"{d}:{orig_path}"
+            try:
+                self.assertEqual(codex_queue.send("t", "m")[0], codex_queue.QUEUE_UNKNOWN)
+            finally:
+                codex_queue.TIMEOUT_S, os.environ["PATH"] = orig_timeout, orig_path
 
     def test_fake_codex_receives_the_exact_bytes(self):
         with tempfile.TemporaryDirectory() as d:

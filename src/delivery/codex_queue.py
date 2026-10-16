@@ -10,7 +10,8 @@ CLI (exit codes are the contract task-notifier.sh reads):
     codex_queue.py mode                                   -> prints send-keys | queue
     codex_queue.py thread --engine R --socket S --session N
         -> prints the thread id; 3 no core thread, 4 no persisted turn, 1 lookup failed
-    codex_queue.py send --thread T --message M            -> 0 queued, 5 refused or failed
+    codex_queue.py send --thread T --message M
+        -> 0 queued; 5 certainly not queued (safe to type); 6 unknown (may be queued: never type)
 """
 
 from __future__ import annotations
@@ -22,7 +23,8 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-NO_THREAD, NO_TURN, QUEUE_FAILED = 3, 4, 5
+NO_THREAD, NO_TURN, QUEUE_FAILED, QUEUE_UNKNOWN = 3, 4, 5, 6
+ACK = "Queued message"
 TIMEOUT_S = 30
 
 
@@ -64,11 +66,16 @@ def send(thread: str, message: str, run=subprocess.run) -> tuple[int, str]:
         return QUEUE_FAILED, "empty thread or message"
     try:
         r = run(queue_argv(thread, message), capture_output=True, text=True, timeout=TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return QUEUE_FAILED, f"codex queue did not run: {exc}"
-    if r.returncode != 0:
-        return QUEUE_FAILED, (r.stderr or r.stdout).strip() or f"codex queue exited {r.returncode}"
-    return 0, r.stdout.strip()
+    except OSError as exc:
+        return QUEUE_FAILED, f"codex queue did not start: {exc}"
+    except subprocess.TimeoutExpired:
+        return QUEUE_UNKNOWN, f"codex queue still running after {TIMEOUT_S}s; it may have queued"
+    said = f"{r.stdout or ''}\n{r.stderr or ''}".strip()
+    if r.returncode == 0:
+        return 0, (r.stdout or "").strip()
+    if ACK in said:
+        return QUEUE_UNKNOWN, f"codex queue exited {r.returncode} after acknowledging: {said}"
+    return QUEUE_FAILED, said or f"codex queue exited {r.returncode}"
 
 
 def main(argv: list[str] | None = None) -> int:

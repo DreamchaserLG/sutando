@@ -44,9 +44,9 @@ WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstr
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 CODEX_QUEUE_PY="$REPO/src/delivery/codex_queue.py"
-# Read once per notifier run; codex_queue.py owns the mode and falls back to send-keys.
+# Read once per run; core only, since a configured core.codex.thread names the core's thread.
 DELIVERY_MODE="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" mode 2>/dev/null)" || DELIVERY_MODE=send-keys
-QUEUE_THREAD=""
+[ -z "$WORKER_INSTANCE" ] || DELIVERY_MODE=send-keys
 watcher_pid=""
 event_dir=""
 workstream_context_file=""
@@ -319,25 +319,25 @@ deliver_prompt() {
   done
 }
 
-# Hand the prompt to `codex queue`; non-zero means the caller types it instead. The pane
-# state is logged as health only. The thread is resolved once, and again after a failure.
+# Hand the prompt to `codex queue`; non-zero means it certainly was not handed off, so the
+# caller types it. The thread is resolved per task: /new or /resume in the TUI changes it.
 queue_prompt() {
-  local filename="$1" prompt="$2" out rc=0
-  if [ -z "$QUEUE_THREAD" ]; then
-    out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>&1)" || rc=$?
-    if [ "$rc" -ne 0 ]; then
-      log_notifier "queue mode: no usable core thread for $filename (rc $rc: $out); falling back to send-keys"
-      return 1
-    fi
-    QUEUE_THREAD="$out"
-  fi
-  out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$QUEUE_THREAD" --message "$prompt" 2>&1)" || rc=$?
+  local filename="$1" prompt="$2" out thread rc=0
+  thread="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" thread --engine "$REPO" --socket "$TMUX_SOCKET" --session "$SESSION" 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    log_notifier "queue mode: codex queue failed for $filename on thread $QUEUE_THREAD (rc $rc: $out); falling back to send-keys"
-    QUEUE_THREAD=""
+    log_notifier "queue mode: no usable core thread for $filename (rc $rc: $thread); falling back to send-keys"
     return 1
   fi
-  log_notifier "queued $filename into thread $QUEUE_THREAD (pane: $(pane_state || echo unreadable))"
+  out="$("$NOTIFIER_PY" "$CODEX_QUEUE_PY" send --thread "$thread" --message "$prompt" 2>&1)" || rc=$?
+  if [ "$rc" -eq 6 ]; then
+    log_notifier "queue mode: outcome UNKNOWN for $filename on thread $thread ($out); not typing it, waiting on its result"
+    return 0
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log_notifier "queue mode: codex queue failed for $filename on thread $thread (rc $rc: $out); falling back to send-keys"
+    return 1
+  fi
+  log_notifier "queued $filename into thread $thread (pane: $(pane_state || echo unreadable))"
 }
 
 # What the prompt tells the session to read: the payload a resolver-backed

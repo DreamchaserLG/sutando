@@ -83,15 +83,25 @@ keystroke can be lost or merged with a draft:
 ```
 
 Restart the core (`bash src/agent/start-cli.sh --restart`, from outside the core)
-for a change to take effect. In queue mode the notifier:
+for a change to take effect. Queue mode applies to the core's notifier only; a pool
+worker's notifier always uses send-keys. In queue mode the notifier:
 
-- resolves the core's thread once, from the rollout file the core's process holds
-  open (`codex-observer.mjs --core-thread`), or from `core.codex.thread` when set;
+- resolves the core's thread for every task (so `/new` or `/resume` in the TUI is
+  followed), from the rollout file the core pane's process tree holds open
+  (`codex-observer.mjs --core-thread`), or from `core.codex.thread` when set. If
+  Codex's shared daemon, not the pane's process tree, holds that file, the lookup
+  finds nothing and every task falls back to send-keys; this is unverified on 0.157+,
+  and `core.codex.thread` is the workaround;
 - sends exactly the prompt the send-keys path would type, as one argument;
-- reads the pane only as health, and never clears or types into it while queueing;
-- falls back to send-keys, with a line in `logs/task-notifier.log`, when no thread
-  is found, the thread has no persisted turn yet (a fresh core's first task always
-  goes by send-keys), or `codex queue` fails.
+- does not wait for the pane to go idle and never clears or types into it while
+  queueing; pane state is logged as health only;
+- falls back to send-keys, with a line in `logs/task-notifier.log`, only when the task
+  certainly was not handed off: no thread found, the thread has no persisted turn yet
+  (a fresh core's first task always goes by send-keys), `codex` could not start, or it
+  exited non-zero without acknowledging the queue. That fallback types through the
+  usual composer check but skips the wait for an idle core;
+- treats a `codex queue` that times out, or acknowledges and then exits non-zero, as
+  an unknown outcome: it logs it and waits for the result, and never types the task.
 
 An active `/goal` keeps the TUI from draining its queue (openai/codex#52705).
 
