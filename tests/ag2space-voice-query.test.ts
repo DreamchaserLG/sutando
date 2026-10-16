@@ -13,7 +13,8 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 if (PRESENT) {
 const {
 	queryMessages, windowStart, resetLastChecked, resetSenderOwners, recordCallEnded, createQueryMessagesTool, addressedTo, QUERY_PROMPT_RULE, QUERY_TURN_CHECK_RULE,
-	QUERY_FIRST_WINDOW_MS, QUERY_ROOM_PAGE, QUERY_ROOM_MAX_PAGES, QUERY_SEARCH_MAX_PAGES, QUERY_BUDGET_MS,
+	QUERY_FIRST_WINDOW_MS, QUERY_ROOM_PAGE, QUERY_ROOM_MAX_PAGES, QUERY_SEARCH_MAX_PAGES, QUERY_BUDGET_MS, QUERY_ROOM_SMALL_PAGE, QUERY_ROOM_NEWER_PAGE, QUERY_MAX_GROUPS,
+	roomStats, createRoomStatsTool,
 } = await import('../skills/ag2space-voice/query.ts');
 
 type Call = { name: string; args: Record<string, unknown> };
@@ -92,7 +93,8 @@ describe('to_me: the agent\'s inbox', () => {
 			assert.deepEqual(r.latest.map(m => m.event_id), ['$i1', '$i2']);
 			assert.equal(r.latest[0].room, 'a direct message');
 			assert.equal(r.latest[0].why, 'dm');
-			assert.deepEqual(r.by_room, [{ room: 'Alpha', count: 2 }, { room: 'a direct message', count: 1 }]);
+			assert.deepEqual(r.groups, [{ key: 'Alpha', count: 2 }, { key: 'a direct message', count: 1 }]);
+			assert.equal(r.oldest?.event_id, '$i3');
 		}
 	});
 
@@ -331,17 +333,23 @@ describe('to_me without the owner\'s inbox: what mentions or answers the owner i
 		assert.equal(windowStart('last_check', 'to_me:this agent', NOW + 5), NOW + 5 - QUERY_FIRST_WINDOW_MS);
 	});
 
-	it('a room read that fails once (an upstream 502) is tried again; a timeout is not', async () => {
+	it('a room read that fails once (an upstream 502) is tried again; a timeout in smaller pages, only with time left', async () => {
 		let n = 0;
 		const f = fake((_n, a) => (a.room_id === '!a:ag2.space' && ++n === 1 ? new Error('room.action.read: AG2 MCP upstream failure (not retried): upstream http 502') : ok({ result: { messages: [m(1, '@chi:ag2.space', { mentions: [OWNER] })], cursor: null } })), ROOMS3, { ownerId: OWNER });
 		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
 		assert.ok(r.ok && r.complete && !r.rooms_unread);
 		assert.equal(f.calls.filter(c => c.args.room_id === '!a:ag2.space').length, 2);
-		let k = 0;
-		const g = fake((_n, a) => (a.room_id === '!a:ag2.space' ? (k++, new Error('tools/call timed out after 15000ms')) : ok({ result: { messages: [], cursor: null } })), ROOMS3, { ownerId: OWNER });
+		const limits: unknown[] = [];
+		const g = fake((_n, a) => (a.room_id === '!a:ag2.space' ? (limits.push(args({ name: '', args: a }).limit), new Error('tools/call timed out after 15000ms')) : ok({ result: { messages: [], cursor: null } })), ROOMS3, { ownerId: OWNER });
 		const t = await queryMessages({ since: 'day' }, g.deps, () => NOW);
 		assert.ok(t.ok && t.rooms_unread === 1);
-		assert.equal(k, 1);
+		assert.deepEqual(t.ok && t.unread_rooms, ['Alpha']);
+		assert.deepEqual(limits, [QUERY_ROOM_PAGE, QUERY_ROOM_SMALL_PAGE]);
+		// With less than one more call's time left in the budget, no second try.
+		limits.length = 0;
+		const h = fake((_n, a) => (a.room_id === '!a:ag2.space' ? (limits.push(1), new Error('tools/call timed out after 15000ms')) : ok({ result: { messages: [], cursor: null } })), ROOMS3, { ownerId: OWNER });
+		await queryMessages({ since: 'day' }, h.deps, () => NOW, 1000);
+		assert.equal(limits.length, 1);
 	});
 
 	it('one malformed inbox item is skipped, never a crash', async () => {
@@ -402,6 +410,161 @@ describe('"new" across calls: kept when a call ends (post-processing), read afte
 		await queryMessages({}, fake(inbox).deps, () => NOW);
 		await handler!();
 		assert.deepEqual(JSON.parse(readFileSync(heardFile, 'utf-8')), { 'to_me:this agent': NOW });
+	});
+});
+
+describe('a busy room: what was read counts, and asking again reads only what is newer', () => {
+	const page = (from: number, count: number, minutesAgo: number) => Array.from({ length: count }, (_, i) => msg(from + i, '@chi:ag2.space', `m${from + i}`, minutesAgo));
+
+	it('a later page that fails keeps the earlier pages, and the room is named as read in part', async () => {
+		const f = fake((_n, a) => {
+			if (a.room_id !== '!a:ag2.space') return ok({ result: { messages: [], cursor: null } });
+			return args({ name: '', args: a }).before ? err('UPSTREAM_UNAVAILABLE') : ok({ result: { messages: page(0, QUERY_ROOM_PAGE, 5), cursor: 'p2' } });
+		});
+		const r = await queryMessages({ scope: 'all', since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.count, QUERY_ROOM_PAGE);
+			assert.equal(r.at_least, true);
+			assert.equal(r.complete, false);
+			assert.deepEqual(r.partial_rooms, ['Alpha']);
+			assert.equal(r.rooms_unread, undefined);
+		}
+	});
+
+	it('asked again, a room is read only back to what the last read returned, and nothing is lost', async () => {
+		let pages = 0;
+		const limits: unknown[] = [];
+		let first: unknown[] = page(0, QUERY_ROOM_PAGE, 5);
+		const f = fake((_n, a) => {
+			if (a.room_id !== '!a:ag2.space') return ok({ result: { messages: [], cursor: null } });
+			pages++;
+			limits.push(args({ name: '', args: a }).limit);
+			return args({ name: '', args: a }).before
+				? ok({ result: { messages: [...page(500, 3, 10), msg(999, '@old:ag2.space', 'old', 120)], cursor: null } })
+				: ok({ result: { messages: first, cursor: 'p2' } });
+		});
+		const r1 = await queryMessages({ scope: 'all', since: 'hour' }, f.deps, () => NOW);
+		assert.equal(pages, 2);
+		first = [msg(900, '@ann:ag2.space', 'new one', 1), ...page(0, QUERY_ROOM_PAGE - 1, 5)];
+		const r2 = await queryMessages({ scope: 'all', since: 'hour' }, f.deps, () => NOW);
+		// One small page: it reached a message the first read returned, and the older page came from that read.
+		assert.equal(pages, 3);
+		assert.deepEqual(limits, [QUERY_ROOM_PAGE, QUERY_ROOM_PAGE, QUERY_ROOM_NEWER_PAGE]);
+		assert.ok(r1.ok && r2.ok);
+		if (r1.ok && r2.ok) {
+			assert.equal(r1.count, QUERY_ROOM_PAGE + 3);
+			assert.equal(r2.count, QUERY_ROOM_PAGE + 4);
+			assert.equal(r2.latest[0].event_id, '$m900');
+			assert.equal(r2.complete, true);
+		}
+	});
+
+	it('a wider window than the last read reads the room afresh', async () => {
+		let pages = 0;
+		const f = fake((_n, a) => {
+			if (a.room_id !== '!a:ag2.space') return ok({ result: { messages: [], cursor: null } });
+			pages++;
+			return ok({ result: { messages: [msg(1, '@chi:ag2.space', 'new', 5), msg(2, '@chi:ag2.space', 'earlier', 180)], cursor: null } });
+		});
+		const hour = await queryMessages({ scope: 'all', since: 'hour' }, f.deps, () => NOW);
+		const week = await queryMessages({ scope: 'all', since: 'week' }, f.deps, () => NOW);
+		assert.ok(hour.ok && hour.count === 1);
+		assert.ok(week.ok && week.count === 2 && week.complete);
+		assert.equal(pages, 2);
+	});
+});
+
+describe('most, least, how many: grouped in the result, never worked out by the model', () => {
+	const at = (h: number) => Date.UTC(2026, 9, 15, h, 0);
+	const rows = {
+		'!a:ag2.space': [msg(1, '@chi:ag2.space', 'a', 10), msg(2, '@chi:ag2.space', 'b', 20), msg(3, '@ann:ag2.space', 'c', 30)],
+		'!b:ag2.space': [msg(4, '@chi:ag2.space', 'd', 40)],
+		'!c:ag2.space': [],
+	};
+	const ROOMS_ABC = [...ROOMS, { room_id: '!c:ag2.space', name: 'Gamma' }];
+	const scan = () => fake((_n, a) => ok({ result: { messages: rows[a.room_id as keyof typeof rows] ?? [], cursor: null } }), ROOMS_ABC);
+
+	it('by room, a room with nothing is a group of 0, and "least" puts it first', async () => {
+		const most = await queryMessages({ scope: 'all', since: 'day' }, scan().deps, () => NOW);
+		const least = await queryMessages({ scope: 'all', since: 'day', rank: 'least' }, scan().deps, () => NOW);
+		assert.ok(most.ok && least.ok);
+		if (most.ok && least.ok) {
+			assert.deepEqual(most.groups, [{ key: 'Alpha', count: 3 }, { key: 'Beta', count: 1 }, { key: 'Gamma', count: 0 }]);
+			assert.deepEqual(least.groups[0], { key: 'Gamma', count: 0 });
+			assert.equal(most.groups_total, 3);
+			assert.equal(most.distinct_rooms, 2);
+			assert.equal(most.distinct_senders, 2);
+			assert.equal(most.oldest?.event_id, '$m4');
+			assert.equal(most.latest[0].event_id, '$m1');
+		}
+	});
+
+	it('by sender, by hour and by day', async () => {
+		const s = await queryMessages({ scope: 'all', since: 'day', group_by: 'sender' }, scan().deps, () => NOW);
+		assert.ok(s.ok && s.group_by === 'sender');
+		if (s.ok) assert.deepEqual(s.groups, [{ key: 'chi', count: 3 }, { key: 'ann', count: 1 }]);
+		const h = await queryMessages({ scope: 'all', since: 'day', group_by: 'hour' }, scan().deps, () => NOW);
+		assert.ok(h.ok);
+		if (h.ok) {
+			assert.equal(h.groups.reduce((n, g) => n + g.count, 0), 4);
+			assert.ok(h.groups.every(g => /^\d\d:00$/.test(g.key)));
+		}
+		const d = await queryMessages({ scope: 'all', since: 'day', group_by: 'day' }, scan().deps, () => NOW);
+		assert.ok(d.ok && d.groups.length >= 1 && /\w{3}, \w{3} \d+/.test(d.groups[0].key));
+		void at;
+	});
+
+	it('at most a fixed number of groups, with how many there were', async () => {
+		const many = Array.from({ length: QUERY_MAX_GROUPS + 3 }, (_, i) => msg(i, `@p${i}:ag2.space`, 'x', 5));
+		const f = fake((_n, a) => ok({ result: { messages: a.room_id === '!a:ag2.space' ? many : [], cursor: null } }));
+		const r = await queryMessages({ scope: 'all', since: 'day', group_by: 'sender' }, f.deps, () => NOW);
+		assert.ok(r.ok && r.groups.length === QUERY_MAX_GROUPS && r.groups_total === QUERY_MAX_GROUPS + 3 && r.distinct_senders === QUERY_MAX_GROUPS + 3);
+	});
+
+	it('the description and the rule say "today" is since midnight and that nothing is estimated', async () => {
+		const t = createQueryMessagesTool(scan().deps);
+		assert.match(t.description, /"today" \(since midnight: "today", "今天"\), "day" \(the last 24 hours\)/);
+		assert.match(t.description, /never estimate it/);
+		assert.match(t.description, /say so first, before any number/);
+		assert.match(QUERY_PROMPT_RULE, /"今天" is since "today", not "day"/);
+		assert.match(QUERY_PROMPT_RULE, /room_stats/);
+	});
+});
+
+describe('room_stats: how many rooms, and members in each', () => {
+	const members = (n: number) => ok({ result: { members: Array.from({ length: n }, (_, i) => ({ user_id: `@u${i}:ag2.space`, display_name: `u${i}` })) } });
+	const ROOMS_ABC = [...ROOMS, { room_id: '!c:ag2.space' }];
+
+	it('counts every room it is in, named or not, and ranks them by members', async () => {
+		const f = fake((_n, a) => (a.action === 'room.members.list' ? members(({ '!a:ag2.space': 5, '!b:ag2.space': 12, '!c:ag2.space': 2 } as Record<string, number>)[a.room_id as string]) : null), ROOMS_ABC);
+		const r = await roomStats({}, f.deps);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.rooms_total, 3);
+			assert.deepEqual(r.rooms, [{ room: 'Beta', members: 12 }, { room: 'Alpha', members: 5 }, { room: 'an unnamed room', members: 2 }]);
+			assert.equal(r.complete, true);
+		}
+		const least = await roomStats({ rank: 'least' }, f.deps);
+		assert.ok(least.ok && least.rooms[0].members === 2);
+	});
+
+	it('a room it cannot count is named, never ranked; no client or no room list is an error', async () => {
+		const f = fake((_n, a) => (a.room_id === '!b:ag2.space' ? err('FORBIDDEN') : members(3)), ROOMS_ABC);
+		const r = await roomStats({}, f.deps);
+		assert.ok(r.ok && !r.complete && r.rooms_unread === 1);
+		if (r.ok) { assert.deepEqual(r.unread_rooms, ['Beta']); assert.equal(r.rooms.length, 2); }
+		assert.deepEqual(await roomStats({}, { ...f.deps, client: () => null }), { ok: false, error: 'not_connected' });
+		const broken = { ...f.deps, client: () => ({ callTool: async () => { throw new Error('down'); }, close() {} }) };
+		assert.deepEqual(await roomStats({}, broken as never), { ok: false, error: 'unavailable' });
+	});
+
+	it('the tool answers through roomStats', async () => {
+		const t = createRoomStatsTool(fake(() => members(1)).deps);
+		assert.equal(t.name, 'room_stats');
+		assert.equal(t.execution, 'inline');
+		assert.equal(((await t.execute({}, {} as never)) as { ok: boolean }).ok, true);
+		assert.match(t.description, /rooms you, the agent, are in/);
 	});
 });
 

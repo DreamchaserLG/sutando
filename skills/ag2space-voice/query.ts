@@ -15,6 +15,14 @@ export const QUERY_MAX_LATEST = 20;
 export const QUERY_ROOM_PAGE = 200;
 export const QUERY_ROOM_MAX_PAGES = 2;
 export const QUERY_ROOM_CONCURRENCY = 6;
+/** A busy room's page of 200 is 0.2–0.45 MB (measured 2026-10-16); after a timeout it is read again in pages this size. */
+export const QUERY_ROOM_SMALL_PAGE = 50;
+/** Asked again, a room's newer messages are read in pages this size: they are few, and a page of 200 costs seconds. */
+export const QUERY_ROOM_NEWER_PAGE = 20;
+/** What a room read already returned is reused this long: a question asked again reads only what is newer. */
+export const QUERY_ROOM_CACHE_TTL_MS = 10 * 60_000;
+/** How many groups a result names, in rank order; `groups_total` says how many there were. */
+export const QUERY_MAX_GROUPS = 10;
 /** A word over every room goes to the server's full-text search instead (space.search.messages): 50 a page. */
 export const QUERY_SEARCH_PAGE = 50;
 export const QUERY_SEARCH_MAX_PAGES = 4;
@@ -25,14 +33,17 @@ export const QUERY_BUDGET_MS = 30_000;
 
 export type QuerySince = 'last_check' | 'hour' | 'today' | 'day' | 'week';
 export type QueryScope = 'to_me' | 'all';
+export type QueryGroupBy = 'room' | 'sender' | 'hour' | 'day';
 
 export interface QueryHit { at: string; room: string; from: string; text: string; event_id: string; why?: string }
 
 export type QueryResult =
 	| {
 		ok: true; scope: QueryScope; since: string; count: number; complete: boolean; at_least: boolean;
-		by_room: Array<{ room: string; count: number }>; latest: QueryHit[];
-		rooms_read?: number; rooms_unread?: number; rooms_skipped?: number; whose?: InboxWhose; owner_error?: string; ms: number;
+		group_by: QueryGroupBy; rank: 'most' | 'least'; groups: Array<{ key: string; count: number }>; groups_total: number;
+		distinct_rooms: number; distinct_senders: number; latest: QueryHit[]; oldest?: QueryHit;
+		rooms_read?: number; rooms_unread?: number; unread_rooms?: string[]; partial_rooms?: string[]; rooms_skipped?: number;
+		whose?: InboxWhose; owner_error?: string; ms: number;
 	}
 	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
 
@@ -94,34 +105,88 @@ export function addressedTo(m: Pick<Msg, 'body' | 'mentions' | 'replyTo'>, owner
 	return null;
 }
 
-/** One room's messages since `start`, newest first, paged back; `full` when the pages or the budget ran out inside the window. */
-async function roomSince(client: McpClient, room: RoomRef, start: number, deadline: number, deps: ReadRoomDeps): Promise<{ ok: true; msgs: Msg[]; full: boolean } | { ok: false }> {
+type Page = { ok: true; msgs: Msg[]; cursor: string | null; older: boolean; size: number } | { ok: false; error: string };
+
+/** One page of a room, newest first; messages older than `floor` only mark that the page reached past it. */
+async function readPage(client: McpClient, room: RoomRef, limit: number, before: string | null, floor: number, deps: ReadRoomDeps): Promise<Page> {
+	const read = await roomRead(client, room, 'room.context.read', { limit, ...(before ? { before } : {}) }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	if (!read.ok) return read;
+	const list = Array.isArray(read.result.messages) ? read.result.messages : [];
+	const msgs: Msg[] = [];
+	let older = false;
+	for (const m of list) {
+		const x = m as { sender?: unknown; body?: unknown; ts?: unknown; event_id?: unknown; mentions?: unknown; reply_to_sender?: unknown };
+		const ts = Number(x.ts);
+		if (!Number.isFinite(ts)) continue;
+		if (ts < floor) { older = true; continue; }
+		if (typeof x.body !== 'string' || !x.body.trim() || typeof x.event_id !== 'string') continue;
+		const sender = typeof x.sender === 'string' ? x.sender : '';
+		const mentions = Array.isArray(x.mentions) ? x.mentions.filter((u): u is string => typeof u === 'string') : undefined;
+		const replyTo = typeof x.reply_to_sender === 'string' ? x.reply_to_sender : undefined;
+		msgs.push({ ts, room: room.name, from: short(sender || '?'), fromId: sender, body: x.body, event_id: x.event_id, ...(mentions ? { mentions } : {}), ...(replyTo ? { replyTo } : {}) });
+	}
+	const cursor = typeof read.result.cursor === 'string' && read.result.cursor ? read.result.cursor : null;
+	return { ok: true, msgs, cursor, older, size: list.length };
+}
+
+/** What a room read returned: every message from `from` up to when it was read (`at`), newest first. */
+interface RoomCache { msgs: Msg[]; from: number; at: number }
+const roomCache = new WeakMap<McpClient, Map<string, RoomCache>>();
+
+/** Pages of a room back to `floor`, or until a message the cache already holds (`known`); a page that times out is read again smaller. */
+async function pagesBack(client: McpClient, room: RoomRef, floor: number, known: Set<string> | null, deadline: number, deps: ReadRoomDeps): Promise<{ ok: true; msgs: Msg[]; reached: boolean } | { ok: false }> {
 	const msgs: Msg[] = [];
 	let before: string | null = null;
-	for (let page = 0; page < QUERY_ROOM_MAX_PAGES; page++) {
-		if (Date.now() > deadline) return page === 0 ? { ok: false } : { ok: true, msgs, full: true };
-		const readArgs = { limit: QUERY_ROOM_PAGE, ...(before ? { before } : {}) };
-		let read = await roomRead(client, room, 'room.context.read', readArgs, deps, ROOM_COMMONS_TIMEOUT_MS);
-		// A read is safe to repeat: one more try after a failed call (an upstream 502 is "unavailable"), never after a timeout.
-		if (!read.ok && read.error === 'unavailable' && Date.now() <= deadline) read = await roomRead(client, room, 'room.context.read', readArgs, deps, ROOM_COMMONS_TIMEOUT_MS);
-		if (!read.ok) { deps.log?.(`[RoomQuery] ${room.name}: ${read.error}`); return { ok: false }; }
-		const list = Array.isArray(read.result.messages) ? read.result.messages : [];
-		let older = false;
-		for (const m of list) {
-			const x = m as { sender?: unknown; body?: unknown; ts?: unknown; event_id?: unknown; mentions?: unknown; reply_to_sender?: unknown };
-			const ts = Number(x.ts);
-			if (!Number.isFinite(ts)) continue;
-			if (ts < start) { older = true; continue; }
-			if (typeof x.body !== 'string' || !x.body.trim() || typeof x.event_id !== 'string') continue;
-			const sender = typeof x.sender === 'string' ? x.sender : '';
-			const mentions = Array.isArray(x.mentions) ? x.mentions.filter((u): u is string => typeof u === 'string') : undefined;
-			const replyTo = typeof x.reply_to_sender === 'string' ? x.reply_to_sender : undefined;
-			msgs.push({ ts, room: room.name, from: short(sender || '?'), fromId: sender, body: x.body, event_id: x.event_id, ...(mentions ? { mentions } : {}), ...(replyTo ? { replyTo } : {}) });
+	let limit = known ? QUERY_ROOM_NEWER_PAGE : QUERY_ROOM_PAGE;
+	// The same number of messages at most, whichever page size the room ends up read in.
+	for (let fetched = 0; fetched < QUERY_ROOM_PAGE * QUERY_ROOM_MAX_PAGES;) {
+		const first = fetched === 0;
+		if (Date.now() > deadline) return first ? { ok: false } : { ok: true, msgs, reached: false };
+		let page = await readPage(client, room, limit, before, floor, deps);
+		// A read is safe to repeat: once more after a failed call (an upstream 502); after a timeout, in smaller pages, if there is time.
+		if (!page.ok && page.error === 'unavailable' && Date.now() <= deadline) page = await readPage(client, room, limit, before, floor, deps);
+		if (!page.ok && page.error === 'timeout' && limit > QUERY_ROOM_SMALL_PAGE && Date.now() + ROOM_COMMONS_TIMEOUT_MS <= deadline) {
+			limit = QUERY_ROOM_SMALL_PAGE;
+			page = await readPage(client, room, limit, before, floor, deps);
 		}
-		before = typeof read.result.cursor === 'string' && read.result.cursor ? read.result.cursor : null;
-		if (older || !before || list.length < QUERY_ROOM_PAGE) return { ok: true, msgs, full: false };
+		if (!page.ok) {
+			deps.log?.(`[RoomQuery] ${room.name}: ${page.error}`);
+			// What the earlier pages returned still counts; only the rest of the window is missing.
+			return first ? { ok: false } : { ok: true, msgs, reached: false };
+		}
+		let overlap = false;
+		for (const m of page.msgs) { if (known?.has(m.event_id)) overlap = true; else msgs.push(m); }
+		if (overlap || page.older || !page.cursor || page.size < limit) return { ok: true, msgs, reached: true };
+		fetched += page.size;
+		before = page.cursor;
 	}
-	return { ok: true, msgs, full: true };
+	return { ok: true, msgs, reached: false };
+}
+
+/** One room's messages since `start`, newest first; `full` when it could not be read back to `start` (pages, budget or a failure). */
+async function roomSince(client: McpClient, room: RoomRef, start: number, deadline: number, deps: ReadRoomDeps): Promise<{ ok: true; msgs: Msg[]; full: boolean } | { ok: false }> {
+	const byRoom = roomCache.get(client) ?? new Map<string, RoomCache>();
+	roomCache.set(client, byRoom);
+	const cached = byRoom.get(room.room_id);
+	const at = Date.now();
+	if (cached && cached.from <= start && at - cached.at < QUERY_ROOM_CACHE_TTL_MS) {
+		// Asked again: only what came after the cached read; the rest is what that read returned.
+		const got = await pagesBack(client, room, start, new Set(cached.msgs.map(m => m.event_id)), deadline, deps);
+		if (got.ok && got.reached) {
+			const msgs = [...got.msgs, ...cached.msgs];
+			byRoom.set(room.room_id, { msgs, from: cached.from, at });
+			return { ok: true, msgs: msgs.filter(m => m.ts >= start), full: false };
+		}
+		// Too much new to reach the cached part: what was read now, cut short.
+		byRoom.delete(room.room_id);
+		return got.ok ? { ok: true, msgs: got.msgs, full: true } : got;
+	}
+	const got = await pagesBack(client, room, start, null, deadline, deps);
+	if (!got.ok) return got;
+	// A read cut short still holds everything from its oldest message on.
+	const from = got.reached ? start : got.msgs.length ? got.msgs[got.msgs.length - 1].ts : at;
+	byRoom.set(room.room_id, { msgs: got.msgs, from, at });
+	return { ok: true, msgs: got.msgs, full: !got.reached };
 }
 
 /** space.search.messages since `start`, newest first, paged; `full` when the pages or the budget ran out with more to come. */
@@ -183,21 +248,30 @@ export async function withoutOwnersAgents(client: McpClient, msgs: Msg[], owner:
 	return msgs.filter(m => senderOwners.get(m.fromId) !== owner);
 }
 
-/** Read rooms back to the window, n at a time; `unread` counts the rooms that could not be read. */
-async function readRooms(client: McpClient, rooms: RoomRef[], start: number, deadline: number, deps: ReadRoomDeps): Promise<{ msgs: Msg[]; full: boolean; unread: number }> {
+/** Read rooms back to the window, n at a time; the rooms that could not be read, or only in part, are named. */
+async function readRooms(client: McpClient, rooms: RoomRef[], start: number, deadline: number, deps: ReadRoomDeps): Promise<{ msgs: Msg[]; read: string[]; unread: string[]; partial: string[] }> {
 	const per = await pool(rooms, QUERY_ROOM_CONCURRENCY, r => roomSince(client, r, start, deadline, deps));
 	const msgs: Msg[] = [];
-	let full = false;
-	let unread = 0;
-	for (const p of per) {
-		if (!p.ok) { unread++; continue; }
-		if (p.full) full = true;
+	const read: string[] = [], unread: string[] = [], partial: string[] = [];
+	per.forEach((p, i) => {
+		if (!p.ok) { unread.push(rooms[i].name); return; }
+		read.push(rooms[i].name);
+		if (p.full) partial.push(rooms[i].name);
 		msgs.push(...p.msgs);
-	}
-	return { msgs, full, unread };
+	});
+	return { msgs, read, unread, partial };
 }
 
-export interface QueryArgs { scope?: QueryScope; since?: QuerySince; room?: string; from?: string; contains?: string; unanswered_only?: boolean; latest?: number }
+export interface QueryArgs { scope?: QueryScope; since?: QuerySince; room?: string; from?: string; contains?: string; unanswered_only?: boolean; latest?: number; group_by?: QueryGroupBy; rank?: 'most' | 'least' }
+
+/** The group a message falls in: its room, its sender, its hour of the day ("14:00") or its day ("Thu, Oct 16"), in local time. */
+function groupKey(m: Msg, by: QueryGroupBy): string {
+	if (by === 'room') return m.room;
+	if (by === 'sender') return m.from;
+	const d = new Date(m.ts);
+	if (by === 'hour') return `${String(d.getHours()).padStart(2, '0')}:00`;
+	return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
 
 export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: () => number = Date.now, budgetMs = QUERY_BUDGET_MS): Promise<QueryResult> {
 	const t0 = Date.now();
@@ -225,7 +299,16 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 
 	let msgs: Msg[] = [];
 	let atLeast = false;
-	const extra: { rooms_read?: number; rooms_unread?: number; rooms_skipped?: number; whose?: InboxWhose; source?: 'inbox' | 'rooms'; owner_error?: string } = {};
+	const extra: { rooms_read?: number; rooms_unread?: number; unread_rooms?: string[]; partial_rooms?: string[]; rooms_skipped?: number; whose?: InboxWhose; source?: 'inbox' | 'rooms'; owner_error?: string } = {};
+	/** Every room a scan read, so a room with nothing in the window still counts as a group of 0. */
+	let readRoomNames: string[] = [];
+	const scanned = (got: { read: string[]; unread: string[]; partial: string[] }) => {
+		atLeast = got.partial.length > 0;
+		readRoomNames = got.read;
+		extra.rooms_read = got.read.length;
+		if (got.unread.length) { extra.rooms_unread = got.unread.length; extra.unread_rooms = got.unread; }
+		if (got.partial.length) extra.partial_rooms = got.partial;
+	};
 	const fromInbox = async (owner: boolean): Promise<QueryResult | null> => {
 		const inboxArgs = { since: new Date(start).toISOString(), include_replied: !args.unanswered_only, owner, deadline, ...(room ? { room_ids: [room.room_id] } : {}) };
 		// The owner's inbox refused here (not enabled, revoked) is not an answer: the room scan below is.
@@ -259,8 +342,8 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 		const rooms = room ? [room] : await listRooms(client, ROOM_INDEX_COLD_TIMEOUT_MS, { unnamed: true }).catch(() => deps.index.rooms());
 		if (!rooms.length) return { ok: false, error: 'unavailable' };
 		const got = await readRooms(client, rooms, start, deadline, deps);
-		if (got.unread === rooms.length) return { ok: false, error: 'unavailable' };
-		atLeast = got.full;
+		if (!got.read.length) return { ok: false, error: 'unavailable' };
+		scanned(got);
 		for (const m of got.msgs) {
 			if (m.fromId === ids.owner || m.fromId === ids.self) continue;
 			const why = addressedTo(m, ids.owner);
@@ -268,8 +351,6 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 		}
 		extra.whose = 'owner';
 		extra.source = 'rooms';
-		extra.rooms_read = rooms.length - got.unread;
-		if (got.unread) extra.rooms_unread = got.unread;
 	} else if (scope === 'all' && word) {
 		const got = await searchSince(client, word, start, deadline, room, names, deps);
 		if (!got.ok) return got;
@@ -280,11 +361,9 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 		if (!rooms.length) rooms = await deps.index.refresh().catch(() => []);
 		if (!rooms.length) return { ok: false, error: 'unavailable' };
 		const got = await readRooms(client, rooms, start, deadline, deps);
-		if (got.unread === rooms.length) return { ok: false, error: 'unavailable' };
-		atLeast = got.full;
+		if (!got.read.length) return { ok: false, error: 'unavailable' };
+		scanned(got);
 		msgs = got.msgs.filter(m => !ids.self || m.fromId !== ids.self);
-		extra.rooms_read = rooms.length - got.unread;
-		if (got.unread) extra.rooms_unread = got.unread;
 	}
 
 	if (scope === 'to_me' && ids.owner) msgs = await withoutOwnersAgents(client, msgs, ids.owner, deadline, deps);
@@ -292,18 +371,27 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 	if (word) msgs = msgs.filter(m => norm(m.body).includes(word));
 	msgs.sort((a, b) => b.ts - a.ts);
 
+	const groupBy: QueryGroupBy = (['sender', 'hour', 'day'] as const).find(g => g === args.group_by) ?? 'room';
+	const rank = args.rank === 'least' ? 'least' : 'most';
 	const counts = new Map<string, number>();
-	for (const m of msgs) counts.set(m.room, (counts.get(m.room) ?? 0) + 1);
-	const by_room = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([r, count]) => ({ room: r, count }));
-	const latest = msgs.slice(0, latestN).map(m => {
+	if (groupBy === 'room') for (const r of readRoomNames) counts.set(r, 0);
+	for (const m of msgs) { const k = groupKey(m, groupBy); counts.set(k, (counts.get(k) ?? 0) + 1); }
+	const groups = [...counts.entries()].sort((a, b) => (rank === 'most' ? b[1] - a[1] : a[1] - b[1])).slice(0, QUERY_MAX_GROUPS).map(([key, count]) => ({ key, count }));
+	const hit = (m: Msg): QueryHit => {
 		const text = m.body.replace(/\s+/g, ' ').trim();
 		return { at: fmt(m.ts), room: m.room, from: m.from, text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text, event_id: m.event_id, ...(m.why ? { why: m.why } : {}) };
-	});
+	};
+	const latest = msgs.slice(0, latestN).map(hit);
+	const stats = {
+		group_by: groupBy, rank, groups, groups_total: counts.size,
+		distinct_rooms: new Set(msgs.map(m => m.room)).size, distinct_senders: new Set(msgs.map(m => m.fromId || m.from)).size,
+		latest, ...(msgs.length ? { oldest: hit(msgs[msgs.length - 1]) } : {}),
+	};
 	const complete = !atLeast && !extra.rooms_unread && !extra.rooms_skipped;
 	// "New" moves only past what was fully read and not filtered: a "new from Chi" leaves everyone else's new.
 	const unfiltered = !room && !from && !word && !args.unanswered_only;
 	if (since === 'last_check' && complete && unfiltered && Date.now() <= deadline) lastChecked.set(key, Math.max(lastChecked.get(key) ?? 0, asked));
-	return { ok: true, scope, since: fmt(start), count: msgs.length, complete, at_least: atLeast, by_room, latest, ...extra, ms: Date.now() - t0 };
+	return { ok: true, scope, since: fmt(start), count: msgs.length, complete, at_least: atLeast, ...stats, ...extra, ms: Date.now() - t0 };
 }
 
 export function createQueryMessagesTool(deps: ReadRoomDeps): ToolDefinition {
@@ -314,10 +402,12 @@ export function createQueryMessagesTool(deps: ReadRoomDeps): ToolDefinition {
 			'Call it every time such a question is asked, even right after a similar one: counts change, and an earlier answer or earlier search_room results are never the count now. ' +
 			'`scope`: "to_me" (default) — messages for the user: those that @-mention them or reply to them in every room you are in (`source` "rooms"), or the user\'s own inbox where the server offers it, which also has their direct messages (`source` "inbox"); `whose` "owner". Without an owner it reads your own inbox (`whose` "this agent" — say so). "all" — every message in your named rooms, your own left out. ' +
 			'`source` "rooms" covers only rooms you are in: a mention in a room you are not in, or a direct message to the user, is not seen — say so when the user asks whether anyone is looking for them. ' +
-			'`since`: "last_check" (default — new since the last complete check, in this call or the last call where the user asked; the first time, the last day), "hour", "today", "day", "week". The server keeps no read/unread marker you can see, so "new" means since the last check — say so if the user asks about unread. ' +
+			'`since`: "last_check" (default — new since the last complete check, in this call or the last call where the user asked; the first time, the last day), "hour", "today" (since midnight: "today", "今天"), "day" (the last 24 hours), "week". The server keeps no read/unread marker you can see, so "new" means since the last check — say so if the user asks about unread. ' +
 			'Optional filters: `room` (as listed in ROOMS), `from` (a person\'s name), `contains` (a word), `unanswered_only` (to_me from the inbox only). ' +
-			'Returns {ok:true, scope, since, count, complete, at_least, by_room:[{room, count}], latest:[{at, room, from, text, event_id, why}], rooms_read, rooms_unread, rooms_skipped, whose, source} newest first — answer with the count and the latest one or two in a sentence or two. ' +
-			'complete:false means the count is partial — at_least:true is "at least <count>", rooms_unread or rooms_skipped rooms were not read — say so, and never say there is nothing new unless complete is true. From the inbox, the server reads only each room\'s latest 50 messages, so over a long window it can come up short. To read around a message, call read_room with its room and `around` = its event_id. ' +
+			'Most / least / how many: `group_by` "room" (default), "sender", "hour" (of the day) or "day", and `rank` "most" (default) or "least" — "who messaged me most" is group_by "sender"; "the quietest room" is group_by "room", rank "least" (rooms with no messages count as 0 there); "the busiest hour" is group_by "hour". ' +
+			'Returns {ok:true, scope, since, count, complete, at_least, group_by, rank, groups:[{key, count}] (at most ' + QUERY_MAX_GROUPS + ', ranked), groups_total, distinct_rooms, distinct_senders, latest:[{at, room, from, text, event_id, why}] newest first, oldest (the earliest message in the window), rooms_read, rooms_unread, unread_rooms, partial_rooms, rooms_skipped, whose, source} — answer in a sentence or two. ' +
+			'Answer only from these fields: the earliest message is `oldest`, how many people or rooms is distinct_senders / distinct_rooms, most or least is `groups` with the matching group_by and rank — call again with them rather than working it out from `latest` or from groups ranked the other way. Something none of these fields gives cannot be answered: say so, never estimate it. ' +
+			'complete:false means the result is partial — say so first, before any number: at_least:true is "at least <count>"; name the rooms in unread_rooms (not read) and partial_rooms (read only in part); rooms_skipped rooms were skipped by the server. Never say there is nothing new, or name an earliest, least or most, as if complete when complete is false. From the inbox, the server reads only each room\'s latest 50 messages, so over a long window it can come up short. To read around a message, call read_room with its room and `around` = its event_id. ' +
 			'Errors: ' + ROOM_NAME_ERRORS + '"not_connected", "timeout" or "unavailable" — say the messages cannot be counted right now.',
 		parameters: z.object({
 			scope: z.enum(['to_me', 'all']).optional().describe('"to_me" (default): addressed to the user; "all": every message in your rooms.'),
@@ -327,19 +417,73 @@ export function createQueryMessagesTool(deps: ReadRoomDeps): ToolDefinition {
 			contains: z.string().max(200).optional().describe('Only messages containing this word or phrase.'),
 			unanswered_only: z.boolean().optional().describe('to_me only: leave out what was already answered.'),
 			latest: z.number().int().min(1).max(QUERY_MAX_LATEST).optional().describe(`How many of the newest to return (default ${QUERY_DEFAULT_LATEST}).`),
+			group_by: z.enum(['room', 'sender', 'hour', 'day']).optional().describe('What `groups` counts by (default "room").'),
+			rank: z.enum(['most', 'least']).optional().describe('"most" (default) or "least" first in `groups`.'),
 		}),
 		execution: 'inline',
-		// The budget stops new reads; the calls already started finish within one call timeout, then the index may be cold.
-		timeout: QUERY_BUDGET_MS + ROOM_COMMONS_TIMEOUT_MS + ROOM_INDEX_COLD_TIMEOUT_MS + 2 * ROOM_READ_CALL_TIMEOUT_MS + 1000,
+		// The budget stops new reads; the calls already started finish within one call timeout; before it, a cold index and the
+		// first call's check of the owner's inbox (room.actions.describe).
+		timeout: QUERY_BUDGET_MS + 2 * ROOM_COMMONS_TIMEOUT_MS + ROOM_INDEX_COLD_TIMEOUT_MS + 2 * ROOM_READ_CALL_TIMEOUT_MS + 1000,
 		async execute(args) {
 			const a = (args ?? {}) as QueryArgs;
 			const r = await queryMessages(a, deps);
-			deps.log?.(`[RoomQuery] ${a.scope ?? 'to_me'} since ${a.since ?? 'last_check'}${a.room ? ` in "${a.room}"` : ''}${a.from ? ` from "${a.from}"` : ''}${a.contains ? ` with "${a.contains}"` : ''} → ${r.ok ? `${r.at_least ? '≥' : ''}${r.count}${r.complete ? '' : ' (partial)'} in ${r.ms}ms` : r.error}`);
+			deps.log?.(`[RoomQuery] ${a.scope ?? 'to_me'} since ${a.since ?? 'last_check'}${a.room ? ` in "${a.room}"` : ''}${a.from ? ` from "${a.from}"` : ''}${a.contains ? ` with "${a.contains}"` : ''}${a.group_by ? ` by ${a.group_by}` : ''}${a.rank ? ` ${a.rank}` : ''} → ${r.ok ? `${r.at_least ? '≥' : ''}${r.count}${r.complete ? '' : ` (partial${r.unread_rooms ? `; not read: ${r.unread_rooms.join(', ')}` : ''})`} in ${r.ms}ms` : r.error}`);
 			return r;
 		},
 	};
 }
 
-export const QUERY_PROMPT_RULE = '- AG2 SPACE ACROSS ROOMS: whether anyone mentioned, tagged, @-ed, replied to or is looking for the user, which rooms have new notifications for them, and any count or list of messages that names no single room — "my latest message", "how many new messages / notifications", "anything new", "anything from <person> today", in any wording → query_messages, every time, even if you counted a moment ago: never answer from an earlier answer or earlier search_room results, and never search room after room for the user\'s name instead. Scope "to_me" (the default) for what is for the user, "all" for everything in your rooms. "New" means since the last complete check; there is no unread marker. A partial result (complete:false) is said as partial, and with source "rooms" say that rooms you are not in and direct messages are not covered. Never submit work for it.';
+/** room.members.list per room is fast (0.2 s measured); these stop a slow server from holding the answer. */
+export const ROOM_STATS_BUDGET_MS = 15_000;
 
-export const QUERY_TURN_CHECK_RULE = '- none: a count or list of AG2 Space messages or notifications across rooms ("my latest message", "how many new messages", "any new notifications", "anything from <person> today") is the assistant\'s own to answer, never work.';
+export type RoomStatsResult =
+	| { ok: true; rooms_total: number; rank: 'most' | 'least'; rooms: Array<{ room: string; members: number }>; rooms_unread?: number; unread_rooms?: string[]; complete: boolean; ms: number }
+	| { ok: false; error: string };
+
+/** How many rooms this agent is in, and how many members each has, ranked. */
+export async function roomStats(args: { rank?: 'most' | 'least' }, deps: ReadRoomDeps, budgetMs = ROOM_STATS_BUDGET_MS): Promise<RoomStatsResult> {
+	const t0 = Date.now();
+	const deadline = t0 + budgetMs;
+	const client = deps.client();
+	if (!client) return { ok: false, error: 'not_connected' };
+	let rooms: RoomRef[];
+	try { rooms = await listRooms(client, ROOM_INDEX_COLD_TIMEOUT_MS, { unnamed: true }); } catch { return { ok: false, error: 'unavailable' }; }
+	const per = await pool(rooms, QUERY_ROOM_CONCURRENCY, async (r): Promise<number | null> => {
+		if (Date.now() > deadline) return null;
+		const got = await roomRead(client, r, 'room.members.list', {}, deps, ROOM_READ_CALL_TIMEOUT_MS);
+		return got.ok && Array.isArray(got.result.members) ? got.result.members.length : null;
+	});
+	const rank = args.rank === 'least' ? 'least' : 'most';
+	const counted = rooms.map((r, i) => ({ room: r.name, members: per[i] })).filter((x): x is { room: string; members: number } => x.members !== null);
+	counted.sort((a, b) => (rank === 'most' ? b.members - a.members : a.members - b.members));
+	const unread = rooms.filter((_, i) => per[i] === null).map(r => r.name);
+	return {
+		ok: true, rooms_total: rooms.length, rank, rooms: counted.slice(0, QUERY_MAX_GROUPS),
+		...(unread.length ? { rooms_unread: unread.length, unread_rooms: unread } : {}), complete: !unread.length, ms: Date.now() - t0,
+	};
+}
+
+export function createRoomStatsTool(deps: ReadRoomDeps): ToolDefinition {
+	return {
+		name: 'room_stats',
+		description:
+			'How many AG2 Space rooms you are in, and how many members each has — "how many rooms do I have", "which room has the most people", "the smallest room". These are the rooms you, the agent, are in: say so if the user asks about their own rooms. ' +
+			'`rank`: "most" (default) or "least" members first. Returns {ok:true, rooms_total, rank, rooms:[{room, members}] (at most ' + QUERY_MAX_GROUPS + ', ranked), complete, rooms_unread, unread_rooms}; members counts people and agents alike. ' +
+			'complete:false: the rooms in unread_rooms could not be counted — say so, and do not call a room the largest or smallest over rooms that were not counted. Errors: "not_connected" or "unavailable" — say the rooms cannot be counted right now.',
+		parameters: z.object({
+			rank: z.enum(['most', 'least']).optional().describe('"most" (default) or "least" members first.'),
+		}),
+		execution: 'inline',
+		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_STATS_BUDGET_MS + ROOM_READ_CALL_TIMEOUT_MS + 1000,
+		async execute(args) {
+			const a = (args ?? {}) as { rank?: 'most' | 'least' };
+			const r = await roomStats(a, deps);
+			deps.log?.(`[RoomStats] ${a.rank ?? 'most'} → ${r.ok ? `${r.rooms_total} rooms${r.complete ? '' : ` (not counted: ${r.unread_rooms?.join(', ')})`} in ${r.ms}ms` : r.error}`);
+			return r;
+		},
+	};
+}
+
+export const QUERY_PROMPT_RULE = '- AG2 SPACE ACROSS ROOMS: whether anyone mentioned, tagged, @-ed, replied to or is looking for the user, which rooms have new notifications for them, and any count or list of messages that names no single room — "my latest message", "how many new messages / notifications", "anything new", "anything from <person> today", in any wording → query_messages, every time, even if you counted a moment ago: never answer from an earlier answer or earlier search_room results, and never search room after room for the user\'s name instead. Scope "to_me" (the default) for what is for the user, "all" for everything in your rooms. "Today" / "今天" is since "today", not "day". Most, least, earliest and how many people or rooms come from its group_by, rank, oldest and distinct fields — call it with them; never work them out from a few listed messages, and what it does not return is said as not available. "New" means since the last complete check; there is no unread marker. A partial result (complete:false) is said as partial first, naming the rooms not read, and with source "rooms" say that rooms you are not in and direct messages are not covered. How many rooms, or members in a room → room_stats. Never submit work for either.';
+
+export const QUERY_TURN_CHECK_RULE = '- none: a count or list of AG2 Space messages or notifications across rooms ("my latest message", "how many new messages", "any new notifications", "anything from <person> today", "the quietest room"), or of rooms and their members ("which room has the most people"), is the assistant\'s own to answer, never work.';
