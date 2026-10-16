@@ -73,8 +73,8 @@ def send(thread: str, message: str, run=subprocess.run) -> tuple[int, str]:
     said = f"{r.stdout or ''}\n{r.stderr or ''}".strip()
     if r.returncode == 0:
         return 0, (r.stdout or "").strip()
-    if ACK in said:
-        return QUEUE_UNKNOWN, f"codex queue exited {r.returncode} after acknowledging: {said}"
+    if ACK in said or r.returncode < 0:
+        return QUEUE_UNKNOWN, f"codex queue exited {r.returncode}, possibly after hand-off: {said}"
     return QUEUE_FAILED, said or f"codex queue exited {r.returncode}"
 
 

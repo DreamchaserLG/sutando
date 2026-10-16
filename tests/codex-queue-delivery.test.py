@@ -88,6 +88,9 @@ class SendTests(unittest.TestCase):
             run = Recorder(Done(1, out, err))
             self.assertEqual(codex_queue.send("t", "m", run=run)[0], codex_queue.QUEUE_UNKNOWN)
 
+    def test_a_codex_killed_by_a_signal_is_unknown(self):
+        self.assertEqual(codex_queue.send("t", "m", run=Recorder(Done(-9)))[0], codex_queue.QUEUE_UNKNOWN)
+
     def test_a_slow_fake_codex_past_the_timeout_is_unknown(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Path(d) / "codex"
