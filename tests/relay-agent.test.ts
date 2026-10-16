@@ -563,7 +563,8 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		assert.match(withTools, /- fetch: a rule above says .* \(query_messages, room_stats\): name that tool\. Every time it is asked, even right after the same question/);
 		assert.match(withTools, /\{"action":"fetch","tool":"<tool name>"\}/);
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
-		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules, fetchTools: \[\.\.\.answeringTools\]/);
+		assert.match(agentSrc, /const fetchTools = \[\.\.\.answeringTools\]\.filter\(\(t\) => personalVoiceSurface\.turnCheckRules\.some\(\(r\) => r\.includes\(`fetch \$\{t\}:`\)\)\);/);
+		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules, fetchTools \}\)/);
 	});
 
 	it('the prompts forbid filling in "that PR" from another request, defer to the assistant\'s own question, and drop fragments', async () => {

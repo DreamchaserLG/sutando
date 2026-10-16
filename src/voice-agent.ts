@@ -651,6 +651,8 @@ function resolveCurrentMode(): ModeState {
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
 /** Skill tools that fetch the answer themselves: the relay agent's turn check leaves those turns alone. */
 const answeringTools = new Set(personalVoiceSurface.answeringTools);
+// The answering tools a skill's turn-check rule names as "fetch <tool>": the only ones a fetch verdict may ask for.
+const fetchTools = [...answeringTools].filter((t) => personalVoiceSurface.turnCheckRules.some((r) => r.includes(`fetch ${t}:`)));
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1014,7 +1016,7 @@ async function main() {
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
-		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules, fetchTools: [...answeringTools] }) : undefined,
+		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules, fetchTools }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => relayAsk.ask(text),
