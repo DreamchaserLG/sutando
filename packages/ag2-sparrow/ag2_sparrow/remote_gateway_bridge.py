@@ -17,7 +17,8 @@ Full spec: docs/remote-gateway-protocol.md
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/results
-       → body {"id": "<task-id>", "body": "<result text>"}  → 200 on accepted
+       → body {"id": "<task-id>", "body": "<result text>",
+               "capabilities": ["voice-outcome-v1"], "dm_only": false}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
        → body {"client": "...", "inflight": N, ...}  → 200 on accepted
 
@@ -438,6 +439,11 @@ LEASE_ID_MAX = 256
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
+# The voice-outcome contract every result carries beside an explicit `dm_only`.
+VOICE_OUTCOME_CONTRACT = "voice-outcome-v1"
+# Broker ids this process saw served with `ack_first`; held in memory only, so after
+# a restart an honoured fold of one closes with the bare marker, as before.
+_ACK_FIRST_SERVED: "set[str]" = set()
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
@@ -1498,7 +1504,8 @@ def _retry_review_control_results() -> None:
             continue
         try:
             _req("POST", "/v1/results", {
-                "id": record["id"], "body": record.get("body") or "[no-send]"})
+                "id": record["id"], "body": record.get("body") or "[no-send]",
+                **_result_contract(False)})
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
             _log(f"review control result {record.get('id')} retry deferred: {exc}")
@@ -3927,6 +3934,8 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if not _valid_tid(broker_tid):
         _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
+    if task.get("ack_first") is True:          # the broker's exact boolean only
+        _ACK_FIRST_SERVED.add(broker_tid)
     # Everything from here down — filenames, ledgers, archives, the serialized
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
@@ -4271,6 +4280,30 @@ def _forget_task_media(tid: str) -> None:
             return
         if media.pop(_broker_tid(delivery), None) is not None:
             _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
+
+
+def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
+    """What an honoured fold posted under `wire` sends as `consolidated_into`.
+
+    The holder's BROKER id, resolved as result egress resolves its own, for a task
+    this process saw served with `ack_first`; "" for every other task, which
+    closes with the bare marker as before (the broker already acts on the field
+    for any task, so typed and Signal tasks must never get it); None to defer
+    while the alias ledger cannot be read.
+    """
+    if wire not in _ACK_FIRST_SERVED:
+        return ""
+    delivery = _delivery_tid((holder or "").strip())
+    if delivery is None:
+        _log(f"delivery deferred for {tid} — alias ledger unreadable")
+        return None
+    target = _broker_tid(delivery)
+    if not (gateway_instance.owns(delivery, GATEWAY_INSTANCE) and _valid_tid(target)):
+        # Another instance's task, or none: this broker never issued that id.
+        _log(f"dedup honour for {tid}: holder {target!r} is not a task of this gateway — "
+             "closed with the marker, without consolidated_into")
+        return ""
+    return target
 
 
 def _read_attachment(path_str: str) -> "tuple[str, str, str]":
@@ -4909,7 +4942,10 @@ def _holder_delivery_state(holder_id: str) -> str:
     body = None
     if record and record.get("payload"):
         try:
-            body = json.loads(record["payload"]).get("body")
+            stored = json.loads(record["payload"])
+            folded = stored.get("consolidated_into")
+            # A fold is stored with an empty body: read it as the marker it replaces.
+            body = f"[deduped: {folded}]" if folded else stored.get("body")
         except (ValueError, TypeError, AttributeError):
             return "failed"
     if body is None:
@@ -5406,9 +5442,27 @@ def _quarantine_unsent(result_file, tid: str, item_id: str, generation=None) -> 
                             requeueable=False, not_requeueable_because=because)
 
 
+def _result_contract(dm_only: bool) -> dict:
+    """The voice-outcome contract every result carries, with an explicit `dm_only`.
+
+    The broker reads them only for a relay ask, and treats a relay ask's result
+    without them as private: that is how an older bridge's answer, its `[dm-only]`
+    line stripped, still reaches only the owner. A broker without the contract
+    ignores both keys.
+    """
+    return {"capabilities": [VOICE_OUTCOME_CONTRACT], "dm_only": bool(dm_only)}
+
+
+def _dm_only(parsed) -> bool:
+    """Whether the body carries `[dm-only]` anywhere. A standalone marker line is
+    stripped from the body sent, so this is how the broker learns the answer is private."""
+    return any(a.kind == "dm-only" for a in parsed.actions)
+
+
 def _deliver_result_payload(tid: str, broker_tid: str, body: str,
                             no_send: bool = False, result_file=None,
-                            generation=None, thread_ask: bool = False) -> bool:
+                            generation=None, thread_ask: bool = False,
+                            dm_only: bool = False, consolidated_into: str = "") -> bool:
     """One outbound result POST through the delivery core. True = the
     gateway confirmed (server lease closed; caller archives). False = not
     confirmed this pass; leave the result file for the next one.
@@ -5419,6 +5473,11 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc = {"id": broker_tid, "body": body}
     if no_send:
         doc["no_send"] = True
+    if consolidated_into:
+        # An honoured fold of a relay ask: the broker records it as merged into
+        # that task and posts nothing for it, so no marker and no `no_send` ride along.
+        doc["consolidated_into"] = consolidated_into
+    doc.update(_result_contract(dm_only))
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
@@ -5440,7 +5499,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         doc["metadata"] = {"worker_id": worker}
         _log(f"result {tid}: attributed to worker {worker}")
     payload = json.dumps(doc).encode("utf-8")
-    item_id = _effective_item_id(core, broker_tid, no_send)
+    # A fold posts nothing either, so it closes an already-accepted id the same way.
+    item_id = _effective_item_id(core, broker_tid, no_send or bool(consolidated_into))
     live = _live_source(result_file, generation)
     # With no result file there is nothing live to protect; the body sent is this call's.
     ruled = live if result_file is not None else body
@@ -5684,11 +5744,16 @@ def _post_ready_results(inflight: set[str]) -> None:
             if _delivery is None:
                 _log(f"delivery deferred for {tid} — alias ledger unreadable")
                 continue
-            if not _deliver_result_payload(tid, _broker_tid(_delivery),
-                                           _lease_close_body(skip),
-                                           no_send=True, result_file=rfile,
-                                           generation=generation):
-                changed |= _settle_delivered(tid, _broker_tid(_delivery), rfile, inflight)
+            _wire = _broker_tid(_delivery)
+            # A `deduped` skip reaches here only once the planner honoured the fold.
+            _folded = _fold_target(tid, _wire, skip.extra) if skip.value == "deduped" else ""
+            if _folded is None:
+                continue
+            if not _deliver_result_payload(tid, _wire,
+                                           "" if _folded else _lease_close_body(skip),
+                                           no_send=not _folded, consolidated_into=_folded,
+                                           result_file=rfile, generation=generation):
+                changed |= _settle_delivered(tid, _wire, rfile, inflight)
                 continue
             if not _archive_result(rfile, tid, generation):
                 continue
@@ -5699,7 +5764,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             _forget_task_room(tid)
             _forget_task_media(tid)
             changed = True
-            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent)")
+            _log(f"archived {tid} (marker {skip.value}, lease closed, not sent"
+                 + (f", folded into {_folded})" if _folded else ")"))
             continue
         out_body = parsed.body
         redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
@@ -5758,7 +5824,8 @@ def _post_ready_results(inflight: set[str]) -> None:
         # A redirected answer leaves the asking room, so it never asks for a thread there.
         thread_ask = redirect is None and any(a.kind == "thread-ask" for a in parsed.actions)
         if not _deliver_result_payload(tid, _wire, out_body, result_file=rfile,
-                                       generation=generation, thread_ask=thread_ask):
+                                       generation=generation, thread_ask=thread_ask,
+                                       dm_only=_dm_only(parsed)):
             changed |= _settle_delivered(tid, _wire, rfile, inflight)
             continue
         if not _archive_result(rfile, tid, generation):
@@ -6014,7 +6081,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
                  "live for a later sweep")
             continue
         if _deliver_result_payload(tid, _btid, labeled, no_send=bool(skip), result_file=rfile,
-                                   generation=generation):
+                                   generation=generation, dm_only=_dm_only(parsed)):
             _log(f"orphan sweep: recovered + gateway accepted {tid}; Matrix delivery unconfirmed")
             if _archive_result(rfile, tid, generation):
                 inflight.discard(tid)           # settled: the in-flight entry was only a marker
