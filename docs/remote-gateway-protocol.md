@@ -123,9 +123,41 @@ retires that ack the same way; a task served without one is acked without the ke
 Return a task's result.
 
 ```
-body: { "id": "task-123", "body": "<result text>" }
-body: { "id": "task-123", "body": "<result text>", "thread": "ask" }   // optional
+body: { "id": "task-123", "body": "<result text>",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }
+body: { ..., "thread": "ask" }                                  // optional
+body: { "id": "ask-…", "body": "", "consolidated_into": "ask-…",
+        "capabilities": ["voice-outcome-v1"], "dm_only": false }  // an honoured fold
 ```
+
+**The voice-outcome contract (`capabilities`, `dm_only`).** Every result carries
+`"capabilities": ["voice-outcome-v1"]` and an explicit boolean `dm_only`: `true`
+when the body carries `[dm-only]` anywhere (a standalone marker line is stripped
+from `body`; an inline mention stays in it), `false` otherwise, a skip and a fold
+included. An AG2 Space broker reads the two only for a voice relay ask, and treats
+such an ask's result without them as private: an older bridge strips the marker
+line and sends no `dm_only`, so its private answers still reach only the owner.
+Both are part of the payload the outbox stores, so a retry, also after a restart,
+resends them; a payload an older bridge stored carries neither. Every existing key
+keeps its value, and a broker that predates the contract reads only the keys it
+names, so it ignores both.
+
+**`consolidated_into` (an honoured fold).** An AG2 Space broker marks a voice relay
+ask it serves with `"ack_first": true`. When the core folds such an ask, or a re-ask
+of it, into another task (`[deduped: <holder>]`) and the dedup planner honours the
+fold, its result closes with `consolidated_into`: the holder's **broker** id,
+resolved as a result's own id is (the dedup alias first, then the instance prefix
+stripped), so a named instance sends `ask-…`, never `task-<instance>~ask-…` or a
+re-ask's `task-<hash>`. It carries an empty `body` and no `no_send`: the broker
+records the ask as merged into the holder and posts nothing for it. While the alias
+ledger cannot be read, the result waits for a later pass; a holder that is not a task
+of this gateway is never named. The bridge knows an ask was served with `ack_first`
+only while the process that took it runs; after a restart, and for every other task
+(typed and Signal tasks included), an honoured fold closes with the bare
+`[deduped: <holder>]` and `no_send` as before, because the broker already acts on
+`consolidated_into` for any task. A fold the planner re-asks or reports is
+unchanged: the re-ask's answer goes under the original id, and the report is a
+warning posted as the answer.
 
 **`thread` (optional).** Defined by the broker in
 [ag2-space/ag2space-backend#2138](https://github.com/ag2-space/ag2space-backend/pull/2138).
