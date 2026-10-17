@@ -425,7 +425,10 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
             break
         result = workspace / "results" / path.name
         action = _owner_action(path)
-        if action is None or path.stem in (hold.get("actions") or []) or result.exists():
+        if action is None:
+            continue
+        if path.stem in (hold.get("actions") or []) or result.exists():
+            _archive_task(workspace, path)
             continue
         kind, model = action
         if kind == "retry":
@@ -442,8 +445,17 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         if ok:
             clear(workspace, now, by=path.stem)
         write_text_whole(result, reply + "\n")
+        _archive_task(workspace, path)
         done.append(path.stem)
     return done
+
+
+def _archive_task(workspace: Path, path: Path) -> None:
+    """Take an answered reply out of the live queue so a returning core never acts on it again.
+    The shared never-delete archive keeps it findable for the bridge that delivers the answer."""
+    from task_archive import archive_file
+    archive_file(path, "tasks", path.stem, tasks_dir=workspace / "tasks" / "archive",
+                 results_dir=workspace / "results" / "archive", log=lambda m: None)
 
 
 def _projects_dir(cwd: Optional[str]) -> Optional[Path]:

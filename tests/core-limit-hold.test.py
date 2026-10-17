@@ -294,6 +294,10 @@ class Launcher(unittest.TestCase):
         self.assertFalse((self.ws / "results" / "task-102.txt").exists())
         import task_queue
         self.assertEqual({p.name for p in task_queue.pending_files(self.ws)}, {"task-101.txt", "task-102.txt"})
+        # The handled reply leaves the live queue; the ordinary owner task stays for the core.
+        self.assertFalse((tasks / "task-100.txt").exists(), "a returning core would re-run the switch")
+        self.assertEqual([p.name for p in (tasks / "archive").rglob("task-100.txt*")], ["task-100.txt"])
+        self.assertTrue((tasks / "task-101.txt").exists())
 
 
 class StatusSurfaces(unittest.TestCase):
@@ -525,6 +529,16 @@ class OwnerRecovery(unittest.TestCase):
         self.assertIn("sonnet", (self.ws / "results" / "task-1.txt").read_text())
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 120, switch_cmd=str(self.switch)), [])
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+        self.assertFalse((self.ws / "tasks" / "task-1.txt").exists())
+
+    def test_answered_but_unarchived_reply_is_archived_not_redone(self):
+        owner_task(self.ws / "tasks", "task-8", "retry now")
+        (self.ws / "results").mkdir(exist_ok=True)
+        (self.ws / "results" / "task-8.txt").write_text("answered before a crash\n")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), [])
+        self.assertFalse((self.ws / "tasks" / "task-8.txt").exists())
+        self.assertEqual((self.ws / "results" / "task-8.txt").read_text(), "answered before a crash\n")
+        self.assertIsNotNone(clh.active_hold(self.ws, self.now + 61))
 
     def test_retry_reply_lifts_the_hold(self):
         owner_task(self.ws / "tasks", "task-2", "retry now")
