@@ -161,6 +161,18 @@ class Success(Base):
         manifest = json.loads((ROOT / "skills" / "image-generation" / "manifest.json").read_text())
         self.assertEqual(line["model"], manifest["config"]["IMAGE_MODEL"])
 
+    def test_the_effective_default_is_the_literal_stable_model(self):
+        """No --model, no env: the request goes to the literal id, so editing both the constant and
+        the manifest to another model fails here."""
+        parts = [{"inlineData": {"mimeType": "image/png", "data": base64.b64encode(PNG).decode()}}]
+        rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.calls[0].full_url,
+                         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image:generateContent")
+        self.assertEqual(line["model"], "gemini-3.1-flash-image")
+        self.assertEqual(gen.manifest_config("IMAGE_MODEL"), "gemini-3.1-flash-image")
+        self.assertEqual(gen.DEFAULT_IMAGE_MODEL, "gemini-3.1-flash-image")
+
 
 class Failures(Base):
     def test_no_key_is_exit_2_and_names_the_remedy(self):
@@ -446,15 +458,11 @@ class InputsAndOutputs(Base):
         rc, line = self.run_main("--prompt", "x", "--output", str(out3), opener=self.opener(response(parts)))
         self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
 
-    def test_a_jpeg_response_to_the_default_png_output_is_never_mislabelled(self):
-        """gemini-nano-banana-2.1 (opt-in via --model; it genuinely returns image/jpeg regardless of
-        the requested extension, unlike the default gemini-3.1-flash-image) with the default output
-        path .png (output_path(None, ".png")). Without this, save_image's wanted/returned branching
-        skipped PNG entirely and wrote raw JPEG bytes under a .png name. Uses real JPEG bytes (not the
-        PNG fixture mislabelled) so the no-Pillow branch's byte check is meaningful, and pins the
-        literal model id in the --model flag and the captured request URL, not the mutable
-        DEFAULT_IMAGE_MODEL/NANO_BANANA_IMAGE_MODEL symbols, so this test still fails if either
-        constant is accidentally changed."""
+    def test_a_jpeg_response_to_the_default_png_output_path_is_never_mislabelled(self):
+        """A real JPEG reply (what the Gemini image models return) to the default .png output path:
+        Pillow converts it to PNG, and without Pillow it lands as a real .jpg. The model is a literal
+        --model argument, so this test does not cover the default model; see
+        test_the_effective_default_is_the_literal_stable_model."""
         FakeImage.saved.clear()
         parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(JPEG).decode()}}]
         with mock.patch.dict(sys.modules, fake_pil()):
@@ -539,6 +547,32 @@ class InputsAndOutputs(Base):
             saved = gen.save_image(webp, "image/webp", out, 90)
         self.assertEqual(saved.suffix, ".webp", "sniffed WEBP magic, not left as .png")
         self.assertEqual(saved.read_bytes(), webp)
+
+    def test_riff_that_is_not_webp_is_not_called_webp(self):
+        riff = b"RIFF" + b"\x00\x00\x00\x00" + b"WAVE" + b"\x00" * 8
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(riff, "image/webp", self.ws / "chart.png", 90)
+        self.assertEqual(saved.suffix, ".bin")
+
+    def test_a_jpeg_requested_as_jpeg_is_written_as_is_not_re_encoded(self):
+        FakeImage.saved.clear()
+        with mock.patch.dict(sys.modules, fake_pil()):
+            saved = gen.save_image(JPEG, "image/jpeg", self.ws / "photo.jpeg", 90)
+        self.assertEqual((saved.suffix, saved.read_bytes(), FakeImage.saved), (".jpeg", JPEG, []))
+
+    def test_without_pillow_the_saved_suffix_always_matches_the_bytes(self):
+        """For every returned format and every requested suffix, whatever the model sent: the
+        suffix on disk is the one the magic bytes name, so a reader never meets a mislabel."""
+        blobs = {".jpg": JPEG, ".png": PNG, ".gif": b"GIF89a" + b"\x00" * 10,
+                 ".webp": b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 8, ".bmp": b"BM" + b"\x00" * 10,
+                 ".bin": b"%PDF-1.4 not an image"}
+        for kind, data in blobs.items():
+            for wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff", ""):
+                with self.subTest(kind=kind, wanted=wanted), \
+                        mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+                    saved = gen.save_image(data, "image/png", self.ws / f"o{kind[1:]}{wanted[1:]}{wanted}", 90)
+                    self.assertEqual(saved.read_bytes(), data)
+                    self.assertEqual(saved.suffix.replace(".jpeg", ".jpg"), kind)
 
     def test_genuinely_unidentifiable_bytes_never_trust_a_misleading_mime_either(self):
         """Bytes sniff_image_ext cannot recognize at all (not jpg/png/gif/webp/bmp magic) must

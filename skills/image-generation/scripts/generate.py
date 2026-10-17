@@ -14,6 +14,8 @@ Usage:
   python3 generate.py --input photo.jpg --prompt "Replace the background"
   python3 generate.py --video --prompt "A timelapse of a city" --output city.mp4
 Output defaults to <workspace>/results/media/generated-<ts>.png (.mp4), inside the attachment allowlist.
+The saved suffix always matches the bytes: without Pillow a JPEG reply lands as .jpg, so attach
+the JSON "path", never the requested name.
 """
 from __future__ import annotations
 
@@ -36,7 +38,7 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution:
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
-NANO_BANANA_IMAGE_MODEL = "gemini-nano-banana-2.1"  # newer release than the default; genuinely returns JPEG, not PNG — select via --model/IMAGE_MODEL
+NANO_BANANA_IMAGE_MODEL = "gemini-nano-banana-2.1"  # newer release of the default tier; select via --model/IMAGE_MODEL
 PRO_IMAGE_MODEL = "gemini-3-pro-image"  # higher quality/cost tier ("Nano Banana Pro"); select via --model/IMAGE_MODEL
 DEFAULT_VIDEO_MODEL = "veo-3.1-generate-preview"
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -241,7 +243,7 @@ def save_image(data: bytes, mime: str, out: Path, quality: int) -> Path:
     # channel this function stopped trusting; truly unidentified bytes get a neutral extension.
     returned = sniff_image_ext(data) or ".bin"
     out.parent.mkdir(parents=True, exist_ok=True)
-    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp") and wanted != returned:
+    if wanted in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp") and wanted.replace(".jpeg", ".jpg") != returned:
         try:
             from PIL import Image  # noqa: PLC0415
             import io  # noqa: PLC0415
