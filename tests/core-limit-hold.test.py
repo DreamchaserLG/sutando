@@ -572,6 +572,92 @@ class OwnerRecovery(unittest.TestCase):
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), [])
 
 
+class Crash(BaseException):
+    """A process death in the middle of an owner action."""
+
+
+class OwnerActionCrash(unittest.TestCase):
+    """A crash between the action's checkpoints: the next revive still answers once, acts
+    once and launches. A repeated switch to the same model would be harmless (same write)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        (self.ws / "tasks").mkdir()
+        self.calls = self.ws / "switch-calls"
+        self.switch = self.ws / "switch.sh"
+        self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
+        self.switch.chmod(0o755)
+        self.now = 1_800_000_000.0
+        self.rec = limited_record(self.now)
+        clh.decide(self.ws, self.now, quota=self.rec)
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def _crash_then_revive(self, body: str, point: str):
+        from unittest import mock
+        import local_record
+        owner_task(self.ws / "tasks", "task-9", body)
+        real_write, real_clear = local_record.write_text_whole, clh.clear
+
+        def write_crashing(path, text):
+            if Path(path).name == "task-9.txt":
+                raise Crash()
+            return real_write(path, text)
+
+        def clear_crashing(*a, **k):
+            raise Crash()
+        real_record = clh._write_hold
+
+        def record_crashing(ws, hold):
+            if hold.get("actions"):
+                raise Crash()
+            return real_record(ws, hold)
+        patch = {"answer": mock.patch.object(local_record, "write_text_whole", side_effect=write_crashing),
+                 "clear": mock.patch.object(clh, "clear", side_effect=clear_crashing),
+                 "record": mock.patch.object(clh, "_write_hold", side_effect=record_crashing)}[point]
+        with patch, self.assertRaises(Crash):
+            clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch))
+        self.assertIs(clh.clear, real_clear)
+        for minute in (2, 4):
+            clh.handle_owner_actions(self.ws, self.now + minute * 60, switch_cmd=str(self.switch))
+        answer = self.ws / "results" / "task-9.txt"
+        self.assertTrue(answer.exists(), f"{point}: the owner never got an answer")
+        self.assertFalse((self.ws / "tasks" / "task-9.txt").exists(), f"{point}: the core would act on it again")
+        self.assertIsNone(clh.active_hold(self.ws, self.now + 300), f"{point}: the core stays held")
+        self.assertTrue(clh.decide(self.ws, self.now + 301, quota=self.rec, launch_model="sonnet").launch)
+        return answer.read_text()
+
+    def test_crash_before_the_answer(self):
+        for body, point in (("switch to sonnet", "answer"), ("retry now", "answer")):
+            with self.subTest(body=body):
+                self.td.cleanup()
+                self.setUp()
+                text = self._crash_then_revive(body, point)
+                self.assertIn("sonnet" if "switch" in body else "Retrying", text)
+                if "switch" in body:
+                    self.assertEqual(len(self.calls.read_text().splitlines()), 1, "the switch ran twice")
+
+    def test_crash_before_the_hold_is_lifted(self):
+        for body in ("switch to sonnet", "retry now"):
+            with self.subTest(body=body):
+                self.td.cleanup()
+                self.setUp()
+                self._crash_then_revive(body, "clear")
+                if "switch" in body:
+                    self.assertEqual(len(self.calls.read_text().splitlines()), 1, "the switch ran twice")
+
+
+    def test_crash_after_the_switch_before_the_record(self):
+        # Nothing durable says the switch ran, so the next pass runs it again: the same model,
+        # written to the same settings key, which is harmless. The owner still gets one answer.
+        text = self._crash_then_revive("switch to sonnet", "record")
+        self.assertIn("sonnet", text)
+        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"] * 2)
+
+
 class NoticeRetry(unittest.TestCase):
     """A notice whose first enqueue failed is still owed, and is sent exactly once."""
 

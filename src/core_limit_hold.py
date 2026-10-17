@@ -410,24 +410,44 @@ def _owner_action(path: Path) -> Optional[tuple]:
     return ("retry", None) if _RETRY.match(body) else None
 
 
+def _recorded_actions(hold: Optional[dict]) -> list:
+    acts = (hold or {}).get("actions") or []
+    return [a for a in acts if isinstance(a, dict) and isinstance(a.get("task"), str)]
+
+
+def _finish(workspace: Path, entry: dict, now: float) -> None:
+    """Complete a recorded action from its record alone, in order: answer, lift, archive.
+    Every step is skipped once done, so a crash at any point is finished by the next pass."""
+    import local_record
+    result = workspace / "results" / f"{entry['task']}.txt"
+    if not result.exists():
+        local_record.write_text_whole(result, entry["reply"] + "\n")
+    hold = read_hold(workspace)
+    if entry.get("ok") and hold and hold.get("status") == "held":
+        clear(workspace, now, by=entry["task"])
+    live = workspace / "tasks" / f"{entry['task']}.txt"
+    if live.exists():
+        _archive_task(workspace, live)
+
+
 def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
                          switch_cmd: Optional[str] = None) -> list:
     """Act on the owner's "switch to <model>" / "retry now" replies while a hold is in force.
     Each reply is answered in its own conversation and acted on once; returns their ids."""
     import subprocess
-    from local_record import write_text_whole
     now = time.time() if now is None else now
     workspace = Path(workspace)
+    for entry in _recorded_actions(read_hold(workspace)):
+        _finish(workspace, entry, now)
     done = []
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
         hold = active_hold(workspace, now)
         if not hold:
             break
-        result = workspace / "results" / path.name
         action = _owner_action(path)
         if action is None:
             continue
-        if path.stem in (hold.get("actions") or []) or result.exists():
+        if (workspace / "results" / path.name).exists():
             _archive_task(workspace, path)
             continue
         kind, model = action
@@ -436,16 +456,14 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         elif not switch_cmd:
             ok, reply = False, "I could not switch the model from here; use the core-model card under Agent Settings."
         else:
+            # A crash before the record below re-runs this switch: the same model written twice.
             run = subprocess.run(["bash", switch_cmd, model, "--offline"], capture_output=True, text=True, timeout=60)
             ok = run.returncode == 0
             reply = (f"Switched the core to {model}. It is starting now and will answer your waiting messages."
                      if ok else f"I could not switch the core to {model}; it stays paused. Try the core-model card under Agent Settings.")
-        hold = dict(hold, actions=(hold.get("actions") or []) + [path.stem])
-        _write_hold(workspace, hold)
-        if ok:
-            clear(workspace, now, by=path.stem)
-        write_text_whole(result, reply + "\n")
-        _archive_task(workspace, path)
+        entry = {"task": path.stem, "kind": kind, "model": model, "ok": ok, "reply": reply, "at": now}
+        _write_hold(workspace, dict(hold, actions=_recorded_actions(hold) + [entry]))
+        _finish(workspace, entry, now)
         done.append(path.stem)
     return done
 
