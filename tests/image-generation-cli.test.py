@@ -521,6 +521,25 @@ class InputsAndOutputs(Base):
         self.assertEqual(saved.suffix, ".bmp", "sniffed BMP magic, not left as .png")
         self.assertEqual(saved.read_bytes(), bmp)
 
+    def test_gif_magic_is_sniffed_and_recognized_not_left_under_png(self):
+        """GIF magic (GIF87a/GIF89a) is a recognized, convertible format in its own right —
+        the other half of sniff_image_ext's magic-byte table, alongside BMP and WEBP below."""
+        gif = b"GIF89a" + b"\x00" * 10  # real GIF magic, not a full valid file
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(gif, "image/gif", out, 90)
+        self.assertEqual(saved.suffix, ".gif", "sniffed GIF magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), gif)
+
+    def test_webp_magic_is_sniffed_and_recognized_not_left_under_png(self):
+        """WEBP magic (RIFF....WEBP) is a recognized, convertible format in its own right."""
+        webp = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 8  # real WEBP magic
+        out = self.ws / "chart.png"
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            saved = gen.save_image(webp, "image/webp", out, 90)
+        self.assertEqual(saved.suffix, ".webp", "sniffed WEBP magic, not left as .png")
+        self.assertEqual(saved.read_bytes(), webp)
+
     def test_genuinely_unidentifiable_bytes_never_trust_a_misleading_mime_either(self):
         """Bytes sniff_image_ext cannot recognize at all (not jpg/png/gif/webp/bmp magic) must
         get a neutral extension even when the API's mime field claims a specific, wrong format
