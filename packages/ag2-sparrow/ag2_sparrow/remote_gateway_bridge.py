@@ -12,7 +12,7 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Full spec: docs/remote-gateway-protocol.md
 
   Protocol (versioned, Bearer-auth):
-  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&capabilities=voice-outcome-v1
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
@@ -439,11 +439,18 @@ LEASE_ID_MAX = 256
 # Re-asked task id -> the id the broker is waiting on. A dedup re-ask gets a
 # fresh local id, but the delivery it answers is still the original one.
 DEDUP_ALIAS_FILE = _STATE / f"remote-dedup-alias{_INST_SUFFIX}.json"
-# The voice-outcome contract every result carries beside an explicit `dm_only`.
+# Broker id -> the local id it was published under, for each task served with `ack_first`.
+# A file of its own: an older bridge prunes the media sidecar when it settles a task.
+ACK_FIRST_FILE = _STATE / f"remote-task-ack-first{_INST_SUFFIX}.json"
+# Local id -> an `ack_first` task staged before its ack and not yet published, so a
+# crash in between publishes an accepted task once and discards a refused one.
+ACK_FIRST_MANIFEST_FILE = _STATE / f"remote-task-ack-first-manifest{_INST_SUFFIX}.json"
+# Declared in the heartbeat and carried on every poll and result; it stands for `dm_only`,
+# `consolidated_into` and acknowledging an `ack_first` task before publishing it.
 VOICE_OUTCOME_CONTRACT = "voice-outcome-v1"
-# Broker ids this process saw served with `ack_first`; held in memory only, so after
-# a restart an honoured fold of one closes with the bare marker, as before.
-_ACK_FIRST_SERVED: "set[str]" = set()
+_POLL_PROOF = f"&capabilities={VOICE_OUTCOME_CONTRACT}"
+# The only source the broker serves with `ack_first`.
+_VOICE_ASK_SOURCE = "matrixrtc-voice"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
@@ -1888,10 +1895,11 @@ _INFLIGHT_MUTEX = threading.RLock()
 # True when the in-flight restore FAILED rather than finding no file. Both cases
 # yield an empty set, but only the second one means "nothing is in flight".
 _INFLIGHT_DEGRADED = False
-# Same hazard as the in-flight set: both ledgers are read-modify-written by the
+# Same hazard as the in-flight set: these ledgers are read-modify-written by the
 # poll loop and the outbound worker, so each load->mutate->write runs under a lock.
 _TASK_MEDIA_MUTEX = threading.RLock()
 _PENDING_ACK_MUTEX = threading.RLock()
+_ACK_FIRST_MUTEX = threading.RLock()
 
 
 def wake_outbound() -> None:
@@ -2898,6 +2906,65 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         return False
 
 
+# Times each waiting line recurred in this process, for `_log_backoff`.
+_LOG_COUNTS: "dict[tuple, int]" = {}
+
+
+def _log_backoff(key: tuple, line: str) -> None:
+    """Log `line` the 1st, 2nd, 4th, 8th ... time `key` recurs in this process, with the count:
+    a wait with no ceiling would otherwise log every second for as long as it lasts."""
+    n = _LOG_COUNTS[key] = _LOG_COUNTS.get(key, 0) + 1
+    if not n & (n - 1):
+        _log(line + (f" (seen {n} times)" if n > 1 else ""))
+
+
+def _log_backoff_forget(first: str) -> None:
+    """Drop every count keyed by `first` (a task or item id) once it is done, so the counts
+    stay bounded; the keys are copied first because another thread may be adding one."""
+    for key in [k for k in list(_LOG_COUNTS) if k[:1] == (first,)]:
+        _LOG_COUNTS.pop(key, None)
+
+
+def _post_ack_first(tid: str, lease_id: "str | None") -> str:
+    """The durable ack of a staged `ack_first` task: "accepted" (a repeat answers
+    `duplicate`); "stale", a newer serve holds the lease, so this one was never accepted;
+    "gone", no lease at all; or "retry" for any other answer. Never raises: the poll
+    meets an auth failure."""
+    wire_tid = _broker_tid(tid)
+    body = {"id": wire_tid, "durable": True}
+    if lease_id:
+        body["lease_id"] = lease_id
+    try:
+        _req("POST", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/ack", body, timeout=10)
+        return "accepted"
+    except urllib.error.HTTPError as e:
+        reason = _http_error_body(e).lower() if e.code == 404 else ""
+        if "not leased" in reason:
+            return "stale" if "stale lease generation" in reason else "gone"
+        _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack answered HTTP {e.code} "
+                     "— kept staged, retrying")
+        return "retry"
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        # A re-ack of an accepted task answers `duplicate`, so retrying is always safe.
+        _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack failed "
+                     f"({type(e).__name__}: {e}) — kept staged, retrying")
+        return "retry"
+
+
+def _ack_first_state(tid: str) -> "str | None":
+    """The broker's state for the ask behind a staged task (`GET /v1/tasks/<id>/status`),
+    or None when it cannot be read."""
+    wire_tid = _broker_tid(tid)
+    try:
+        doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
+                     f"({type(e).__name__}: {e}) — kept staged")
+        return None
+    state = doc.get("state") if isinstance(doc, dict) else None
+    return state if isinstance(state, str) else None
+
+
 _CORE_STEP_MAX = 500
 
 
@@ -3448,7 +3515,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status", "team-collaborator"],
+                             "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).
@@ -3512,6 +3579,9 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},
         }
+        if _HELD_UNRESOLVED:
+            # Staged relay asks the bridge can neither publish nor clear without a person.
+            payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
         if _reenroll_state.get("code"):
@@ -3923,10 +3993,12 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
                      name=f"on-task-{tid}", daemon=True).start()
 
 
-def _write_task(task: dict) -> "tuple[str, bool] | None":
+def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     """Serialize a gateway task into tasks/task-<id>.txt (same schema as bridges).
     Returns (task id, durable) — `durable` says the queue write and its sidecar
-    committed, which is what an ack may claim — or None when nothing was queued."""
+    committed, which is what an ack may claim — or None when nothing was queued.
+    With `hold` (an `ack_first` task) a fresh task is staged, not published:
+    `_advance_held` publishes it once its ack is accepted."""
     broker_tid = str(task.get("id") or "").strip()
     if not broker_tid:
         _log("dropping task with no id")
@@ -3934,8 +4006,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     if not _valid_tid(broker_tid):
         _log(f"dropping task with unsafe id {broker_tid!r}")
         return None
-    if task.get("ack_first") is True:          # the broker's exact boolean only
-        _ACK_FIRST_SERVED.add(broker_tid)
     # Everything from here down — filenames, ledgers, archives, the serialized
     # id: header the core echoes back as the result filename — uses the LOCAL
     tid = _local_tid(broker_tid)
@@ -4113,7 +4183,7 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
     from .local_task_protocol import apply_task_stamper
     task_text = apply_task_stamper("\n".join(lines) + "\n")
-    tmp = _stage_durable(dest, task_text)
+    tmp = _stage_durable(_held_dir() / dest.name if hold else dest, task_text)
     if tmp is None:
         _log(f"task write FAILED for {tid} — not queued, not acked")
         return None
@@ -4123,9 +4193,17 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
         tmp.unlink(missing_ok=True)
         _log(f"media sidecar FAILED for {tid} — not queued, not acked")
         return None
+    if hold:
+        return _hold_staged(tid, tmp, task_text, task, sender_tier)
     if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
+    _on_published(tid, dest, task_text, task, sender_tier)
+    return tid, True
+
+
+def _on_published(tid: str, dest: Path, task_text: str, task: dict, sender_tier: str) -> None:
+    """What follows a fresh publish of a served task, and only that."""
     _log(f"queued {tid}")
     # #2274 parity: one task_processed per NEWLY queued task (idempotent early
     # returns never reach here), bucketed to this gateway's own "remote" surface
@@ -4140,7 +4218,6 @@ def _write_task(task: dict) -> "tuple[str, bool] | None":
     _write_owner_activity(task, sender_tier)
     # Only a fresh publish reaches here, so redelivery and restarts never re-fire.
     _fire_on_task(tid, dest, task_text)
-    return tid, True
 
 
 def _load_dedup_aliases() -> "dict[str, str] | None":
@@ -4282,16 +4359,401 @@ def _forget_task_media(tid: str) -> None:
             _durable_write(TASK_MEDIA_FILE, json.dumps(media, sort_keys=True))
 
 
+def _load_ack_first() -> "dict | None":
+    """The `ack_first` marks, or None when the file exists but cannot be read.
+
+    None is not "no mark": guessing none closes a relay ask's honoured fold as a
+    bare suppression, and the broker can no longer say where its answer went.
+    """
+    if not ACK_FIRST_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(ACK_FIRST_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"ack_first marks unreadable ({exc}) — deferring")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _record_ack_first(tid: str) -> bool:
+    """Commit the mark of a task served with `ack_first`, before its ack. False withholds
+    the ack; marks that cannot be read are never overwritten."""
+    with _ACK_FIRST_MUTEX:
+        marks = _load_ack_first()
+        if marks is None:
+            return False
+        marks[_broker_tid(tid)] = tid
+        return _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
+
+
+def _forget_ack_first(broker_id: str) -> bool:
+    """Retire a mark. True once it is gone; False while the marks cannot be read or written."""
+    with _ACK_FIRST_MUTEX:
+        marks = _load_ack_first()
+        if marks is None:
+            return False
+        if marks.pop(broker_id, None) is None:
+            return True
+        return _durable_write(ACK_FIRST_FILE, json.dumps(marks, sort_keys=True))
+
+
+def _retire_delivered_marks() -> None:
+    """At start, retire each mark whose result the outbox shows delivered once no result
+    of its task is still live: a crash came between that result's archive and its retirement."""
+    marks = _load_ack_first()
+    if not marks:
+        return
+    aliases = _load_dedup_aliases()
+    if aliases is None:
+        return              # a re-ask's live result cannot be ruled out: the marks wait
+    root = _delivery_core().backend.root
+    for broker_id, local in sorted(marks.items()):
+        if not (_valid_tid(broker_id) and isinstance(local, str) and _valid_local_tid(local)):
+            continue
+        if (read_item(root, broker_id) or {}).get("status") != "DELIVERED":
+            continue
+        # A re-ask answers under its original's id, so its live result keeps the mark too.
+        answers = {local} | {k for k, v in aliases.items() if v == local and _valid_local_tid(k)}
+        if not any(os.path.lexists(RESULTS_DIR / f"{t}.txt") for t in answers):
+            _forget_ack_first(broker_id)
+
+
+# The served task behind each staged `ack_first` task, for the publish that follows its ack.
+_HELD_TASKS: "dict[str, tuple[dict, str, str]]" = {}
+# Entries this process already logged as unresolved, so a stuck entry logs once.
+_HELD_REPORTED: "set[str]" = set()
+# Entries the last pass could neither publish nor clear, reported in the gateway status.
+_HELD_UNRESOLVED: "set[str]" = set()
+# A task still staged this long after it was staged is reported too; it keeps being retried.
+ACK_FIRST_UNRESOLVED_AFTER_S = 600
+
+
+def _held_dir() -> Path:
+    """Where `ack_first` tasks wait for their ack: on the queue's filesystem, outside its globs."""
+    return TASKS_DIR / f".ack-first{_INST_SUFFIX}"
+
+
+def _load_held() -> "dict | None":
+    """The manifest of staged `ack_first` tasks, or None when it cannot be read."""
+    if not ACK_FIRST_MANIFEST_FILE.exists():
+        return {}
+    try:
+        loaded = json.loads(ACK_FIRST_MANIFEST_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        _log(f"ack_first manifest unreadable ({exc}) — nothing staged is acked or published")
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _put_held(tid: str, entry: "dict | None") -> bool:
+    """Commit one manifest entry, or remove it with None. Only the poll loop writes it."""
+    held = _load_held()
+    if held is None:
+        return False
+    if entry is not None:
+        held[tid] = entry
+    elif held.pop(tid, None) is None:
+        return True
+    return _durable_write(ACK_FIRST_MANIFEST_FILE, json.dumps(held, sort_keys=True))
+
+
+def _held_entry_ok(tid: str, entry) -> bool:
+    """An entry names only its own task's files: its staged file and its queue file."""
+    if not (_valid_local_tid(tid) and isinstance(entry, dict)):
+        return False
+    staged = entry.get("staged")
+    return (entry.get("broker_id") == _broker_tid(tid) and entry.get("dest") == f"{tid}.txt"
+            and isinstance(staged, str) and Path(staged).name == staged
+            and staged.startswith(f"{tid}.txt.") and staged.endswith(".tmp"))
+
+
+def _held_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _drop_staged(staged: Path) -> None:
+    """Remove a staged `ack_first` task file, which the core never saw."""
+    staged.unlink(missing_ok=True)
+
+
+def _sweep_held_dir() -> None:
+    """At start, remove each staged file no manifest entry names: a crash came before its
+    entry, or after a discard or a newer serve had moved the entry on."""
+    held = _load_held()
+    if held is None:
+        return
+    named = {e.get("staged") for e in held.values() if isinstance(e, dict)}
+    try:
+        files = [f for f in _held_dir().iterdir() if f.is_file()]
+    except OSError:
+        return
+    for staged in files:
+        if staged.name not in named:
+            _drop_staged(staged)
+            _log(f"removed staged file {staged.name}: no ack_first manifest entry names it")
+
+
+def _hold_staged(tid: str, tmp: Path, task_text: str, task: dict,
+                 sender_tier: str) -> "tuple[str, bool] | None":
+    """Commit the manifest entry of a staged `ack_first` task, which stays unpublished until
+    its ack is accepted; every later step resumes from the entry. None, with nothing staged,
+    when the staged file's directory entry or the manifest entry does not commit."""
+    held = _load_held()
+    entry = {"broker_id": _broker_tid(tid), "lease_id": _lease_id_of(task),
+             "staged": tmp.name, "dest": f"{tid}.txt", "sha256": _held_digest(task_text),
+             "accepted": False}
+    if (held is None or not _fsync_in_place(tid, _held_dir(), TASKS_DIR)
+            or not _put_held(tid, entry)):
+        _drop_staged(tmp)
+        _log(f"ack_first stage FAILED for {tid} — not staged, not acked")
+        return None
+    previous = held.get(tid)
+    if _held_entry_ok(tid, previous) and previous["staged"] != tmp.name:
+        # Served again before its ack: only the newest serve is acked and published.
+        _drop_staged(_held_dir() / previous["staged"])
+    _HELD_TASKS[tid] = (task, sender_tier, task_text)
+    _log(f"staged {tid} until its ack is accepted (ack_first)")
+    return tid, True
+
+
+def _held_published(tid: str, entry: dict, dest: Path) -> bool:
+    """A matching task file, a claimed or archived copy, or a result for the task."""
+    try:
+        if dest.exists():
+            return _held_digest(dest.read_text(encoding="utf-8")) == entry.get("sha256")
+    except (OSError, ValueError):
+        return False
+    return (_task_pending(tid) or _archived_task_file(tid) is not None
+            or os.path.lexists(RESULTS_DIR / f"{tid}.txt") or _delivered_copy_exists(tid)
+            or bool(undelivered_quarantine.find_quarantined(RESULTS_DIR, tid)))
+
+
+def _ack_verdict(tid: str, entry: dict) -> str:
+    """The verdict on a staged task's ack (accepted, refused or retry), asking the broker's
+    state when the ack cannot settle it. Never refused for an ask the broker holds acknowledged."""
+    outcome = _post_ack_first(tid, entry.get("lease_id"))
+    if outcome == "accepted":
+        return "accepted"
+    if outcome == "stale":
+        return "refused"        # an acknowledged ask is never served again, so this one was not
+    state = _ack_first_state(tid)
+    if state in ("withdrawn", "dead", "result_ready"):
+        return "refused"        # ended, or answered elsewhere: this copy never ran
+    # With no lease at all, `acknowledged` is this serve's; any other serve's would answer stale.
+    if state == "acknowledged" and outcome == "gone":
+        return "accepted"
+    return "retry"
+
+
+def _discard_held(tid: str, entry: dict, staged: Path, inflight: "set[str]") -> None:
+    """A refused ack: the task never reached the core, so nothing of it is kept. The entry
+    records the decision first and goes last, so a crash midway resumes the discard."""
+    if entry.get("refused") is not True and not _put_held(tid, {**entry, "refused": True}):
+        return                                  # the next pass re-acks and decides again
+    _drop_staged(staged)
+    _HELD_TASKS.pop(tid, None)
+    _forget_task_media(tid)
+    # Marks outlive tasks whose result may still come; a task refused before it ran has none.
+    if not _forget_ack_first(entry["broker_id"]):
+        return
+    inflight.discard(tid)
+    if not (_save_inflight(inflight) and _put_held(tid, None)):
+        return
+    _log_backoff_forget(tid)
+    _log(f"ack_first task {tid}: ack refused (withdrawn, expired or served again) "
+         "— discarded, never published")
+
+
+def _clear_held(tid: str, why: str = "") -> bool:
+    """Remove a published task's entry, only once both directories hold its rename: a power
+    loss could otherwise bring the staged name back with no entry to say it was published."""
+    if not (_fsync_in_place(tid, _held_dir(), TASKS_DIR) and _put_held(tid, None)):
+        return False
+    _HELD_TASKS.pop(tid, None)
+    _log_backoff_forget(tid)
+    if why:
+        _log(f"ack_first task {tid}: {why}")
+    return True
+
+
+def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
+    """Move a staged `ack_first` task on: published once its ack is accepted and recorded,
+    discarded once it is refused, otherwise left staged for the next pass. True once published."""
+    staged, dest = _held_dir() / entry["staged"], TASKS_DIR / entry["dest"]
+    if entry.get("refused") is True:
+        _discard_held(tid, entry, staged, inflight)
+        return False
+    if not staged.exists():
+        # `_publish_staged` consumes the staged file, so only a publish removes it.
+        if _held_published(tid, entry, dest):
+            _clear_held(tid, "already published — manifest entry cleared")
+            return False
+        _HELD_UNRESOLVED.add(tid)
+        if tid not in _HELD_REPORTED:
+            _HELD_REPORTED.add(tid)
+            _log(f"ERROR ack_first task {tid}: staged file gone and no copy of the task or its "
+                 "result found — manifest entry kept, nothing guessed; reported in the gateway status")
+        return False
+    if entry.get("accepted") is not True:
+        # The mark and the in-flight set are on disk before the ack, as `durable` claims.
+        if not _record_ack_first(tid):
+            return False
+        if tid not in inflight and not _track_durably(tid, inflight):
+            return False
+        verdict = _ack_verdict(tid, entry)
+        if verdict == "refused":
+            _discard_held(tid, entry, staged, inflight)
+            return False
+        # An acceptance that is not on disk keeps the task staged: the next pass acks again.
+        if verdict != "accepted" or not _put_held(tid, {**entry, "accepted": True}):
+            return False
+    else:
+        if tid not in inflight and not _track_durably(tid, inflight):
+            return False
+        if _held_published(tid, entry, dest):
+            # A power loss brought the staged name back after its publish: never publish twice.
+            _drop_staged(staged)
+            _clear_held(tid, "already published — the staged copy left beside it was dropped")
+            return False
+    # After the ack, before the publish: the entry stays held and accepted, so
+    # exactly-once is untouched and only the publication waits.
+    if _staged_tier_withdrawn(tid, staged):
+        return False
+    if not _publish_staged(staged, dest):
+        return False
+    served = _HELD_TASKS.pop(tid, None)
+    if served is not None:
+        _on_published(tid, dest, served[2], served[0], served[1])
+    else:
+        _log(f"queued {tid} (staged and acknowledged before a restart)")
+        _fire_on_task(tid, dest)
+    _clear_held(tid)
+    return True
+
+
+def _advance_held_tasks(inflight: "set[str]") -> bool:
+    """Every pass: retry a staged `ack_first` task's ack, and after a restart publish an
+    accepted one once or discard a refused one. True when any was published."""
+    published = False
+    _HELD_UNRESOLVED.clear()
+    for tid, entry in sorted((_load_held() or {}).items()):
+        if _held_entry_ok(tid, entry):
+            published |= _advance_held(tid, entry, inflight)
+            continue
+        _HELD_UNRESOLVED.add(tid)
+        if tid not in _HELD_REPORTED:
+            _HELD_REPORTED.add(tid)
+            _log(f"ERROR ack_first manifest entry for {tid!r} is malformed — left as it is; "
+                 "reported in the gateway status")
+    for tid, entry in (_load_held() or {}).items():
+        if _held_entry_ok(tid, entry) and _held_overdue(_held_dir() / entry["staged"]):
+            _HELD_UNRESOLVED.add(tid)
+            _log_backoff((tid, "overdue"), f"ERROR ack_first task {tid}: still staged "
+                         f"{ACK_FIRST_UNRESOLVED_AFTER_S} s after it was staged — reported in the "
+                         "gateway status, still retrying")
+    return published
+
+
+def _staged_policy_tier(staged: Path) -> "tuple[str, str] | None":
+    """The access tier frozen into a staged task and the sender it names, or None when
+    that cannot be proven: the file cannot be read or parsed, or names no known tier.
+
+    Read from the ARTIFACT, not from the manifest entry: the staged body is what a
+    resume publishes, so it is what has to be re-examined, and a task staged by an
+    older build is then covered by the same check without a schema migration. The
+    trusted parser is the correct one by writer — this module wrote the file and
+    newline-strips every value, and it writes the locally-decided `access_tier`
+    last precisely so it beats anything the remote side claimed earlier.
+    """
+    try:
+        text = staged.read_text(encoding="utf-8", errors="replace")
+        headers = local_task_protocol.parse_task_headers_trusted(text).headers
+    except Exception:  # noqa: BLE001 — unprovable, so withheld by the caller, never published
+        return None
+    frozen = local_task_protocol.canonical_access_tier(headers.get("access_tier"))
+    if frozen not in _TIER_RANK:
+        return None     # every render writes a known tier, so a missing one is damage
+    return frozen, (headers.get("user_id") or "")
+
+
+def _staged_tier_withdrawn(tid: str, staged: Path) -> bool:
+    """True when a staged task must wait: the capability it froze is no longer granted
+    locally, or what it froze cannot be proven.
+
+    A staged task freezes its whole policy envelope at stage time — the
+    `access_tier` line, that tier's in-band guardrail, the owner-only prelude —
+    and a resume publishes the text verbatim, so a cap the operator lowered in
+    between would be bypassed by replay alone. Re-resolving the frozen tier
+    through `_tier_for` cannot escalate it (the resolver takes the lower of
+    attested and local), so a drop means local access was genuinely withdrawn.
+    An envelope that cannot be proven (unreadable, unparsable, no known tier) is
+    withheld too and checked again on every pass: a transient read error delays
+    the task and never publishes an envelope nobody could check.
+    """
+    frozen = _staged_policy_tier(staged)
+    if frozen is None:
+        _HELD_UNRESOLVED.add(tid)
+        _log_backoff((tid, "tier-unproven"),
+                     f"ERROR ack_first task {tid}: the tier its staged file froze cannot be read "
+                     "— kept staged, not published, checked again every pass. Reported in the "
+                     "gateway status")
+        return True
+    now = _tier_for(frozen[1], frozen[0])
+    if _TIER_RANK[now] >= _TIER_RANK[frozen[0]]:
+        return False
+    _HELD_UNRESOLVED.add(tid)
+    _log_backoff((tid, "tier-withdrawn"),
+                 f"ERROR ack_first task {tid}: staged as {frozen[0]} but local access is now "
+                 f"{now} — kept staged, not published; publishing would hand it the capability "
+                 "that was withdrawn. Reported in the gateway status")
+    return True
+
+
+def _held_overdue(staged: Path) -> bool:
+    """Staged longer than `ACK_FIRST_UNRESOLVED_AFTER_S`: its file is written once, when staged."""
+    try:
+        return time.time() - staged.stat().st_mtime >= ACK_FIRST_UNRESOLVED_AFTER_S
+    except OSError:
+        return False
+
+
+def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
+    """A task served with `ack_first`: staged, acked on its own and published only once
+    the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
+    written = _write_task(task, hold=True)
+    if written is None:
+        return False
+    tid, durable = written
+    held = _load_held()
+    if held is None:
+        return False                            # nothing is acked while it cannot be read
+    entry = held.get(tid)
+    if not _held_entry_ok(tid, entry):
+        # Already queued or handled here: acked as any redelivery is.
+        lease = _lease_id_of(task)
+        if _track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)]):
+            _post_task_ack(tid, durable, lease)
+        return False
+    return _advance_held(tid, entry, inflight)
+
+
 def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
     """What an honoured fold posted under `wire` sends as `consolidated_into`.
 
     The holder's BROKER id, resolved as result egress resolves its own, for a task
-    this process saw served with `ack_first`; "" for every other task, which
-    closes with the bare marker as before (the broker already acts on the field
-    for any task, so typed and Signal tasks must never get it); None to defer
-    while the alias ledger cannot be read.
+    whose `ack_first` mark is kept; "" for every other task, which closes with the
+    bare marker as before (the broker already acts on the field for any task, so
+    typed and Signal tasks must never get it); None to defer while the marks (for a
+    voice ask) or the alias ledger cannot be read.
     """
-    if wire not in _ACK_FIRST_SERVED:
+    marks = _load_ack_first()
+    if marks is None:
+        # Only a voice ask can carry a mark, so every other task still closes as before.
+        if _task_source(tid) != _VOICE_ASK_SOURCE:
+            return ""
+        _log(f"delivery deferred for {tid} — ack_first marks unreadable")
+        return None
+    if wire not in marks:
         return ""
     delivery = _delivery_tid((holder or "").strip())
     if delivery is None:
@@ -4304,6 +4766,19 @@ def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
              "closed with the marker, without consolidated_into")
         return ""
     return target
+
+
+def _task_source(tid: str) -> "str | None":
+    """The `source:` header of tid's task file, queued or archived; None when unknown.
+    A re-ask's file carries its original's headers."""
+    tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
+    if tfile is None:
+        return None
+    try:
+        text = tfile.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return local_task_protocol.parse_task_headers_trusted(text).headers.get("source")
 
 
 def _read_attachment(path_str: str) -> "tuple[str, str, str]":
@@ -5732,6 +6207,8 @@ def _post_ready_results(inflight: set[str]) -> None:
                 # id, so only a retired delivery gives up its media mode.
                 if action != "requeue":
                     _forget_task_media(tid)
+                if action == "report":
+                    _forget_ack_first(_broker_tid(_delivery))
                 _forget_dedup_alias(tid)
                 if action == "requeue":
                     inflight.add(payload)
@@ -5763,6 +6240,8 @@ def _post_ready_results(inflight: set[str]) -> None:
             inflight.discard(tid)
             _forget_task_room(tid)
             _forget_task_media(tid)
+            # After the archive, so a re-run of an accepted fold still names its holder.
+            _forget_ack_first(_wire)
             changed = True
             _log(f"archived {tid} (marker {skip.value}, lease closed, not sent"
                  + (f", folded into {_folded})" if _folded else ")"))
@@ -5833,6 +6312,7 @@ def _post_ready_results(inflight: set[str]) -> None:
         inflight.discard(tid)
         _forget_task_room(tid)
         _forget_task_media(tid)
+        _forget_ack_first(_wire)
         _forget_dedup_alias(tid)
         changed = True
         _log(f"archived gateway-accepted result for {tid}; Matrix delivery unconfirmed")
@@ -5855,8 +6335,9 @@ def _reconcile_abandoned(inflight: set[str], suspects: set[str]) -> set[str]:
     the previous pass's candidates): a result landing between the task-file
     check and the discard is then picked up by the next `_post_ready_results`
     instead of being raced. Returns the new suspects set for the next pass."""
+    staged = _load_held() or {}                 # no task file until their ack is accepted
     gone = {tid for tid in inflight
-            if _valid_local_tid(tid)
+            if _valid_local_tid(tid) and tid not in staged
             and not _task_pending(tid)
             and not (RESULTS_DIR / f"{tid}.txt").exists()
             and not _task_archived_recently(tid)}
@@ -6086,6 +6567,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
             if _archive_result(rfile, tid, generation):
                 inflight.discard(tid)           # settled: the in-flight entry was only a marker
                 _save_inflight(inflight)
+                _forget_ack_first(_btid)
             continue
         _item = _effective_item_id(_delivery_core(), _btid, bool(skip))
         if _delivery_core().backend.is_terminal(_item):
@@ -6347,6 +6829,11 @@ def main() -> None:
     _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
+    for sweep in (_retire_delivered_marks, _sweep_held_dir):
+        try:
+            sweep()
+        except Exception as e:  # noqa: BLE001 — what a sweep leaves waits for the next start
+            _log(f"{sweep.__name__} failed ({type(e).__name__}: {e}) — continuing")
     abandoned_suspects: set[str] = set()
     _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
@@ -6382,9 +6869,11 @@ def main() -> None:
             # LAST of the beat's work, on a daemon thread: two optional 15 s
             # requests never delay the next task poll or a durable retry.
             _push_pool_advertisement()
+            if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
+                wake_outbound()
             prev_ok = last_poll_ok
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = time.time()
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
@@ -6397,7 +6886,14 @@ def main() -> None:
                 poll_failures = 0
             added = False
             pending_ack = []
-            for task in resp.get("tasks", []):
+            tasks = resp.get("tasks", [])
+            # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
+            for task in tasks:
+                if task.get("ack_first") is True:
+                    added |= _take_ack_first(task, inflight)
+            for task in tasks:
+                if task.get("ack_first") is True:
+                    continue
                 hitl_out = _handle_hitl_action(task)
                 if hitl_out:
                     body = "[no-send]"
