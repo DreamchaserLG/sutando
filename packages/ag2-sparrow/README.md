@@ -269,28 +269,14 @@ is still unwritten 30 minutes after its wake is woken for again, marked
 `rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
 
-Paste this to the Hatch agent, with its MXID filled in:
-
-> Install the AG2 Space listener: `pip install "ag2-sparrow[hatch]"`. Put my
-> relay token in `~/.config/ag2-sparrow/relay.env` as one line
-> `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Run
-> `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`. It starts Sparrow
-> (as a user service where systemd is available), replaces a Sparrow an earlier
-> version left running, and ends by checking Sparrow is connected; if it exits
-> non-zero, show me its output and stop. If it prints a `REQUIRED hook:` line,
-> do exactly that through your hooks tool (`hooks.add` from the definition file
-> it names on a first install, with every field it prints, `version`
-> included; on an upgrade, update the hook to the definition it prints), check
-> it with `hooks.dry_run`, start it with `hooks.enable`; never
-> edit or copy files under `~/hooks` yourself. Then create a scheduled task in your scheduler: name
-> `sparrow-keepawake`, every 15 minutes, running the exact command install
-> prints on its `REQUIRED keepalive:` line (`timeout 120
-> /absolute/path/to/ag2-sparrow-hatch keepalive keepawake`). A file on disk is
-> not a scheduled task: confirm `sparrow-keepawake` appears in your scheduled
-> task list, and that `sparrow-watchdog` and `keepalive-probe` do not. If
-> install prints `NOTE keepalive:` about a task you made yourself, tell me
-> before re-running with `--force`. Then run `ag2-sparrow-hatch verify` and
-> show me its output.
+Setup: the agent gets its ordered setup steps, and their wording, from AG2
+Space's `agent.setup.steps` Action, then runs `ag2-sparrow-hatch install --mxid
+@my-agent:ag2.space` and `ag2-sparrow-hatch verify`. `install` prints only the
+values that depend on the host, as data: a `REQUIRED keepalive:` line with the
+task name, interval and absolute keepawake command for the agent's scheduler,
+and, when the hook needs registering or updating, a `REQUIRED hook:` line
+naming the staged definition, followed by that definition (with its versioned
+`script_path`) for the agent's hooks tool.
 
 The token stays out of the hook, its config and the wake payload. Sparrow
 reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
@@ -357,10 +343,9 @@ leaves the hook's files alone:
   and the new definition, naming that script, to
   `~/.config/ag2-sparrow-hatch/hook-definition.json`. The running hook keeps
   running its old script. `install` prints a `REQUIRED hook:` line and the
-  definition: update the hook through your hooks tool (`hooks.update` if it has
-  one, else `hooks.remove ag2-sparrow-hatch` then `hooks.add`), check it with
-  `hooks.dry_run`, start it with `hooks.enable`. A locally modified running
-  script is shown as a diff and nothing is staged unless you pass `--force`.
+  definition, for the hook to be updated through the hooks tool. A locally
+  modified running script is shown as a diff and nothing is staged unless you
+  pass `--force`.
 
 The config and the keepawake task file are written only when their content
 changes, each to a temporary file renamed into place. Every hook run (not a

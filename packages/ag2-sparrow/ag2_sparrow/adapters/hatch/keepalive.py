@@ -179,10 +179,10 @@ def install_tasks(cfg: dict, force: bool) -> None:
     """Install the keepawake task and remove the ones it replaces. Never fails the install."""
     directory = cron_dir(cfg)
     if _install_task(directory, render_task(_command(cfg)), force):
-        print(f"keepalive: {directory / task_file()} is the install record health is timed "
-              f"from; Hatch's scheduler does not run it. The keepalive log is {log_path(cfg)}")
+        print(f"keepalive: {directory / task_file()} (install record), log {log_path(cfg)}")
     _remove_old_tasks(directory, force)
-    print(f"REQUIRED keepalive: {register_step(cfg)}")
+    print(f"REQUIRED keepalive: {TASK} every {INTERVAL_MIN} minutes: "
+          f"{keepawake_command(_command(cfg))} (register it through your scheduler)")
 
 
 def uninstall_tasks(cfg: dict) -> int:

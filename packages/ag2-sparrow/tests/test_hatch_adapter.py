@@ -794,8 +794,8 @@ class Cli(Base):
     def test_install_writes_script_definition_and_config(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("REQUIRED hook: register the hook through your hooks tool: hooks.add with "
-                      f"every field of the definition in {self.staged}", r.stdout)
+        self.assertIn(f"REQUIRED hook: {self.staged} (register it through your hooks tool)\n"
+                      + self.staged.read_text(), r.stdout, "the line, then the definition")
         self.assertFalse(self.definition.exists(), "the hooks tool owns ~/hooks/definitions")
         self.assertEqual(self.script.read_text(), SCRIPT.read_text())
         self.assertTrue(os.access(self.script, os.X_OK))
@@ -812,7 +812,7 @@ class Cli(Base):
         self.assertIn(f"STATE_DIR={self.state.resolve()}", text)
         self.assertIn("GATEWAY_INSTANCE=''", text)
         again = self.cli("install", "--mxid", AGENT)
-        self.assertIn("REQUIRED hook: register", again.stdout, "until the hooks tool has it")
+        self.assertIn("REQUIRED hook: ", again.stdout, "until the hooks tool has it")
         self.register()
         again = self.cli("install", "--mxid", AGENT)
         self.assertEqual(again.returncode, 0, again.stderr)
@@ -821,7 +821,7 @@ class Cli(Base):
 
     def test_the_definition_has_every_field_hatch_requires(self):
         r = self.cli("install", "--mxid", AGENT)
-        printed = r.stdout.split("(printed below)", 1)[1]
+        printed = r.stdout.split("REQUIRED hook: ", 1)[1]
         printed = json.loads(printed[printed.index("\n{") + 1:printed.index("\n}\n") + 2])
         for definition in (json.loads(self.staged.read_text()), printed):
             self.assertEqual(definition["version"], 1)
@@ -846,7 +846,7 @@ class Cli(Base):
         self.assertIn(f"FAIL hook definition: {registered} lacks version: Hatch marks this hook "
                       "invalid", r.stdout)
         # install stages the full definition again rather than leaving it invalid.
-        self.assertIn("REQUIRED hook: install left the running hook",
+        self.assertIn(f"REQUIRED hook: {self.staged} (update hook ag2-sparrow-hatch",
                       self.cli("install", "--mxid", AGENT).stdout)
         registered.unlink()
         self.assertIn(f"FAIL hook definition: {registered} missing: the hook is not registered",
@@ -938,10 +938,9 @@ class Cli(Base):
                          [hatch_cli._sha256(older), hatch_cli._sha256(SCRIPT.read_text())])
         staged = json.loads(self.staged.read_text())
         self.assertEqual(staged["script_path"], f"~/hooks/scripts/{self.versioned.name}")
-        self.assertIn(f"REQUIRED hook: install left the running hook ag2-sparrow-hatch as it is; "
-                      f"update it through your hooks tool to the definition in {self.staged}",
-                      r.stdout)
-        self.assertIn(self.staged.read_text(), r.stdout, "the exact definition is printed")
+        self.assertIn(f"REQUIRED hook: {self.staged} (update hook ag2-sparrow-hatch to it "
+                      "through your hooks tool)\n" + self.staged.read_text(), r.stdout,
+                      "the line, then the exact definition")
         # Until the agent's hooks tool takes it, verify fails.
         self.sparrow_status()
         self.hook_ran(sha=hatch_cli._sha256(older))
@@ -1421,7 +1420,8 @@ class Service(Base):
         self.assertIn("enabled: ag2-sparrow.service (running)", r.stdout)
         self.assertIn("NOTE service: loginctl enable-linger hatch failed (Could not enable "
                       "linger: Access denied)", r.stdout)
-        self.assertIn("Next: do each REQUIRED step above", r.stdout)
+        self.assertIn("REQUIRED keepalive: sparrow-keepawake every 15 minutes: ", r.stdout)
+        self.assertNotIn("Next:", r.stdout)
 
     def test_linger_already_on_or_root_is_not_enabled_again(self):
         fake = FakeSystemd(linger="yes")
@@ -1587,14 +1587,11 @@ class Keepalive(Base):
         self.assertTrue(text.startswith(keepalive.TASK_MARKER))
         self.assertIn(f"\ntimeout {keepalive.RUN_TIMEOUT_S} {self.reply_stub} keepalive "
                       "keepawake\n", text)
-        self.assertIn(f"keepalive: {self.task} is the install record health is timed from; "
-                      "Hatch's scheduler does not run it.", r.stdout)
-        self.assertIn("REQUIRED keepalive: create a scheduled task through your scheduler (a "
-                      "file on disk is not enough): name sparrow-keepawake, every 15 minutes, "
-                      f"running exactly: timeout 120 {self.reply_stub} keepalive keepawake ; then "
-                      "confirm it appears in your scheduled task list\n", r.stdout)
-        self.assertIn("(the sparrow-keepawake scheduled task, and the hook when install printed "
-                      "a step for it), then run: ag2-sparrow-hatch verify", r.stdout)
+        self.assertIn(f"keepalive: {self.task} (install record), log {self.log}\n", r.stdout)
+        self.assertIn("\nREQUIRED keepalive: sparrow-keepawake every 15 minutes: timeout 120 "
+                      f"{self.reply_stub} keepalive keepawake (register it through your "
+                      "scheduler)\n", r.stdout)
+        self.assertNotIn("Next:", r.stdout)
         self.assertIn("KEEPALIVE_LOG=''", (self.home / ".config" / "ag2-sparrow-hatch" /
                                             "config").read_text())
         self.assertIn(f"unchanged: {self.task}", self.installed().stdout)

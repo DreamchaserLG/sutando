@@ -243,10 +243,7 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
             _record_script(sha)
         want = render_definition(mxid, reply_command, _script_path(canonical))
         staged = _stage_definition(want)
-        print(f"REQUIRED hook: register the hook through your hooks tool: hooks.add with every "
-              f"field of the definition in {staged} (printed below), check it with "
-              f"hooks.dry_run, start it with hooks.enable, and confirm {HOOK_ID} is listed "
-              "as valid in hooks.list")
+        print(f"REQUIRED hook: {staged} (register it through your hooks tool)")
         print(want, end="")
         return True
     script_path = str(registered.get("script_path") or _script_path(canonical))
@@ -277,12 +274,7 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
         print(f"unchanged: hook {HOOK_ID} ({current} and {def_path}; install did not touch them)")
         return True
     staged = _stage_definition(want)
-    print(f"REQUIRED hook: install left the running hook {HOOK_ID} as it is; update it through "
-          f"your hooks tool to the definition in {staged} (printed below): hooks.update if your "
-          f"hooks tool has it, else hooks.remove {HOOK_ID} then hooks.add; check it with "
-          "hooks.dry_run and start it with hooks.enable. Never edit or copy files under "
-          "~/hooks yourself: a hook changed behind the hooks tool stops running. verify "
-          "fails until the hook has run the new script")
+    print(f"REQUIRED hook: {staged} (update hook {HOOK_ID} to it through your hooks tool)")
     print(want, end="")
     return True
 
@@ -653,8 +645,6 @@ def install(args) -> int:
         print("skipped: starting and checking Sparrow (--no-start)")
     else:
         rc = keepalive.ensure_sparrow(read_config(config_path()), not args.no_keepalive)
-    print(f"\nNext: do each REQUIRED step above (the {keepalive.TASK} scheduled task, and the "
-          "hook when install printed a step for it), then run: ag2-sparrow-hatch verify")
     return rc
 
 
