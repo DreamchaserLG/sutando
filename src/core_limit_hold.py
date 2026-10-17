@@ -458,7 +458,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     gate = sub.add_parser("gate", help="decide whether the core may launch now")
     gate.add_argument("--cwd", default="", help="the core's working directory (finds its transcripts)")
-    gate.add_argument("--model-switch", default="", help="the model-switch entry the launcher provides")
+    gate.add_argument("--switch-entry", default="", help="the model-switch entry the launcher provides")
     sub.add_parser("status", help="print the hold record")
     sub.add_parser("clear", help="lift the hold now")
     args = ap.parse_args(argv)
@@ -471,7 +471,7 @@ def main(argv=None) -> int:
         hold = clear(workspace)
         print("hold lifted" if hold and hold.get("status") == "cleared" else "no hold in force")
         return 0
-    handle_owner_actions(workspace, switch_cmd=args.model_switch or None)
+    handle_owner_actions(workspace, switch_cmd=args.switch_entry or None)
     model = qa.seat_model(qa.SeatEnv(True, None, os.environ.get("CLAUDE_CONFIG_DIR")), workspace)
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model)
     if decision.launch:

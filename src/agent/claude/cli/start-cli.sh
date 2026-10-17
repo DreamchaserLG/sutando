@@ -551,7 +551,7 @@ fi
 # provider limit is held until the reset or a backoff; any other death launches as before.
 if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
   _hold_rc=0
-  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --model-switch "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
   if [ "$_hold_rc" = 75 ]; then
     echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
