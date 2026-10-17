@@ -299,7 +299,7 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 
 	let msgs: Msg[] = [];
 	let atLeast = false;
-	const extra: { rooms_read?: number; rooms_unread?: number; unread_rooms?: string[]; partial_rooms?: string[]; rooms_skipped?: number; whose?: InboxWhose; source?: 'inbox' | 'rooms'; owner_error?: string } = {};
+	const extra: { rooms_read?: number; rooms_unread?: number; unread_rooms?: string[]; partial_rooms?: string[]; rooms_skipped?: number; whose?: InboxWhose; source?: 'inbox' | 'rooms' | 'rooms+inbox'; owner_error?: string } = {};
 	/** Every room a scan read, so a room with nothing in the window still counts as a group of 0. */
 	let readRoomNames: string[] = [];
 	const scanned = (got: { read: string[]; unread: string[]; partial: string[] }) => {
@@ -309,48 +309,61 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 		if (got.unread.length) { extra.rooms_unread = got.unread.length; extra.unread_rooms = got.unread; }
 		if (got.partial.length) extra.partial_rooms = got.partial;
 	};
-	const fromInbox = async (owner: boolean): Promise<QueryResult | null> => {
-		const inboxArgs = { since: new Date(start).toISOString(), include_replied: !args.unanswered_only, owner, deadline, ...(room ? { room_ids: [room.room_id] } : {}) };
-		// The owner's inbox refused here (not enabled, revoked) is not an answer: the room scan below is.
+	/** The inbox as messages, leaving out the rooms in `scannedRooms` (read whole already); `replied` is every item it marks answered. */
+	const fromInbox = async (owner: boolean, scannedRooms: ReadonlySet<string> = new Set()): Promise<{ ok: true; replied: Set<string> } | { ok: false; error: string; refused: boolean }> => {
+		// With rooms scanned, answered ones are read too: the scan cannot tell them, and the inbox's mark is what leaves them out.
+		const inboxArgs = { since: new Date(start).toISOString(), include_replied: !args.unanswered_only || scannedRooms.size > 0, owner, deadline, ...(room ? { room_ids: [room.room_id] } : {}) };
 		const got = await fetchInbox(client, inboxArgs, deps);
-		if (!got.ok) {
-			if (owner && !['timeout', 'unavailable', 'bad_response'].includes(got.error)) { extra.owner_error = got.error; return null; }
-			return got;
-		}
-		atLeast = got.more;
-		extra.whose = owner ? 'owner' : 'this agent';
-		extra.source = 'inbox';
+		// The owner's inbox refused here (not enabled, revoked) is not an answer: the room scan is.
+		if (!got.ok) return { ...got, refused: owner && !['timeout', 'unavailable', 'bad_response'].includes(got.error) };
+		if (got.more) atLeast = true;
 		if (got.rooms_skipped) extra.rooms_skipped = got.rooms_skipped;
+		const replied = new Set<string>();
 		for (const raw of got.items) {
 			if (!raw || typeof raw !== 'object') continue;
-			const it = raw as { sender?: { user_id?: unknown } | null; sent_at?: unknown; body?: unknown };
+			const it = raw as { room_id?: unknown; sender?: { user_id?: unknown } | null; sent_at?: unknown; body?: unknown; replied?: unknown };
 			const ts = typeof it.sent_at === 'string' ? Date.parse(it.sent_at) : NaN;
 			const [line] = toInboxItems([raw]);
 			if (!line || !Number.isFinite(ts) || typeof it.body !== 'string') continue;
+			if (it.replied === true) replied.add(line.event_id);
+			if (typeof it.room_id === 'string' && scannedRooms.has(it.room_id)) continue;
+			if (args.unanswered_only && it.replied === true) continue;
 			const name = line.room.startsWith('!') ? names.get(line.room) ?? (line.why === 'dm' ? 'a direct message' : line.room) : line.room;
 			const sender = it.sender && typeof it.sender === 'object' && typeof it.sender.user_id === 'string' ? it.sender.user_id : '';
 			msgs.push({ ts, room: name, from: line.from, fromId: sender, body: it.body, event_id: line.event_id, why: line.why });
 		}
-		return null;
+		return { ok: true, replied };
 	};
-	if (scope === 'to_me' && (ownerInbox || !ids.owner)) {
-		const err = await fromInbox(ownerInbox);
-		if (err) return err;
-	}
-	if (scope === 'to_me' && ids.owner && extra.source !== 'inbox') {
-		// No owner inbox here (or refused): the owner's mentions and replies in every room this agent is in, named or not.
+	if (scope === 'to_me' && !ids.owner) {
+		// No owner known: this agent's own inbox, said as such.
+		const got = await fromInbox(false);
+		if (!got.ok) return { ok: false, error: got.error };
+		extra.whose = 'this agent';
+		extra.source = 'inbox';
+	} else if (scope === 'to_me' && ids.owner) {
+		// The owner's: what mentions or answers them in every room this agent is in, read whole (the server's inbox reads only
+		// each room's latest 50, and a busy room's mentions from this morning were missing, 2026-10-16); the inbox adds their
+		// direct messages and the rooms this agent is not in, where the server offers it.
+		const owner = ids.owner;
 		const rooms = room ? [room] : await listRooms(client, ROOM_INDEX_COLD_TIMEOUT_MS, { unnamed: true }).catch(() => deps.index.rooms());
-		if (!rooms.length) return { ok: false, error: 'unavailable' };
-		const got = await readRooms(client, rooms, start, deadline, deps);
-		if (!got.read.length) return { ok: false, error: 'unavailable' };
+		const got = rooms.length ? await readRooms(client, rooms, start, deadline, deps) : { msgs: [], read: [], unread: [], partial: [] };
+		const readIds = new Set(rooms.filter(r => got.read.includes(r.name)).map(r => r.room_id));
+		const inbox = ownerInbox ? await fromInbox(true, readIds) : null;
+		if (inbox && !inbox.ok && inbox.refused) extra.owner_error = inbox.error;
+		const inboxRead = !!inbox?.ok;
+		if (!got.read.length && !inboxRead) return { ok: false, error: inbox && !inbox.ok && !inbox.refused ? inbox.error : 'unavailable' };
+		const partial = atLeast;
 		scanned(got);
+		atLeast = atLeast || partial;
+		const replied = inbox?.ok ? inbox.replied : new Set<string>();
 		for (const m of got.msgs) {
-			if (m.fromId === ids.owner || m.fromId === ids.self) continue;
-			const why = addressedTo(m, ids.owner);
+			if (m.fromId === owner || m.fromId === ids.self) continue;
+			if (args.unanswered_only && replied.has(m.event_id)) continue;
+			const why = addressedTo(m, owner);
 			if (why) msgs.push({ ...m, why });
 		}
 		extra.whose = 'owner';
-		extra.source = 'rooms';
+		extra.source = inboxRead ? 'rooms+inbox' : 'rooms';
 	} else if (scope === 'all' && word) {
 		const got = await searchSince(client, word, start, deadline, room, names, deps);
 		if (!got.ok) return got;
@@ -400,10 +413,10 @@ export function createQueryMessagesTool(deps: ReadRoomDeps): ToolDefinition {
 		description:
 			'Count and list AG2 Space messages across all your rooms at once, right now (a few seconds) — for questions that name no single room: "what is my latest message", "how many new messages / notifications do I have", "anything new", "anything from Chi today", "how many messages mention the launch this week". ' +
 			'Call it every time such a question is asked, even right after a similar one: counts change, and an earlier answer or earlier search_room results are never the count now. ' +
-			'`scope`: "to_me" (default) — messages for the user: those that @-mention them or reply to them in every room you are in (`source` "rooms"), or the user\'s own inbox where the server offers it, which also has their direct messages (`source` "inbox"); `whose` "owner". Without an owner it reads your own inbox (`whose` "this agent" — say so). "all" — every message in your named rooms, your own left out. ' +
+			'`scope`: "to_me" (default) — messages for the user (`whose` "owner"): those that @-mention them or reply to them, read whole in every room you are in, plus their direct messages and the rooms you are not in from the user\'s own inbox where the server offers it (`source` "rooms+inbox"; the inbox part covers only each room\'s latest 50 messages). Without an owner it reads your own inbox (`whose` "this agent" — say so). "all" — every message in your named rooms, your own left out. ' +
 			'`source` "rooms" covers only rooms you are in: a mention in a room you are not in, or a direct message to the user, is not seen — say so when the user asks whether anyone is looking for them. ' +
 			'`since`: "last_check" (default — new since the last complete check, in this call or the last call where the user asked; the first time, the last day), "hour", "today" (since midnight: "today", "今天"), "day" (the last 24 hours), "week". The server keeps no read/unread marker you can see, so "new" means since the last check — say so if the user asks about unread. ' +
-			'Optional filters: `room` (as listed in ROOMS), `from` (a person\'s name), `contains` (a word), `unanswered_only` (to_me from the inbox only). ' +
+			'Optional filters: `room` (as listed in ROOMS), `from` (a person\'s name), `contains` (a word), `unanswered_only` (to_me: leaves out what the inbox marks answered; a message the inbox does not list is kept). ' +
 			'Most / least / how many: `group_by` "room" (default), "sender", "hour" (of the day) or "day", and `rank` "most" (default) or "least" — "who messaged me most" is group_by "sender"; "the quietest room" is group_by "room", rank "least" (rooms with no messages count as 0 there); "the busiest hour" is group_by "hour". ' +
 			'Returns {ok:true, scope, since, count, complete, at_least, group_by, rank, groups:[{key, count}] (at most ' + QUERY_MAX_GROUPS + ', ranked), groups_total, distinct_rooms, distinct_senders, latest:[{at, room, from, text, event_id, why}] newest first, oldest (the earliest message in the window), rooms_read, rooms_unread, unread_rooms, partial_rooms, rooms_skipped, whose, source} — answer in a sentence or two. ' +
 			'Answer only from these fields: the earliest message is `oldest`, how many people or rooms is distinct_senders / distinct_rooms, most or least is `groups` with the matching group_by and rank — call again with them rather than working it out from `latest` or from groups ranked the other way. Something none of these fields gives cannot be answered: say so, never estimate it. ' +
@@ -415,7 +428,7 @@ export function createQueryMessagesTool(deps: ReadRoomDeps): ToolDefinition {
 			room: z.string().optional().describe('Only this room, e.g. "Sutando Triage". Omit for all rooms.'),
 			from: z.string().max(80).optional().describe('Only messages from this person, by name, e.g. "Chi".'),
 			contains: z.string().max(200).optional().describe('Only messages containing this word or phrase.'),
-			unanswered_only: z.boolean().optional().describe('to_me only: leave out what was already answered.'),
+			unanswered_only: z.boolean().optional().describe('to_me only: leave out what the inbox marks answered.'),
 			latest: z.number().int().min(1).max(QUERY_MAX_LATEST).optional().describe(`How many of the newest to return (default ${QUERY_DEFAULT_LATEST}).`),
 			group_by: z.enum(['room', 'sender', 'hour', 'day']).optional().describe('What `groups` counts by (default "room").'),
 			rank: z.enum(['most', 'least']).optional().describe('"most" (default) or "least" first in `groups`.'),

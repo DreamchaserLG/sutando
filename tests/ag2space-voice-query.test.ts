@@ -230,10 +230,10 @@ describe('"new" is never consumed by a filtered or partial read', () => {
 
 describe('to_me is the owner\'s where the server offers it', () => {
 	it('reads with scope "owner" and says whose', async () => {
-		const f = fake(() => ok({ result: { mentions: [item(1)], next_cursor: null, has_more: false, rooms_skipped: 0 } }), ROOMS, { ownerId: OWNER, ownerScope: true });
+		const f = fake(() => ok({ result: { mentions: [item(1, { room_id: '!dm:ag2.space', room_name: null, reason: 'dm' })], messages: [], next_cursor: null, has_more: false, rooms_skipped: 0 } }), ROOMS, { ownerId: OWNER, ownerScope: true });
 		const r = await queryMessages({}, f.deps, () => NOW);
-		assert.equal(args(f.calls[0]).scope, 'owner');
-		assert.ok(r.ok && r.whose === 'owner');
+		assert.equal(args(f.calls.find(c => (c.args as { action?: string }).action === 'mentions.inbox')!).scope, 'owner');
+		assert.ok(r.ok && r.whose === 'owner' && r.count === 1);
 	});
 
 	it('a word is matched in the whole message, not the cut shown', async () => {
@@ -278,20 +278,53 @@ describe('to_me without the owner\'s inbox: what mentions or answers the owner i
 		}
 	});
 
-	it('the owner\'s inbox where the server offers it, not a scan', async () => {
-		const f = fake(() => ok({ result: { mentions: [item(1)], next_cursor: null, has_more: false, rooms_skipped: 0 } }), ROOMS3, { ownerId: OWNER, ownerScope: true });
-		const r = await queryMessages({}, f.deps, () => NOW);
-		assert.ok(r.ok && r.whose === 'owner' && r.source === 'inbox');
-		assert.ok(!f.calls.some(c => c.name === 'room.list'));
+	it('with the owner\'s inbox too: rooms it is in are read whole, the inbox adds direct messages and other rooms, nothing twice', async () => {
+		// 2026-10-16: the server's inbox reads each room's latest 50 only, and four mentions in Sutando Triage from that morning were missing.
+		const inbox = [
+			item(1, { room_id: '!a:ag2.space', room_name: 'Alpha', event_id: '$m1' }),        // also in the scan: counted once
+			item(2, { room_id: '!dm:ag2.space', room_name: null, reason: 'dm', event_id: '$dm' }),
+			item(3, { room_id: '!x:ag2.space', room_name: 'Elsewhere', event_id: '$x' }),    // a room this agent is not in
+		];
+		const scan = rooms({ '!a:ag2.space': [m(1, '@chi:ag2.space', { mentions: [OWNER] }), m(7, '@qy:ag2.space', { mentions: [OWNER] }, 600)] });
+		const f = fake((n, a) => (a.action === 'mentions.inbox' ? ok({ result: { mentions: inbox, next_cursor: null, has_more: false, rooms_skipped: 0 } }) : scan(n, a)), ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok);
+		if (r.ok) {
+			assert.equal(r.source, 'rooms+inbox');
+			assert.equal(r.whose, 'owner');
+			assert.deepEqual(r.latest.map(x => x.event_id).sort(), ['$dm', '$m1', '$m7', '$x']);
+			assert.equal(r.count, 4);
+		}
+	});
+
+	it('unanswered_only leaves out what the inbox marks answered, in scanned rooms too; one it does not list stays', async () => {
+		const inbox = [item(1, { room_id: '!a:ag2.space', event_id: '$m1', replied: true })];
+		const scan = rooms({ '!a:ag2.space': [m(1, '@chi:ag2.space', { mentions: [OWNER] }), m(2, '@bob:ag2.space', { mentions: [OWNER] })] });
+		const f = fake((n, a) => (a.action === 'mentions.inbox' ? ok({ result: { mentions: inbox, next_cursor: null, has_more: false, rooms_skipped: 0 } }) : scan(n, a)), ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const r = await queryMessages({ since: 'day', unanswered_only: true }, f.deps, () => NOW);
+		assert.ok(r.ok);
+		if (r.ok) assert.deepEqual(r.latest.map(x => x.event_id), ['$m2']);
+		assert.equal(args(f.calls.find(c => (c.args as { action?: string }).action === 'mentions.inbox')!).include_replied, true, 'the answered ones are read, to know them');
+	});
+
+	it('an inbox that does not answer leaves the scan, said as rooms only; rooms that cannot be read leave the inbox', async () => {
+		const scan = rooms({ '!a:ag2.space': [m(1, '@chi:ag2.space', { mentions: [OWNER] })] });
+		const f = fake((n, a) => (a.action === 'mentions.inbox' ? new Error('tools/call timed out after 15000ms') : scan(n, a)), ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok && r.source === 'rooms' && r.count === 1);
+		const g = fake((_n, a) => (a.action === 'mentions.inbox' ? ok({ result: { mentions: [item(2, { room_id: '!a:ag2.space', event_id: '$i' })], next_cursor: null, has_more: false, rooms_skipped: 0 } }) : err('FORBIDDEN')), ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const t = await queryMessages({ since: 'day' }, g.deps, () => NOW);
+		assert.ok(t.ok && t.count === 1 && !t.complete && t.rooms_unread === 3, 'the inbox fills in for rooms not read, and it is partial');
 	});
 
 	it('what the owner\'s own agents sent is left out of "to me"; people and unknown senders stay', async () => {
 		const MADDY = '@susan-maddy.agent:ag2.space';
-		const items = [item(1), item(2, { sender: { user_id: MADDY, display_name: 'Maddy' } }), item(3, { sender: { user_id: '@dot.agent:ag2.space', display_name: 'Dot' } }), item(4, { sender: { user_id: '@lost:ag2.space', display_name: 'Lost' } })];
+		const elsewhere = { room_id: '!x:ag2.space', room_name: 'Elsewhere' };
+		const items = [item(1, elsewhere), item(2, { ...elsewhere, sender: { user_id: MADDY, display_name: 'Maddy' } }), item(3, { ...elsewhere, sender: { user_id: '@dot.agent:ag2.space', display_name: 'Dot' } }), item(4, { ...elsewhere, sender: { user_id: '@lost:ag2.space', display_name: 'Lost' } })];
 		const profiles: Record<string, unknown> = { '@chi:ag2.space': ok({ result: { owner: null, kind: 'human' } }), [MADDY]: ok({ result: { owner: OWNER, kind: 'agent' } }), '@dot.agent:ag2.space': ok({ result: { owner: '@someone-else:ag2.space', kind: 'agent' } }), '@lost:ag2.space': err('UPSTREAM_UNAVAILABLE') };
 		const handler = (_n: string, a: Record<string, unknown>) => a.action === 'space.user.profile.read'
 			? profiles[(a.arguments as { user_id: string }).user_id]
-			: ok({ result: { mentions: items, next_cursor: null, has_more: false, rooms_skipped: 0 } });
+			: ok({ result: { mentions: items, messages: [], next_cursor: null, has_more: false, rooms_skipped: 0 } });
 		const f = fake(handler, ROOMS3, { ownerId: OWNER, ownerScope: true });
 		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
 		assert.ok(r.ok);
