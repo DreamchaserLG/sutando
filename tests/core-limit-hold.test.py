@@ -377,6 +377,12 @@ class EdgePaths(unittest.TestCase):
         self.assertFalse(d.launch)
         self.assertIsNone(clh.clear(self.ws / "nowhere"))
 
+    def test_unqueued_notice_does_not_stop_the_hold(self):
+        (self.ws / "results").write_text("a file where the directory should be")
+        d = clh.decide(self.ws, 1_800_000_000.0, quota=limited_record(1_800_000_000.0))
+        self.assertFalse(d.launch)
+        self.assertIsNone(d.hold["notice"])
+
     def test_cli_status_clear_gate(self):
         import contextlib
         import io
