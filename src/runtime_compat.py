@@ -507,11 +507,11 @@ def _failed(reason: str, detail: str, n: int, root: Path, retry: str) -> RepairR
 def auth_status(runtime: str, binary: str, *, env: Optional[dict] = None, run: Runner = _run,
                 claude_config_dir: Optional[str] = None,
                 keychain_check: Optional[Callable[[], bool]] = None) -> dict:
-    """{state: ok|logged-out|unknown, remedy}. Claude's verdict is auth_preflight's."""
+    """{login: ok|logged-out|unknown, remedy}. Claude's verdict is auth_preflight's."""
     env = dict(os.environ if env is None else env)
     if runtime == "claude":
         if not claude_config_dir:
-            return {"state": "unknown", "remedy": "", "detail": "no config dir to check"}
+            return {"login": "unknown", "remedy": "", "detail": "no config dir to check"}
         here = str(Path(__file__).resolve().parent)
         if here not in sys.path:
             sys.path.insert(0, here)
@@ -521,17 +521,17 @@ def auth_status(runtime: str, binary: str, *, env: Optional[dict] = None, run: R
             kwargs["keychain_check"] = keychain_check
         r = auth_preflight.check_auth_state(claude_config_dir, **kwargs)
         if r["verdict"] == "ok":
-            return {"state": "ok", "remedy": "", "detail": "logged in"}
-        return {"state": "logged-out", "remedy": r["remedy"], "detail": "; ".join(r["reasons"])}
+            return {"login": "ok", "remedy": "", "detail": "logged in"}
+        return {"login": "logged-out", "remedy": r["remedy"], "detail": "; ".join(r["reasons"])}
     home = env.get("CODEX_HOME")
     login = (f"CODEX_HOME={shlex.quote(home)} " if home else "") + f"{shlex.quote(binary)} login"
     try:
         r = run([binary, "login", "status"], env=env)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        return {"state": "unknown", "remedy": login, "detail": f"login status failed: {exc}"}
+        return {"login": "unknown", "remedy": login, "detail": f"login status failed: {exc}"}
     if r.returncode == 0:
-        return {"state": "ok", "remedy": "", "detail": "logged in"}
-    return {"state": "logged-out", "remedy": f"run: {login}",
+        return {"login": "ok", "remedy": "", "detail": "logged in"}
+    return {"login": "logged-out", "remedy": f"run: {login}",
             "detail": f"Codex CLI is not authenticated for {home or 'the default Codex home'}"}
 
 
@@ -593,7 +593,7 @@ def ensure(runtime: str, *, env: Optional[dict] = None, wait_s: float = 0.0,
         say(plan(report).reason)
     say(f"using {sel.path} ({sel.version})")
     auth = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
-    if auth["state"] == "logged-out":
+    if auth["login"] == "logged-out":
         say(f"{spec.binary} is not logged in: {auth['detail']}")
         say(f"fix: {auth['remedy']}")
         holder = {"auth": auth}
@@ -601,9 +601,9 @@ def ensure(runtime: str, *, env: Optional[dict] = None, wait_s: float = 0.0,
         def recheck() -> dict:
             holder["auth"] = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
             return holder["auth"]
-        _wait(auth, wait_s, recheck, lambda a: a["state"] != "logged-out", say, sleep, now,
+        _wait(auth, wait_s, recheck, lambda a: a["login"] != "logged-out", say, sleep, now,
               f"waiting up to {int(wait_s)}s for the login; the launch continues on its own.")
-        if holder["auth"]["state"] == "logged-out" and enforce_auth:
+        if holder["auth"]["login"] == "logged-out" and enforce_auth:
             say(f"{spec.binary} is not authenticated; the core was not started.{again}")
             return EXIT_LOGIN, None
     return EXIT_OK, sel.path
@@ -635,7 +635,7 @@ def _doctor_lines(report: Report, auth: Optional[dict]) -> List[str]:
     lines.append(f"  fix: {step.command}")
     if step.assisted:
         lines.append(f"  assisted fix (asks first): {step.assisted}")
-    if auth and auth["state"] == "logged-out":
+    if auth and auth["login"] == "logged-out":
         lines.append(f"  login: {auth['remedy']}")
     return lines
 

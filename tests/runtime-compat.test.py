@@ -456,30 +456,30 @@ class Auth(Base):
         p = fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, login_rc=1, label="")
         self.env["CODEX_HOME"] = str(self.home / "codex home")
         a = rc.auth_status("codex", p, env=self.env)
-        self.assertEqual(a["state"], "logged-out")
+        self.assertEqual(a["login"], "logged-out")
         self.assertIn("login", a["remedy"])
         self.assertIn("'", a["remedy"])
 
     def test_codex_logged_in_and_unknown(self):
         p = fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="")
-        self.assertEqual(rc.auth_status("codex", p, env=self.env)["state"], "ok")
+        self.assertEqual(rc.auth_status("codex", p, env=self.env)["login"], "ok")
 
         def run(argv, **_kw):
             raise OSError("x")
-        self.assertEqual(rc.auth_status("codex", p, env=self.env, run=run)["state"], "unknown")
+        self.assertEqual(rc.auth_status("codex", p, env=self.env, run=run)["login"], "unknown")
 
     def test_claude_auth_uses_auth_preflight(self):
         cfg = self.tmp / "cfg"
         cfg.mkdir()
         a = rc.auth_status("claude", "claude", env=self.env, claude_config_dir=str(cfg),
                            keychain_check=lambda: False)
-        self.assertEqual(a["state"], "logged-out")
+        self.assertEqual(a["login"], "logged-out")
         self.assertIn("/login", a["remedy"])
         (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"x": 1}}))
         (cfg / ".credentials.json").write_text("{}")
         self.assertEqual(rc.auth_status("claude", "claude", env=self.env,
-                                        claude_config_dir=str(cfg))["state"], "ok")
-        self.assertEqual(rc.auth_status("claude", "claude", env=self.env)["state"], "unknown")
+                                        claude_config_dir=str(cfg))["login"], "ok")
+        self.assertEqual(rc.auth_status("claude", "claude", env=self.env)["login"], "unknown")
 
 
 class Ensure(Base):
@@ -489,7 +489,7 @@ class Ensure(Base):
 
     def ensure(self, reports, auths=None, **kw):
         reports = list(reports)
-        auths = list(auths or [{"state": "ok"}])
+        auths = list(auths or [{"login": "ok"}])
         clock = [0.0]
 
         def sleep(s):
@@ -544,18 +544,18 @@ class Ensure(Base):
         self.assertEqual(self.ensure([self.report(status=rc.NEWER_UNTESTED)])[0], 0)
 
     def test_logged_out_enforced_stops(self):
-        out = {"state": "logged-out", "remedy": "run: codex login", "detail": "not authenticated"}
+        out = {"login": "logged-out", "remedy": "run: codex login", "detail": "not authenticated"}
         code, _ = self.ensure([self.report()], [out], enforce_auth=True)
         self.assertEqual(code, rc.EXIT_LOGIN)
         self.assertTrue(any("not authenticated" in m for m in self.said))
 
     def test_logged_out_advisory_continues(self):
-        out = {"state": "logged-out", "remedy": "/login", "detail": "x"}
+        out = {"login": "logged-out", "remedy": "/login", "detail": "x"}
         self.assertEqual(self.ensure([self.report()], [out])[0], 0)
 
     def test_auth_recovery_waits_for_login_then_continues(self):
-        out = {"state": "logged-out", "remedy": "run: codex login", "detail": "x"}
-        code, _ = self.ensure([self.report()], [out, out, {"state": "ok"}], enforce_auth=True,
+        out = {"login": "logged-out", "remedy": "run: codex login", "detail": "x"}
+        code, _ = self.ensure([self.report()], [out, out, {"login": "ok"}], enforce_auth=True,
                               wait_s=60)
         self.assertEqual(code, 0)
 
