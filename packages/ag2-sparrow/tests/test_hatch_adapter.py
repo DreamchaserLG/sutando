@@ -24,7 +24,7 @@ from unittest import mock
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import outbox  # noqa: E402
+from ag2_sparrow import health_command as hc, outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 REAL_SYSTEMD_RUN = hatch_cli._systemd_run
@@ -1342,22 +1342,18 @@ class Service(Base):
 
 
 class Keepalive(Base):
-    """The watchdog and probe install schedules as Hatch tasks, and the commands they run."""
+    """The one keepawake task install schedules, the command it runs, and Sparrow's health row."""
     cli, state, sparrow_status = Cli.cli, Cli.state, Cli.sparrow_status
-    LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ listener=(up|down) watchdog=(up|down) "
-                      r"listener_restarts=\d+( watchdog_restarted| watchdog_task_present)?$")
+    LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ keepawake listener=(up|down) "
+                      r"restarted=[01]$")
 
     @property
     def crons(self):
         return self.home / "workspace" / "cron.d" / "minutely"
 
     @property
-    def watchdog_task(self):
-        return self.crons / "sparrow-watchdog__interval@5m.md"
-
-    @property
-    def probe_task(self):
-        return self.crons / "keepalive-probe__interval@15m.md"
+    def task(self):
+        return self.crons / "sparrow-keepawake__interval@15m.md"
 
     @property
     def log(self):
@@ -1374,135 +1370,101 @@ class Keepalive(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         return r
 
-    def set_watchdog_seen(self, ts):
-        path = self.state / "hatch-keepalive.json"
-        state = json.loads(path.read_text()) if path.exists() else {}
-        state.update(installed_at=ts, last_run=ts)
-        path.write_text(json.dumps(state))
+    def keepawake_at(self, ts, listener="up"):
+        with self.log.open("a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts))} keepawake "
+                     f"listener={listener} restarted=0\n")
 
-    def test_install_schedules_both_tasks_running_the_installed_command(self):
+    def health(self):
+        r = self.cli("keepalive", "health")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_install_schedules_one_task_under_a_hard_timeout(self):
         r = self.installed()
-        for task, sub in ((self.watchdog_task, "watchdog"), (self.probe_task, "probe")):
-            text = task.read_text()
-            self.assertTrue(text.startswith(keepalive.TASK_MARKER))
-            self.assertIn(f"{self.reply_stub} keepalive {sub}\n", text)
-        self.assertIn("keepalive: sparrow-watchdog, keepalive-probe scheduled", r.stdout)
+        self.assertEqual([p.name for p in self.crons.iterdir()], [self.task.name])
+        text = self.task.read_text()
+        self.assertTrue(text.startswith(keepalive.TASK_MARKER))
+        self.assertIn(f"\ntimeout {keepalive.RUN_TIMEOUT_S} {self.reply_stub} keepalive "
+                      "keepawake\n", text)
+        self.assertIn("keepalive: sparrow-keepawake scheduled every 15 minutes", r.stdout)
         self.assertIn("KEEPALIVE_LOG=''", (self.home / ".config" / "ag2-sparrow-hatch" /
                                             "config").read_text())
+        self.assertIn(f"unchanged: {self.task}", self.installed().stdout)
 
-    def test_reinstall_does_not_duplicate_and_replaces_its_own_other_interval(self):
-        self.installed()
-        stale = self.crons / "keepalive-probe__interval@30m.md"
-        stale.write_text(keepalive.TASK_MARKER + "\nold\n")
-        r = self.installed()
-        self.assertIn(f"unchanged: {self.watchdog_task}", r.stdout)
-        self.assertIn(f"replaced: {stale}", r.stdout)
-        self.assertEqual(sorted(p.name for p in self.crons.iterdir()),
-                         [self.probe_task.name, self.watchdog_task.name])
-
-    def test_a_hand_made_task_of_the_same_name_is_reported_and_kept_unless_forced(self):
+    def test_install_removes_the_tasks_an_earlier_install_wrote(self):
         self.crons.mkdir(parents=True)
-        hand = self.crons / "keepalive-probe__interval@15m.md"
-        hand.write_text("Append the UTC time to ~/keepalive-probe.log\n")
+        old = [self.crons / "sparrow-watchdog__interval@5m.md",
+               self.crons / "keepalive-probe__interval@15m.md",
+               self.crons / "sparrow-keepawake__interval@30m.md"]
+        for p in old:
+            p.write_text(keepalive.TASK_MARKER + "\nold\n")
         r = self.installed()
-        self.assertIn(f"NOTE keepalive: {hand} was not written by install", r.stdout)
-        self.assertEqual(hand.read_text(), "Append the UTC time to ~/keepalive-probe.log\n")
-        self.assertTrue(self.watchdog_task.exists())
+        for p in old[:2]:
+            self.assertIn(f"removed: {p} (replaced by sparrow-keepawake)", r.stdout)
+        self.assertIn(f"replaced: {old[2]}", r.stdout)
+        self.assertEqual([p.name for p in self.crons.iterdir()], [self.task.name])
+
+    def test_hand_made_tasks_are_kept_unless_forced(self):
+        self.crons.mkdir(parents=True)
+        probe = self.crons / "keepalive-probe__interval@15m.md"
+        probe.write_text("Append the UTC time to ~/keepalive-probe.log\n")
+        mine = self.crons / "sparrow-keepawake.md"
+        mine.write_text("my own keepawake\n")
+        r = self.installed()
+        self.assertIn(f"NOTE keepalive: {probe} was not written by install, so it was kept",
+                      r.stdout)
+        self.assertIn(f"NOTE keepalive: {mine} was not written by install", r.stdout)
+        self.assertEqual(sorted(p.name for p in self.crons.iterdir()),
+                         sorted([probe.name, mine.name]))
+        self.assertEqual(probe.read_text(), "Append the UTC time to ~/keepalive-probe.log\n")
         r = self.installed("--force")
-        self.assertIn(f"replaced: {hand} (hand-made)", r.stdout)
-        self.assertTrue(hand.read_text().startswith(keepalive.TASK_MARKER))
+        self.assertIn(f"removed: {probe} (replaced by sparrow-keepawake) (hand-made)", r.stdout)
+        self.assertIn(f"replaced: {mine} (hand-made)", r.stdout)
+        self.assertEqual([p.name for p in self.crons.iterdir()], [self.task.name])
 
     def test_no_keepalive_and_uninstall(self):
         r = self.installed("--no-keepalive")
-        self.assertIn("skipped: the keepalive watchdog and probe (--no-keepalive)", r.stdout)
+        self.assertIn("skipped: the keepalive task (--no-keepalive)", r.stdout)
         self.assertFalse(self.crons.exists())
         self.installed()
-        self.log.write_text("2026-10-15T00:00:00Z\n")
+        self.keepawake_at(time.time())
         (self.crons / "other__interval@5m.md").write_text("not ours\n")
+        (self.crons / "keepalive-probe__interval@15m.md").write_text(keepalive.TASK_MARKER)
+        self.state.mkdir(exist_ok=True)
+        (self.state / "hatch-keepalive.json").write_text("{}")
         r = self.cli("uninstall", "--keepalive")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([p.name for p in self.crons.iterdir()], ["other__interval@5m.md"])
         self.assertTrue(self.log.exists())
         self.assertFalse((self.state / "hatch-keepalive.json").exists())
-        self.assertFalse((self.state / "hatch-keepalive-probe.json").exists())
+        self.assertIsNone(self.health(), "no task installed: no row")
 
     def test_a_custom_log_and_cron_dir_are_recorded(self):
-        crons, log = self.home / "c", self.home / "logs" / "probe.log"
+        crons, log = self.home / "c", self.home / "logs" / "k.log"
         self.installed("--cron-dir", str(crons), "--keepalive-log", str(log))
-        self.assertTrue((crons / self.watchdog_task.name).exists())
-        r = self.cli("keepalive", "probe")
-        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((crons / self.task.name).exists())
+        r = self.cli("keepalive", "keepawake")
+        self.assertEqual(r.returncode, 1, "the stub Sparrow is not on PATH")
         self.assertRegex(log.read_text().strip(), self.LINE)
 
-    def test_probe_line_format_and_status_appends_nothing(self):
-        self.installed()
-        self.sparrow_status()
-        r = self.cli("keepalive", "status")
-        self.assertRegex(r.stdout.strip(), self.LINE)
-        self.assertIn(" listener=up watchdog=up listener_restarts=0", r.stdout)
-        self.assertFalse(self.log.exists())
-        r = self.cli("keepalive", "probe")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        lines = self.log.read_text().splitlines()
-        self.assertEqual(len(lines), 1)
-        self.assertRegex(lines[0], self.LINE)
-        self.assertTrue(lines[0].endswith("listener=up watchdog=up listener_restarts=0"))
-
-    def test_probe_never_restarts_the_listener(self):
-        self.installed()
-        with mock.patch.object(keepalive, "restart_listener") as restart, \
-                mock.patch.object(keepalive.subprocess, "Popen") as popen:
-            r = self.cli("keepalive", "probe")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        restart.assert_not_called()
-        popen.assert_not_called()
-        self.assertIn(" listener=down ", self.log.read_text())
-
-    def test_probe_restarts_a_dead_watchdog_and_marks_the_line(self):
-        self.installed()
-        self.sparrow_status()
-        self.watchdog_task.unlink()
-        self.set_watchdog_seen(time.time() - keepalive.WATCHDOG_STALE_S - 5)
-        r = self.cli("keepalive", "probe")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        line = self.log.read_text().splitlines()[-1]
-        self.assertRegex(line, self.LINE)
-        self.assertIn(" watchdog=down ", line)
-        self.assertTrue(line.endswith(" watchdog_restarted"))
-        self.assertTrue(self.watchdog_task.read_text().startswith(keepalive.TASK_MARKER))
-        self.set_watchdog_seen(time.time())
-        self.cli("keepalive", "probe")
-        line = self.log.read_text().splitlines()[-1]
-        self.assertIn(" watchdog=up ", line)
-        self.assertNotIn("watchdog_restarted", line)
-
-    def test_probe_with_the_watchdog_task_still_present_reports_that_honestly(self):
-        """The likeliest real failure is the scheduler stopping on an intact task file,
-        not the file vanishing. _install_task returns True there too (cli.py's old == text
-        branch only chmods), so the probe must not call that a restart it didn't do."""
-        self.installed()
-        self.sparrow_status()
-        before = self.watchdog_task.stat().st_mtime
-        self.set_watchdog_seen(time.time() - keepalive.WATCHDOG_STALE_S - 5)
-        r = self.cli("keepalive", "probe")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        line = self.log.read_text().splitlines()[-1]
-        self.assertRegex(line, self.LINE)
-        self.assertIn(" watchdog=down ", line)
-        self.assertTrue(line.endswith(" watchdog_task_present"))
-        self.assertNotIn("watchdog_restarted", line)
-        self.assertEqual(self.watchdog_task.stat().st_mtime, before, "nothing was rewritten")
-
-    def test_watchdog_leaves_a_running_listener_alone(self):
+    def test_keepawake_leaves_a_running_listener_alone_and_status_writes_nothing(self):
         self.installed()
         self.sparrow_status(connected=False, error="401")
+        r = self.cli("keepalive", "status")
+        self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=none$")
+        self.assertFalse(self.log.exists())
         with mock.patch.object(keepalive, "restart_listener") as restart:
-            r = self.cli("keepalive", "watchdog")
+            r = self.cli("keepalive", "keepawake")
         self.assertEqual(r.returncode, 0, r.stderr)
         restart.assert_not_called()
-        self.assertIn("listener up", r.stdout)
+        (line,) = self.log.read_text().splitlines()
+        self.assertRegex(line, self.LINE)
+        self.assertTrue(line.endswith(" keepawake listener=up restarted=0"))
+        self.assertRegex(self.cli("keepalive", "status").stdout.strip(),
+                         r"Z listener=up last_keepawake=\S+Z health=healthy$")
 
-    def test_watchdog_restarts_through_the_installed_service(self):
+    def test_keepawake_restarts_through_the_installed_service(self):
         self.installed()
         fake = FakeSystemd(state="failed")
         path = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
@@ -1510,70 +1472,196 @@ class Keepalive(Base):
         path.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\n")
         with mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
                 mock.patch.object(hatch_cli.shutil, "which", return_value="/usr/bin/systemctl"):
-            r = self.cli("keepalive", "watchdog")
+            r = self.cli("keepalive", "keepawake")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(fake.ran("reset-failed"), [["--user", "reset-failed", "ag2-sparrow.service"]])
         self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+        self.assertTrue(self.log.read_text().strip().endswith("listener=down restarted=1"))
 
-    def test_watchdog_restarts_a_detached_sparrow_and_the_probe_counts_it_once(self):
+    def test_keepawake_starts_a_detached_sparrow_that_reports_health(self):
         self.installed()
         marker = self.home / "sparrow-env"
         executable(self.bin / hatch_cli.SPARROW_COMMAND,
-                   f'#!/bin/sh\necho "$AGENT_CONNECT_TASK_DIR" > {marker}\nsleep 2\n')
+                   f'#!/bin/sh\necho "$AGENT_CONNECT_TASK_DIR|$REMOTE_HEALTH_COMMAND" > {marker}\n'
+                   "sleep 2\n")
         with mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3):
-            r = self.cli("keepalive", "watchdog")
+            r = self.cli("keepalive", "keepawake")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("listener was down; restarted: started", r.stdout)
         deadline = time.monotonic() + 5
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertEqual(marker.read_text().strip(), str(self.tasks.resolve()))
-        self.sparrow_status()
-        self.cli("keepalive", "probe")
-        self.assertTrue(self.log.read_text().strip().endswith("listener_restarts=1"))
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.call(keepalive.probe, self.log, now=time.time() + 60)
-        self.assertTrue(self.log.read_text().splitlines()[-1].endswith("listener_restarts=0"))
+        self.assertEqual(marker.read_text().strip(),
+                         f"{self.tasks.resolve()}|{self.reply_stub} keepalive health")
+        self.assertTrue(self.log.read_text().strip().endswith("listener=down restarted=1"))
 
-    def test_a_sparrow_that_exits_at_once_is_not_counted(self):
+    def test_a_sparrow_that_exits_at_once_is_not_a_restart(self):
         self.installed()
         executable(self.bin / hatch_cli.SPARROW_COMMAND, "#!/bin/sh\nexit 75\n")
-        r = self.cli("keepalive", "watchdog")
+        r = self.cli("keepalive", "keepawake")
         self.assertEqual(r.returncode, 1)
         self.assertIn("exited 75 at once (another Sparrow holds the lock)", r.stderr)
-        self.assertNotIn("restart_total",
-                         json.loads((self.state / "hatch-keepalive.json").read_text()))
+        self.assertTrue(self.log.read_text().strip().endswith("listener=down restarted=0"))
 
-    def test_report_lists_gaps_and_restarts(self):
+    def test_health_row_fresh_stale_and_absent(self):
+        self.installed()
+        self.assertIsNone(self.health(), "no keepawake line yet: no row")
+        self.log.write_text("2026-10-14T07:30:00Z listener=up watchdog=up listener_restarts=0\n")
+        self.assertIsNone(self.health(), "a probe line is not a keepawake run")
+        now = time.time()
+        self.keepawake_at(now - keepalive.STALE_S + 60)
+        row = self.health()
+        self.assertEqual(row, {"alive": True, "motion": "unknown", "condition": "healthy",
+                               "reason": None, "since": None})
+        self.assertEqual(hc.validate(row), (row, None))
+        self.log.write_text("")
+        self.keepawake_at(now - keepalive.STALE_S - 60)
+        row = self.health()
+        self.assertEqual((row["alive"], row["condition"], row["reason"]),
+                         (None, "abnormal", "keepawake-not-running"))
+        self.assertEqual(hc.validate(row), (row, None))
+        activity = self.home / ".muse" / "last_active"
+        activity.touch()
+        self.assertEqual((self.health()["alive"], self.health()["condition"]),
+                         (True, "abnormal"), "the hook woke it; the scheduler still did not")
+        self.assertRegex(self.cli("keepalive", "status").stdout,
+                         r" health=abnormal \(keepawake-not-running\)$")
+
+    def test_the_service_unit_carries_the_health_command(self):
+        self.installed()
+        fake = FakeSystemd()
+        executable(self.bin / hatch_cli.SPARROW_COMMAND, "#!/bin/sh\nexit 0\n")
+        real_which = shutil.which
+        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=fake), \
+                mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda name, *a, **k:
+                                  "/usr/bin/systemctl" if name == "systemctl"
+                                  else real_which(name, *a, **k)):
+            r = self.cli("install", "--mxid", AGENT)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            unit = (self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME).read_text()
+            self.assertIn(f'\nEnvironment="REMOTE_HEALTH_COMMAND={self.reply_stub} keepalive '
+                          'health"\n', unit)
+            self.assertIn(f"\nEnvironment=AGENT_CONNECT_TASK_DIR={self.tasks.resolve()}\n", unit)
+            self.cli("install", "--mxid", AGENT, "--no-keepalive")
+            unit = (self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME).read_text()
+            self.assertNotIn("REMOTE_HEALTH_COMMAND", unit)
+
+    def test_report_reads_old_and_new_lines(self):
         self.log.write_text(
             "2026-10-14T07:30:00Z\n"
             "2026-10-14T07:45:00Z\n"
             "2026-10-14T09:09:30Z listener=down watchdog=up listener_restarts=0\n"
             "not a line\n"
-            "2026-10-14T09:24:30Z listener=up watchdog=up listener_restarts=1\n"
-            "2026-10-14T09:39:30Z listener=up watchdog=down listener_restarts=0 "
+            "2026-10-14T09:24:30Z listener=up watchdog=down listener_restarts=1 "
             "watchdog_restarted\n"
-            "2026-10-14T09:55:00Z listener=up watchdog=up listener_restarts=2\n")
+            "2026-10-14T09:39:30Z keepawake listener=down restarted=1\n"
+            "2026-10-14T09:54:30Z keepawake listener=up restarted=0\n")
         r = self.cli("keepalive", "report")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.splitlines(), [
-            f"{self.log}: 6 probe lines, 2026-10-14T07:30:00Z to 2026-10-14T09:55:00Z "
+            f"{self.log}: 6 lines, 2026-10-14T07:30:00Z to 2026-10-14T09:54:30Z "
             "(1 unreadable lines skipped)",
             "gaps over 16 min: 1 (the scheduler or the VM did not run)",
             "  2026-10-14T07:45:00Z -> 2026-10-14T09:09:30Z  84 min",
-            "listener down at a probe: 1",
-            "listener restarts by the watchdog: 3",
-            "watchdog down at a probe: 1; restarted by the probe: 1",
+            "listener down at a run: 2",
+            "listener restarts: 2",
+            "earlier probe lines: 2; watchdog down at one: 1; restarted by the probe: 1",
         ])
         self.assertIn("gaps over 90 min: 0\n", self.cli("keepalive", "report", "--gap-minutes",
                                                         "90").stdout)
         self.assertEqual(self.cli("keepalive", "report", "--log",
                                   str(self.home / "missing.log")).returncode, 1)
 
-    def test_verify_notes_the_keepalive_line(self):
+    def test_verify_notes_the_keepalive_state(self):
         self.installed()
         r = self.cli("verify")
-        self.assertRegex(r.stdout, r"NOTE keepalive: \S+Z listener=down watchdog=up ")
+        self.assertRegex(r.stdout, r"NOTE keepalive: \S+Z listener=down last_keepawake=never "
+                         r"health=none \(sparrow-keepawake has not run in the last 30 minutes, or not yet")
+
+
+HEARTBEAT = """
+import json
+from unittest import mock
+from ag2_sparrow import remote_gateway_bridge as m
+with mock.patch.object(m, "_req") as req:
+    sent = m._post_heartbeat(set(), force=True)
+print(json.dumps(req.call_args.args[2] if sent else None))
+"""
+
+
+class HealthCommand(Base):
+    """Sparrow's runner for an injected health command, and the Hatch row riding the heartbeat."""
+
+    def stub(self, out, code=0):
+        path = self.bin / "health-stub"
+        executable(path, f"#!/bin/sh\ncat <<'EOF'\n{out}\nEOF\nexit {code}\n")
+        return str(path)
+
+    def test_the_runner_passes_a_valid_row_and_drops_anything_else(self):
+        row = {"alive": True, "motion": "idle", "condition": "healthy", "reason": None,
+               "since": None}
+        self.assertEqual(hc.run(self.stub(json.dumps({**row, "extra": 1}))), (row, None))
+        self.assertEqual(hc.run(self.stub("")), (None, None))
+        for out, why in (("not json", "stdout is not JSON"),
+                         (json.dumps({**row, "condition": "fine"}), "condition must be"),
+                         (json.dumps({**row, "reason": "Not A Slug"}), "reason must be"),
+                         (json.dumps({**row, "alive": "yes"}), "alive must be")):
+            got, error = hc.run(self.stub(out))
+            self.assertIsNone(got)
+            self.assertIn(why, error)
+        self.assertEqual(hc.run(self.stub("{}", code=3))[1], "exited 3")
+        executable(self.bin / "slow", "#!/bin/sh\nsleep 5\n")
+        self.assertEqual(hc.run(str(self.bin / "slow"), timeout=0.2)[1], "timed out after 0.2s")
+        self.assertIn("FileNotFoundError", hc.run(str(self.home / "missing"))[1])
+
+    def test_the_command_is_reused_within_its_ttl_and_unset_means_no_row(self):
+        logs = []
+        cmd = hc.HealthCommand(self.stub("not json"), 60, logs.append)
+        self.assertIsNone(cmd.row())
+        self.assertIsNone(cmd.row())
+        self.assertEqual(logs, ["health command gave no row: stdout is not JSON"])
+        self.assertFalse(hc.HealthCommand("", 60, logs.append))
+        self.assertIsNone(hc.HealthCommand("  ", 60, logs.append).row())
+
+    def heartbeat(self, health_command):
+        env = py_env(self.home)
+        env.update({"AGENT_CONNECT_TASK_DIR": str(self.tasks),
+                    "AGENT_CONNECT_RESULT_DIR": str(self.results),
+                    "AGENT_CONNECT_STATE_DIR": str(self.home / "state"),
+                    "REMOTE_TASK_URL": "https://gw.example/relay",
+                    "REMOTE_TASK_TOKEN": "fake-relay-token-0123456789abcdef",
+                    "REMOTE_HEALTH_COMMAND": health_command})
+        r = subprocess.run([sys.executable, "-c", HEARTBEAT], env=env, capture_output=True,
+                           text=True, cwd=str(self.home), timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_the_heartbeat_carries_the_hatch_row(self):
+        command = f"{sys.executable} -m ag2_sparrow.adapters.hatch.cli keepalive health"
+        crons = self.home / "workspace" / "cron.d" / "minutely"
+        crons.mkdir(parents=True)
+        (crons / keepalive.task_file()).write_text(keepalive.TASK_MARKER)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3600))
+        (self.home / "keepalive-probe.log").write_text(
+            f"{stamp} keepawake listener=up restarted=0\n")
+        body = self.heartbeat(command)
+        self.assertEqual((body["health"]["condition"], body["health"]["reason"]),
+                         ("abnormal", "keepawake-not-running"))
+        self.assertIn("worker_health.v1", body["capabilities"])
+        self.assertEqual(body["status"], "unknown")
+
+    def test_the_command_never_sees_the_relay_token(self):
+        row = {"alive": True, "motion": "idle", "condition": "healthy", "reason": None,
+               "since": None}
+        path = self.bin / "token-check"
+        executable(path, '#!/bin/sh\n[ -z "$REMOTE_TASK_TOKEN" ] && echo \'%s\'\n'
+                   % json.dumps(row))
+        self.assertEqual(self.heartbeat(str(path))["health"], row)
+
+    def test_a_command_with_no_row_sends_the_heartbeat_without_health(self):
+        body = self.heartbeat(self.stub(""))
+        self.assertNotIn("health", body)
+        self.assertNotIn("worker_health.v1", body["capabilities"])
 
 
 def project_scripts() -> set:

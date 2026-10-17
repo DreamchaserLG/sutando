@@ -308,6 +308,7 @@ from . import undelivered_quarantine
 from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
+from . import health_command
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch
@@ -3121,6 +3122,10 @@ def _workers_body(ad: dict) -> dict:
 HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
 HEALTH_TTL_S = 15.0
 _health_cache: dict = {"at": None, "value": None, "error": None}
+# An adapter's own core row, when it injects one; it outranks the monorepo snapshot's.
+_HEALTH_COMMAND = health_command.HealthCommand(
+    os.environ.get("REMOTE_HEALTH_COMMAND") or "", HEARTBEAT_INTERVAL, lambda m: _log(m),
+    env=lambda: _on_task_env())
 
 
 def _health_snapshot() -> "dict | None":
@@ -3426,7 +3431,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
-    health = _core_health(_health_snapshot())
+    health = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False

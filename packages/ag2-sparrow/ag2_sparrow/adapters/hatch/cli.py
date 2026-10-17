@@ -3,10 +3,10 @@
 install writes the hook script to ~/hooks/scripts/, the hook definition to
 ~/hooks/definitions/ and the config the script reads, where systemd runs a user
 manager the ag2-sparrow user service that restarts Sparrow, and the keepalive
-watchdog and probe as Hatch scheduled tasks; verify checks that setup;
+as a Hatch scheduled task; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it;
-keepalive runs the watchdog and probe, and reports on the probe log."""
+keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log."""
 from __future__ import annotations
 
 import argparse
@@ -245,7 +245,8 @@ def systemd_user_available() -> bool:
 
 
 def render_service(exec_start: str, env: dict) -> str:
-    rows = "".join(f"Environment={k}={v}\n" for k, v in env.items())
+    rows = "".join(f'Environment="{k}={v}"\n' if " " in v else f"Environment={k}={v}\n"
+                   for k, v in env.items())
     return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
@@ -301,7 +302,7 @@ def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -
 
 
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool) -> None:
+                    force: bool, health_command: str = "") -> None:
     """Write, enable and start the ag2-sparrow user service. Never fails the install:
     each problem prints a NOTE saying what was not done and how to finish by hand."""
     def note(text: str) -> None:
@@ -334,6 +335,8 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     try:
         exec_start = _unit_value(exec_start)
         env = {k: _unit_value(v) for k, v in env.items()}
+        if health_command:
+            env["REMOTE_HEALTH_COMMAND"] = " ".join(map(_unit_value, health_command.split(" ")))
     except ValueError as e:
         note(f"{e}; no service was set up")
         return
@@ -428,6 +431,7 @@ def service_status() -> "tuple[bool | None, str]":
 
 
 def install(args) -> int:
+    from . import keepalive
     reply_command = find_reply_command()
     problem = reply_command_problem(reply_command)
     if problem:
@@ -471,15 +475,15 @@ def install(args) -> int:
               "after a crash or reboot unless you keep it running another way")
     else:
         install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
-                        args.force)
+                        args.force,
+                        "" if args.no_keepalive else keepalive.health_command(reply_command))
     if args.no_keepalive:
-        print("skipped: the keepalive watchdog and probe (--no-keepalive)")
+        print("skipped: the keepalive task (--no-keepalive)")
     else:
-        from . import keepalive
         keepalive.install_tasks(read_config(config_path()), args.force)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
           "test it with hooks.dry_run, start it with hooks.enable, check that Hatch's scheduled "
-          "tasks list sparrow-watchdog and keepalive-probe, then run: ag2-sparrow-hatch verify")
+          f"tasks list {keepalive.TASK}, then run: ag2-sparrow-hatch verify")
     return 0
 
 
@@ -616,9 +620,9 @@ def verify(_args) -> int:
            f"armed: a wake after {HEARTBEAT_INTERVAL_S}s quiet unless {activity} is fresher")
 
     from . import keepalive
-    line, wd_up = keepalive.status_line(cfg)
-    print(f"NOTE keepalive: {line}" + ("" if wd_up else " (the watchdog has not run in the "
-          f"last {keepalive.WATCHDOG_STALE_S // 60} minutes; check Hatch's scheduled tasks)"))
+    line, healthy = keepalive.status_line(cfg)
+    print(f"NOTE keepalive: {line}" + ("" if healthy else f" ({keepalive.TASK} has not run in "
+          f"the last {keepalive.STALE_S // 60} minutes, or not yet; check Hatch's scheduled tasks)"))
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
     print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "
@@ -810,27 +814,28 @@ def main(argv=None) -> int:
     p.add_argument("--gateway-instance", help="Sparrow's GATEWAY_INSTANCE (default: from the "
                    "environment, as ag2-sparrow reads it)")
     p.add_argument("--force", action="store_true", help="replace a locally modified hook script, "
-                   "ag2-sparrow.service, or same-named keepalive tasks install did not write")
+                   "ag2-sparrow.service, or keepalive tasks install did not write")
     p.add_argument("--no-service", action="store_true", help="do not set up the ag2-sparrow "
                    "systemd user service that restarts Sparrow")
     p.add_argument("--no-keepalive", action="store_true", help="do not schedule the keepalive "
-                   "watchdog and probe")
+                   "task")
     p.add_argument("--cron-dir", help="where Hatch reads scheduled tasks (default: "
                    "~/workspace/cron.d/minutely)")
-    p.add_argument("--keepalive-log", help="the probe log (default: ~/keepalive-probe.log)")
+    p.add_argument("--keepalive-log", help="the keepalive log (default: "
+                   "~/keepalive-probe.log)")
     p.set_defaults(func=install)
     u = sub.add_parser("uninstall", help="remove what install set up")
     u.add_argument("--service", action="store_true", help="stop, disable and remove the "
                    "ag2-sparrow user service")
-    u.add_argument("--keepalive", action="store_true", help="remove the keepalive watchdog and "
-                   "probe tasks install wrote (the probe log is kept)")
+    u.add_argument("--keepalive", action="store_true", help="remove the keepalive tasks install "
+                   "wrote (the keepalive log is kept)")
     u.set_defaults(func=uninstall)
-    k = sub.add_parser("keepalive", help="the keepalive scheduled tasks run these")
-    k.add_argument("action", choices=("watchdog", "probe", "status", "report"),
-                   help="watchdog: restart Sparrow if it is down; probe: append the status line "
-                   "to the log; status: print that line only; report: list the log's gaps and "
-                   "restarts")
-    k.add_argument("--log", help="the probe log (default: as install recorded it, else "
+    k = sub.add_parser("keepalive", help="what the keepalive task and Sparrow run")
+    k.add_argument("action", choices=("keepawake", "health", "status", "report"),
+                   help="keepawake: restart Sparrow if it is down and append a line to the log; "
+                   "health: print Sparrow's health row (JSON); status: print the state, writing "
+                   "nothing; report: list the log's gaps and restarts")
+    k.add_argument("--log", help="the keepalive log (default: as install recorded it, else "
                    "~/keepalive-probe.log)")
     k.add_argument("--gap-minutes", type=float, default=16.0,
                    help="report: a gap longer than this is a stop (default 16)")
