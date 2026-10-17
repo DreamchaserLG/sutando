@@ -96,9 +96,10 @@ def item_id(tid: str, instance: str = "") -> "str | None":
     return broker if local_task_protocol.valid_task_id(broker) else None
 
 
-def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict | None":
+def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") -> "dict | None":
+    """`instance` None reads every instance's task."""
     tid = task_file.stem
-    if item_id(tid, instance) is None:
+    if instance is not None and item_id(tid, instance) is None:
         return None
     try:
         text = task_file.read_text(encoding="utf-8", errors="replace")
@@ -131,8 +132,8 @@ def task_fields(task_file: Path, result_dir: Path, instance: str = "") -> "dict 
     return item
 
 
-def list_open_tasks(task_dir: Path, result_dir: Path, instance: str = "") -> list:
-    """Task files with no result yet, oldest first."""
+def list_open_tasks(task_dir: Path, result_dir: Path, instance: "str | None" = "") -> list:
+    """Task files with no result yet, oldest first; `instance` None lists every instance's."""
     def mtime(p: Path) -> float:
         try:
             return p.stat().st_mtime

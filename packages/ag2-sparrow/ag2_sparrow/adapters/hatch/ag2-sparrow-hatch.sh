@@ -44,6 +44,14 @@ if ! flock -n 9; then
   silent "previous poll still running" '{}'
 fi
 
+# verify and the health row read this: when the scheduler last ran the hook, and which script.
+RUN_STAMP="$SPARROW_STATE_DIR/hatch-hook-last-run"
+if [[ "$DRY_RUN" != "1" ]]; then
+  self_sha="$( { sha256sum "${BASH_SOURCE[0]}" 2>/dev/null || shasum -a 256 "${BASH_SOURCE[0]}" 2>/dev/null; } | cut -d' ' -f1)" || self_sha=""
+  { mkdir -p "$SPARROW_STATE_DIR" && printf '%s %s\n' "$(date +%s)" "${self_sha:-unknown}" >"$RUN_STAMP.$$" \
+    && mv -f "$RUN_STAMP.$$" "$RUN_STAMP"; } 2>/dev/null || rm -f "$RUN_STAMP.$$"
+fi
+
 # task_fields validates AGENT_MXID, so the hook and `install` accept the same MXIDs.
 rc=0
 items="$(timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
