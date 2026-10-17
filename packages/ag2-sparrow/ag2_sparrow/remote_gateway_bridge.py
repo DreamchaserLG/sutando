@@ -7231,14 +7231,16 @@ _STUCK_POLL_CLOCK_SKEW_S = 60
 STUCK_POLL_EXIT_CODE = 69
 _POLL_TIMED_OUT = "poll timed out: the relay held the task poll past the read timeout"
 _POLL_STREAK = {"timeouts": 0, "since": None, "stuck_since": None, "held_logged": False,
-                "stamp_logged": False}
+                "stamp_logged": False, "unrecorded_logged": False}
+# When this process first found the restart stamp unreadable; one hold per episode.
+_BAD_STAMP = {"seen_at": None}
 
 
 def _poll_streak_reset() -> None:
     if _POLL_STREAK["stuck_since"] is not None:
         _log(f"stuck relay poll cleared after {_POLL_STREAK['timeouts']} timeouts")
     _POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
-                        stamp_logged=False)
+                        stamp_logged=False, unrecorded_logged=False)
 
 
 def _log_stamp_once(msg: str) -> None:
@@ -7247,20 +7249,34 @@ def _log_stamp_once(msg: str) -> None:
         _log(f"stuck relay poll: {msg}")
 
 
+def _write_stuck_stamp(now: float) -> bool:
+    try:
+        written = _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)}))
+    except Exception:  # noqa: BLE001 — a state write must never break the poll loop
+        return False
+    if written:
+        _BAD_STAMP["seen_at"] = None
+    return written
+
+
 def _last_stuck_recovery(now: float) -> "float | None":
     """When the last stuck-poll restart ran, or None when none did. An unreadable
-    stamp counts as a restart now and is rewritten, so it holds for one interval."""
+    stamp counts as a restart when first seen, so it holds for one interval only."""
     try:
         at = json.loads(STUCK_POLL_RECOVERY_FILE.read_text())["at"]
         if isinstance(at, bool) or not isinstance(at, (int, float)) or not abs(at) < float("inf"):
             raise ValueError(f"bad stamp {at!r}")
     except FileNotFoundError:
+        _BAD_STAMP["seen_at"] = None
         return None
     except (OSError, ValueError, TypeError, KeyError) as e:
-        _log_stamp_once(f"restart stamp unreadable ({type(e).__name__}) — holding the next "
-                        f"restart for {STUCK_POLL_RECOVERY_INTERVAL_S}s")
-        _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)}))
-        return now
+        if _BAD_STAMP["seen_at"] is None:
+            _log(f"stuck relay poll: restart stamp unreadable ({type(e).__name__}) — holding "
+                 f"the next restart for {STUCK_POLL_RECOVERY_INTERVAL_S}s")
+            _write_stuck_stamp(now)
+            _BAD_STAMP["seen_at"] = now
+        return _BAD_STAMP["seen_at"]
+    _BAD_STAMP["seen_at"] = None
     if at > now + _STUCK_POLL_CLOCK_SKEW_S:
         _log_stamp_once(f"restart stamp is {int(at - now)}s in the future (clock moved back) "
                         "— ignoring it")
@@ -7292,8 +7308,10 @@ def _stuck_poll_restart_due(now: float) -> bool:
                  f"allowed in {int(STUCK_POLL_RECOVERY_INTERVAL_S - (now - last))}s")
         return False
     # The stamp is what bounds the restarts; unwritten, restarting could loop.
-    if not _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)})):
-        _log("stuck relay poll: could not record the restart — staying up")
+    if not _write_stuck_stamp(now):
+        if not s["unrecorded_logged"]:
+            s["unrecorded_logged"] = True
+            _log("stuck relay poll: could not record the restart — staying up")
         return False
     return True
 

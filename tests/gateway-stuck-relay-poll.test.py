@@ -330,9 +330,16 @@ class StuckPollDecisionTest(unittest.TestCase):
         gw.STUCK_POLL_RECOVERY_FILE = self.stamp
         gw._log = lambda m: self.logs.append(str(m))
         gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False)
+        self._bad = dict(getattr(gw, "_BAD_STAMP", {}))
+        if hasattr(gw, "_BAD_STAMP"):
+            gw._BAD_STAMP["seen_at"] = None
+        self._durable_write = gw._durable_write
 
     def tearDown(self):
         gw = self.gw
+        gw._durable_write = self._durable_write
+        if hasattr(gw, "_BAD_STAMP"):
+            gw._BAD_STAMP.clear(); gw._BAD_STAMP.update(self._bad)
         gw.STUCK_POLL_RECOVERY_FILE, gw._log, streak, req_ok = self._saved
         gw._POLL_STREAK.clear(); gw._POLL_STREAK.update(streak)
         gw._LAST_REQ_OK.clear(); gw._LAST_REQ_OK.update(req_ok)
@@ -343,7 +350,7 @@ class StuckPollDecisionTest(unittest.TestCase):
         30 s before the last one; that last decision."""
         start = self.T0 if start is None else start
         self.gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
-                                    stamp_logged=False)
+                                    stamp_logged=False, unrecorded_logged=False)
         times = [start + i * _poll_budget(self.gw) for i in range(STUCK_N)]
         self.gw._LAST_REQ_OK["at"] = times[-1] - 30
         return [self.gw._stuck_poll_restart_due(t) for t in times][-1]
@@ -377,6 +384,34 @@ class StuckPollDecisionTest(unittest.TestCase):
                 self.assertTrue(self.streak(start=last_poll + interval + 1),
                                 "the hold outlasted one interval")
                 self.stamp.unlink()
+
+    def _corrupt_stamp_with_unwritable_state(self, failing_write):
+        """A corrupt stamp the bridge cannot rewrite holds once, for one interval."""
+        interval = getattr(self.gw, "STUCK_POLL_RECOVERY_INTERVAL_S", 600)
+        self.stamp.write_text("{not json")
+        self.gw._durable_write = failing_write
+        first_seen = self.T0 + (STUCK_N - 1) * _poll_budget(self.gw)
+        try:
+            self.assertFalse(self.streak(), "a corrupt stamp did not hold the first restart")
+            self.assertFalse(self.streak(start=first_seen + interval / 2), "the hold ended early")
+            self.logs.clear()
+            self.assertFalse(self.streak(start=first_seen + interval + 1),
+                             "restarted without recording the restart")
+        except Exception as e:  # noqa: BLE001 — the escape IS the failure
+            self.fail(f"the stamp write's {type(e).__name__} escaped the poll loop's decision")
+        self.assertFalse(any("next one allowed in" in m for m in self.logs),
+                         f"the hold was renewed by a later read: {self.logs}")
+        self.assertTrue(any("could not record the restart" in m for m in self.logs), self.logs)
+        self.assertIsNotNone(self.gw._POLL_STREAK["stuck_since"], "stuck_poll no longer reported")
+        self.assertEqual(self.stamp.read_text(), "{not json", "the stamp was rewritten after all")
+
+    def test_a_corrupt_stamp_that_cannot_be_rewritten_holds_one_interval_only(self):
+        self._corrupt_stamp_with_unwritable_state(lambda *a, **k: False)
+
+    def test_a_corrupt_stamp_whose_rewrite_raises_holds_one_interval_and_never_raises(self):
+        def raises(*a, **k):
+            raise OSError(28, "No space left on device")
+        self._corrupt_stamp_with_unwritable_state(raises)
 
     def test_a_stamp_far_in_the_future_does_not_hold_recovery(self):
         # The clock moved back ten hours after the last restart was stamped.
