@@ -501,6 +501,7 @@ def assisted_install(runtime: str, *, env: Optional[dict] = None, run: Runner = 
     before = os.readlink(str(link)) if os.path.islink(str(link)) else None
     from file_lock import locked_file
     with locked_file(base / ".lock"):
+        recover_swaps(root, runtime, pid_alive, log)
         for stale in interrupted_updates(root, runtime, pid_alive):
             log(f"removing an interrupted update at {stale}; the previous version was kept")
             shutil.rmtree(stale, ignore_errors=True)
@@ -562,7 +563,6 @@ def _install_npm(ctx: _Ctx) -> RepairResult:
                    npm_config_audit="false")
     argv = [ctx.installer.argv[0], "install", "-g", "--prefix", str(staging),
             f"{spec.package}@{spec.tested_major}"]
-    aside = None
     try:
         failed, n = _run_with_retry(ctx, argv, npm_env,
                                     before=lambda: shutil.rmtree(staging, ignore_errors=True))
@@ -577,16 +577,10 @@ def _install_npm(ctx: _Ctx) -> RepairResult:
         final.parent.mkdir(parents=True, exist_ok=True)
         if final.exists() and probe(str(final / "bin" / spec.binary), spec, env=env, run=ctx.run).usable:
             ctx.log(f"{spec.binary} {staged.version} is already installed and works; reusing it")
-        else:
-            if final.exists():
-                aside = final.with_name(f".replaced-{staged.version}-{os.getpid()}-{int(ctx.now())}")
-                os.rename(str(final), str(aside))
-            os.rename(str(staging), str(final))
+            return _publish(ctx, final / "bin" / spec.binary, n)
+        return _publish(ctx, final / "bin" / spec.binary, n, staging=staging, final=final)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-        if aside is not None:
-            shutil.rmtree(aside, ignore_errors=True)
-    return _link_and_verify(ctx, final / "bin" / spec.binary, n)
 
 
 def _install_external(ctx: _Ctx) -> RepairResult:
@@ -599,26 +593,103 @@ def _install_external(ctx: _Ctx) -> RepairResult:
     if not got.usable:
         return RepairResult(False, "verify-failed", f"the installed {ctx.spec.binary} {got.detail}",
                             f"Install it yourself: {_manual_without_installer(ctx.spec)}", n)
-    return _link_and_verify(ctx, target, n)
+    return _publish(ctx, target, n)
 
 
-def _link_and_verify(ctx: _Ctx, target: Path, n: int) -> RepairResult:
-    """Switch the managed link, launch through it, and switch back if it does not run."""
+_rename = os.rename
+
+
+class _Unusable(Exception):
+    pass
+
+
+def _publish(ctx: _Ctx, target: Path, n: int, staging: Optional[Path] = None,
+             final: Optional[Path] = None) -> RepairResult:
+    """Move a staged version into place and switch the link, as one transaction.
+    A journal written first lets a later run undo it if this process dies midway."""
+    from local_record import write_whole
     spec = ctx.spec
     link = ctx.root / "bin" / spec.binary
-    previous = os.readlink(str(link)) if os.path.islink(str(link)) else None
-    _swap_link(link, target)
-    live = probe(str(link), spec, source="managed", env=ctx.env, run=ctx.run)
-    if not live.usable:
-        if previous is not None:
-            _swap_link(link, Path(previous))
-        else:
-            os.unlink(str(link))
+    tag = f"{os.getpid()}-{int(ctx.now())}"
+    j = {"previous": os.readlink(str(link)) if os.path.islink(str(link)) else None,
+         "final": str(final) if final else None, "aside": None, "placed": False,
+         "committed": False}
+    journal = ctx.base / f".swap-{tag}.json"
+    write_whole(journal, j)
+    try:
+        if final is not None and staging is not None:
+            if final.exists():
+                j["aside"] = str(final.with_name(f".replaced-{tag}-{final.name}"))
+                write_whole(journal, j)
+                _rename(str(final), j["aside"])
+            _rename(str(staging), str(final))
+            j["placed"] = True
+            write_whole(journal, j)
+        _swap_link(link, target)
+        live = probe(str(link), spec, source="managed", env=ctx.env, run=ctx.run)
+        if not live.usable:
+            raise _Unusable(live.detail)
+    except _Unusable as exc:
+        _undo(link, j, journal)
         return RepairResult(False, "verify-failed",
-                            f"the installed {spec.binary} {live.detail}; the previous version was restored",
+                            f"the installed {spec.binary} {exc}; the previous version was restored",
                             f"Install it yourself: {spec.manual_install}", n)
+    except BaseException:
+        _undo(link, j, journal)
+        raise
+    j["committed"] = True
+    write_whole(journal, j)
+    _commit(j, journal)
     return RepairResult(True, "installed", f"{spec.binary} {live.version} at {link}", "", n,
                         str(link))
+
+
+def _commit(j: dict, journal: Path) -> None:
+    if j.get("aside"):
+        shutil.rmtree(j["aside"], ignore_errors=True)
+    journal.unlink()
+
+
+def _undo(link: Path, j: dict, journal: Path) -> None:
+    """Put the link and the version folders back exactly as they were before the swap."""
+    if j.get("previous") is not None:
+        _swap_link(link, Path(j["previous"]))
+    elif os.path.lexists(str(link)):
+        os.unlink(str(link))
+    final, aside = j.get("final"), j.get("aside")
+    if aside and os.path.exists(aside):
+        if final and os.path.exists(final):
+            shutil.rmtree(final)
+        os.rename(aside, final)
+    elif j.get("placed") and final and os.path.exists(final):
+        shutil.rmtree(final)
+    journal.unlink()
+
+
+def recover_swaps(root: Path, runtime: str, pid_alive: Callable[[int], bool] = None,
+                  log: Callable[[str], None] = lambda _m: None) -> List[str]:
+    """Finish or undo a swap whose process died; only Sutando-owned files are touched."""
+    pid_alive = pid_alive or _pid_alive
+    base = root / runtime
+    done = []
+    for path in sorted(base.glob(".swap-*.json")) if base.is_dir() else []:
+        parts = path.name.split("-")
+        pid = int(parts[1]) if len(parts) > 2 and parts[1].isdigit() else 0
+        if pid and pid_alive(pid):
+            continue
+        try:
+            j = json.loads(path.read_text())
+        except (OSError, ValueError):
+            path.unlink()
+            continue
+        if j.get("committed"):
+            _commit(j, path)
+            log(f"finished an interrupted update ({path.name})")
+        else:
+            _undo(root / "bin" / RUNTIMES[runtime].binary, j, path)
+            log(f"undid an interrupted update ({path.name}); the previous version is back")
+        done.append(str(path))
+    return done
 
 
 def _failed(reason: str, detail: str, n: int, root: Path, retry: str,
@@ -689,7 +760,10 @@ def install_phrase(runtime: str) -> str:
 
 
 class Incident:
-    """One owner DM per incident: a fixed name, persisted, queued once, closed on success."""
+    """One owner DM per incident, and a durable record of each owner reply.
+
+    A reply is recorded when taken, then marked applied, answered and archived as
+    each step lands, so a crash replays only the steps that did not finish."""
 
     def __init__(self, workspace: Path, runtime: str, clock: Callable[[], float] = time.time):
         self.workspace, self.runtime, self.clock = Path(workspace), runtime, clock
@@ -704,19 +778,25 @@ class Incident:
         return self.rec.get("status") == "open"
 
     @property
-    def actions(self) -> List[str]:
-        return list(self.rec.get("actions") or [])
+    def entries(self) -> List[dict]:
+        return [e for e in (self.rec.get("actions") or [])
+                if isinstance(e, dict) and isinstance(e.get("task"), str)]
 
     def _save(self) -> None:
         from local_record import write_whole
         write_whole(self.path, self.rec)
+
+    def _unfinished(self) -> List[dict]:
+        from owner_reply import STEPS
+        return [e for e in self.entries if not all(e.get(s) for s in STEPS)]
 
     def notify(self, body: str) -> bool:
         """Queue the incident's DM if it is not queued yet. True when this call queued it."""
         from owner_reply import queue_notice
         if not self.open:
             t = int(self.clock())
-            self.rec = {"status": "open", "opened_at": t, "actions": [], "notice_queued": False,
+            self.rec = {"status": "open", "opened_at": t, "actions": self._unfinished(),
+                        "notice_queued": False,
                         "notice": f"proactive-runtime-compat-{self.runtime}-{t}.txt"}
             self._save()
         if self.rec.get("notice_queued") or not queue_notice(self.workspace, self.rec["notice"], body):
@@ -725,17 +805,45 @@ class Incident:
         self._save()
         return True
 
-    def take_replies(self) -> List[Tuple[Path, str]]:
-        """Owner replies to this incident not yet acted on; each is recorded before it runs."""
+    def take_replies(self) -> None:
+        """Record the owner's new replies to this incident before anything acts on them."""
         from owner_reply import matching_replies
         if not self.open:
-            return []
+            return
+        known = {e["task"] for e in self.entries}
         got = list(matching_replies(self.workspace, (install_phrase(self.runtime), RETRY_PHRASE),
-                                    skip=self.actions))
+                                    skip=known))
         if got:
-            self.rec["actions"] = self.actions + [p.stem for p, _ in got]
+            self.rec["actions"] = self.entries + [
+                {"task": p.stem, "phrase": phrase, "at": int(self.clock())} for p, phrase in got]
             self._save()
-        return got
+
+    def pending(self) -> set:
+        """Phrases of recorded replies whose action has not been applied yet."""
+        return {e["phrase"] for e in self.entries if not e.get("applied")}
+
+    def apply(self, phrase: Optional[str], reply: str) -> None:
+        """Mark recorded replies applied (all, or one phrase), with the answer they get."""
+        changed = False
+        for e in self.entries:
+            if not e.get("applied") and (phrase is None or e["phrase"] == phrase):
+                e.update(applied=True, reply=reply)
+                changed = True
+        if changed:
+            self._save()
+
+    def mark(self, task: str, step: str) -> None:
+        for e in self.entries:
+            if e["task"] == task:
+                e[step] = True
+        self._save()
+
+    def finish(self) -> None:
+        """Answer and archive every applied reply; each step is marked as it lands."""
+        from owner_reply import finish
+        for e in self._unfinished():
+            if e.get("applied"):
+                finish(self.workspace, e, lambda step, task=e["task"]: self.mark(task, step))
 
     def close(self) -> None:
         if self.open:
@@ -775,53 +883,49 @@ def ensure(runtime: str, *, env: Optional[dict] = None, wait_s: float = 0.0,
     `consent`, or the owner's "install compatible <cli>" reply to this incident's DM."""
     env = dict(os.environ if env is None else env)
     inc = Incident(workspace, runtime, clock) if workspace else None
-    acted: List[Tuple[Path, str]] = []
-    outcome = {"rc": EXIT_UNUSABLE, "repair": None, "why": ""}
-    try:
-        rc, path = _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_dir,
-                           resume_hint, inc, notify_owner, acted, outcome, say, discover_fn,
-                           repair_fn, auth_fn, sleep, now)
-        outcome["rc"] = rc
-        if rc == EXIT_OK and inc is not None:
+    outcome = {"rc": EXIT_UNUSABLE, "why": ""}
+    if inc is not None:
+        inc.finish()
+    # An exception here is a crash: the record stays as it is and the next run replays it.
+    rc, path = _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_dir,
+                       resume_hint, inc, notify_owner, outcome, say, discover_fn,
+                       repair_fn, auth_fn, sleep, now)
+    if inc is not None:
+        inc.apply(None, f"{RUNTIMES[runtime].binary} works now. The core is starting."
+                  if rc == EXIT_OK else f"The core still cannot start: {outcome['why']}")
+        inc.finish()
+        if rc == EXIT_OK:
             inc.close()
-        return rc, path
-    finally:
-        for task, phrase in acted:
-            _answer_reply(workspace, task, phrase, runtime, outcome)
+    return rc, path
 
 
-def _answer_reply(workspace, task, phrase, runtime, outcome) -> None:
-    from owner_reply import answer
-    repaired = outcome["repair"]
-    if outcome["rc"] == EXIT_OK:
-        text = (f"Installed {repaired.detail} in Sutando's own folder. The core is starting now."
-                if phrase != RETRY_PHRASE and repaired is not None and repaired.ok
-                else f"{RUNTIMES[runtime].binary} works now. The core is starting.")
-    elif repaired is not None and not repaired.ok:
-        text = f"That did not fix it: {repaired.detail}. Next: {repaired.user_action}"
-    else:
-        text = f"The core still cannot start: {outcome['why']}"
-    answer(workspace, task, text)
+def _repair_reply(result: RepairResult) -> str:
+    if result.ok:
+        return f"Installed {result.detail} in Sutando's own folder. The core is starting now."
+    return f"That did not fix it: {result.detail}. Next: {result.user_action}"
 
 
 def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_dir, resume_hint,
-            inc, notify_owner, acted, outcome, say, discover_fn, repair_fn, auth_fn, sleep, now):
+            inc, notify_owner, outcome, say, discover_fn, repair_fn, auth_fn, sleep, now):
     spec = RUNTIMES[runtime]
     again = f" Then run again: {resume_hint}" if resume_hint else ""
 
     def replies() -> set:
-        got = inc.take_replies() if inc is not None else []
-        acted.extend(got)
-        return {phrase for _, phrase in got}
+        if inc is None:
+            return set()
+        inc.take_replies()
+        return inc.pending()
 
     def repair_now() -> None:
         result = repair_fn(runtime, env=env, log=say)
-        outcome["repair"] = result
+        if inc is not None:
+            inc.apply(install_phrase(runtime), _repair_reply(result))
         say(f"repair {'succeeded' if result.ok else 'failed'}: {result.detail}")
         if not result.ok:
             say(f"next: {result.user_action}")
 
     owner_said = replies()
+    recover_swaps(managed_root(env), runtime, log=say)
     report = discover_fn(runtime, env=env)
     for stale in report.interrupted:
         say(f"an interrupted update left {stale}; the previous version is still in use.")

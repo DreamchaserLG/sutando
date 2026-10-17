@@ -48,7 +48,7 @@ class Gate(unittest.TestCase):
         self.repo = self.tmp / "repo"
         for rel in ("src/runtime_compat.py", "src/auth_preflight.py",
                     "src/agent/runtime-compat-gate.sh", "scripts/python-binary.sh",
-                    "src/file_lock.py"):
+                    "src/file_lock.py", "src/local_record.py"):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, self.repo / rel)
         self.bin1, self.bin2 = self.tmp / "bin1", self.tmp / "bin2"

@@ -5,6 +5,11 @@ DM under a fixed `results/proactive-*.txt` name, reads the owner's bare reply
 from `tasks/`, answers that reply in its own conversation, and archives it so a
 core that comes up later never acts on it a second time.
 
+A caller records each reply it takes and the steps it finished (`STEPS`), each
+persisted as it lands, so a crash replays only what did not finish. The record
+decides whether an answer was written, never the live result file, and an
+answer already delivered and archived by a bridge is never sent again.
+
 This module holds only that shape, so a second gate reuses it instead of copying
 it. The decision of what a reply means stays with the caller.
 """
@@ -12,9 +17,10 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable, Iterator, Optional, Tuple
+from typing import Callable, Iterable, Iterator, Optional, Tuple
 
 _TRAILING = re.compile(r"[\s.!]+$")
+STEPS = ("applied", "answered", "archived")
 
 
 def _ws(workspace: Optional[Path]) -> Path:
@@ -46,8 +52,9 @@ def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
     wanted = {normalize(p): p for p in phrases}
     skip = set(skip)
     workspace = _ws(workspace)
+    from local_task_protocol import find_result
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
-        if path.stem in skip or (workspace / "results" / path.name).exists():
+        if path.stem in skip or find_result(workspace / "results", path.stem) is not None:
             continue
         body = owner_reply_text(path)
         if body is not None and normalize(body) in wanted:
@@ -65,11 +72,21 @@ def queue_notice(workspace: Optional[Path], name: str, body: str) -> bool:
     return True
 
 
-def answer(workspace: Optional[Path], path: Path, text: str) -> None:
-    """Reply in the task's own conversation, then move the task out of the live queue."""
+def finish(workspace: Optional[Path], entry: dict, mark: Callable[[str], None]) -> None:
+    """Answer, then archive, one applied reply; `mark(step)` persists each step as it lands.
+    An unmarked answer may have been written just before a crash, so any copy counts."""
     from local_record import write_text_whole
+    from local_task_protocol import find_result
     from task_archive import archive_file
     workspace = _ws(workspace)
-    write_text_whole(workspace / "results" / path.name, text.rstrip("\n") + "\n")
-    archive_file(path, "tasks", path.stem, tasks_dir=workspace / "tasks" / "archive",
-                 results_dir=workspace / "results" / "archive", log=lambda _m: None)
+    task = entry["task"]
+    if not entry.get("answered"):
+        if find_result(workspace / "results", task) is None:
+            write_text_whole(workspace / "results" / f"{task}.txt", entry["reply"].rstrip("\n") + "\n")
+        mark("answered")
+    if not entry.get("archived"):
+        live = workspace / "tasks" / f"{task}.txt"
+        if live.exists():
+            archive_file(live, "tasks", task, tasks_dir=workspace / "tasks" / "archive",
+                         results_dir=workspace / "results" / "archive", log=lambda _m: None)
+        mark("archived")

@@ -615,8 +615,8 @@ class Ensure(Base):
         self.assertEqual(code, 0)
 
 
-class OwnerReply(Base):
-    """Off a terminal: one DM per incident, the owner's bare reply repairs, and the launch goes on."""
+class OwnerReplyBase(Base):
+    """A temp workspace with tasks/, results/ and state/, and helpers for owner replies."""
 
     def setUp(self):
         super().setUp()
@@ -644,6 +644,11 @@ class OwnerReply(Base):
 
     def incident(self, runtime="claude"):
         return json.loads((self.ws / "state" / f"runtime-compat-{runtime}.json").read_text())
+
+
+
+class OwnerReply(OwnerReplyBase):
+    """Off a terminal: one DM per incident, the owner's bare reply repairs, and the launch goes on."""
 
     def test_off_tty_queues_one_dm_per_incident(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
@@ -708,10 +713,12 @@ class OwnerReply(Base):
         self.ensure()
         task = self.reply("install compatible claude")
         rec = self.incident()
-        rec["actions"] = [task.stem]
+        rec["actions"] = [{"task": task.stem, "phrase": "install compatible claude",
+                           "applied": True, "reply": "recorded answer"}]
         (self.ws / "state" / "runtime-compat-claude.json").write_text(json.dumps(rec))
         self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], rc.EXIT_UNUSABLE)
         self.assertEqual(self.repairs, 0)
+        self.assertEqual((self.ws / "results" / task.name).read_text(), "recorded answer\n")
 
     def test_retry_now_after_a_manual_fix(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
@@ -742,7 +749,9 @@ class OwnerReply(Base):
     def test_other_text_non_owner_and_no_incident_are_ignored(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
         early = self.reply("install compatible claude", name="task-001")
-        self.assertEqual(rc.Incident(self.ws, "claude").take_replies(), [])
+        early_inc = rc.Incident(self.ws, "claude")
+        early_inc.take_replies()
+        self.assertEqual(early_inc.entries, [])
         self.ensure()
         early.unlink()
         self.reply("please install compatible claude", name="task-002")
@@ -896,6 +905,291 @@ class ConcurrentRepair(Base):
         self.assertEqual(results[0].path, results[1].path)
 
 
+class Crash(BaseException):
+    """Stands in for the process dying at a step boundary: nothing catches it."""
+
+
+class DurableReplies(OwnerReplyBase):
+    """Each step of a reply is recorded as it lands; a crash replays only what did not."""
+
+    def open_incident(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        self.ensure()
+        return self.reply("install compatible claude")
+
+    def crash_on(self, step):
+        """The step's work lands, then the process dies before its mark is saved."""
+        orig = rc.Incident.mark
+
+        def mark(inc, task, s):
+            if s == step:
+                rc.Incident.mark = orig
+                raise Crash()
+            orig(inc, task, s)
+        rc.Incident.mark = mark
+        self.addCleanup(setattr, rc.Incident, "mark", orig)
+
+    def answers(self, task):
+        found = list((self.ws / "results").rglob(f"{task.stem}.txt"))
+        return [p.read_text() for p in found]
+
+    def assert_done_once(self, task):
+        rec = self.incident()["actions"]
+        self.assertEqual([(e["task"], e.get("applied"), e.get("answered"), e.get("archived")) for e in rec],
+                         [(task.stem, True, True, True)])
+        self.assertEqual(len(self.answers(task)), 1)
+        self.assertFalse(task.exists())
+
+    def test_crash_after_the_reply_is_recorded_reruns_only_the_action(self):
+        task = self.open_incident()
+
+        def dying(*a, **k):
+            raise Crash()
+        with self.assertRaises(Crash):
+            self.ensure(repair_fn=dying)
+        self.assertEqual(self.incident()["actions"][0].get("applied"), None)
+        self.assertEqual(self.answers(task), [])
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], 0)
+        self.assertEqual(self.repairs, 1)
+        self.assert_done_once(task)
+
+    def test_crash_after_apply_does_not_repair_again(self):
+        task = self.open_incident()
+        orig = owner_reply.finish
+
+        def dying(*a, **k):
+            raise Crash()
+        owner_reply.finish = dying
+        try:
+            with self.assertRaises(Crash):
+                self.ensure(repair_fn=self.counting_repair)
+        finally:
+            owner_reply.finish = orig
+        self.assertTrue(self.incident()["actions"][0]["applied"])
+        self.ensure(repair_fn=self.counting_repair)
+        self.assertEqual(self.repairs, 1)
+        self.assert_done_once(task)
+        self.assertIn("Installed claude 2.3.0", self.answers(task)[0])
+
+    def test_crash_after_the_answer_is_written_never_sends_it_twice(self):
+        task = self.open_incident()
+        self.crash_on("answered")
+        with self.assertRaises(Crash):
+            self.ensure(repair_fn=self.counting_repair)
+        first = self.answers(task)
+        self.assertEqual(len(first), 1)
+        (self.ws / "results" / f"{task.stem}.txt").write_text("delivered copy\n")
+        self.ensure(repair_fn=self.counting_repair)
+        self.assert_done_once(task)
+        self.assertEqual(self.answers(task), ["delivered copy\n"])
+
+    def test_crash_after_answered_mark_archives_on_replay(self):
+        task = self.open_incident()
+        self.crash_on("archived")
+        with self.assertRaises(Crash):
+            self.ensure(repair_fn=self.counting_repair)
+        self.ensure(repair_fn=self.counting_repair)
+        self.assert_done_once(task)
+
+    def test_answer_delivered_and_archived_by_the_bridge_is_not_resent(self):
+        task = self.open_incident()
+        self.crash_on("answered")
+        with self.assertRaises(Crash):
+            self.ensure(repair_fn=self.counting_repair)
+        live = self.ws / "results" / f"{task.stem}.txt"
+        month = self.ws / "results" / "archive" / "2026-10"
+        month.mkdir(parents=True)
+        live.rename(month / live.name)
+        self.ensure(repair_fn=self.counting_repair)
+        self.assertFalse(live.exists())
+        self.assert_done_once(task)
+
+    def test_reply_after_the_wait_window_is_handled_on_the_next_launch(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+        self.assertEqual(self.ensure(wait_s=600, sleep=sleep, now=lambda: clock[0])[0],
+                         rc.EXIT_UNUSABLE)
+        self.assertGreaterEqual(clock[0], 600)
+        task = self.reply("install compatible claude", name="task-700")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], 0)
+        self.assert_done_once(task)
+
+    def test_unfinished_reply_survives_a_new_incident(self):
+        task = self.open_incident()
+        orig = owner_reply.finish
+
+        def dying(*a, **k):
+            raise Crash()
+        owner_reply.finish = dying
+        try:
+            with self.assertRaises(Crash):
+                self.ensure(repair_fn=self.counting_repair)
+        finally:
+            owner_reply.finish = orig
+        inc = rc.Incident(self.ws, "claude")
+        inc.close()
+        inc.notify("a new incident")
+        self.assertEqual([e["task"] for e in rc.Incident(self.ws, "claude").entries], [task.stem])
+
+
+class PublishFaults(Base):
+    """Fault at every publication boundary: the old version and the link always survive."""
+
+    npm = AssistedRepair.npm
+    good_npm = AssistedRepair.good_npm
+    install = Base.install
+
+    def setUp(self):
+        super().setUp()
+        self.old = self.managed_version("2.1.0")
+        self.stale = self.root / "claude" / "versions" / "2.3.0"
+        write_exe(self.stale / "bin" / "claude", "echo stale; exit 1\n")
+        self.good_npm("2.3.0")
+
+    def assert_intact(self):
+        link = self.root / "bin" / "claude"
+        self.assertEqual(os.readlink(link), str(self.old))
+        self.assertTrue(os.path.exists(link), "dangling managed link")
+        self.assertEqual(self.discover().selected.version, "2.1.0")
+        self.assertIn("echo stale", (self.stale / "bin" / "claude").read_text())
+        leftovers = [p.name for p in (self.root / "claude").iterdir() if p.name.startswith((".staging", ".replaced", ".swap"))]
+        self.assertEqual(leftovers, [])
+
+    def fail_nth_rename(self, n, after=False):
+        calls = []
+        real = rc._rename
+
+        def rename(a, b):
+            calls.append(1)
+            if len(calls) == n:
+                if after:
+                    real(a, b)
+                raise Crash()
+            return real(a, b)
+        rc._rename = rename
+        self.addCleanup(setattr, rc, "_rename", real)
+
+    def test_fault_after_staging(self):
+        real = rc.probe
+
+        def probe(path, spec, **kw):
+            if kw.get("source") == "staged":
+                raise Crash()
+            return real(path, spec, **kw)
+        rc.probe = probe
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            rc.probe = real
+        self.assert_intact()
+
+    def test_fault_after_the_old_folder_is_moved_aside(self):
+        self.fail_nth_rename(1, after=True)
+        with self.assertRaises(Crash):
+            self.install()
+        self.assert_intact()
+
+    def test_fault_renaming_the_new_folder_into_place(self):
+        self.fail_nth_rename(2)
+        with self.assertRaises(Crash):
+            self.install()
+        self.assert_intact()
+
+    def test_fault_after_the_new_folder_is_in_place(self):
+        self.fail_nth_rename(2, after=True)
+        with self.assertRaises(Crash):
+            self.install()
+        self.assert_intact()
+
+    def test_fault_swapping_the_link(self):
+        real = rc._swap_link
+        calls = []
+
+        def swap(link, target):
+            calls.append(1)
+            if len(calls) == 1:
+                raise Crash()
+            return real(link, target)
+        rc._swap_link = swap
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            rc._swap_link = real
+        self.assert_intact()
+
+    def test_fault_in_the_live_probe(self):
+        real = rc.probe
+
+        def probe(path, spec, **kw):
+            if kw.get("source") == "managed":
+                raise Crash()
+            return real(path, spec, **kw)
+        rc.probe = probe
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            rc.probe = real
+        self.assert_intact()
+
+    def test_live_probe_fails_restores_old_folder_and_link(self):
+        real = rc.probe
+
+        def probe(path, spec, **kw):
+            c = real(path, spec, **kw)
+            if kw.get("source") == "managed":
+                c.status, c.detail = rc.BROKEN, "would not start"
+            return c
+        rc.probe = probe
+        try:
+            r = self.install()
+        finally:
+            rc.probe = real
+        self.assertEqual(r.reason, "verify-failed")
+        self.assert_intact()
+
+    def test_process_killed_mid_swap_is_undone_by_the_next_run(self):
+        real_undo = rc._undo
+
+        def dead_undo(*a, **k):
+            raise Crash()
+        rc._undo = dead_undo
+        self.fail_nth_rename(2, after=True)
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            rc._undo = real_undo
+        self.assertTrue(list((self.root / "claude").glob(".swap-*.json")))
+        done = rc.recover_swaps(self.root, "claude", pid_alive=lambda _p: False, log=self.said.append)
+        self.assertEqual(len(done), 1)
+        self.assert_intact()
+
+    def test_committed_swap_left_by_a_killed_process_is_finished(self):
+        self.assertTrue(self.install().ok)
+        journal = self.root / "claude" / ".swap-999999-1.json"
+        aside = self.root / "claude" / ".replaced-999999-1-2.0.0"
+        aside.mkdir()
+        journal.write_text(json.dumps({"previous": None, "final": None, "aside": str(aside),
+                                       "placed": False, "committed": True}))
+        bad = self.root / "claude" / ".swap-999998-1.json"
+        bad.write_text("{not json")
+        rc.recover_swaps(self.root, "claude", pid_alive=lambda _p: False)
+        self.assertFalse(aside.exists() or journal.exists() or bad.exists())
+        self.assertEqual(self.discover().selected.version, "2.3.0")
+        live = self.root / "claude" / f".swap-{os.getpid()}-1.json"
+        live.write_text("{}")
+        self.assertEqual(rc.recover_swaps(self.root, "claude"), [])
+        self.assertEqual(rc.recover_swaps(self.root, "codex"), [])
+
+
 class Cli(Base):
     def main(self, *argv, consent=lambda _q: False):
         out, err = io.StringIO(), io.StringIO()
@@ -1005,7 +1299,7 @@ class HealthCheck(unittest.TestCase):
 
 
 AssistedRepair.good_npm.__doc__ = "Shared with Cli: an npm stub that installs a working CLI."
-Cli.npm = OwnerReply.npm = ConcurrentRepair.npm = AssistedRepair.npm
+Cli.npm = OwnerReplyBase.npm = ConcurrentRepair.npm = AssistedRepair.npm
 
 
 if __name__ == "__main__":

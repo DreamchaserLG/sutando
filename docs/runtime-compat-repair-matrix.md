@@ -47,7 +47,14 @@ Off a terminal, Sutando sends you **one DM per incident**, however often the
 launch is retried. It names the problem and what the fix changes. Reply with
 the whole message `install compatible claude` (or `install compatible codex`)
 to let Sutando install it. Reply `retry now` after you fixed it yourself or
-logged in. Sutando acts on each reply once, answers it in the same
+logged in. Sutando records each reply before it acts, then marks it applied,
+answered and archived as each step lands, so a crash replays only the steps that
+did not finish. An answer already written, even one a bridge has delivered and
+archived, is never sent again. A reply that arrives after the launch stopped
+waiting is handled by the next launch
+(`test_crash_after_*`, `test_answer_delivered_and_archived_by_the_bridge_is_not_resent`,
+`test_reply_after_the_wait_window_is_handled_on_the_next_launch`).
+Sutando acts on each reply once, answers it in the same
 conversation, and the same launch continues. The DM and reply path is the
 engine half that the desktop app's repair card calls.
 
@@ -93,6 +100,7 @@ or a consent given in one of the ways above.
 | interrupted update | npm killed mid-install, or a leftover `.staging-*` folder whose process is gone | the half-written install never replaces the old one; the leftover is reported and removed by the next repair | nothing | `test_interrupted_update_keeps_old_version`, `test_leftover_staging_is_reported_then_cleaned` |
 | new binary will not run | the staged or switched binary fails the same `--version` and `--help` probe | reports failure; the link is switched back to the previous version | use the manual command | `test_unusable_download_keeps_old_version`, `test_failed_post_swap_verify_restores_the_previous_link`, `test_link_that_will_not_launch_is_not_success`, `test_native_install_that_does_not_run_is_not_success` |
 | same version reinstalled | that version's folder already exists | a working copy is reused untouched; a broken one is replaced, never the one in use | nothing | `test_reinstall_of_same_version_keeps_the_live_target`, `test_reinstall_replaces_a_broken_copy_of_the_same_version` |
+| fault while publishing | an error or crash after staging, after the old folder is moved aside, while renaming the new folder in, while swapping the link, or in the live probe | a journal (`<root>/<cli>/.swap-*.json`) is written first. Any failure puts the old folder and the link back; the backup is deleted only after the new version runs. A process killed midway is undone (or, if it had committed, finished) by the next run | nothing | `test_fault_after_staging`, `test_fault_after_the_old_folder_is_moved_aside`, `test_fault_renaming_the_new_folder_into_place`, `test_fault_after_the_new_folder_is_in_place`, `test_fault_swapping_the_link`, `test_fault_in_the_live_probe`, `test_live_probe_fails_restores_old_folder_and_link`, `test_process_killed_mid_swap_is_undone_by_the_next_run`, `test_committed_swap_left_by_a_killed_process_is_finished` |
 | two repairs at once | two launchers repair the same CLI | a lock on `<root>/<cli>` runs them one at a time; the second one finds the first one's result and uses it | nothing | `test_two_racing_repairs_install_once_and_both_see_the_result`, `test_concurrent_installs_are_serialized` |
 | no installer | no `npm`, and no native installer route for this CLI | reports it with the user step | follow the "neither" row above | `test_npm_missing` |
 
