@@ -2,8 +2,9 @@
 
 Every 15 minutes the agent's scheduler runs `keepalive keepawake` (the run is what keeps
 the agent awake); the agent registers that task itself, since Hatch's scheduler does not
-run task files on disk. It restarts Sparrow if Sparrow is not running and appends one line
-to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1`. A scheduler
+run task files on disk. It restarts Sparrow if Sparrow is not running, replaces one no unit
+runs whose environment lacks REMOTE_HEALTH_COMMAND, and appends one line to the keepalive
+log: `<utc> keepawake listener=up|down restarted=0|1[ reason=...]`. A scheduler
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last
@@ -36,6 +37,7 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
@@ -294,6 +296,37 @@ def _stop(pid: int) -> bool:
     return False
 
 
+def health_env_problem(cfg: dict, pid: "int | None") -> "str | None":
+    """None when Sparrow `pid` runs with this install's REMOTE_HEALTH_COMMAND, else
+    NO_HEALTH_COMMAND, or UNKNOWN_ENV when its environment cannot be read."""
+    env = sparrow_env(pid) if pid is not None else None
+    if env is None:
+        return UNKNOWN_ENV
+    ok = env.get("REMOTE_HEALTH_COMMAND") == health_command(_command(cfg))
+    return None if ok else NO_HEALTH_COMMAND
+
+
+def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
+    """For a Sparrow no unit runs: the pid holding its lock, and health_env_problem.
+    (None, None) when a systemd unit (ours or hand-made) runs Sparrow."""
+    if _unit_owner() is not None:
+        return None, None
+    pid = _cli.live_lock_holder(_cli._lock_record(_state_dir(cfg), _instance(cfg)))
+    return pid, health_env_problem(cfg, pid)
+
+
+def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
+    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND, and start one
+    that has it."""
+    print(f"replacing: Sparrow (pid {pid}) runs without "
+          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}")
+    if not _stop(pid):
+        return False, f"the old Sparrow (pid {pid}) did not stop"
+    ok, how = restart_listener(cfg)
+    return ok, (how if ok else
+                f"{how}; the old Sparrow (pid {pid}) was stopped, so none is running now")
+
+
 def _unit_owner() -> "str | None":
     """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit
     (or no systemd to run it)."""
@@ -361,15 +394,16 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                 stopped = holder
             start = True
     elif holder is not None:
-        env = sparrow_env(holder)
-        want = health_command(_command(cfg))
-        if env is None:
+        problem = health_env_problem(cfg, holder)
+        if problem == UNKNOWN_ENV:
             _left_running(holder)
-        elif health and env.get("REMOTE_HEALTH_COMMAND") != want:
-            print(f"replacing: Sparrow (pid {holder}) runs without REMOTE_HEALTH_COMMAND={want}")
-            if not _stop(holder):
+        elif health and problem == NO_HEALTH_COMMAND:
+            ok, how = replace_sparrow(cfg, holder)
+            if not ok:
+                print(f"error: Sparrow was not replaced: {how}", file=sys.stderr)
                 return 1
-            start, stopped = True, holder
+            print(f"started: {how}")
+            return _await_connected(state, instance, started)
     else:
         start = not listener_up(cfg, started)
     if start:
@@ -405,7 +439,7 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     now = time.time() if now is None else now
-    up, restarted, rc = listener_up(cfg, now), 0, 0
+    up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)
         if ok:
@@ -414,7 +448,18 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         else:
             print(f"listener is down and the restart failed: {how}", file=sys.stderr)
             rc = 1
-    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}"
+    else:
+        pid, reason = unmanaged_health_problem(cfg)
+        if reason == NO_HEALTH_COMMAND:
+            ok, how = replace_sparrow(cfg, pid)
+            if ok:
+                restarted = 1
+                print(f"restarted: {how}")
+            else:
+                print(f"the replace failed: {how}", file=sys.stderr)
+                rc = 1
+    line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
+        + (f" reason={reason}" if reason else "")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as fh:
         fh.write(line + "\n")
@@ -509,8 +554,12 @@ def status_line(cfg: dict, now: float | None = None) -> "tuple[str, dict | None]
     last, row = last_keepawake(log), health_row(cfg, log, now)
     health = ("none" if row is None else row["condition"]
               + (f" ({row['reason']})" if row["reason"] else ""))
-    return (f"{_utc(now)} listener={'up' if listener_up(cfg, now) else 'down'} "
-            f"last_keepawake={_utc(last) if last is not None else 'never'} health={health}", row)
+    up = listener_up(cfg, now)
+    # The row cannot carry this: a Sparrow without the command never asks for the row.
+    flag = up and unmanaged_health_problem(cfg)[1] == NO_HEALTH_COMMAND
+    return (f"{_utc(now)} listener={'up' if up else 'down'} "
+            f"last_keepawake={_utc(last) if last is not None else 'never'} health={health}"
+            + (f" flag=sparrow-{NO_HEALTH_COMMAND}" if flag else ""), row)
 
 
 def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:

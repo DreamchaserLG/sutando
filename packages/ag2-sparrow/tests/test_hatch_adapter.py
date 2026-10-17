@@ -1545,7 +1545,7 @@ class Keepalive(Base):
     """The one keepawake task install schedules, the command it runs, and Sparrow's health row."""
     cli, state, sparrow_status = Cli.cli, Cli.state, Cli.sparrow_status
     LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ keepawake listener=(up|down) "
-                      r"restarted=[01]$")
+                      r"restarted=[01]( reason=\S+)?$")
 
     @property
     def crons(self):
@@ -1664,7 +1664,8 @@ class Keepalive(Base):
         restart.assert_not_called()
         (line,) = self.log.read_text().splitlines()
         self.assertRegex(line, self.LINE)
-        self.assertTrue(line.endswith(" keepawake listener=up restarted=0"))
+        self.assertTrue(line.endswith(" keepawake listener=up restarted=0 reason=unknown-env"),
+                        "no lock record names the running Sparrow")
         self.assertRegex(self.cli("keepalive", "status").stdout.strip(),
                          r"Z listener=up last_keepawake=\S+Z health=healthy$")
 
@@ -1986,6 +1987,53 @@ class StartSparrow(Base):
         self.assertIsNone(old.poll())
         self.assertFalse(self.seen.exists())
         self.assertIn("sparrow: running and connected", r.stdout)
+
+    def keepawake(self, env):
+        """keepawake against the old Sparrow, its environment read as `env`."""
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        with mock.patch.object(keepalive, "sparrow_env", return_value=env):
+            r = self.cli("keepalive", "keepawake")
+        return r, (self.home / "keepalive-probe.log").read_text().strip()
+
+    def test_keepawake_replaces_a_sparrow_without_the_health_command(self):
+        old = self.old_sparrow()
+        r, line = self.keepawake({"HOME": "x"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=no-health-command"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def test_keepawake_leaves_a_sparrow_it_cannot_read_or_that_has_it(self):
+        old = self.old_sparrow()
+        want = keepalive.health_command(str(self.reply_stub))
+        for env, tail in ((None, " restarted=0 reason=unknown-env"),
+                          ({"REMOTE_HEALTH_COMMAND": want}, " restarted=0")):
+            r, line = self.keepawake(env)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(line.splitlines()[-1].endswith(tail), line)
+        self.assertIsNone(old.poll())
+        self.assertFalse(self.seen.exists())
+
+    def test_verify_fails_a_sparrow_without_the_health_command(self):
+        old = self.old_sparrow()
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}):
+            r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"\nFAIL sparrow health: sparrow runs without the health command (pid "
+                      f"{old.pid}): its heartbeats carry no health row; run install\n", r.stdout)
+        self.assertIn(" flag=sparrow-no-health-command", r.stdout)
+        with mock.patch.object(keepalive, "sparrow_env", return_value=None):
+            r = self.cli("verify")
+        self.assertIn("\nNOTE sparrow health: the running Sparrow's environment cannot be read",
+                      r.stdout)
+        self.assertNotIn("FAIL sparrow health", r.stdout)
+        with mock.patch.object(keepalive, "sparrow_env",
+                               return_value={"REMOTE_HEALTH_COMMAND": want}):
+            r = self.cli("verify")
+        self.assertNotIn("sparrow health", r.stdout)
+        self.assertIsNone(old.poll(), "verify only observes")
 
     def service(self, fake, token=True, on_restart=None):
         """Our unit file, `fake` as systemctl, and (with `token`) the relay token file."""

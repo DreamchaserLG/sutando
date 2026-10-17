@@ -832,6 +832,14 @@ def verify(_args) -> int:
         print(f"NOTE keepalive: {line} ({task} has not run yet; unless you already did, {step})")
     else:
         print(f"NOTE keepalive: {line}")
+    if row is not None and keepalive.listener_up(cfg, time.time()):
+        pid, problem = keepalive.unmanaged_health_problem(cfg)
+        if problem == keepalive.NO_HEALTH_COMMAND:
+            _check(results, False, "sparrow health", f"sparrow runs without the health command "
+                   f"(pid {pid}): its heartbeats carry no health row; run install")
+        elif problem == keepalive.UNKNOWN_ENV:
+            print("NOTE sparrow health: the running Sparrow's environment cannot be read, so "
+                  "whether its heartbeats carry the health row is unknown")
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
     print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "

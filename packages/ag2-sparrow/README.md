@@ -527,6 +527,14 @@ lock, is not a restart. Each run appends one line to `~/keepalive-probe.log`:
 ```
 
 `listener` is what the run found; `restarted=1` means it started Sparrow again.
+With no unit install wrote, a running Sparrow whose environment (from `/proc`)
+lacks `REMOTE_HEALTH_COMMAND`, for example one started by hand, sends no health
+row; the run replaces it the way install does and logs `listener=up restarted=1
+reason=no-health-command`. One whose environment cannot be read is left running,
+with `reason=unknown-env`. `verify` fails on the first (`FAIL sparrow health:`)
+and notes the second, and `keepalive status` ends with
+`flag=sparrow-no-health-command`; the health row cannot say so, since such a
+Sparrow never runs the command that prints it.
 
 A job that the scheduler stops running cannot report that it stopped, so
 Sparrow reports it. `install` puts `REMOTE_HEALTH_COMMAND=<ag2-sparrow-hatch>
