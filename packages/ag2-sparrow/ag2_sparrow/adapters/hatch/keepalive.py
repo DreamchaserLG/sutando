@@ -3,8 +3,8 @@
 Every 15 minutes the agent's scheduler runs `keepalive keepawake` (the run is what keeps
 the agent awake); the agent registers that task itself, since Hatch's scheduler does not
 run task files on disk. It restarts Sparrow if Sparrow is not running, replaces one no unit
-runs whose environment lacks REMOTE_HEALTH_COMMAND, and appends one line to the keepalive
-log: `<utc> keepawake listener=up|down restarted=0|1[ reason=...]`. A scheduler
+runs whose REMOTE_HEALTH_COMMAND is missing or not this install's, and appends one line
+to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1[ reason=...]`. A scheduler
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last

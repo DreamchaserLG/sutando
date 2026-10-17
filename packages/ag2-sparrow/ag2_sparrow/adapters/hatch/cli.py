@@ -469,16 +469,24 @@ def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -
     return code != SPARROW_DOWN and not ran
 
 
+def keepawake_note(reply_command: str, keepalive_on: bool = True) -> str:
+    """Who keeps Sparrow running when no user service does."""
+    if not keepalive_on:
+        return "with no keepalive task, nothing restarts Sparrow after a crash or reboot"
+    cmd = shlex.join([reply_command or REPLY_COMMAND, "keepalive", "keepawake"])
+    return f"the agent keeps Sparrow running with {cmd} from its scheduler"
+
+
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool, health_command: str = "") -> None:
+                    force: bool, health_command: str = "", reply_command: str = "") -> None:
     """Write, enable and start the ag2-sparrow user service. Never fails the install:
     each problem prints a NOTE saying what was not done and how to finish by hand."""
     def note(text: str) -> None:
         print(f"NOTE service: {text}")
 
     if not systemd_user_available():
-        note("systemctl --user is not available here, so no service was set up and nothing "
-             "restarts Sparrow after a crash or reboot; keep ag2-sparrow running another way")
+        note("systemctl --user is not available here, so no service was set up; "
+             + keepawake_note(reply_command, bool(health_command)))
         return
     exec_start = _find_console_script(SPARROW_COMMAND)
     if not exec_start:
@@ -580,15 +588,15 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              f"run: loginctl enable-linger {user or '$USER'}")
 
 
-def service_status() -> "tuple[bool | None, str]":
+def service_status(reply_command: str = "") -> "tuple[bool | None, str]":
     """(True, detail) installed and enabled; (False, detail) installed but not enabled;
     (None, detail) when there is nothing to judge (no systemd, or no unit)."""
     unit = service_path()
     if not systemd_user_available():
-        return None, "systemctl --user is not available; nothing restarts Sparrow by itself"
+        return None, f"systemctl --user is not available; {keepawake_note(reply_command)}"
     if not unit.is_file():
-        return None, (f"{unit} not installed; nothing restarts Sparrow after a crash or reboot. "
-                      "Run ag2-sparrow-hatch install to set it up")
+        return None, (f"{unit} not installed; {keepawake_note(reply_command)}. Run "
+                      "ag2-sparrow-hatch install to set the service up")
     enabled = _systemd_run(["systemctl", "--user", "is-enabled", SERVICE_NAME])
     if not _ok(enabled):
         return False, (f"{unit} installed but not enabled; run systemctl --user enable --now "
@@ -630,12 +638,13 @@ def install(args) -> int:
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     if args.no_service:
-        print("skipped: the ag2-sparrow user service (--no-service); nothing restarts Sparrow "
-              "after a crash or reboot unless you keep it running another way")
+        print("skipped: the ag2-sparrow user service (--no-service); "
+              + keepawake_note(reply_command, not args.no_keepalive))
     else:
         install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
                         args.force,
-                        "" if args.no_keepalive else keepalive.health_command(reply_command))
+                        "" if args.no_keepalive else keepalive.health_command(reply_command),
+                        reply_command)
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
@@ -787,7 +796,7 @@ def verify(_args) -> int:
         ok, detail = True, f"last run {int(time.time() - run[0])}s ago, this ag2-sparrow's script"
     _check(results, ok, "hook run", detail)
 
-    ok, detail = service_status()
+    ok, detail = service_status(cfg.get("REPLY_COMMAND", ""))
     if ok is None:
         print(f"NOTE service: {detail}")
     else:
@@ -859,10 +868,10 @@ def uninstall(args) -> int:
     if args.keepalive:
         from . import keepalive
         rc = keepalive.uninstall_tasks(_installed_config())
-    return max(rc, uninstall_service()) if args.service else rc
+    return max(rc, uninstall_service(not args.keepalive)) if args.service else rc
 
 
-def uninstall_service() -> int:
+def uninstall_service(keepalive_on: bool = True) -> int:
     """Stop, disable and remove the ag2-sparrow user service install wrote."""
     unit = service_path()
     if not unit.is_file():
@@ -882,8 +891,8 @@ def uninstall_service() -> int:
     print(f"removed: {unit}")
     if systemd_user_available():
         _systemd_run(["systemctl", "--user", "daemon-reload"])
-    print("Linger was left as it is (other user services may need it); nothing restarts Sparrow "
-          "now, so keep ag2-sparrow running another way or run install again.")
+    print("Linger was left as it is (other user services may need it); "
+          + keepawake_note(_installed_config().get("REPLY_COMMAND", ""), keepalive_on) + ".")
     return 0
 
 
@@ -1096,11 +1105,11 @@ def main(argv=None) -> int:
     p.add_argument("--force", action="store_true", help="replace a locally modified hook script, "
                    "ag2-sparrow.service, or keepalive tasks install did not write")
     p.add_argument("--no-service", action="store_true", help="do not set up the ag2-sparrow "
-                   "systemd user service that restarts Sparrow")
+                   "systemd user service; the agent's keepawake task still restarts Sparrow")
     p.add_argument("--no-keepalive", action="store_true", help="do not schedule the keepalive "
                    "task")
     p.add_argument("--no-start", action="store_true", help="do not start, replace or check "
-                   "Sparrow (keep it running another way)")
+                   "Sparrow now; the agent's keepawake task starts it on its next run")
     p.add_argument("--cron-dir", help="where Hatch reads scheduled tasks (default: "
                    "~/workspace/cron.d/minutely)")
     p.add_argument("--keepalive-log", help="the keepalive log (default: "

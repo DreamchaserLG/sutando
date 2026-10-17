@@ -367,8 +367,12 @@ line and `verify` prints a `hook run` line.
 ### Keeping Sparrow running
 
 The hook cannot start Sparrow, and a stopped Sparrow writes no task files.
-Where `systemctl --user` reaches a user manager, `install` runs Sparrow as a
-user service so it restarts after a crash or a reboot. It writes
+The agent keeps Sparrow running with `ag2-sparrow-hatch keepalive keepawake`
+from its scheduler (see
+[Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)), with or
+without a service. Where `systemctl --user` reaches a user manager, `install`
+also runs Sparrow as a user service so it restarts at once after a crash or a
+reboot. It writes
 `~/.config/systemd/user/ag2-sparrow.service`:
 
 ```ini
@@ -447,9 +451,11 @@ password:
 `install` wrote (a unit it did not write is refused), and leaves linger as it
 is, since other user services may need it. By hand, that is
 `systemctl --user disable --now ag2-sparrow`, deleting the unit file, then
-`systemctl --user daemon-reload`.
+`systemctl --user daemon-reload`. Without the service, the keepawake task still
+restarts Sparrow.
 
-Pass `--no-service` to skip all of this. Run `install` and `verify` with the
+Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
+running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
@@ -483,17 +489,17 @@ An upgrade never needs Sparrow stopped by hand. After writing its files,
   unit stays stopped and install exits non-zero saying so.
 - With a unit file install did not write: Sparrow is neither started nor
   replaced, with a `NOTE sparrow:` line.
-- Without one: a Sparrow that runs without `REMOTE_HEALTH_COMMAND` in its
-  environment (read from `/proc`) is stopped with SIGTERM and started again the
-  way the keepawake task starts it, which sets it. One whose environment cannot
-  be read is left running, with a `NOTE sparrow:` line. If none runs, one is
-  started.
+- Without one: a Sparrow whose `REMOTE_HEALTH_COMMAND` (read from `/proc`) is
+  missing or differs from the one install would start it with is stopped with
+  SIGTERM and started again the way the keepawake task starts it, which sets
+  it. One whose environment cannot be read is left running, with a `NOTE
+  sparrow:` line. If none runs, one is started.
 
 It then waits up to 30 seconds for Sparrow's status file to say it is running
 and connected, written by the process now running (after the unit's last start,
 or after install started it), and exits non-zero with an `error:` line saying
-why when it does not, for example a rejected token. `--no-start` skips this step for a
-Sparrow you keep running another way.
+why when it does not, for example a rejected token. `--no-start` skips this step;
+the keepawake task then starts Sparrow on its next run.
 
 ### Keepalive: one scheduled task and the health panel
 
@@ -527,9 +533,11 @@ lock, is not a restart. Each run appends one line to `~/keepalive-probe.log`:
 ```
 
 `listener` is what the run found; `restarted=1` means it started Sparrow again.
-With no unit install wrote, a running Sparrow whose environment (from `/proc`)
-lacks `REMOTE_HEALTH_COMMAND`, for example one started by hand, sends no health
-row; the run replaces it the way install does and logs `listener=up restarted=1
+With no systemd unit for Sparrow (one install wrote or a hand-made one; a unit
+runs its own Sparrow, which the run never replaces), a running Sparrow whose
+`REMOTE_HEALTH_COMMAND` (from `/proc`) is missing or differs from this
+install's, for example one started by hand, sends no health row, or the wrong
+one; the run replaces it the way install does and logs `listener=up restarted=1
 reason=no-health-command`. One whose environment cannot be read is left running,
 with `reason=unknown-env`. `verify` fails on the first (`FAIL sparrow health:`)
 and notes the second, and `keepalive status` ends with

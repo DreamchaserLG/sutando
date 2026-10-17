@@ -29,6 +29,8 @@ sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import health_command as hc, outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
+KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
+
 REAL_SYSTEMD_RUN = hatch_cli._systemd_run
 REAL_ENSURE_SPARROW = keepalive.ensure_sparrow
 
@@ -1308,7 +1310,8 @@ class Service(Base):
         r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(self.unit.exists())
-        self.assertIn("NOTE service: systemctl --user is not available", r.stdout)
+        self.assertIn("NOTE service: systemctl --user is not available here, so no service was "
+                      f"set up; {KEEPAWAKE_NOTE % self.reply_stub}\n", r.stdout)
         self.assertEqual(fake.calls, [["--user", "show-environment"]])
 
     def test_a_path_systemd_cannot_carry_is_refused_and_non_ascii_is_kept(self):
@@ -1406,6 +1409,7 @@ class Service(Base):
         self.assertEqual(fake.ran("disable"), [["--user", "disable", "--now", "ag2-sparrow.service"]])
         self.assertEqual(len(fake.ran("daemon-reload")), 1)
         self.assertEqual([c for c in fake.calls if c[0] == "loginctl"], [])
+        self.assertIn(f"may need it); {KEEPAWAKE_NOTE % self.reply_stub}.\n", r.stdout)
         r = self.with_systemd(fake, "uninstall", "--service")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("nothing to remove", r.stdout)
@@ -1423,7 +1427,11 @@ class Service(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(self.unit.exists())
         self.assertEqual(fake.calls, [])
-        self.assertIn("skipped: the ag2-sparrow user service (--no-service)", r.stdout)
+        self.assertIn("skipped: the ag2-sparrow user service (--no-service); "
+                      f"{KEEPAWAKE_NOTE % self.reply_stub}\n", r.stdout)
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-service", "--no-keepalive",
+                              env={"USER": "hatch"})
+        self.assertIn("(--no-service); with no keepalive task, nothing restarts Sparrow", r.stdout)
 
     def test_linger_failure_is_not_fatal(self):
         fake = FakeSystemd(linger_ok=False)
@@ -1547,7 +1555,7 @@ class Service(Base):
         r = self.with_systemd(FakeSystemd(), "verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("NOTE service:", r.stdout)
-        self.assertIn("not installed; nothing restarts Sparrow", r.stdout)
+        self.assertIn(f"not installed; {KEEPAWAKE_NOTE % self.reply_stub}. Run", r.stdout)
         r = self.with_systemd(FakeSystemd(available=False), "verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("NOTE service: systemctl --user is not available", r.stdout)
@@ -2198,6 +2206,48 @@ class StartSparrow(Base):
         self.assertIsNone(old.poll())
         self.assertFalse(self.seen.exists())
         self.assertEqual(fake.ran("restart"), [])
+
+    def test_keepawake_never_replaces_a_sparrow_a_unit_runs(self):
+        hand_made = "[Service]\nExecStart=/usr/bin/ag2-sparrow\nRestart=always\n"
+        for unit_text in (hatch_cli.SERVICE_MARKER + "\n[Service]\n", hand_made):
+            old = self.old_sparrow()
+            self.old_pid = old.pid
+            fake = FakeSystemd(state="active", main_pid=old.pid)
+            self.cli("install", "--mxid", AGENT, "--no-service")
+            with self.service(fake):
+                unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+                unit.write_text(unit_text)
+                with mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}):
+                    r = self.cli("keepalive", "keepawake")
+            line = (self.home / "keepalive-probe.log").read_text().splitlines()[-1]
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertTrue(line.endswith(" listener=up restarted=0"), (unit_text, line))
+            self.assertIsNone(old.poll(), "keepawake signalled a Sparrow a unit runs")
+            self.assertEqual(fake.ran("restart"), [], unit_text)
+            self.assertFalse(self.seen.exists())
+            old.kill()
+
+    def test_the_health_command_must_match_exactly(self):
+        want = keepalive.health_command(str(self.reply_stub))
+        cfg = {"REPLY_COMMAND": str(self.reply_stub)}
+        cases = ((None, keepalive.UNKNOWN_ENV), ({"REMOTE_HEALTH_COMMAND": want}, None),
+                 ({"HOME": "x"}, keepalive.NO_HEALTH_COMMAND),
+                 ({"REMOTE_HEALTH_COMMAND": ""}, keepalive.NO_HEALTH_COMMAND),
+                 ({"REMOTE_HEALTH_COMMAND": want + " --x"}, keepalive.NO_HEALTH_COMMAND),
+                 ({"REMOTE_HEALTH_COMMAND": want[:-1]}, keepalive.NO_HEALTH_COMMAND),
+                 ({"REMOTE_HEALTH_COMMAND": "/old/ag2-sparrow-hatch-reply keepalive health"},
+                  keepalive.NO_HEALTH_COMMAND))
+        for env, problem in cases:
+            with mock.patch.object(keepalive, "sparrow_env", return_value=env):
+                self.assertEqual(keepalive.health_env_problem(cfg, 4242), problem, env)
+
+    def test_keepawake_replaces_a_sparrow_with_a_different_health_command(self):
+        old = self.old_sparrow()
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": "/old/reply keepalive health"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=no-health-command"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
 
     def test_a_failed_start_after_a_stop_says_none_runs(self):
         old = self.old_sparrow()
