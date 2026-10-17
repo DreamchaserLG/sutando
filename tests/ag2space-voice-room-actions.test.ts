@@ -517,6 +517,11 @@ describe('the tools as the voice model sees them', () => {
 	it('the rules name the tools', () => {
 		for (const name of ['find_room_actions', 'describe_room_action', 'run_room_action']) assert.ok(ROOM_ACTIONS_PROMPT_RULE.includes(name), name);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /^- none:/);
+		// 2026-10-16 03:33: "write something in it" right after the project was made went to the core as work.
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /Writing or changing what a LaTeX or Typst project's files say .* is yours too, never work/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.pages\.read .* room\.commons\.changes\.apply/);
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /write into its main file, never a new page/);
+		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /writing or changing what its files say/);
 	});
 });
 }

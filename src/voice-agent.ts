@@ -1005,7 +1005,7 @@ async function main() {
 		store: voiceTaskStore,
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
-		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
+		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), ownRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
 		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
 		// and sent "那个餐馆的 menu" with the blank in it).
