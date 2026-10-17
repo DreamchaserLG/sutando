@@ -241,17 +241,6 @@ def _proc(pid: int, name: str) -> "bytes | None":
         return None
 
 
-def _gone(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except OSError:
-        return False
-    stat = _proc(pid, "stat") or b""
-    return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
-
-
 def is_sparrow_argv(argv: "list[str]") -> bool:
     """The `ag2-sparrow` console script, run directly or by its Python, or `-m ag2_sparrow`."""
     if any(os.path.basename(a) == _cli.SPARROW_COMMAND for a in argv[:2]):
@@ -287,7 +276,7 @@ def _stop(pid: int) -> bool:
         return False
     deadline = time.monotonic() + STOP_WAIT_S
     while time.monotonic() < deadline:
-        if _gone(pid):
+        if _cli.process_gone(pid):
             return True
         time.sleep(0.2)
     print(f"error: Sparrow (pid {pid}) did not exit within {STOP_WAIT_S:g}s of SIGTERM",

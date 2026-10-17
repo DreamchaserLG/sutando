@@ -1689,13 +1689,17 @@ class StartSparrow(Base):
         with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
             return self.cli("install", "--mxid", AGENT, "--no-service", *extra)
 
-    def old_sparrow(self, sparrow=True):
+    def old_sparrow(self, sparrow=True, linger=0.0):
         """A live process holding Sparrow's lock, reaped as soon as it exits; its command line
-        is Sparrow's unless `sparrow` is False."""
+        is Sparrow's unless `sparrow` is False, and it exits `linger` s after SIGTERM."""
         script = self.home / (hatch_cli.SPARROW_COMMAND if sparrow else "not-sparrow")
-        script.write_text("import time\ntime.sleep(60)\n")
+        ready = self.home / "old-sparrow-ready"
+        script.write_text("import pathlib, signal, sys, time\n" + (
+            f"signal.signal(signal.SIGTERM, lambda *a: (time.sleep({linger}), sys.exit(0)))\n"
+            if linger else "") + f"pathlib.Path({str(ready)!r}).touch()\ntime.sleep(60)\n")
         self.old_argv = [sys.executable, str(script)]
         proc = subprocess.Popen(self.old_argv)
+        self.wait_for(ready)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         threading.Thread(target=proc.wait, daemon=True).start()
         path = self.state / "locks" / "gateway-bridge.lock"
@@ -1789,6 +1793,53 @@ class StartSparrow(Base):
         self.assertEqual(r, 0, self.out + self.err)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
         self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+
+    def test_a_status_written_before_the_start_does_not_count(self):
+        old = self.old_sparrow()  # leaves a connected status 5 s old
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="inactive")
+        with mock.patch.object(keepalive, "START_WAIT_S", 1.0), self.service(fake):
+            r = self.call_ensure()
+        self.assertEqual(r, 1, self.out)
+        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+        self.assertNotIn("running and connected", self.out)
+
+    def test_the_start_waits_for_the_stopped_sparrow_to_exit(self):
+        old = self.old_sparrow(linger=1.5)
+        self.old_pid = old.pid
+        fake, alive_at_start = FakeSystemd(state="inactive"), []
+
+        def restarted(cmd):
+            try:
+                old.wait(0.2)
+            except subprocess.TimeoutExpired:
+                alive_at_start.append(old.pid)
+            self.status(-1)
+            return fake(cmd)
+        with self.service(fake, on_restart=restarted):
+            r = self.call_ensure()
+        self.assertEqual(r, 0, self.out + self.err)
+        self.assertEqual(alive_at_start, [], "the new Sparrow started before the old one exited")
+        self.assertEqual(old.returncode, 0)
+
+    def test_a_zombie_lock_holder_is_not_live(self):
+        record = {"pid": os.getpid(), "heartbeat_at": int(time.time()),
+                  "host": hatch_cli.workspace_lock._host_label()}
+        for state, want in ((b"S", os.getpid()), (b"Z", None)):
+            stat = b"%d (ag2-sparrow) %s 1 2 3" % (os.getpid(), state)
+            with mock.patch.object(hatch_cli, "_proc_stat", return_value=stat):
+                self.assertEqual(hatch_cli.live_lock_holder(record), want, state)
+                self.assertEqual(hatch_cli.process_gone(os.getpid()), want is None, state)
+
+    @unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")
+    def test_a_real_zombie_counts_as_gone(self):
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.addCleanup(proc.wait)
+        deadline = time.monotonic() + 5
+        while b") Z" not in hatch_cli._proc_stat(proc.pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(hatch_cli.process_gone(proc.pid))
+        self.assertFalse(hatch_cli.process_gone(os.getpid()))
 
     def test_a_lock_holder_that_is_not_sparrow_is_left_alone(self):
         old = self.old_sparrow(sparrow=False)
@@ -1962,6 +2013,15 @@ class HealthCommand(Base):
         executable(path, "#!/bin/sh\nhead -c 6000 /dev/zero | tr '\\0' x >&2\n"
                    "echo >&2\necho 'the real reason' >&2\nexit 1\n")
         self.assertEqual(hc.run(str(path)), (None, "exited 1: the real reason"))
+
+    def test_only_the_end_of_stderr_is_read(self):
+        path = self.bin / "longline"
+        executable(path, "#!/bin/sh\nhead -c 9000 /dev/zero | tr '\\0' x >&2\n"
+                   "echo ' end' >&2\nexit 1\n")
+        row, why = hc.run(str(path))
+        self.assertIsNone(row)
+        self.assertTrue(why.endswith("x end"), why[-20:])
+        self.assertLessEqual(len(why), len("exited 1: ") + hc.MAX_OUTPUT)
 
     def test_stdout_is_read_only_up_to_its_bound(self):
         big = json.dumps({**self.ROW, "pad": "x" * hc.MAX_OUTPUT})

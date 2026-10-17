@@ -289,17 +289,32 @@ def _lock_record(state_dir: Path, instance: str) -> "dict | None":
     return holder if ok else None
 
 
+def _proc_stat(pid: int) -> bytes:
+    try:
+        return Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return b""
+
+
+def process_gone(pid: int) -> bool:
+    """Whether `pid` has exited, a zombie included; False when that cannot be told."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    stat = _proc_stat(pid)
+    return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
+
+
 def live_lock_holder(holder: "dict | None") -> "int | None":
     """The pid of a live Sparrow holding `holder` with a fresh heartbeat, else None."""
     pid = (holder or {}).get("pid")
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    if process_gone(pid):
         return None  # its holder crashed; the fresh status file is a corpse
-    except OSError:
-        pass
     return pid if workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS) else None
 
 
