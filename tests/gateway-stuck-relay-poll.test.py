@@ -34,6 +34,9 @@ _SHORT_READ_TIMEOUT_S = 0.3
 _TIME_SCALE = 0.1
 
 
+STUCK_N = getattr(_GW, "STUCK_POLL_TIMEOUTS", 5)
+
+
 def _poll_budget(gw) -> float:
     return getattr(gw, "POLL_READ_TIMEOUT_S", gw.POLL_WAIT + 10)
 
@@ -309,6 +312,78 @@ class StuckRelayPollTest(unittest.TestCase):
         self.assertTrue(list(self.gw.TASKS_DIR.glob(f"{tid}*")), "the task file is gone")
         self.assertIn(tid, self.gw._load_inflight(), "the relaunch would not reload it in flight")
         self.assertIn(tid, self.gw._load_pending_acks(), "the relaunch would not retry its ack")
+
+
+class StuckPollDecisionTest(unittest.TestCase):
+    """The restart decision on its own: what counts as a recent success elsewhere,
+    and what a missing, unreadable or future restart stamp means."""
+
+    T0 = 1_800_000_000.0
+
+    def setUp(self):
+        gw = self.gw = _GW
+        self.tmp = tempfile.TemporaryDirectory()
+        self.stamp = Path(self.tmp.name) / "gateway-stuck-poll.json"
+        self.logs: list[str] = []
+        self._saved = (gw.STUCK_POLL_RECOVERY_FILE, gw._log, dict(gw._POLL_STREAK),
+                       dict(gw._LAST_REQ_OK))
+        gw.STUCK_POLL_RECOVERY_FILE = self.stamp
+        gw._log = lambda m: self.logs.append(str(m))
+        gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False)
+
+    def tearDown(self):
+        gw = self.gw
+        gw.STUCK_POLL_RECOVERY_FILE, gw._log, streak, req_ok = self._saved
+        gw._POLL_STREAK.clear(); gw._POLL_STREAK.update(streak)
+        gw._LAST_REQ_OK.clear(); gw._LAST_REQ_OK.update(req_ok)
+        self.tmp.cleanup()
+
+    def streak(self, start=None):
+        """N timeouts one poll budget apart from `start`, with a heartbeat answered
+        30 s before the last one; that last decision."""
+        start = self.T0 if start is None else start
+        self.gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
+                                    stamp_logged=False)
+        times = [start + i * _poll_budget(self.gw) for i in range(STUCK_N)]
+        self.gw._LAST_REQ_OK["at"] = times[-1] - 30
+        return [self.gw._stuck_poll_restart_due(t) for t in times][-1]
+
+    def test_a_recent_success_elsewhere_restarts(self):
+        self.assertTrue(self.streak())
+
+    def test_one_early_success_then_only_failures_is_an_outage_not_a_stuck_poll(self):
+        # One heartbeat answered just after the streak began; nothing since, for hours.
+        self.gw._POLL_STREAK["stamp_logged"] = False
+        self.gw._LAST_REQ_OK["at"] = self.T0 + 1
+        self.gw._POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False)
+        due = [self.gw._stuck_poll_restart_due(self.T0 + i * 3600) for i in range(STUCK_N + 3)]
+        self.assertEqual(due, [False] * (STUCK_N + 3), "a stale success kept restarting the bridge")
+        self.assertIsNone(self.gw._POLL_STREAK["stuck_since"], "still reported as a stuck poll")
+        self.assertFalse(self.stamp.exists(), "a restart was recorded")
+
+    def test_a_missing_stamp_means_no_earlier_restart(self):
+        self.assertTrue(self.streak())
+        self.assertTrue(self.stamp.exists())
+
+    def test_an_unreadable_stamp_holds_one_interval_then_restarts(self):
+        interval = getattr(self.gw, "STUCK_POLL_RECOVERY_INTERVAL_S", 600)
+        for bad in ("{not json", '{"at": "yesterday"}', '["at"]', '{"at": NaN}'):
+            with self.subTest(stamp=bad):
+                self.stamp.write_text(bad)
+                self.logs.clear()
+                last_poll = self.T0 + (STUCK_N - 1) * _poll_budget(self.gw)
+                self.assertFalse(self.streak(), "an unreadable stamp read as no earlier restart")
+                self.assertEqual(sum("unreadable" in m for m in self.logs), 1, self.logs)
+                self.assertTrue(self.streak(start=last_poll + interval + 1),
+                                "the hold outlasted one interval")
+                self.stamp.unlink()
+
+    def test_a_stamp_far_in_the_future_does_not_hold_recovery(self):
+        # The clock moved back ten hours after the last restart was stamped.
+        self.stamp.write_text(json.dumps({"at": int(self.T0 + 36_000)}))
+        last_poll = self.T0 + (STUCK_N - 1) * _poll_budget(self.gw)
+        self.assertTrue(self.streak(), "a future stamp held recovery back for hours")
+        self.assertLessEqual(json.loads(self.stamp.read_text())["at"], last_poll + 1)
 
 
 class SlowRelayHoldTest(unittest.TestCase):

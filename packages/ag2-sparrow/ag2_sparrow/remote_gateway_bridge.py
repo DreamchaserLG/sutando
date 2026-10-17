@@ -7222,24 +7222,50 @@ STUCK_POLL_TIMEOUTS = 5
 # Shortest streak that can be judged stuck: N polls, each held to the read timeout.
 STUCK_POLL_DETECTION_WINDOW_S = STUCK_POLL_TIMEOUTS * POLL_READ_TIMEOUT_S
 STUCK_POLL_RECOVERY_INTERVAL_S = 600
+# A live relay answers a heartbeat at least once per pass: one held poll, one
+# back-off and one heartbeat interval. An older success says nothing about now.
+STUCK_POLL_OTHER_OK_WITHIN_S = POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + HEARTBEAT_INTERVAL
+# A restart stamp further ahead than this is a clock that moved back, not a restart.
+_STUCK_POLL_CLOCK_SKEW_S = 60
 # EX_UNAVAILABLE: every supervisor relaunches it; 75 is the stand-down none relaunch.
 STUCK_POLL_EXIT_CODE = 69
 _POLL_TIMED_OUT = "poll timed out: the relay held the task poll past the read timeout"
-_POLL_STREAK = {"timeouts": 0, "since": None, "stuck_since": None, "held_logged": False}
+_POLL_STREAK = {"timeouts": 0, "since": None, "stuck_since": None, "held_logged": False,
+                "stamp_logged": False}
 
 
 def _poll_streak_reset() -> None:
     if _POLL_STREAK["stuck_since"] is not None:
         _log(f"stuck relay poll cleared after {_POLL_STREAK['timeouts']} timeouts")
-    _POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False)
+    _POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
+                        stamp_logged=False)
 
 
-def _last_stuck_recovery() -> "float | None":
+def _log_stamp_once(msg: str) -> None:
+    if not _POLL_STREAK["stamp_logged"]:
+        _POLL_STREAK["stamp_logged"] = True
+        _log(f"stuck relay poll: {msg}")
+
+
+def _last_stuck_recovery(now: float) -> "float | None":
+    """When the last stuck-poll restart ran, or None when none did. An unreadable
+    stamp counts as a restart now and is rewritten, so it holds for one interval."""
     try:
-        at = json.loads(STUCK_POLL_RECOVERY_FILE.read_text()).get("at")
-    except (OSError, ValueError, AttributeError):
+        at = json.loads(STUCK_POLL_RECOVERY_FILE.read_text())["at"]
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not abs(at) < float("inf"):
+            raise ValueError(f"bad stamp {at!r}")
+    except FileNotFoundError:
         return None
-    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        _log_stamp_once(f"restart stamp unreadable ({type(e).__name__}) — holding the next "
+                        f"restart for {STUCK_POLL_RECOVERY_INTERVAL_S}s")
+        _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)}))
+        return now
+    if at > now + _STUCK_POLL_CLOCK_SKEW_S:
+        _log_stamp_once(f"restart stamp is {int(at - now)}s in the future (clock moved back) "
+                        "— ignoring it")
+        return None
+    return float(at)
 
 
 def _stuck_poll_restart_due(now: float) -> bool:
@@ -7249,13 +7275,16 @@ def _stuck_poll_restart_due(now: float) -> bool:
     if not s["timeouts"]:
         s["since"] = now
     s["timeouts"] += 1
-    if s["timeouts"] < STUCK_POLL_TIMEOUTS or _LAST_REQ_OK["at"] <= s["since"]:
+    other_ok = _LAST_REQ_OK["at"]
+    if (s["timeouts"] < STUCK_POLL_TIMEOUTS or other_ok <= s["since"]
+            or now - other_ok > STUCK_POLL_OTHER_OK_WITHIN_S):
+        s["stuck_since"] = None  # the rest stopped answering too: an outage, not a stuck poll
         return False
     if s["stuck_since"] is None:
         s["stuck_since"] = now
         _log(f"stuck relay poll: {s['timeouts']} consecutive task polls timed out while "
              f"other requests to {_redact_url(URL)} succeed — the relay is not serving this agent")
-    last = _last_stuck_recovery()
+    last = _last_stuck_recovery(now)
     if last is not None and now - last < STUCK_POLL_RECOVERY_INTERVAL_S:
         if not s["held_logged"]:
             s["held_logged"] = True
