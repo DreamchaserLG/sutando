@@ -215,20 +215,36 @@ def transcript_evidence(projects_dir: Optional[Path], now: float) -> Optional[Li
                 lines = fh.read().decode("utf-8", "replace").splitlines()
         except OSError:
             continue
-        for line in reversed(lines):
+        entries = []
+        for line in lines:
             try:
                 entry = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(entry, dict) or not entry.get("isApiErrorMessage"):
+            if isinstance(entry, dict):
+                entries.append(entry)
+        for i in range(len(entries) - 1, -1, -1):
+            entry = entries[i]
+            if _served_turn(entry) is not None:
+                return None  # the provider served a turn after any error: served-since
+            if not entry.get("isApiErrorMessage"):
                 continue
             at = qa._parse_when(entry.get("timestamp"))
             if at is None or not (0 <= now - at <= EVIDENCE_WINDOW_S):
                 break
-            msg = entry.get("message")
-            model = qa._norm_model(msg.get("model")) if isinstance(msg, dict) else None
-            return classify_text(_entry_text(entry), at, None if model == "<synthetic>" else model)
+            model = next((m for m in map(_served_turn, reversed(entries[:i])) if m), None)
+            return classify_text(_entry_text(entry), at, model)
     return None
+
+
+def _served_turn(entry: dict) -> Optional[str]:
+    """The model of a real assistant turn the provider served, else None. The CLI writes its
+    own errors as assistant entries with the model `<synthetic>`; those are not served turns."""
+    msg = entry.get("message")
+    if entry.get("type") != "assistant" or entry.get("isApiErrorMessage") or not isinstance(msg, dict):
+        return None
+    model = qa._norm_model(msg.get("model"))
+    return model if model and model != "<synthetic>" else None
 
 
 # ---- the hold record ----------------------------------------------------------
@@ -382,6 +398,7 @@ def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None
     if by:
         hold["cleared_by"] = by
     _write_hold(workspace, hold)
+    _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
     return hold
 
 

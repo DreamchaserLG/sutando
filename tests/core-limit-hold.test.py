@@ -214,6 +214,64 @@ exec "$REAL_PY" "$@"
 """
 
 
+def transcript(proj: Path, *entries) -> None:
+    """A session transcript, oldest first: ("error", age, text) or ("served", age, model)."""
+    now, lines = time.time(), []
+    for kind, age, value in entries:
+        if kind == "error":
+            lines.append({"type": "assistant", "isApiErrorMessage": True, "timestamp": iso(now - age),
+                          "message": {"model": "<synthetic>", "content": [{"type": "text", "text": value}]}})
+        else:
+            lines.append({"type": "assistant", "timestamp": iso(now - age),
+                          "message": {"model": value, "content": [{"type": "text", "text": "done"}]}})
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "s.jsonl").write_text("".join(json.dumps(e) + "\n" for e in lines))
+
+
+class ServedSince(unittest.TestCase):
+    """The transcript twin of the record's served-since check (Susan's review at 849cdcad)."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        self.proj = self.ws / "projects"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_a_turn_served_after_the_error_does_not_hold(self):
+        transcript(self.proj, ("served", 900, "claude-opus-5-5"),
+                   ("error", 600, "Claude usage limit reached. Your limit will reset at 3pm (UTC)."),
+                   ("served", 300, "claude-opus-5-5"))
+        d = clh.decide(self.ws, time.time(), quota=None, projects_dir=self.proj)
+        self.assertTrue(d.launch, "a core that answered after the error was held")
+
+    def test_sonnet_served_after_an_opus_limit_does_not_hold_sonnet(self):
+        transcript(self.proj, ("served", 900, "claude-opus-5-5"),
+                   ("error", 600, "Opus weekly limit reached ∙ resets 3pm (UTC)"),
+                   ("served", 300, "claude-sonnet-5"))
+        d = clh.decide(self.ws, time.time(), quota=None, projects_dir=self.proj, launch_model="sonnet")
+        self.assertTrue(d.launch, "the documented /model sonnet recovery was held until the Opus reset")
+
+    def test_the_limited_model_comes_from_the_last_real_turn(self):
+        transcript(self.proj, ("served", 900, "claude-opus-5-5"),
+                   ("error", 600, "Claude usage limit reached. Your limit will reset at 3pm (UTC)."))
+        lim = clh.transcript_evidence(self.proj, time.time())
+        self.assertEqual(lim.model, "claude-opus-5-5")
+        self.assertTrue(clh.decide(self.ws, time.time(), quota=None, projects_dir=self.proj,
+                                   launch_model="sonnet").launch)
+        self.assertFalse(clh.decide(self.ws, time.time(), quota=None, projects_dir=self.proj,
+                                    launch_model="claude-opus-5-5").launch)
+
+    def test_clear_mirrors_starting(self):
+        now = 1_800_000_000.0
+        clh.decide(self.ws, now, quota=limited_record(now))
+        clh.clear(self.ws, now + 1)
+        status = json.loads((self.ws / "state" / "core-status.json").read_text())
+        self.assertEqual(status["status"], "starting")
+
+
 class Launcher(unittest.TestCase):
     """The desktop's revive is `start-cli.sh` with the session up and the core gone."""
 
