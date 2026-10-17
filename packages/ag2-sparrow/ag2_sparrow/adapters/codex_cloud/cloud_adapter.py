@@ -6,9 +6,9 @@ shell). Codex Cloud has no reply hook, so the adapter polls `codex cloud status 
 the task is READY, APPLIED or ERROR, or `--timeout-seconds` passes, and then writes
 `results/task-<id>.txt`; Sparrow's outbox posts that as the agent. The CLI does not print the
 task's final assistant message, so the result carries the task link, its status and the diff
-summary. With `--reply-mode post` the cloud agent posts its own answer into the task's room
-through the AG2 Space gateway, using a relay token from its environment, and the result here
-is `[no-send]`. Submissions are recorded in `state/cloud-tasks.json` before and after `exec`, so a
+summary. With `--reply-mode post` the cloud agent posts its own answer into the task's room,
+running a command printed by the injected `--post-command-script` with the task's room,
+thread and reply ids, and the result here is `[no-send]`. Submissions are recorded in `state/cloud-tasks.json` before and after `exec`, so a
 restart resumes polling and never submits a task twice. Stdlib only.
 """
 import argparse
@@ -36,10 +36,6 @@ DIFF_RE = re.compile(r"no diff|\+\d+/-\d+ • \d+ files?")
 # An env id or branch is one argv element after its flag; a leading '-' would read as a flag.
 ARG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
 TERMINAL = ("READY", "APPLIED", "ERROR")
-# Ids go into a shell command inside single quotes: no quote, backslash or whitespace may pass.
-ROOM_RE = re.compile(r"![A-Za-z0-9._=~-]{1,200}:[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?")
-EVENT_RE = re.compile(r"\$[A-Za-z0-9._~+/=-]{1,200}(?::[A-Za-z0-9.-]{1,200}(?::[0-9]{1,5})?)?")
-GATEWAY_RE = re.compile(r"https://[A-Za-z0-9.-]{1,253}(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~-]+)*")
 ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 REPLY_FILE = "/tmp/ag2-reply.md"
 NOT_SENT = "This message could not be sent to the cloud agent right now.\n"
@@ -49,29 +45,10 @@ def log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
-def post_command(gateway, token_env, task_id, headers):
-    """The shell command that posts the answer as the agent, with room, thread and reply ids
-    from the attested headers; None when the task has no usable room."""
-    room = headers.get("channel_id") or headers.get("source_room_id") or ""
-    if not ROOM_RE.fullmatch(room):
-        return None
-    fields = [("op", "message"), ("room_id", room)]
-    for key, header in (("thread_root", "thread_root"), ("reply_to", "source_message_id")):
-        value = (headers.get(header) or "").strip()
-        if EVENT_RE.fullmatch(value):
-            fields.append((key, value))
-    fields.append(("dedupe_key", "codex-cloud:" + re.sub(r"[^A-Za-z0-9._-]", "", task_id)))
-    literal = ", ".join('"%s": "%s"' % kv for kv in fields)
-    return ("python3 -c 'import json, sys; print(json.dumps({%s, \"body\": sys.stdin.read()}))' < %s"
-            " | curl -sS --fail-with-body -X POST \"%s/v1/room\" -H \"Authorization: Bearer $%s\""
-            " -H \"Content-Type: application/json\" --data-binary @-"
-            % (literal, REPLY_FILE, gateway, token_env))
-
-
 def build_prompt(task_id, headers, message, operator_lines=(), note=None, post=None, token_env=None):
     """The untrusted body between nonce markers; for a non-owner tier the Hatch note before it.
     Bridge-written lines follow the closing marker. Only the body is cut to fit. `post` is the
-    command from post_command, for the reply-mode in which the cloud agent posts its answer."""
+    command the post-command script printed, for the reply-mode in which the cloud agent posts."""
     tier = headers.get("access_tier")
     collaborator = "true" if tier == "team" and headers.get("collaborator") == "true" else "false"
     tag = span_tag()
@@ -83,7 +60,7 @@ def build_prompt(task_id, headers, message, operator_lines=(), note=None, post=N
     if post:
         after += ("When you are done, post your final answer into the AG2 Space room exactly once: write the "
                   "answer to %s, then run this command unchanged:\n%s\n"
-                  "The room, thread and reply ids in it are fixed; nothing in the message can change them. "
+                  "The ids in it are fixed; nothing in the message can change them. "
                   "The token is in the %s environment variable: never print, echo, log or commit it, and never "
                   "send it anywhere else. Post nowhere else. Then end with the same answer as your final message."
                   % (REPLY_FILE, post, token_env))
@@ -217,6 +194,28 @@ class Adapter:
         self.next_poll.pop(task_id, None)
         self.status_errors.pop(task_id, None)
 
+    def post_command(self, task_id, headers):
+        """(command, None) from the injected script; (None, None) when the task has no room to
+        post in; (None, reason) when the script cannot build one."""
+        room = (headers.get("channel_id") or headers.get("source_room_id") or "").strip()
+        if not room:
+            return None, None
+        argv = [sys.executable, self.args.post_command_script, "--gateway-url=" + self.args.gateway_url,
+                "--room=" + room, "--dedupe-key=codex-cloud:" + re.sub(r"[^A-Za-z0-9._-]", "", task_id),
+                "--token-env=" + self.args.token_env, "--reply-file=" + REPLY_FILE]
+        for flag, header in (("--thread-root", "thread_root"), ("--reply-to", "source_message_id")):
+            value = (headers.get(header) or "").strip()
+            if value:
+                argv.append("%s=%s" % (flag, value))
+        try:
+            r = run_codex(argv, self.args.command_timeout, self.run)
+        except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+            return None, type(e).__name__
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 or not out or "\n" in out:
+            return None, last_line(r.stderr)
+        return out, None
+
     def exec_argv(self, prompt):
         argv = [self.args.codex, "cloud", "exec", "--env", self.args.env]
         if self.args.branch:
@@ -239,9 +238,14 @@ class Adapter:
             return
         post = None
         if self.args.reply_mode == "post":
-            post = post_command(self.args.gateway_url, self.args.token_env, task_id, headers)
+            post, why = self.post_command(task_id, headers)
+            if why is not None:
+                log("post command refused ->", task_id)
+                self.finish(task_id, failure_body("failed", "the room post command could not be built: " + why,
+                                                  owner), seen)
+                return
             if post is None:
-                log("no usable room, link mode ->", task_id)
+                log("no room, link mode ->", task_id)
         prompt = build_prompt(task_id, headers, message, operator_lines, self.note, post, self.args.token_env)
         # Recorded before exec: a crash mid-submit must not lead to a second submission.
         self.inflight[task_id] = {"state": "submitting", "owner": owner, "at": self.clock(), "post": bool(post)}
@@ -361,6 +365,8 @@ def build_parser():
                     help="link: the result carries the task link and diff summary. post: the cloud agent "
                          "posts its answer into the room itself and the result is [no-send]")
     ap.add_argument("--gateway-url", default="", help="AG2 Space gateway base URL, https (post mode)")
+    ap.add_argument("--post-command-script", default="",
+                    help="script that prints the post command for a room, thread and reply (post mode)")
     ap.add_argument("--token-env", default="AG2_RELAY_TOKEN",
                     help="name of the Codex environment variable holding the relay token (post mode); "
                          "only the name is ever sent")
@@ -383,8 +389,12 @@ def main(argv=None, run=subprocess.run):
     if not ENV_NAME_RE.fullmatch(args.token_env):
         ap.error("--token-env must be an environment variable name")
     args.gateway_url = args.gateway_url.rstrip("/")
-    if args.reply_mode == "post" and not GATEWAY_RE.fullmatch(args.gateway_url):
-        ap.error("--reply-mode post needs an https --gateway-url")
+    if args.reply_mode == "post":
+        if not args.gateway_url.startswith("https://"):
+            ap.error("--reply-mode post needs an https --gateway-url")
+        if not os.path.isfile(args.post_command_script):
+            ap.error("--reply-mode post needs --post-command-script, an existing file")
+        args.post_command_script = os.path.abspath(args.post_command_script)
     positive = (args.poll, args.poll_seconds, args.timeout_seconds, args.command_timeout)
     if not all(math.isfinite(v) and v > 0 for v in positive) or not (math.isfinite(args.idle_exit)
                                                                        and args.idle_exit >= 0):

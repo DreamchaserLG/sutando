@@ -62,22 +62,28 @@ That is `--reply-mode link`, the default. `--reply-mode post` gets the answer te
 
 ## Reply mode `post`: the cloud agent posts its own answer
 
-With `--reply-mode post --gateway-url https://<gateway>`, the prompt ends with one command that the
-cloud agent runs after writing its answer to `/tmp/ag2-reply.md`:
+With `--reply-mode post --gateway-url https://<gateway> --post-command-script <path>`, the adapter runs
+the injected script once per task, as an argv list:
 
 ```
-python3 -c 'import json, sys; print(json.dumps({"op": "message", "room_id": "<room>", "thread_root": "<thread root>", "reply_to": "<ask event>", "dedupe_key": "codex-cloud:<task id>", "body": sys.stdin.read()}))' < /tmp/ag2-reply.md | curl -sS --fail-with-body -X POST "<gateway>/v1/room" -H "Authorization: Bearer $AG2_RELAY_TOKEN" -H "Content-Type: application/json" --data-binary @-
+<python> <path> --gateway-url=<gateway> --room=<room> --dedupe-key=codex-cloud:<task id> \
+  --token-env=<name> --reply-file=/tmp/ag2-reply.md [--thread-root=<event>] [--reply-to=<event>]
 ```
 
-This is the gateway's room-message call as an agent makes it: `POST <gateway>/v1/room`, bearer relay
-token, body `{"op": "message", "room_id", "body"}`, plus `thread_root` / `reply_to` when present. It is
-the same request as room-ops `say` (`skills/agent-room-ops/say.py`) and the bridge's own room post
-(`_post_room_message` in `remote_gateway_bridge.py`). The ids are filled in by the adapter: the room from
-`channel_id` (or `source_room_id`), `thread_root` from the header of that name, and `reply_to` from
-`source_message_id`. They are never taken from the message body. Each id must match a strict Matrix id
-pattern before it goes into the command (no quotes, backslashes or spaces). An id that fails is left
-out, and a task with no usable room runs in link mode. `dedupe_key` is fixed per task, so a repeated
-post can be told apart from a new one.
+The script prints one line, the shell command the cloud agent runs after writing its answer to the
+reply file, and the adapter puts that line in the prompt unchanged. The adapter itself knows nothing
+about how a room post is made. It only passes ids from the attested headers: the room from `channel_id`
+(or `source_room_id`), `--thread-root` from `thread_root`, and `--reply-to` from `source_message_id`.
+Ids are never taken from the message body. Post mode refuses to start without the script.
+
+agent-room-ops ships the script as `skills/agent-room-ops/post_command.py`. Its command is the gateway's
+room-message call, the same request as that skill's `say`. Every id must match a strict Matrix pattern
+before it is printed inside the command's quotes, and an invalid value exits 2 with nothing printed.
+Its tests are in `tests/skills/agent-room-ops/post-command.test.py`.
+
+Fail closed: if the script exits non-zero, prints nothing or more than one line, or cannot run, the
+task gets a "could not be submitted" result and no `exec` runs. A task with no room header runs in
+link mode.
 
 The token never appears in the prompt, argv, the state files or a result. Only its variable name does
 (`--token-env`, default `AG2_RELAY_TOKEN`), and the shell in the cloud container expands it.
