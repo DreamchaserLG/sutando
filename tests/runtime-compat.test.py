@@ -1172,13 +1172,119 @@ class PublishFaults(Base):
         self.assertEqual(len(done), 1)
         self.assert_intact()
 
+    def kill_inside_undo(self, boundary):
+        """Fail the live probe so _undo runs, then kill the process at `boundary` inside it."""
+        state = {"in_undo": False}
+        real_undo, real_probe = rc._undo, rc.probe
+        seams = {"phase": "_write_journal", "link": "_swap_link", "drop_new": "_rmtree",
+                 "restore_old": "_rename"}
+        name = seams[boundary]
+        real_seam = getattr(rc, name)
+
+        def seam(*a, **k):
+            out = real_seam(*a, **k)
+            if state["in_undo"]:
+                raise Crash()
+            return out
+
+        def undo(*a, **k):
+            state["in_undo"] = True
+            try:
+                return real_undo(*a, **k)
+            finally:
+                state["in_undo"] = False
+
+        def probe(path, spec, **kw):
+            if kw.get("source") == "managed":
+                raise Crash()
+            return real_probe(path, spec, **kw)
+        return {"_undo": undo, "probe": probe, name: seam}
+
+    def patched(self, patches):
+        saved = {k: getattr(rc, k) for k in patches}
+        for k, v in patches.items():
+            setattr(rc, k, v)
+        return saved
+
+    def recover(self):
+        return rc.recover_swaps(self.root, "claude", pid_alive=lambda _p: False, log=self.said.append)
+
+    def assert_undo_survives(self, boundary):
+        saved = self.patched(self.kill_inside_undo(boundary))
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            for k, v in saved.items():
+                setattr(rc, k, v)
+        self.assertTrue(list((self.root / "claude").glob(".swap-*.json")), "the journal must survive the kill")
+        saved = self.patched({k: v for k, v in self.kill_inside_undo(boundary).items() if k != "probe"})
+        try:
+            try:
+                self.recover()
+            except Crash:
+                pass
+        finally:
+            for k, v in saved.items():
+                setattr(rc, k, v)
+        self.recover()
+        self.recover()
+        self.assert_intact()
+
+    def kill_at_journal_delete(self):
+        """The rollback finished its file moves; the process dies as it deletes the journal."""
+        real_unlink = Path.unlink
+        fired = []
+
+        def unlink(p, *a, **k):
+            if p.name.startswith(".swap-") and p.suffix == ".json" and not fired:
+                fired.append(1)
+                raise Crash()
+            return real_unlink(p, *a, **k)
+        Path.unlink = unlink
+        self.addCleanup(setattr, Path, "unlink", real_unlink)
+        return fired
+
+    def test_owner_repro_undo_killed_before_the_journal_delete_then_two_recoveries(self):
+        real_probe = rc.probe
+
+        def probe(path, spec, **kw):
+            if kw.get("source") == "managed":
+                raise Crash()
+            return real_probe(path, spec, **kw)
+        rc.probe = probe
+        fired = self.kill_at_journal_delete()
+        try:
+            with self.assertRaises(Crash):
+                self.install()
+        finally:
+            rc.probe = real_probe
+        self.assertEqual(fired, [1])
+        self.assertTrue((self.stale / "bin" / "claude").exists(), "the original is back before recovery")
+        self.recover()
+        self.recover()
+        self.assert_intact()
+        self.assertEqual(list((self.root / "claude").glob(".swap-*")), [])
+
+    def test_undo_killed_after_the_phase_is_written_then_recovered_twice(self):
+        self.assert_undo_survives("phase")
+
+    def test_undo_killed_after_the_link_is_restored_then_recovered_twice(self):
+        self.assert_undo_survives("link")
+
+    def test_undo_killed_after_the_new_folder_is_removed_then_recovered_twice(self):
+        self.assert_undo_survives("drop_new")
+
+    def test_undo_killed_after_the_old_folder_is_restored_then_recovered_twice(self):
+        self.assert_undo_survives("restore_old")
+
     def test_committed_swap_left_by_a_killed_process_is_finished(self):
         self.assertTrue(self.install().ok)
         journal = self.root / "claude" / ".swap-999999-1.json"
         aside = self.root / "claude" / ".replaced-999999-1-2.0.0"
         aside.mkdir()
         journal.write_text(json.dumps({"previous": None, "final": None, "aside": str(aside),
-                                       "placed": False, "committed": True}))
+                                       "placed": False, "phase": "committed"}))
         bad = self.root / "claude" / ".swap-999998-1.json"
         bad.write_text("{not json")
         rc.recover_swaps(self.root, "claude", pid_alive=lambda _p: False)

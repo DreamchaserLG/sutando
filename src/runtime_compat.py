@@ -597,34 +597,62 @@ def _install_external(ctx: _Ctx) -> RepairResult:
 
 
 _rename = os.rename
+_rmtree = shutil.rmtree
 
 
 class _Unusable(Exception):
     pass
 
 
+def _ino(path: Optional[str]) -> Optional[int]:
+    try:
+        return os.stat(path).st_ino if path else None
+    except OSError:
+        return None
+
+
+def _write_journal(journal: Path, j: dict) -> None:
+    """Atomic and fsync'd: recovery acts on this record after a power loss too."""
+    tmp = journal.with_name(journal.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(j, fh)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(str(tmp), str(journal))
+    try:
+        fd = os.open(str(journal.parent), os.O_RDONLY)
+    except OSError:  # pragma: no cover - a platform without directory fds
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - a filesystem that refuses a directory fsync
+        pass
+    finally:
+        os.close(fd)
+
+
 def _publish(ctx: _Ctx, target: Path, n: int, staging: Optional[Path] = None,
              final: Optional[Path] = None) -> RepairResult:
     """Move a staged version into place and switch the link, as one transaction.
     A journal written first lets a later run undo it if this process dies midway."""
-    from local_record import write_whole
     spec = ctx.spec
     link = ctx.root / "bin" / spec.binary
     tag = f"{os.getpid()}-{int(ctx.now())}"
-    j = {"previous": os.readlink(str(link)) if os.path.islink(str(link)) else None,
+    j = {"phase": "started", "previous": os.readlink(str(link)) if os.path.islink(str(link)) else None,
          "final": str(final) if final else None, "aside": None, "placed": False,
-         "committed": False}
+         "old_ino": None, "new_ino": _ino(str(staging)) if staging else None}
     journal = ctx.base / f".swap-{tag}.json"
-    write_whole(journal, j)
+    _write_journal(journal, j)
     try:
         if final is not None and staging is not None:
             if final.exists():
                 j["aside"] = str(final.with_name(f".replaced-{tag}-{final.name}"))
-                write_whole(journal, j)
+                j["old_ino"] = _ino(str(final))
+                _write_journal(journal, j)
                 _rename(str(final), j["aside"])
             _rename(str(staging), str(final))
             j["placed"] = True
-            write_whole(journal, j)
+            _write_journal(journal, j)
         _swap_link(link, target)
         live = probe(str(link), spec, source="managed", env=ctx.env, run=ctx.run)
         if not live.usable:
@@ -637,8 +665,8 @@ def _publish(ctx: _Ctx, target: Path, n: int, staging: Optional[Path] = None,
     except BaseException:
         _undo(link, j, journal)
         raise
-    j["committed"] = True
-    write_whole(journal, j)
+    j["phase"] = "committed"
+    _write_journal(journal, j)
     _commit(j, journal)
     return RepairResult(True, "installed", f"{spec.binary} {live.version} at {link}", "", n,
                         str(link))
@@ -651,18 +679,20 @@ def _commit(j: dict, journal: Path) -> None:
 
 
 def _undo(link: Path, j: dict, journal: Path) -> None:
-    """Put the link and the version folders back exactly as they were before the swap."""
+    """Put the link and the version folders back as they were. Safe to repeat after any
+    interruption: a folder is removed only when its inode is the new install's."""
+    if j.get("phase") != "rolling_back":
+        j["phase"] = "rolling_back"
+        _write_journal(journal, j)
     if j.get("previous") is not None:
         _swap_link(link, Path(j["previous"]))
     elif os.path.lexists(str(link)):
         os.unlink(str(link))
-    final, aside = j.get("final"), j.get("aside")
-    if aside and os.path.exists(aside):
-        if final and os.path.exists(final):
-            shutil.rmtree(final)
-        os.rename(aside, final)
-    elif j.get("placed") and final and os.path.exists(final):
-        shutil.rmtree(final)
+    final, aside, new_ino = j.get("final"), j.get("aside"), j.get("new_ino")
+    if final and new_ino is not None and _ino(final) == new_ino:
+        _rmtree(final)
+    if aside and os.path.exists(aside) and final and not os.path.exists(final):
+        _rename(aside, final)
     journal.unlink()
 
 
@@ -682,7 +712,7 @@ def recover_swaps(root: Path, runtime: str, pid_alive: Callable[[int], bool] = N
         except (OSError, ValueError):
             path.unlink()
             continue
-        if j.get("committed"):
+        if j.get("phase") == "committed":
             _commit(j, path)
             log(f"finished an interrupted update ({path.name})")
         else:

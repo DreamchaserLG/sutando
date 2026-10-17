@@ -153,11 +153,9 @@ for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
 done
 export PATH
 
-# The core can be launched while the app is still installing Codex (observed:
-# engine unpacked at :25, codex landed at :32 of the following minute). Exiting
-# on the first miss leaves a dead window that never recovers even once the
-# install finishes, so wait briefly for it to appear before giving up.
-CODEX_WAIT_TIMEOUT="${SUTANDO_CODEX_WAIT_TIMEOUT:-120}"
+# A launch can race the app's Codex install; the compat gate below waits for it,
+# bounded by SUTANDO_CODEX_WAIT_TIMEOUT.
+
 # Seconds a freshly created core session may take to answer has-session; a stub
 # tmux that never reports one (tests) sets this to 0. Polls run every 0.2 s.
 SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S:-5}"
@@ -183,23 +181,6 @@ else
 fi
 SESSION_UP_LABEL="$(( SESSION_UP_TRIES * 2 / 10 )).$(( SESSION_UP_TRIES * 2 % 10 ))s"
 echo "  · session-up wait: at most ${SESSION_UP_TRIES} poll(s), ${SESSION_UP_LABEL}" >&2
-if ! command -v codex >/dev/null 2>&1; then
-  echo "  … waiting for the Codex CLI to finish installing (up to ${CODEX_WAIT_TIMEOUT}s)" >&2
-  _codex_waited=0
-  while [ "$_codex_waited" -lt "$CODEX_WAIT_TIMEOUT" ]; do
-    sleep 2
-    _codex_waited=$((_codex_waited + 2))
-    command -v codex >/dev/null 2>&1 && break
-  done
-  if command -v codex >/dev/null 2>&1; then
-    echo "  ✓ Codex CLI appeared after ${_codex_waited}s" >&2
-  else
-    echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
-    echo "  (looked on PATH and in $CODEX_INSTALL_BIN)" >&2
-    exit 127
-  fi
-fi
-
 # Use the configured CODEX_HOME (or another env name chosen by the operator).
 # The default points at ~/.codex to reuse the existing authenticated install.
 config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
@@ -210,12 +191,19 @@ if [ -n "$config_env" ] && [ -n "$config_value" ]; then
   echo "  ✓ $config_env=$config_value"
 fi
 
-# Version, capabilities and login, before anything below can replace a core.
-# The gate waits for a fix when a person is at the terminal, then continues.
+# Presence, version, capabilities and login, before anything below can replace a core.
+# It finds a managed or known install off PATH, and waits for a fix, a reply or an install.
 _codex_gate_rc=0
-sutando_runtime_compat_gate "$REPO" codex --enforce-auth || _codex_gate_rc=$?
+SUTANDO_RUNTIME_WAIT_S="${SUTANDO_RUNTIME_WAIT_S:-${SUTANDO_CODEX_WAIT_TIMEOUT:-}}" \
+  sutando_runtime_compat_gate "$REPO" codex --enforce-auth || _codex_gate_rc=$?
 if [ "$_codex_gate_rc" -ne 0 ]; then
   exit "$_codex_gate_rc"
+fi
+# Reached without a verdict only when the gate could not run (no Python, or skipped).
+if ! command -v "$SUTANDO_CORE_CLI_BIN" >/dev/null 2>&1; then
+  echo "Codex CLI is not installed. Install it, run 'codex login', then retry." >&2
+  echo "  (looked on PATH and in $CODEX_INSTALL_BIN)" >&2
+  exit 127
 fi
 
 # The Codex adapter depends on tmux for a persistent pane and fswatch for

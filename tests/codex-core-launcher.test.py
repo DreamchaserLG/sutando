@@ -912,6 +912,35 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
 
+    def test_no_codex_anywhere_with_consent_installs_and_launches(self):
+        (self.bin / "codex").unlink()
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good),
+                                              "SUTANDO_RUNTIME_REPAIR_CONSENT": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repair succeeded", result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
+    def test_working_managed_codex_off_path_is_found_and_launched(self):
+        (self.bin / "codex").unlink()
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        managed.parent.mkdir(parents=True)
+        managed.write_text(CODEX_STUB)
+        managed.chmod(0o755)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("not installed", result.stderr)
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
     def test_notifier_supervisor_restarts_after_child_exit(self):
         count = Path(self.tmp.name) / "notifier-count"
         self._write_exe("tmux", '''#!/bin/bash
