@@ -2426,7 +2426,8 @@ def main() -> int:
     # it. Asserted against the loaded function, not a copy of the file.
     import inspect
     _loop = inspect.getsource(rtc.main)
-    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1][:400]
+    # The poll call through its timeout handler's benign-empty fallback.
+    _poll_call = _loop.split('"GET", f"/v1/tasks?wait=', 1)[-1].split('resp = {"tasks": []}', 1)[0]
     check("_poll_timeout_is_empty" in _poll_call,
           "poll-timeout: the poll call site consults the policy")
     check("except (TimeoutError, socket.timeout)" in _poll_call,

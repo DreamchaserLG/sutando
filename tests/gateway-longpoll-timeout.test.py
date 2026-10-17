@@ -4,8 +4,9 @@
 Drives the real poll loop for one iteration. The relay's contract is
 `200 {"tasks": []}` when the hold window expires; when it instead lets the
 client's read timeout fire, the two are indistinguishable, so classifying the
-timeout as a network error backed a healthy bridge off and wrote
-`connected: false` while tasks were still arriving.
+timeout as a network error backed a healthy bridge off while tasks were
+still arriving. It is still not a success: it reports `connected: false` and
+leaves `last_ok_ts` alone (#5678).
 """
 from __future__ import annotations
 
@@ -143,8 +144,10 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [], "a benign empty poll must not back off")
         self.assertNotIn("poll network error",
                          " ".join(loop.logs), "and must not log an outage")
-        self.assertIn((True, {}), loop.status,
-                      "the iteration completes, so the bridge reports connected")
+        self.assertNotIn((True, {}), loop.status,
+                         "a timed-out poll is not a success, so it never reports connected")
+        self.assertIn("timed out", str(loop.status[-1][1].get("error")),
+                      "the iteration completes and says the poll timed out")
 
     def test_a_timeout_past_the_grace_takes_the_outage_path(self):
         grace = self.gw.POLL_TIMEOUT_GRACE_S
