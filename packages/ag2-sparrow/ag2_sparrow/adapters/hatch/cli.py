@@ -622,6 +622,7 @@ def verify(_args) -> int:
     from . import keepalive
     line, row = keepalive.status_line(cfg)
     hint = (f" (no {keepalive.TASK} task is installed)" if row is None else
+            f" ({keepalive.TASK} has not run yet)" if row["condition"] == "unknown" else
             f" ({keepalive.TASK} has not run in the last {keepalive.STALE_S // 60} minutes; "
             "check Hatch's scheduled tasks)" if row["condition"] != "healthy" else "")
     print(f"NOTE keepalive: {line}{hint}")

@@ -73,8 +73,8 @@ def run(command: str, timeout: float = TIMEOUT_S,
         except (OSError, ValueError) as e:
             return None, f"{type(e).__name__}: {e}"
         out.seek(0)
-        err.seek(0)
-        data, tail = out.read(MAX_OUTPUT + 1), err.read(MAX_OUTPUT)
+        err.seek(max(0, err.seek(0, 2) - MAX_OUTPUT))
+        data, tail = out.read(MAX_OUTPUT + 1), err.read()
     if r.returncode != 0:
         lines = tail.decode("utf-8", "replace").strip().splitlines()
         return None, f"exited {r.returncode}" + (f": {lines[-1]}" if lines else "")
@@ -121,8 +121,11 @@ class HealthCommand:
             return self._row
 
     def refresh(self) -> "dict | None":
-        """Run the command now and cache what it gave; an error clears the row."""
-        row, error = run(self.command, env=self.env() if self.env else None)
+        """Run the command now and cache what it gave; any error clears the row."""
+        try:
+            row, error = run(self.command, env=self.env() if self.env else None)
+        except Exception as e:  # noqa: BLE001 — a dead refresh would pin the old row
+            row, error = None, f"{type(e).__name__}: {e}"
         with self._lock:
             if error and error != self._error:
                 self.log(f"health command gave no row: {error}")

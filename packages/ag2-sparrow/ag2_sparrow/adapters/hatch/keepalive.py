@@ -6,8 +6,8 @@ to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1`. A schedu
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last
-keepawake line, or the task's install when it never ran, is under two intervals old,
-else abnormal (`keepawake-not-running`).
+keepawake line is under two intervals old, unknown while a task that has not run yet
+is that young, else abnormal (`keepawake-not-running`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
@@ -282,10 +282,11 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     fresh = _within(now, last)
     alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
         else None
-    return {"alive": alive, "motion": "unknown",
-            "condition": "healthy" if fresh else "abnormal",
-            "reason": None if fresh else NOT_RUNNING,
-            "since": None if fresh else last + STALE_S}
+    # Fresh but never run: no evidence either way yet.
+    condition = "abnormal" if not fresh else "healthy" if ran is not None else "unknown"
+    return {"alive": alive, "motion": "unknown", "condition": condition,
+            "reason": NOT_RUNNING if condition == "abnormal" else None,
+            "since": last + STALE_S if condition == "abnormal" else None}
 
 
 def status_line(cfg: dict, now: float | None = None) -> "tuple[str, dict | None]":

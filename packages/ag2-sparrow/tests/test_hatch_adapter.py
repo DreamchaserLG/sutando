@@ -1453,7 +1453,7 @@ class Keepalive(Base):
         self.installed()
         self.sparrow_status(connected=False, error="401")
         r = self.cli("keepalive", "status")
-        self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=healthy$")
+        self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=unknown$")
         self.assertFalse(self.log.exists())
         with mock.patch.object(keepalive, "restart_listener") as restart:
             r = self.cli("keepalive", "keepawake")
@@ -1512,7 +1512,8 @@ class Keepalive(Base):
         self.installed()
         row = self.health()
         self.assertEqual((row["alive"], row["condition"], row["reason"]),
-                         (None, "healthy", None), "a fresh install is not a red row")
+                         (None, "unknown", None), "a fresh install is neither red nor green")
+        self.assertEqual(hc.validate(row), (row, None))
         self.age_task(keepalive.STALE_S + 60)
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", "keepawake-not-running"))
@@ -1633,7 +1634,8 @@ class Keepalive(Base):
     def test_verify_notes_the_keepalive_state(self):
         self.installed()
         self.assertRegex(self.cli("verify").stdout, r"NOTE keepalive: \S+Z listener=down "
-                         r"last_keepawake=never health=healthy\n")
+                         r"last_keepawake=never health=unknown \(sparrow-keepawake has not run "
+                         r"yet\)\n")
         self.age_task(keepalive.STALE_S + 60)
         self.assertRegex(self.cli("verify").stdout, r"health=abnormal \(keepawake-not-running\) "
                          r"\(sparrow-keepawake has not run in the last 30 minutes; check")
@@ -1707,6 +1709,35 @@ class HealthCommand(Base):
         first.join(10)
         self.assertEqual(cmd.row(), self.ROW)
         self.assertIs(cmd._thread, first, "within the ttl nothing is run again")
+
+    def test_a_refresh_that_raises_clears_the_row_and_does_not_pile_up_threads(self):
+        logs = []
+        cmd = hc.HealthCommand(self.stub(json.dumps(self.ROW)), 60, logs.append)
+        self.assertEqual(cmd.refresh(), self.ROW)
+        cmd._at -= 61
+        threads = set()
+        with mock.patch.object(hc.tempfile, "TemporaryFile",
+                               side_effect=OSError(28, "No space left on device")):
+            for _ in range(5):
+                cmd.row()
+                if cmd._thread is not None:
+                    threads.add(cmd._thread)
+                    cmd._thread.join(10)
+        self.assertIsNone(cmd.row(), "the old healthy row is not sent on")
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(logs, ["health command gave no row: OSError: [Errno 28] "
+                                "No space left on device"])
+
+    def test_one_refresh_at_a_time(self):
+        path = self.bin / "slow-row"
+        executable(path, "#!/bin/sh\nsleep 1\n")
+        cmd = hc.HealthCommand(str(path), 0, lambda m: None)
+        cmd.row()
+        first = cmd._thread
+        for _ in range(5):
+            cmd.row()
+            self.assertIs(cmd._thread, first)
+        first.join(10)
 
     def test_an_error_clears_the_cached_row_and_is_logged_once(self):
         logs = []

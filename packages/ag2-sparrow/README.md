@@ -461,7 +461,7 @@ panel shows this agent's core instead of asking you to update:
 | --- | --- | --- | --- |
 | 30 minutes old or less (two runs) | `healthy` | | `true` |
 | older | `abnormal` | `keepawake-not-running` | `true` if the hook's activity marker (`--activity-file`, default `~/.muse/last_active`) changed in the last 30 minutes, else unknown |
-| none yet | as above, timed from when install wrote the task: `healthy` for its first 30 minutes, then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
+| none yet | timed from when install wrote the task: `unknown` for its first 30 minutes (neither red nor green), then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
 | no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
 
 `motion` is always `unknown`. Sparrow drops a row that is not valid for the
