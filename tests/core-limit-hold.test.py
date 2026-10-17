@@ -60,6 +60,12 @@ def limited_record(now: float, *, reset_in: float = 3600, rejected: bool = True,
     }
 
 
+def owner_task(tasks: Path, name: str, body: str, tier: str = "owner") -> Path:
+    path = tasks / f"{name}.txt"
+    path.write_text(f"id: {name}\nsource: ag2space\naccess_tier: {tier}\ntask: {body}\n")
+    return path
+
+
 class Classifier(unittest.TestCase):
     def test_limits(self):
         now = time.time()
@@ -269,6 +275,26 @@ class Launcher(unittest.TestCase):
         self.assertTrue(healed, out[-600:])
         self.assertEqual(json.loads((self.ws / "state" / clh.HOLD_FILE).read_text())["status"], "released")
 
+    def test_owner_reply_switches_model_and_the_core_starts(self):
+        self.write_quota(limited_record(time.time()))
+        rc, out, healed = self.revive()
+        self.assertEqual(rc, 75, out[-600:])
+        tasks = self.ws / "tasks"
+        tasks.mkdir(exist_ok=True)
+        owner_task(tasks, "task-100", "switch to sonnet")
+        owner_task(tasks, "task-101", "what is on my calendar today?")
+        owner_task(tasks, "task-102", "switch to sonnet", tier="guest")
+        rc, out, healed = self.revive()
+        self.assertTrue(healed, out[-900:])
+        models = [json.loads(p.read_text()).get("model") for p in self.ws.rglob("settings.json")]
+        self.assertIn("sonnet", models, out[-900:])
+        self.assertIn("sonnet", (self.ws / "results" / "task-100.txt").read_text())
+        # The ordinary owner task waits for the core; a guest's reply is not an action.
+        self.assertFalse((self.ws / "results" / "task-101.txt").exists())
+        self.assertFalse((self.ws / "results" / "task-102.txt").exists())
+        import task_queue
+        self.assertEqual({p.name for p in task_queue.pending_files(self.ws)}, {"task-101.txt", "task-102.txt"})
+
 
 class StatusSurfaces(unittest.TestCase):
     def _load(self, name, rel):
@@ -381,7 +407,7 @@ class EdgePaths(unittest.TestCase):
         (self.ws / "results").write_text("a file where the directory should be")
         d = clh.decide(self.ws, 1_800_000_000.0, quota=limited_record(1_800_000_000.0))
         self.assertFalse(d.launch)
-        self.assertIsNone(d.hold["notice"])
+        self.assertFalse(d.hold["notice_queued"])
 
     def test_cli_status_clear_gate(self):
         import contextlib
@@ -436,7 +462,7 @@ class ReviewFixes(unittest.TestCase):
         self.assertTrue(body.startswith("[dm-only]\n"))
         self.assertIn("usage limit on claude-opus-5-5", body)
         self.assertIn("starts again by itself", body)
-        self.assertIn("Sonnet", body)
+        self.assertIn("switch to sonnet", body)
         self.assertEqual(clh.read_hold(self.ws)["notice"], files[0].name)
         # The retry after the hold is refused again: a longer hold, no second notice.
         after = now + 3600 + clh.RESET_GRACE_S + 1
@@ -459,6 +485,114 @@ class ReviewFixes(unittest.TestCase):
         for text in ("API Error: 429 overloaded", "HTTP 429", '{"status": 429}', "status_code=429",
                      "429 Too Many Requests"):
             self.assertIsNotNone(clh.classify_text(text, now), text)
+
+
+class OwnerRecovery(unittest.TestCase):
+    """The owner's way out while the core is down."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        (self.ws / "tasks").mkdir()
+        self.calls = self.ws / "switch-calls"
+        self.switch = self.ws / "switch.sh"
+        self.switch.write_text(f'#!/bin/bash\necho "$@" >> {self.calls}\nexit 0\n')
+        self.switch.chmod(0o755)
+        self.now = 1_800_000_000.0
+        clh.decide(self.ws, self.now, quota=limited_record(self.now))
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def notices(self):
+        return sorted((self.ws / "results").glob("proactive-*.txt"))
+
+    def test_notice_offers_product_actions(self):
+        body = self.notices()[0].read_text()
+        self.assertIn('"switch to sonnet"', body)
+        self.assertIn('"retry now"', body)
+        self.assertIn("Agent Settings", body)
+        self.assertNotIn("python3", body)
+        self.assertNotIn("settings.json", body)
+
+    def test_switch_reply_runs_the_switch_once_and_lifts_the_hold(self):
+        owner_task(self.ws / "tasks", "task-1", "Switch to Sonnet")
+        done = clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch))
+        self.assertEqual(done, ["task-1"])
+        self.assertEqual(self.calls.read_text().split(), ["sonnet", "--offline"])
+        self.assertIsNone(clh.active_hold(self.ws, self.now + 61))
+        self.assertIn("sonnet", (self.ws / "results" / "task-1.txt").read_text())
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 120, switch_cmd=str(self.switch)), [])
+        self.assertEqual(len(self.calls.read_text().splitlines()), 1)
+
+    def test_retry_reply_lifts_the_hold(self):
+        owner_task(self.ws / "tasks", "task-2", "retry now")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), ["task-2"])
+        self.assertIsNone(clh.active_hold(self.ws, self.now + 61))
+        self.assertTrue(clh.decide(self.ws, self.now + 62, quota=limited_record(self.now)).launch)
+
+    def test_non_owner_and_other_text_are_not_actions(self):
+        owner_task(self.ws / "tasks", "task-3", "switch to sonnet", tier="team")
+        owner_task(self.ws / "tasks", "task-4", "please switch to sonnet when you can and also email Bob")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), [])
+        self.assertFalse(self.calls.exists())
+        self.assertIsNotNone(clh.active_hold(self.ws, self.now + 61))
+
+    def test_failed_switch_keeps_the_hold_and_says_so(self):
+        self.switch.write_text("#!/bin/bash\necho refused >&2\nexit 9\n")
+        owner_task(self.ws / "tasks", "task-5", "switch to sonnet")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), ["task-5"])
+        self.assertIsNotNone(clh.active_hold(self.ws, self.now + 61))
+        self.assertIn("could not", (self.ws / "results" / "task-5.txt").read_text())
+
+    def test_switch_without_a_writer_says_so(self):
+        owner_task(self.ws / "tasks", "task-7", "switch to haiku")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), ["task-7"])
+        self.assertIsNotNone(clh.active_hold(self.ws, self.now + 61))
+        self.assertIn("could not", (self.ws / "results" / "task-7.txt").read_text())
+
+    def test_no_hold_no_action(self):
+        clh.clear(self.ws, self.now + 1)
+        owner_task(self.ws / "tasks", "task-6", "retry now")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None), [])
+
+
+class NoticeRetry(unittest.TestCase):
+    """A notice whose first enqueue failed is still owed, and is sent exactly once."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def notices(self):
+        return sorted((self.ws / "results").glob("proactive-*.txt"))
+
+    def test_failed_enqueue_is_retried_once_storage_recovers(self):
+        now = 1_800_000_000.0
+        rec = limited_record(now)
+        (self.ws / "results").write_text("storage is broken")
+        self.assertFalse(clh.decide(self.ws, now, quota=rec).launch)
+        (self.ws / "results").unlink()
+        for minute in (2, 4, 6):
+            self.assertFalse(clh.decide(self.ws, now + minute * 60, quota=rec).launch)
+        self.assertEqual(len(self.notices()), 1)
+        self.assertTrue(clh.read_hold(self.ws)["notice_queued"])
+
+    def test_no_duplicates_after_success_even_once_delivered(self):
+        now = 1_800_000_000.0
+        rec = limited_record(now)
+        clh.decide(self.ws, now, quota=rec)
+        first = self.notices()
+        self.assertEqual(len(first), 1)
+        first[0].unlink()  # the bridge delivered it and removed the file
+        for minute in (2, 4, 6):
+            clh.decide(self.ws, now + minute * 60, quota=rec)
+        self.assertEqual(self.notices(), [])
 
 
 class AdapterEdges(unittest.TestCase):

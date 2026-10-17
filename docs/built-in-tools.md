@@ -422,5 +422,8 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 `--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
 model (above) is the way to keep going before then. A core that died on a limit is not relaunched
-until the reset (or a backoff of 5 to 60 minutes when none is given): `python3 src/core_limit_hold.py
-status` prints the hold and its reason, and `... clear` lifts it so the next revive launches.
+until the reset (or a backoff of 5 to 60 minutes when none is given), and the owner gets one DM
+saying so. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
+launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
+then starts the core. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+`... clear` lifts it.

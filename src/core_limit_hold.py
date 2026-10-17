@@ -18,6 +18,9 @@ never held, so it is revived as before.
     core_limit_hold.py gate [--cwd DIR]   exit 0: launch; exit 75: held, reason on stdout
     core_limit_hold.py status             the hold record, if any
     core_limit_hold.py clear              lift the hold now (the next revive launches)
+
+While a hold is in force the gate also acts on the owner's bare replies to the notice,
+"switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
 """
 from __future__ import annotations
 
@@ -284,26 +287,31 @@ def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
     return limit is not None and _same_family(limit.model, launch_model)
 
 
-def _notify_owner(workspace: Path, hold: dict) -> Optional[str]:
-    """One DM per hold episode through the proactive path; the bridges deliver it while
-    the core is down. Returns the queued file name, or None when it could not be queued."""
-    from local_record import write_text_whole
-    from proactive_routing import proactive_filename
+def _notice_body(hold: dict) -> str:
     from result_markers import neutralize_markers
     when = (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
             else f"It tries again {_when(hold['until'])}")
-    body = "[dm-only]\n" + neutralize_markers(
+    return "[dm-only]\n" + neutralize_markers(
         f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]}.\n\n"
         f"{when}, and the core starts again by itself after that. Messages you send meanwhile "
         "wait and are answered then.\n\n"
-        "To keep working sooner, switch the core to a smaller model such as Sonnet (set "
-        '"model": "sonnet" in the core\'s Claude settings); the next revive then starts it. '
-        "python3 src/core_limit_hold.py status shows the hold.\n")
+        'To keep working now, reply "switch to sonnet" (or another model: haiku, opus, fable), '
+        "or pick a model in the core-model card under Agent Settings, Runtime, Model. "
+        'Reply "retry now" to try the current model again at once.\n')
+
+
+def _ensure_notice(workspace: Path, hold: dict) -> bool:
+    """Queue the hold's owed DM under its stable name, once. True when it is queued.
+    A retry rewrites the same name, so it cannot become a second message."""
+    if hold.get("notice_queued"):
+        return False
+    from local_record import write_text_whole
     try:
-        name = proactive_filename(f"core-limit-hold-{int(hold['set_at'] * 1000)}")
-        return write_text_whole(Path(workspace) / "results" / name, body).name
+        write_text_whole(Path(workspace) / "results" / hold["notice"], _notice_body(hold))
     except OSError:
-        return None
+        return False
+    hold["notice_queued"] = True
+    return True
 
 
 def _hold_until(limit: Limit, strikes: int, now: float) -> float:
@@ -328,6 +336,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     workspace = Path(workspace)
     hold = read_hold(workspace)
     if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model):
+        if _ensure_notice(workspace, hold):
+            _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
@@ -346,8 +356,13 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
         }
         new["reason"] = status_line(new)
-        prior = hold.get("notice") if hold and recent else None
-        new["notice"] = prior or _notify_owner(workspace, new)
+        if hold and recent and hold.get("notice"):
+            new["notice"], new["notice_queued"] = hold["notice"], bool(hold.get("notice_queued"))
+        else:
+            from proactive_routing import proactive_filename
+            new["notice"] = proactive_filename(f"core-limit-hold-{int(now * 1000)}")
+            new["notice_queued"] = False
+        _ensure_notice(workspace, new)
         _write_hold(workspace, new)
         _mirror_core_status(workspace, "paused", new["reason"], now)
         return Decision(False, new, new["reason"])
@@ -358,14 +373,77 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     return Decision(True, hold, "")
 
 
-def clear(workspace: Path, now: Optional[float] = None) -> Optional[dict]:
+def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None) -> Optional[dict]:
     """Lift the hold. Its evidence stays recorded, so only a new refusal re-arms it."""
     hold = read_hold(workspace)
     if not hold or hold.get("status") != "held":
         return hold
     hold = dict(hold, status="cleared", released_at=time.time() if now is None else now)
+    if by:
+        hold["cleared_by"] = by
     _write_hold(workspace, hold)
     return hold
+
+
+# ---- the owner's way out while the core is down -----------------------------
+
+# The whole message must be the action, so a sentence that mentions it is never one.
+_SWITCH = re.compile(r"^(?:please\s+)?(?:switch|change)\s+(?:the\s+core\s+)?(?:model\s+)?to\s+"
+                     r"(sonnet|haiku|opus|fable)\s*[.!]?$", re.I)
+_RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
+
+
+def _owner_action(path: Path) -> Optional[tuple]:
+    """("switch", model) or ("retry", None) for an owner's bare reply, else None."""
+    from local_task_protocol import parse_task_headers_lenient, split_reply_context
+    from policy.egress.result import resolve_access_tier
+    if resolve_access_tier(path) != "owner":
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    body = split_reply_context(parse_task_headers_lenient(text).body)[1].strip()
+    m = _SWITCH.match(body)
+    if m:
+        return ("switch", m.group(1).lower())
+    return ("retry", None) if _RETRY.match(body) else None
+
+
+def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
+                         switch_cmd: Optional[str] = None) -> list:
+    """Act on the owner's "switch to <model>" / "retry now" replies while a hold is in force.
+    Each reply is answered in its own conversation and acted on once; returns their ids."""
+    import subprocess
+    from local_record import write_text_whole
+    now = time.time() if now is None else now
+    workspace = Path(workspace)
+    done = []
+    for path in sorted((workspace / "tasks").glob("task-*.txt")):
+        hold = active_hold(workspace, now)
+        if not hold:
+            break
+        result = workspace / "results" / path.name
+        action = _owner_action(path)
+        if action is None or path.stem in (hold.get("actions") or []) or result.exists():
+            continue
+        kind, model = action
+        if kind == "retry":
+            ok, reply = True, "Retrying now: the core is starting. If the limit is still in force it pauses again and I will tell you."
+        elif not switch_cmd:
+            ok, reply = False, "I could not switch the model from here; use the core-model card under Agent Settings."
+        else:
+            run = subprocess.run(["bash", switch_cmd, model, "--offline"], capture_output=True, text=True, timeout=60)
+            ok = run.returncode == 0
+            reply = (f"Switched the core to {model}. It is starting now and will answer your waiting messages."
+                     if ok else f"I could not switch the core to {model}; it stays paused. Try the core-model card under Agent Settings.")
+        hold = dict(hold, actions=(hold.get("actions") or []) + [path.stem])
+        _write_hold(workspace, hold)
+        if ok:
+            clear(workspace, now, by=path.stem)
+        write_text_whole(result, reply + "\n")
+        done.append(path.stem)
+    return done
 
 
 def _projects_dir(cwd: Optional[str]) -> Optional[Path]:
@@ -380,6 +458,7 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     gate = sub.add_parser("gate", help="decide whether the core may launch now")
     gate.add_argument("--cwd", default="", help="the core's working directory (finds its transcripts)")
+    gate.add_argument("--model-switch", default="", help="the model-switch entry the launcher provides")
     sub.add_parser("status", help="print the hold record")
     sub.add_parser("clear", help="lift the hold now")
     args = ap.parse_args(argv)
@@ -392,6 +471,7 @@ def main(argv=None) -> int:
         hold = clear(workspace)
         print("hold lifted" if hold and hold.get("status") == "cleared" else "no hold in force")
         return 0
+    handle_owner_actions(workspace, switch_cmd=args.model_switch or None)
     model = qa.seat_model(qa.SeatEnv(True, None, os.environ.get("CLAUDE_CONFIG_DIR")), workspace)
     decision = decide(workspace, projects_dir=_projects_dir(args.cwd), launch_model=model)
     if decision.launch:
