@@ -431,7 +431,13 @@ An upgrade never needs Sparrow stopped by hand. After writing its files,
 `install` makes sure one Sparrow runs with the environment it wrote:
 
 - With the user service: a changed unit is restarted, as above, and an
-  inactive one is started, after stopping a Sparrow running outside it.
+  inactive one is started, after stopping a Sparrow running outside it. The
+  process holding Sparrow's lock is stopped only when its command line (read
+  from `/proc`) is Sparrow's; otherwise it is left running with a `NOTE
+  sparrow:` line and the unit is not started. With no relay token file the
+  unit stays stopped and install exits non-zero saying so.
+- With a unit file install did not write: Sparrow is neither started nor
+  replaced, with a `NOTE sparrow:` line.
 - Without one: a Sparrow that runs without `REMOTE_HEALTH_COMMAND` in its
   environment (read from `/proc`) is stopped with SIGTERM and started again the
   way the keepawake task starts it, which sets it. One whose environment cannot
@@ -439,8 +445,9 @@ An upgrade never needs Sparrow stopped by hand. After writing its files,
   started.
 
 It then waits up to 30 seconds for Sparrow's status file to say it is running
-and connected, and exits non-zero with an `error:` line saying why when it
-does not, for example a rejected token. `--no-start` skips this step for a
+and connected, written by the process now running (after the unit's last start,
+or after install started it), and exits non-zero with an `error:` line saying
+why when it does not, for example a rejected token. `--no-start` skips this step for a
 Sparrow you keep running another way.
 
 ### Keepalive: one scheduled task and the health panel

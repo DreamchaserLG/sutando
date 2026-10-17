@@ -260,12 +260,17 @@ def is_sparrow_argv(argv: "list[str]") -> bool:
                for a, b in zip(argv, argv[1:]))
 
 
+def is_sparrow_pid(pid: int) -> bool:
+    """Whether `pid` runs a Sparrow command line; False when that cannot be read."""
+    cmd = _proc(pid, "cmdline")
+    return is_sparrow_argv([a.decode(errors="replace") for a in (cmd or b"").split(b"\0") if a])
+
+
 def sparrow_env(pid: int) -> "dict[str, str] | None":
     """The environment of Sparrow process `pid`; None when it cannot be read (no /proc, or
     another process now has that pid)."""
-    cmd, env = _proc(pid, "cmdline"), _proc(pid, "environ")
-    argv = [a.decode(errors="replace") for a in (cmd or b"").split(b"\0") if a]
-    if env is None or not is_sparrow_argv(argv):
+    env = _proc(pid, "environ")
+    if env is None or not is_sparrow_pid(pid):
         return None
     pairs = (p.split(b"=", 1) for p in env.split(b"\0") if b"=" in p)
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
@@ -290,10 +295,32 @@ def _stop(pid: int) -> bool:
     return False
 
 
-def _service_managed() -> bool:
+def _unit_owner() -> "str | None":
+    """"ours" for the unit install wrote, "other" for a hand-made one, None for no unit
+    (or no systemd to run it)."""
     unit = _cli.service_path()
-    return unit.is_file() and unit.read_text(encoding="utf-8", errors="replace") \
-        .startswith(_cli.SERVICE_MARKER) and _cli.systemd_user_available()
+    if not unit.is_file() or not _cli.systemd_user_available():
+        return None
+    text = unit.read_text(encoding="utf-8", errors="replace")
+    return "ours" if text.startswith(_cli.SERVICE_MARKER) else "other"
+
+
+def _service_managed() -> bool:
+    return _unit_owner() == "ours"
+
+
+def _wall_from_monotonic_us(value: "str | None") -> "float | None":
+    """A systemd *TimestampMonotonic property as wall-clock seconds; None when unset."""
+    try:
+        us = int(value or 0)
+    except ValueError:
+        return None
+    return time.time() - (time.monotonic() - us / 1e6) if us > 0 else None
+
+
+def _left_running(pid: int) -> None:
+    print(f"NOTE sparrow: pid {pid} holds Sparrow's lock but its command line or environment "
+          "cannot be read as Sparrow's, so it was left running as it is")
 
 
 def ensure_sparrow(cfg: dict, health: bool) -> int:
@@ -302,36 +329,59 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     state, instance = _state_dir(cfg), _instance(cfg)
     started = time.time()
     holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
-    start = False
-    if _service_managed():
-        props = _cli._unit_props("ActiveState", "MainPID")
+    owner = _unit_owner()
+    if owner == "other":
+        print(f"NOTE sparrow: {_cli.service_path()} was not written by install, so install "
+              "neither starts nor replaces the Sparrow it runs; run ag2-sparrow-hatch verify")
+        return 0
+    start, stopped, since = False, None, None
+    if owner == "ours":
+        props = _cli._unit_props("ActiveState", "MainPID", "ExecMainStartTimestampMonotonic")
         active = props.get("ActiveState") in ("active", "reloading")
-        if not active:
+        if active:
+            # install_service may have just restarted the unit: only its new process counts.
+            since = _wall_from_monotonic_us(props.get("ExecMainStartTimestampMonotonic")) \
+                or started
+        else:
+            device_env = _cli.device_env_path()
+            if not device_env.is_file():
+                print(f"error: Sparrow was not started: {device_env} is missing, so "
+                      f"{_cli.SERVICE_NAME} was left stopped. Put your relay token in it as one "
+                      "line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: systemctl --user "
+                      f"start {_cli.SERVICE_NAME}", file=sys.stderr)
+                return 1
             if holder is not None and str(holder) != props.get("MainPID"):
+                if not is_sparrow_pid(holder):
+                    _left_running(holder)
+                    print(f"error: {_cli.SERVICE_NAME} was not started while pid {holder} holds "
+                          "Sparrow's lock; run install again once it exits", file=sys.stderr)
+                    return 1
                 print(f"replacing: the Sparrow outside {_cli.SERVICE_NAME} (pid {holder})")
                 if not _stop(holder):
                     return 1
+                stopped = holder
             start = True
     elif holder is not None:
         env = sparrow_env(holder)
         want = health_command(_command(cfg))
         if env is None:
-            print(f"NOTE sparrow: cannot read the environment of Sparrow (pid {holder}), so it "
-                  "was left running as it is")
+            _left_running(holder)
         elif health and env.get("REMOTE_HEALTH_COMMAND") != want:
             print(f"replacing: Sparrow (pid {holder}) runs without REMOTE_HEALTH_COMMAND={want}")
             if not _stop(holder):
                 return 1
-            start = True
+            start, stopped = True, holder
     else:
         start = not listener_up(cfg, started)
     if start:
         ok, how = restart_listener(cfg)
         if not ok:
-            print(f"error: Sparrow did not start: {how}", file=sys.stderr)
+            gone = "" if stopped is None else \
+                f"; the old Sparrow (pid {stopped}) was stopped, so none is running now"
+            print(f"error: Sparrow did not start: {how}{gone}", file=sys.stderr)
             return 1
         print(f"started: {how}")
-    return _await_connected(state, instance, started if start else None)
+    return _await_connected(state, instance, started if start else since)
 
 
 def _await_connected(state: Path, instance: str, since: "float | None") -> int:

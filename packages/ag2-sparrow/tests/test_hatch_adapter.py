@@ -995,9 +995,10 @@ class FakeSystemd:
     """Stands in for systemctl --user and loginctl, recording each call."""
 
     def __init__(self, available=True, linger_ok=True, linger="no", state="inactive",
-                 enabled=False, main_pid=0, ran=False):
+                 enabled=False, main_pid=0, ran=False, start_us=None):
         self.available, self.linger_ok, self.linger = available, linger_ok, linger
         self.state, self.enabled, self.main_pid, self.ran_before = state, enabled, main_pid, ran
+        self.start_us = start_us if start_us is not None else 123456 if ran else 0
         self.calls = []
 
     @property
@@ -1015,7 +1016,7 @@ class FakeSystemd:
             rc, err = 1, "Failed to connect to bus: No medium found"
         elif cmd[2] == "show":
             out = (f"ActiveState={self.state}\nMainPID={self.main_pid}\n"
-                   f"ExecMainStartTimestampMonotonic={123456 if self.ran_before else 0}\n")
+                   f"ExecMainStartTimestampMonotonic={self.start_us}\n")
         elif cmd[2] == "is-active":
             rc = 0 if self.active else 3
         elif cmd[2] == "is-enabled":
@@ -1688,9 +1689,13 @@ class StartSparrow(Base):
         with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
             return self.cli("install", "--mxid", AGENT, "--no-service", *extra)
 
-    def old_sparrow(self):
-        """A live process holding Sparrow's lock, reaped as soon as it exits."""
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    def old_sparrow(self, sparrow=True):
+        """A live process holding Sparrow's lock, reaped as soon as it exits; its command line
+        is Sparrow's unless `sparrow` is False."""
+        script = self.home / (hatch_cli.SPARROW_COMMAND if sparrow else "not-sparrow")
+        script.write_text("import time\ntime.sleep(60)\n")
+        self.old_argv = [sys.executable, str(script)]
+        proc = subprocess.Popen(self.old_argv)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         threading.Thread(target=proc.wait, daemon=True).start()
         path = self.state / "locks" / "gateway-bridge.lock"
@@ -1736,33 +1741,135 @@ class StartSparrow(Base):
         self.assertFalse(self.seen.exists())
         self.assertIn("sparrow: running and connected", r.stdout)
 
+    def service(self, fake, token=True, on_restart=None):
+        """Our unit file, `fake` as systemctl, and (with `token`) the relay token file."""
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\n")
+        if token:
+            relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
+            relay.parent.mkdir(parents=True, exist_ok=True)
+            relay.write_text("REMOTE_TASK_TOKEN=x\n")
+        real_which, real_proc = shutil.which, keepalive._proc
+
+        def run(cmd):
+            if cmd[2:3] == ["restart"] and on_restart:
+                return on_restart(cmd)
+            return fake(cmd)
+
+        def proc(pid, name):
+            # Hosts without /proc (macOS) read the lock holder's argv from the fixture.
+            if name == "cmdline" and not Path("/proc").is_dir() and \
+                    pid == getattr(self, "old_pid", None):
+                return b"\0".join(a.encode() for a in self.old_argv) + b"\0"
+            return real_proc(pid, name)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(hatch_cli, "_systemd_run", side_effect=run))
+        stack.enter_context(mock.patch.object(
+            hatch_cli.shutil, "which", side_effect=lambda n, *a, **k:
+            "/usr/bin/systemctl" if n == "systemctl" else real_which(n)))
+        stack.enter_context(mock.patch.object(keepalive, "_proc", side_effect=proc))
+        return stack
+
+    def status(self, age):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "gateway-status.json").write_text(json.dumps(
+            {"connected": True, "ts": int(time.time()) - age, "error": None}))
+
     def test_the_outside_sparrow_is_replaced_by_the_installed_service(self):
         old = self.old_sparrow()
-        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
-        unit.parent.mkdir(parents=True)
-        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\n")
+        self.old_pid = old.pid
         fake = FakeSystemd(state="inactive")
-        real_which = shutil.which
 
         def restarted(cmd):
-            if cmd[2:3] == ["restart"]:
-                (self.state / "gateway-status.json").write_text(json.dumps(
-                    {"connected": True, "ts": int(time.time()) + 1, "error": None}))
+            self.status(-1)
             return fake(cmd)
-        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=restarted), \
-                mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda n, *a, **k:
-                                  "/usr/bin/systemctl" if n == "systemctl" else real_which(n)):
+        with self.service(fake, on_restart=restarted):
             r = self.call_ensure()
-        self.assertEqual(r, 0)
+        self.assertEqual(r, 0, self.out + self.err)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
         self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+
+    def test_a_lock_holder_that_is_not_sparrow_is_left_alone(self):
+        old = self.old_sparrow(sparrow=False)
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="inactive")
+        with self.service(fake):
+            r = self.call_ensure()
+        self.assertEqual(r, 1)
+        self.assertIsNone(old.poll(), "a process that is not Sparrow got a signal")
+        self.assertIn(f"NOTE sparrow: pid {old.pid} holds Sparrow's lock", self.out)
+        self.assertIn(f"pid {old.pid} holds Sparrow's lock; run install again", self.err)
+        self.assertEqual(fake.ran("restart"), [])
+
+    def test_a_restarted_unit_must_report_after_its_start(self):
+        # The unit started 5 s ago; the status file is the previous process's, 60 s old.
+        start_us = int((time.monotonic() - 5) * 1e6)
+        fake = FakeSystemd(state="active", main_pid=4242, ran=True, start_us=start_us)
+        self.status(60)
+        with mock.patch.object(keepalive, "START_WAIT_S", 1.0), self.service(fake):
+            r = self.call_ensure()
+        self.assertEqual(r, 1, self.out)
+        self.assertNotIn("running and connected", self.out)
+        self.assertIn("is not running and connected 1s after install", self.err)
+        self.status(2)
+        with mock.patch.object(keepalive, "START_WAIT_S", 1.0), self.service(fake):
+            r = self.call_ensure()
+        self.assertEqual(r, 0, self.out + self.err)
+        self.assertIn("sparrow: running and connected", self.out)
+        self.assertEqual(fake.ran("restart"), [])
+
+    def test_with_no_relay_token_the_unit_is_left_stopped(self):
+        fake = FakeSystemd(state="inactive")
+        with self.service(fake, token=False):
+            r = self.call_ensure()
+        self.assertEqual(r, 1)
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertEqual(fake.ran("reset-failed"), [])
+        self.assertIn("error: Sparrow was not started: ", self.err)
+        self.assertIn("relay.env is missing, so ag2-sparrow.service was left stopped", self.err)
+        self.assertNotIn("after install", self.err)
+
+    def test_a_hand_made_unit_is_left_to_run_sparrow(self):
+        old = self.old_sparrow()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="active")
+        with self.service(fake):
+            unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+            unit.write_text("[Service]\nExecStart=/usr/bin/ag2-sparrow\nRestart=always\n")
+            with mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}):
+                r = self.call_ensure()
+        self.assertEqual(r, 0, self.out + self.err)
+        self.assertIn("was not written by install, so install neither starts nor replaces",
+                      self.out)
+        self.assertIsNone(old.poll())
+        self.assertFalse(self.seen.exists())
+        self.assertEqual(fake.ran("restart"), [])
+
+    def test_a_failed_start_after_a_stop_says_none_runs(self):
+        old = self.old_sparrow()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="inactive")
+
+        def failed(cmd):
+            fake(cmd)
+            return subprocess.CompletedProcess(cmd, 1, "", "Unit failed")
+        with self.service(fake, on_restart=failed):
+            r = self.call_ensure()
+        self.assertEqual(r, 1)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertIn(f"the old Sparrow (pid {old.pid}) was stopped, so none is running now",
+                      self.err)
 
     def call_ensure(self):
         env = {"HOME": str(self.home), "PATH": f"{self.bin}:{os.environ['PATH']}"}
         self.cli("install", "--mxid", AGENT, "--no-service")
+        out, err = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), \
-                contextlib.redirect_stdout(io.StringIO()):
-            return REAL_ENSURE_SPARROW(hatch_cli._installed_config(), True)
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = REAL_ENSURE_SPARROW(hatch_cli._installed_config(), True)
+        self.out, self.err = out.getvalue(), err.getvalue()
+        return rc
 
     def test_install_fails_loudly_when_sparrow_does_not_connect(self):
         executable(self.bin / hatch_cli.SPARROW_COMMAND,
