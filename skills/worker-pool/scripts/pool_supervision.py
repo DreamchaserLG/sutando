@@ -133,8 +133,15 @@ def _is_watcher_loss(obs: Observation) -> bool:
             and obs.watcher_held is False)
 
 
+def _frame_moved(obs: Observation, ev: WorkerEvidence) -> bool:
+    """The raw frame differs from the last tick's: the session is progressing.
+    A banner left on screen after the wait ended does not make a moving pane wait."""
+    return bool(obs.pane_id and ev.last_pane_id and obs.pane_id != ev.last_pane_id)
+
+
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
-    """"login" (the session is logged out), "human" (a gate or limit on screen),
+    """"login" (the session is logged out), "human" (a gate or limit on a frame
+    that has not moved since the last tick),
     "abnormal" (cli_wedge text), "stuck" (a turn whose raw frame has not changed
     since the last tick), else None. A logged-out session is wedged whether or
     not it owes work: nothing routed to it can ever run. Otherwise only a worker
@@ -146,7 +153,7 @@ def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
         return "login"
     if obs.work_outstanding is not True:
         return None
-    if obs.pane in _HUMAN_PANES:
+    if obs.pane in _HUMAN_PANES and not _frame_moved(obs, ev):
         return "human"
     if obs.pane == PANE_ABNORMAL:
         return "abnormal"
