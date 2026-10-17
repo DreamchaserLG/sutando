@@ -309,7 +309,9 @@ owes work would read as stuck; a running Claude turn's timer keeps it changing.
 session meets the same network error, rate limit, API error or retry, and loses the
 turn in flight. With the same sustain and stale line, once per episode:
 
-- a gate or a limit escalates, as a gate always has;
+- a gate or a limit escalates, as a gate always has, only while its raw frame stays
+  unchanged across ticks: a limit banner the CLI leaves painted after a re-login sits
+  under a session that is still working, and a moving frame clears the episode;
 - abnormal text raises a card that quotes the banner line and names the cause. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
