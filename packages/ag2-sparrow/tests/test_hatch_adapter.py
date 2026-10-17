@@ -1780,14 +1780,26 @@ class StartSparrow(Base):
         self.assertIn("skipped: starting and checking Sparrow (--no-start)", r.stdout)
         self.assertFalse(self.seen.exists())
 
+    def test_only_a_sparrow_command_line_counts(self):
+        for argv, want in ((["/home/u/.local/bin/ag2-sparrow"], True),
+                           (["/usr/bin/python3", "/home/u/.local/bin/ag2-sparrow"], True),
+                           (["python3", "-m", "ag2_sparrow"], True),
+                           (["python3", "/src/packages/ag2-sparrow/tests/t.py"], False),
+                           (["/home/u/.local/bin/ag2-sparrow-hatch", "verify"], False),
+                           (["python3", "-c", "x", "ag2-sparrow"], False), ([], False)):
+            self.assertEqual(keepalive.is_sparrow_argv(argv), want, argv)
+
     @unittest.skipUnless(Path("/proc/self/environ").exists(), "needs /proc")
     def test_sparrow_env_reads_a_sparrow_process_only(self):
         self.assertIsNone(keepalive.sparrow_env(os.getpid()), "not a Sparrow command line")
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
-                                 "ag2-sparrow"], env={"REMOTE_HEALTH_COMMAND": "x y"})
+        script = self.home / "ag2-sparrow"
+        script.write_text("import time\ntime.sleep(30)\n")
+        proc = subprocess.Popen([sys.executable, str(script)],
+                                env={"REMOTE_HEALTH_COMMAND": "x y"})
         self.addCleanup(proc.kill)
         time.sleep(0.2)
-        self.assertEqual(keepalive.sparrow_env(proc.pid), {"REMOTE_HEALTH_COMMAND": "x y"})
+        self.assertEqual((keepalive.sparrow_env(proc.pid) or {}).get("REMOTE_HEALTH_COMMAND"),
+                         "x y")
 
 
 HEARTBEAT = """

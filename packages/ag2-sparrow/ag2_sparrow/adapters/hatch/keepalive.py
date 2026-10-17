@@ -252,12 +252,20 @@ def _gone(pid: int) -> bool:
     return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
 
 
+def is_sparrow_argv(argv: "list[str]") -> bool:
+    """The `ag2-sparrow` console script, run directly or by its Python, or `-m ag2_sparrow`."""
+    if any(os.path.basename(a) == _cli.SPARROW_COMMAND for a in argv[:2]):
+        return True
+    return any(a == "-m" and b in ("ag2_sparrow", "ag2_sparrow.remote_gateway_bridge")
+               for a, b in zip(argv, argv[1:]))
+
+
 def sparrow_env(pid: int) -> "dict[str, str] | None":
     """The environment of Sparrow process `pid`; None when it cannot be read (no /proc, or
     another process now has that pid)."""
     cmd, env = _proc(pid, "cmdline"), _proc(pid, "environ")
-    if cmd is None or env is None or not any(
-            m in cmd for m in (_cli.SPARROW_COMMAND.encode(), b"ag2_sparrow")):
+    argv = [a.decode(errors="replace") for a in (cmd or b"").split(b"\0") if a]
+    if env is None or not is_sparrow_argv(argv):
         return None
     pairs = (p.split(b"=", 1) for p in env.split(b"\0") if b"=" in p)
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
