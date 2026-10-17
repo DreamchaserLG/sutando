@@ -13,6 +13,12 @@ unset _self_dir
 cd "$REPO"
 # Shared with the claude launcher: one owner for the in-session restart policy.
 . "$REPO/src/agent/restart-guard.sh"
+# Shared with the claude launcher: one owner for the core-CLI compatibility gate.
+if [ -r "$REPO/src/agent/runtime-compat-gate.sh" ]; then
+  . "$REPO/src/agent/runtime-compat-gate.sh"
+else
+  sutando_runtime_compat_gate() { SUTANDO_CORE_CLI_BIN="$2"; }
+fi
 
 # This entry point only launches the canonical core. A Codex pool worker uses
 # the pool's runtime launcher instead.
@@ -204,20 +210,12 @@ if [ -n "$config_env" ] && [ -n "$config_value" ]; then
   echo "  ✓ $config_env=$config_value"
 fi
 
-# `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
-# probe — the exit code IS the signal here, not a failure.
-_codex_auth_rc=0
-codex login status >/dev/null 2>&1 || _codex_auth_rc=$?
-if [ "$_codex_auth_rc" -eq 127 ]; then
-  # 127 is "could not execute", not "not logged in" — almost always a missing
-  # node on PATH. Saying "run codex login" here sends people the wrong way.
-  echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
-  exit 127
-fi
-if [ "$_codex_auth_rc" -ne 0 ]; then
-  echo "Codex CLI is not authenticated for ${CODEX_HOME:-~/.codex}. Run 'codex login' and retry." >&2
-  exit 1
+# Version, capabilities and login, before anything below can replace a core.
+# The gate waits for a fix when a person is at the terminal, then continues.
+_codex_gate_rc=0
+sutando_runtime_compat_gate "$REPO" codex --enforce-auth || _codex_gate_rc=$?
+if [ "$_codex_gate_rc" -ne 0 ]; then
+  exit "$_codex_gate_rc"
 fi
 
 # The Codex adapter depends on tmux for a persistent pane and fswatch for
@@ -569,7 +567,7 @@ if ! tmux_available; then
     exit 1
   fi
   echo "  ⚠ tmux not found — Codex will run, but file-bridge task wakeups are unavailable" >&2
-  if ! command -v codex >/dev/null 2>&1; then
+  if ! command -v "$SUTANDO_CORE_CLI_BIN" >/dev/null 2>&1; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
@@ -578,7 +576,7 @@ if ! tmux_available; then
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e
-  exec codex "${CODEX_ARGS[@]}"
+  exec "$SUTANDO_CORE_CLI_BIN" "${CODEX_ARGS[@]}"
   _exec_rc=$?
   set -e
   restore_shutdown_sentinel
@@ -603,7 +601,7 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
-  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
+  tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" "$SUTANDO_CORE_CLI_BIN" "${CODEX_ARGS[@]}"
   for _ in $(seq 1 "$SESSION_UP_TRIES"); do
     session_exists "$SESSION" && break
     sleep 0.2

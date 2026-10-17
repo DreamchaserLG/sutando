@@ -86,6 +86,16 @@ exit 0
 '''
 
 
+# Answers the compat gate's probes the way a real codex-cli does.
+CODEX_STUB = """#!/bin/bash
+case "${1:-}" in
+  --version) echo "codex-cli 0.160.1" ;;
+  --help) echo "--cd --add-dir --sandbox --ask-for-approval --search --no-alt-screen --config --model" ;;
+esac
+exit 0
+"""
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -99,6 +109,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/runtime-compat-gate.sh",
+            "src/runtime_compat.py",
+            "src/auth_preflight.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             # cli_wedge imports sutando_platform; without it every classify
@@ -165,7 +178,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             }],
         }))
         self.bin.mkdir()
-        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
+        self._write_exe("codex", CODEX_STUB)
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
         self._write_exe("uname", '#!/bin/bash\nprintf "Darwin\\n"\n')
         self._write_exe("launchctl", '''#!/bin/bash
@@ -310,6 +323,8 @@ exit 0
         env.pop("SUTANDO_TMUX_SESSION", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -345,6 +360,8 @@ exit 0
         env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -848,7 +865,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("sutando-core already running (codex)", result.stdout)
 
     def test_auth_failure_stops_before_tmux_launch(self):
-        self._write_exe("codex", '#!/bin/bash\nexit 1\n')
+        self._write_exe("codex", CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0"))
         result = self.run_launcher()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not authenticated", result.stderr)
