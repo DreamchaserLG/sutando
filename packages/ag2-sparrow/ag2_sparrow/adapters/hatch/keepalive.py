@@ -6,7 +6,8 @@ to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1`. A schedu
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last
-keepawake line is under two intervals old, else abnormal (`keepawake-not-running`).
+keepawake line, or the task's install when it never ran, is under two intervals old,
+else abnormal (`keepawake-not-running`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -64,7 +66,7 @@ def task_file(name: str = TASK, minutes: int = INTERVAL_MIN) -> str:
 
 def health_command(command: str) -> str:
     """REMOTE_HEALTH_COMMAND for Sparrow: this adapter's health row."""
-    return f"{command} keepalive health"
+    return shlex.join([command, "keepalive", "health"])
 
 
 def render_task(command: str) -> str:
@@ -262,31 +264,35 @@ def _mtime(path: Path) -> float | None:
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
-    """The core row for Sparrow's heartbeat; None while no keepawake task is installed
-    or it has not run yet. `alive` also counts the hook's activity marker."""
+    """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
+    `alive` also counts the hook's activity marker."""
     now = time.time() if now is None else now
-    last = last_keepawake(log)
-    if last is None or not _found(cron_dir(cfg), TASK):
+    tasks = _found(cron_dir(cfg), TASK)
+    if not tasks:
         return None
+    ran = last_keepawake(log)
+    # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
+    last = ran if ran is not None else max(
+        (m for m in map(_mtime, tasks) if m is not None), default=now)
     fresh = now - last <= STALE_S
     active = _mtime(_activity_file(cfg))
-    alive = True if fresh or (active is not None and now - active <= STALE_S) else None
+    alive = True if (fresh and ran is not None) or (
+        active is not None and now - active <= STALE_S) else None
     return {"alive": alive, "motion": "unknown",
             "condition": "healthy" if fresh else "abnormal",
             "reason": None if fresh else NOT_RUNNING,
             "since": None if fresh else last + STALE_S}
 
 
-def status_line(cfg: dict, now: float | None = None) -> "tuple[str, bool]":
-    """What keepalive status prints, and whether the row is healthy. Observes only."""
+def status_line(cfg: dict, now: float | None = None) -> "tuple[str, dict | None]":
+    """What keepalive status prints, and the health row. Observes only."""
     now = time.time() if now is None else now
     log = log_path(cfg)
     last, row = last_keepawake(log), health_row(cfg, log, now)
     health = ("none" if row is None else row["condition"]
               + (f" ({row['reason']})" if row["reason"] else ""))
     return (f"{_utc(now)} listener={'up' if listener_up(cfg, now) else 'down'} "
-            f"last_keepawake={_utc(last) if last is not None else 'never'} health={health}",
-            row is not None and row["condition"] == "healthy")
+            f"last_keepawake={_utc(last) if last is not None else 'never'} health={health}", row)
 
 
 def report(log: Path, gap_minutes: float = GAP_MINUTES) -> int:

@@ -204,14 +204,15 @@ Unset (the default), Sparrow behaves exactly as before.
 ### Reporting your agent's health
 
 Set `REMOTE_HEALTH_COMMAND` and Sparrow runs it (split like
-`REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 10 s
+`REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 5 s
 timeout) at most once a minute, and sends the one JSON object it prints as
 the `health` row on its heartbeat, so AG2 Space's health panel shows your
 agent's core. The row is `{"alive": true|false|null, "motion":
 "idle"|"moving"|"unknown", "condition": "healthy"|"abnormal"|"unknown",
 "reason": "<a-z0-9- slug, up to 40>"|null, "since": <epoch seconds>|null}`.
 Printing nothing sends no row. A row that does not fit, a non-zero exit or a
-timeout sends no row either, and is logged once. The Hatch adapter's
+timeout sends no row either, and is logged once. The row does not change the
+presence status Sparrow reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
 ## Meta Hatch agents (`ag2-sparrow[hatch]`)
@@ -459,10 +460,13 @@ panel shows this agent's core instead of asking you to update:
 | --- | --- | --- | --- |
 | 30 minutes old or less (two runs) | `healthy` | | `true` |
 | older | `abnormal` | `keepawake-not-running` | `true` if the hook's activity marker (`--activity-file`, default `~/.muse/last_active`) changed in the last 30 minutes, else unknown |
-| none, or no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
+| none yet | as above, timed from when install wrote the task: `healthy` for its first 30 minutes, then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
+| no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
 
 `motion` is always `unknown`. Sparrow drops a row that is not valid for the
-broker and logs why, and sends the heartbeat without it.
+broker and logs why, and sends the heartbeat without it. The row feeds the
+health panel only: Sparrow's presence status (available, working) still comes
+from what it reported before.
 
 `ag2-sparrow-hatch keepalive status` prints whether Sparrow is up, the last
 keepawake run and the health row, without writing or restarting anything;

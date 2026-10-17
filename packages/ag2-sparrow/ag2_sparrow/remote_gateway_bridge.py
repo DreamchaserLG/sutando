@@ -45,6 +45,8 @@ Config (env / .env):
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
                         file (argv split with shlex, no shell; file path appended;
                         the task's bytes on stdin, routing headers as SPARROW_* env)
+  REMOTE_HEALTH_COMMAND optional command printing the core's health row (JSON) for
+                        the heartbeat; see health_command.py
   REMOTE_OUTBOUND_SCAN_S outbound worker scan period seconds (default 1.0)
 
 Stdlib only (urllib) — no new dependencies.
@@ -3119,7 +3121,7 @@ def _workers_body(ad: dict) -> dict:
     return ad["workers"]
 
 
-HEALTH_FIELDS = ("alive", "motion", "condition", "reason", "since")
+HEALTH_FIELDS = health_command.FIELDS
 HEALTH_TTL_S = 15.0
 _health_cache: dict = {"at": None, "value": None, "error": None}
 # An adapter's own core row, when it injects one; it outranks the monorepo snapshot's.
@@ -3151,10 +3153,9 @@ def _health_snapshot() -> "dict | None":
 
 
 def _health_row(agent: dict) -> dict:
-    """The wire row; the broker takes `reason` as a slug of [a-z0-9-]{1,40}."""
+    """The wire row, its `reason` made a slug the broker accepts."""
     row = {k: agent.get(k) for k in HEALTH_FIELDS}
-    if row["reason"] is not None:
-        row["reason"] = re.sub(r"[^a-z0-9-]+", "-", str(row["reason"]).lower()).strip("-")[:40].strip("-") or None
+    row["reason"] = health_command.slug(row["reason"])
     return row
 
 
@@ -3437,7 +3438,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         return False
     _last_heartbeat_at = now
     _last_core_health = health
-    _status, _step = _reported_core_status(health)
+    # An injected row is not the core's beat: presence status stays the core-status file's.
+    _status, _step = _reported_core_status(None if _HEALTH_COMMAND else health)
     try:
         payload = {
             "client": "sutando-gateway-client",

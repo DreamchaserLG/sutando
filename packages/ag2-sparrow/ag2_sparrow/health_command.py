@@ -6,7 +6,7 @@ refuses a whole heartbeat whose row is malformed, so a row that does not match i
 contract (alive: bool|null; motion: idle|moving|unknown; condition:
 healthy|abnormal|unknown; reason: a [a-z0-9-]{1,40} slug or null; since: epoch
 seconds or null) is dropped and logged, never sent. Empty stdout means no row.
-This module names no adapter: what the command measures is the adapter's business."""
+This module owns that contract for every row the bridge sends; it names no adapter."""
 from __future__ import annotations
 
 import json
@@ -17,10 +17,21 @@ import subprocess
 import time
 from collections.abc import Callable
 
+FIELDS = ("alive", "motion", "condition", "reason", "since")
 MOTIONS = ("idle", "moving", "unknown")
 CONDITIONS = ("healthy", "abnormal", "unknown")
-REASON_RE = re.compile(r"[a-z0-9-]{1,40}")
-TIMEOUT_S = 10.0
+REASON_MAX = 40
+REASON_RE = re.compile(f"[a-z0-9-]{{1,{REASON_MAX}}}")
+# The heartbeat waits on this in the poll loop.
+TIMEOUT_S = 5.0
+
+
+def slug(value) -> "str | None":
+    """`value` as a reason REASON_RE accepts, or None when nothing is left."""
+    if value is None:
+        return None
+    text = re.sub(r"[^a-z0-9-]+", "-", str(value).lower()).strip("-")
+    return text[:REASON_MAX].strip("-") or None
 
 
 def _epoch(value) -> bool:
@@ -32,7 +43,7 @@ def validate(value) -> "tuple[dict | None, str | None]":
     """(row, None) for a row the broker accepts, else (None, why)."""
     if not isinstance(value, dict):
         return None, "not a JSON object"
-    row = {k: value.get(k) for k in ("alive", "motion", "condition", "reason", "since")}
+    row = {k: value.get(k) for k in FIELDS}
     if row["alive"] is not None and not isinstance(row["alive"], bool):
         return None, "alive must be true, false or null"
     if row["motion"] not in MOTIONS:

@@ -336,7 +336,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         exec_start = _unit_value(exec_start)
         env = {k: _unit_value(v) for k, v in env.items()}
         if health_command:
-            env["REMOTE_HEALTH_COMMAND"] = " ".join(map(_unit_value, health_command.split(" ")))
+            env["REMOTE_HEALTH_COMMAND"] = " ".join(map(_unit_value, shlex.split(health_command)))
     except ValueError as e:
         note(f"{e}; no service was set up")
         return
@@ -620,9 +620,11 @@ def verify(_args) -> int:
            f"armed: a wake after {HEARTBEAT_INTERVAL_S}s quiet unless {activity} is fresher")
 
     from . import keepalive
-    line, healthy = keepalive.status_line(cfg)
-    print(f"NOTE keepalive: {line}" + ("" if healthy else f" ({keepalive.TASK} has not run in "
-          f"the last {keepalive.STALE_S // 60} minutes, or not yet; check Hatch's scheduled tasks)"))
+    line, row = keepalive.status_line(cfg)
+    hint = (f" (no {keepalive.TASK} task is installed)" if row is None else
+            f" ({keepalive.TASK} has not run in the last {keepalive.STALE_S // 60} minutes; "
+            "check Hatch's scheduled tasks)" if row["condition"] != "healthy" else "")
+    print(f"NOTE keepalive: {line}{hint}")
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
     print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "

@@ -7,6 +7,7 @@ real task-field helper; `flock` and `timeout` are stubbed. Run:
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -1452,7 +1453,7 @@ class Keepalive(Base):
         self.installed()
         self.sparrow_status(connected=False, error="401")
         r = self.cli("keepalive", "status")
-        self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=none$")
+        self.assertRegex(r.stdout.strip(), r"Z listener=up last_keepawake=never health=healthy$")
         self.assertFalse(self.log.exists())
         with mock.patch.object(keepalive, "restart_listener") as restart:
             r = self.cli("keepalive", "keepawake")
@@ -1503,11 +1504,37 @@ class Keepalive(Base):
         self.assertIn("exited 75 at once (another Sparrow holds the lock)", r.stderr)
         self.assertTrue(self.log.read_text().strip().endswith("listener=down restarted=0"))
 
-    def test_health_row_fresh_stale_and_absent(self):
+    def age_task(self, seconds):
+        ts = time.time() - seconds
+        os.utime(self.task, (ts, ts))
+
+    def test_a_task_that_never_runs_goes_abnormal_from_its_install(self):
         self.installed()
-        self.assertIsNone(self.health(), "no keepawake line yet: no row")
-        self.log.write_text("2026-10-14T07:30:00Z listener=up watchdog=up listener_restarts=0\n")
-        self.assertIsNone(self.health(), "a probe line is not a keepawake run")
+        row = self.health()
+        self.assertEqual((row["alive"], row["condition"], row["reason"]),
+                         (None, "healthy", None), "a fresh install is not a red row")
+        self.age_task(keepalive.STALE_S + 60)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "keepawake-not-running"))
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertRegex(self.cli("keepalive", "status").stdout,
+                         r" last_keepawake=never health=abnormal \(keepawake-not-running\)$")
+
+    def test_old_probe_lines_do_not_count_as_a_keepawake_run(self):
+        self.installed()
+        self.log.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ") +
+                            " listener=up watchdog=up listener_restarts=0\n")
+        self.age_task(keepalive.STALE_S + 60)
+        self.assertEqual(self.health()["reason"], "keepawake-not-running")
+
+    def test_no_task_installed_means_no_row_even_with_a_fresh_line(self):
+        self.installed("--no-keepalive")
+        self.keepawake_at(time.time())
+        self.assertIsNone(self.health())
+        self.assertRegex(self.cli("keepalive", "status").stdout, r" health=none$")
+
+    def test_health_row_fresh_and_stale(self):
+        self.installed()
         now = time.time()
         self.keepawake_at(now - keepalive.STALE_S + 60)
         row = self.health()
@@ -1526,6 +1553,11 @@ class Keepalive(Base):
                          (True, "abnormal"), "the hook woke it; the scheduler still did not")
         self.assertRegex(self.cli("keepalive", "status").stdout,
                          r" health=abnormal \(keepawake-not-running\)$")
+
+    def test_the_health_command_survives_a_path_with_a_space(self):
+        command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
+        self.assertEqual(shlex.split(command),
+                         ["/opt/my tools/ag2-sparrow-hatch", "keepalive", "health"])
 
     def test_the_service_unit_carries_the_health_command(self):
         self.installed()
@@ -1574,9 +1606,15 @@ class Keepalive(Base):
 
     def test_verify_notes_the_keepalive_state(self):
         self.installed()
-        r = self.cli("verify")
-        self.assertRegex(r.stdout, r"NOTE keepalive: \S+Z listener=down last_keepawake=never "
-                         r"health=none \(sparrow-keepawake has not run in the last 30 minutes, or not yet")
+        self.assertRegex(self.cli("verify").stdout, r"NOTE keepalive: \S+Z listener=down "
+                         r"last_keepawake=never health=healthy\n")
+        self.age_task(keepalive.STALE_S + 60)
+        self.assertRegex(self.cli("verify").stdout, r"health=abnormal \(keepawake-not-running\) "
+                         r"\(sparrow-keepawake has not run in the last 30 minutes; check")
+        self.installed("--no-keepalive")
+        self.task.unlink()
+        self.assertIn("health=none (no sparrow-keepawake task is installed)",
+                      self.cli("verify").stdout)
 
 
 HEARTBEAT = """
@@ -1648,7 +1686,7 @@ class HealthCommand(Base):
         self.assertEqual((body["health"]["condition"], body["health"]["reason"]),
                          ("abnormal", "keepawake-not-running"))
         self.assertIn("worker_health.v1", body["capabilities"])
-        self.assertEqual(body["status"], "unknown")
+        self.assertNotIn("status", body, "the injected row does not drive presence")
 
     def test_the_command_never_sees_the_relay_token(self):
         row = {"alive": True, "motion": "idle", "condition": "healthy", "reason": None,
