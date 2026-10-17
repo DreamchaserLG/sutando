@@ -912,11 +912,6 @@ def _words(text: str) -> list:
     return _TOKEN.findall(_normalized(text))
 
 
-def _whole(text: str) -> str:
-    """The text for a whole-message match: @-mentions and punctuation kept, spacing dropped."""
-    return "".join(unicodedata.normalize("NFKC", text).casefold().split())
-
-
 def _weight(tokens: list) -> int:
     """How much of a quote `tokens` is, in units where ANSWERING_MIN_WORDS words or
     ANSWERING_MIN_CHARS unspaced characters are each the minimum."""
@@ -928,12 +923,8 @@ def answers(body: str, quoted: str) -> bool:
     """Whether `quoted` is ANSWERING_MIN_WORDS or more consecutive words of the message in
     `body` (ANSWERING_MIN_CHARS characters of text written without spaces, such as Chinese,
     Japanese or Thai; all of it when shorter); case, punctuation and @-mentions do not count.
-    A message with no words (e.g. only emoji) is named only by all of it, punctuation included.
-    The whole message, mentions and punctuation included, always names it, however short."""
+    A message with no words (e.g. only emoji) is named only by all of it, punctuation included."""
     message = message_text(body)
-    whole = _whole(quoted)
-    if whole and whole == _whole(message):
-        return True
     have, want = _words(message), _words(quoted)
     if not have:  # no words at all, e.g. a lone emoji: only the whole message names it
         squeeze = "".join(_normalized(quoted).split())
@@ -960,7 +951,7 @@ def _misrouted(tid: str, task_dir: Path, result_dir: Path, instance: str, quoted
              "result_file." if fits else
              f" Copy {ANSWERING_MIN_WORDS} or more consecutive words (or {ANSWERING_MIN_CHARS} "
              "characters of text written without spaces) of the message you answer from its "
-             "snippet, or the whole message exactly.")
+             "snippet.")
     return (f"--answering {quoted!r} is not the message of {tid} "
             f"({snippet(body)[:200]!r}); nothing written.{where}")
 
@@ -1027,7 +1018,7 @@ def reply(args) -> int:
     if args.answering is None:
         print(f"error: name the message this answers: --answering '<{ANSWERING_MIN_WORDS} or "
               f"more consecutive words ({ANSWERING_MIN_CHARS} characters of text written "
-              "without spaces) copied from its snippet, or the whole message>'; nothing written",
+              "without spaces) copied from its snippet>'; nothing written",
               file=sys.stderr)
         return 2
     if not answers(_task_body(task_dir / f"{tid}.txt"), args.answering):
@@ -1139,8 +1130,7 @@ def main(argv=None) -> int:
     r.add_argument("--answering", metavar="WORDS",
                    help=f"{ANSWERING_MIN_WORDS} or more consecutive words ({ANSWERING_MIN_CHARS} "
                    "characters of text written without spaces) of the message this "
-                   "answers, copied from its snippet, or the whole message (required: a reply "
-                   "to another item's "
+                   "answers, copied from its snippet (required: a reply to another item's "
                    "message is refused)")
     r.add_argument("--body", help="the reply text (default: read from stdin)")
     r.add_argument("--no-send", action="store_true", help="close the item without posting")
