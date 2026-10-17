@@ -147,6 +147,13 @@ class Base(unittest.TestCase):
         ensure.start()
         self.addCleanup(ensure.stop)
 
+    def hook_ran(self, age_s=0, sha=None, state=None):
+        """The stamp the hook script writes each run, `age_s` old, for script `sha`."""
+        state = state or self.home / "state"
+        state.mkdir(exist_ok=True)
+        sha = sha or hatch_cli._sha256(SCRIPT.read_text())
+        (state / hatch_cli.HOOK_RUN_FILE).write_text(f"{int(time.time()) - age_s} {sha}\n")
+
     def add_task(self, tid, event_id, sender="@bob:ag2.space", thread_root=None, mtime=None,
                  text=None, **kw):
         path = self.tasks / f"{tid}.txt"
@@ -320,6 +327,19 @@ class HookScript(Base):
         self.assertEqual(self.events_list(), ["WAKE", "STATE_SET"])
         self.assertEqual(json.loads(self.state.read_text())["seen_ids"], ["task-1784700000001"])
 
+    def test_every_run_stamps_when_and_which_script(self):
+        stamp = self.sparrow_state / hatch_cli.HOOK_RUN_FILE
+        before = int(time.time())
+        self.assertEqual(self.run_script().returncode, 0)
+        when, sha = stamp.read_text().split()
+        self.assertGreaterEqual(int(when), before)
+        self.assertEqual(sha, hatch_cli._sha256(SCRIPT.read_text()))
+        stamp.write_text("1 old\n")
+        self.add_task("task-1784700000001", "$reply")
+        self.assertEqual(self.run_script().returncode, 0)
+        self.assertGreaterEqual(int(stamp.read_text().split()[0]), before, "a waking run too")
+        self.assertEqual(hatch_cli.hook_last_run(self.sparrow_state)[1], sha)
+
     def test_dry_run_writes_nothing(self):
         self.add_task("task-1784700000001", "$reply")
         r = self.run_script(HATCH_HOOK_DRY_RUN="1")
@@ -327,6 +347,7 @@ class HookScript(Base):
         self.assertTrue(self.wake_out.exists())
         self.assertNotIn("STATE_SET", self.events_list())
         self.assertFalse(self.state.exists())
+        self.assertFalse((self.sparrow_state / hatch_cli.HOOK_RUN_FILE).exists())
 
     def test_closed_and_own_tasks_do_not_wake(self):
         self.add_task("task-1784700000001", "$done")
@@ -731,6 +752,8 @@ class Cli(Base):
     def test_install_writes_script_definition_and_config(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("REQUIRED hook: register the hook through your hooks tool: hooks.add with "
+                      f"the definition in {self.definition}", r.stdout)
         self.assertEqual(self.script.read_text(), SCRIPT.read_text())
         self.assertTrue(os.access(self.script, os.X_OK))
         definition = json.loads((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
@@ -747,7 +770,49 @@ class Cli(Base):
         self.assertIn("GATEWAY_INSTANCE=''", text)
         again = self.cli("install", "--mxid", AGENT)
         self.assertEqual(again.returncode, 0, again.stderr)
-        self.assertIn(f"unchanged: {self.script}", again.stdout)
+        self.assertIn(f"unchanged: hook ag2-sparrow-hatch ({self.script} and", again.stdout)
+        self.assertNotIn("REQUIRED hook:", again.stdout)
+
+    def test_install_twice_touches_no_hook_or_config_file(self):
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        files = (self.script, self.definition, self.config, self.marker)
+        for f in files:
+            os.utime(f, (1_000_000, 1_000_000))
+        before = {f: (f.stat().st_mtime_ns, f.stat().st_ctime_ns, f.stat().st_ino)
+                  for f in files}
+        time.sleep(0.05)
+        r = self.cli("install", "--mxid", AGENT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual({f: (f.stat().st_mtime_ns, f.stat().st_ctime_ns, f.stat().st_ino)
+                          for f in files}, before)
+        self.assertNotIn("REQUIRED hook:", r.stdout)
+        self.assertFalse(self.staged.exists())
+
+    @property
+    def definition(self):
+        return self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json"
+
+    @property
+    def config(self):
+        return self.home / ".config" / "ag2-sparrow-hatch" / "config"
+
+    @property
+    def staged(self):
+        return self.home / ".config" / "ag2-sparrow-hatch" / "hook-definition.json"
+
+    @property
+    def versioned(self):
+        sha = hatch_cli._sha256(SCRIPT.read_text())
+        return self.script.with_name(f"ag2-sparrow-hatch.{sha[:12]}.sh")
+
+    def test_a_changed_config_is_rewritten_atomically(self):
+        self.cli("install", "--mxid", AGENT)
+        inode = self.config.stat().st_ino
+        r = self.cli("install", "--mxid", AGENT, "--gateway-instance", "green")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"installed: {self.config}", r.stdout)
+        self.assertNotEqual(self.config.stat().st_ino, inode, "a new file renamed into place")
+        self.assertEqual(stat.S_IMODE(self.config.stat().st_mode), 0o600)
 
     def test_install_refuses_a_locally_modified_script(self):
         self.cli("install", "--mxid", AGENT)
@@ -761,7 +826,9 @@ class Cli(Base):
         self.assertEqual(self.marker.read_text().strip(), hatch_cli._sha256(SCRIPT.read_text()))
         forced = self.cli("install", "--mxid", AGENT, "--force")
         self.assertEqual(forced.returncode, 0, forced.stderr)
-        self.assertEqual(self.script.read_text(), SCRIPT.read_text())
+        self.assertEqual(self.script.read_text(), edited, "the running hook's script is kept")
+        self.assertEqual(self.versioned.read_text(), SCRIPT.read_text())
+        self.assertIn("REQUIRED hook:", forced.stdout)
 
     @property
     def marker(self):
@@ -774,12 +841,49 @@ class Cli(Base):
         older = "#!/usr/bin/env bash\n# an earlier ag2-sparrow hook\n"
         self.script.write_text(older)
         self.marker.write_text(hatch_cli._sha256(older) + "\n")
+        registered = self.definition.read_text()
+        for f in (self.script, self.definition):
+            os.utime(f, (1_000_000, 1_000_000))
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(f"upgraded: {self.script}", r.stdout)
         self.assertNotIn("DIFF", r.stdout)
-        self.assertEqual(self.script.read_text(), SCRIPT.read_text())
-        self.assertEqual(self.marker.read_text().strip(), hatch_cli._sha256(SCRIPT.read_text()))
+        # The running hook's files are left exactly as they are.
+        self.assertEqual(self.script.read_text(), older)
+        self.assertEqual(self.definition.read_text(), registered)
+        self.assertEqual({f.stat().st_mtime for f in (self.script, self.definition)}, {1_000_000})
+        self.assertEqual(self.versioned.read_text(), SCRIPT.read_text())
+        self.assertTrue(os.access(self.versioned, os.X_OK))
+        self.assertEqual(self.marker.read_text().split(),
+                         [hatch_cli._sha256(older), hatch_cli._sha256(SCRIPT.read_text())])
+        staged = json.loads(self.staged.read_text())
+        self.assertEqual(staged["script_path"], f"~/hooks/scripts/{self.versioned.name}")
+        self.assertIn(f"REQUIRED hook: install left the running hook ag2-sparrow-hatch as it is; "
+                      f"update it through your hooks tool to the definition in {self.staged}",
+                      r.stdout)
+        self.assertIn(self.staged.read_text(), r.stdout, "the exact definition is printed")
+        # Until the agent's hooks tool takes it, verify fails.
+        self.sparrow_status()
+        self.hook_ran(sha=hatch_cli._sha256(older))
+        v = self.cli("verify")
+        self.assertEqual(v.returncode, 1)
+        self.assertIn(f"FAIL hook script: {self.script} differs from this ag2-sparrow's copy; "
+                      f"update the hook through your hooks tool to the definition in "
+                      f"{self.staged}", v.stdout)
+        self.assertIn("FAIL hook definition:", v.stdout)
+        self.assertIn("FAIL hook run: the hook runs an older script", v.stdout)
+        # The hooks tool registered it; the hook has not run the new script yet.
+        self.definition.write_text(json.dumps(dict(staged, enabled=True)))
+        v = self.cli("verify")
+        self.assertIn(f"PASS hook script: {self.versioned}", v.stdout)
+        self.assertIn("PASS hook definition:", v.stdout)
+        self.assertIn("FAIL hook run: the hook runs an older script", v.stdout)
+        self.hook_ran()
+        v = self.cli("verify")
+        self.assertEqual(v.returncode, 0, v.stdout)
+        # Re-running install now changes nothing and asks for nothing.
+        again = self.cli("install", "--mxid", AGENT)
+        self.assertNotIn("REQUIRED hook:", again.stdout)
+        self.assertIn("unchanged: hook ag2-sparrow-hatch", again.stdout)
 
     def test_install_upgrades_a_released_copy_without_a_marker(self):
         released = "#!/usr/bin/env bash\n# the 0.5.0 hook\n"
@@ -825,10 +929,11 @@ class Cli(Base):
     def test_verify_passes_after_install(self):
         self.cli("install", "--mxid", AGENT)
         self.sparrow_status(age_s=30)
+        self.hook_ran(age_s=5)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         for check in ("hook script", "hook definition", "config", "task_dir", "sparrow",
-                      "reply command", "tools", "heartbeat"):
+                      "hook run", "reply command", "tools", "heartbeat"):
             self.assertIn(f"PASS {check}:", r.stdout)
         self.assertIn("Manual test: from another account, mention " + AGENT, r.stdout)
 
@@ -861,6 +966,7 @@ class Cli(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("not connected: auth rejected HTTP 401", r.stdout)
         self.sparrow_status()
+        self.hook_ran()
         r = self.cli("verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("PASS sparrow: running and connected", r.stdout)
@@ -1231,7 +1337,7 @@ class Service(Base):
         self.assertIn("enabled: ag2-sparrow.service (running)", r.stdout)
         self.assertIn("NOTE service: loginctl enable-linger hatch failed (Could not enable "
                       "linger: Access denied)", r.stdout)
-        self.assertIn("Next: register the hook", r.stdout)
+        self.assertIn("Next: do each REQUIRED step above", r.stdout)
 
     def test_linger_already_on_or_root_is_not_enabled_again(self):
         fake = FakeSystemd(linger="yes")
@@ -1332,6 +1438,7 @@ class Service(Base):
     def test_verify_reports_the_service(self):
         self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT, env={"USER": "hatch"})
         self.sparrow_status()
+        self.hook_ran()
         r = self.with_systemd(FakeSystemd(enabled=True, state="active"), "verify")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(f"PASS service: {self.unit} installed and enabled (active)", r.stdout)
@@ -1401,7 +1508,8 @@ class Keepalive(Base):
                       "file on disk is not enough): name sparrow-keepawake, every 15 minutes, "
                       f"running exactly: timeout 120 {self.reply_stub} keepalive keepawake ; then "
                       "confirm it appears in your scheduled task list\n", r.stdout)
-        self.assertIn("create the sparrow-keepawake scheduled task as REQUIRED above", r.stdout)
+        self.assertIn("(the sparrow-keepawake scheduled task, and the hook when install printed "
+                      "a step for it), then run: ag2-sparrow-hatch verify", r.stdout)
         self.assertIn("KEEPALIVE_LOG=''", (self.home / ".config" / "ag2-sparrow-hatch" /
                                             "config").read_text())
         self.assertIn(f"unchanged: {self.task}", self.installed().stdout)
@@ -1593,6 +1701,58 @@ class Keepalive(Base):
                          (True, "abnormal"), "the hook woke it; the scheduler still did not")
         self.assertRegex(self.cli("keepalive", "status").stdout,
                          r" health=abnormal \(keepawake-not-running\)$")
+
+    def test_a_stale_hook_run_is_abnormal_and_fails_verify(self):
+        self.installed()
+        self.sparrow_status()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran(age_s=5)
+        self.assertEqual(self.health()["condition"], "healthy")
+        self.hook_ran(age_s=keepalive.HOOK_STALE_S + 60)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "hook-not-running"),
+                         "a fresh keepawake line does not mask a stopped hook")
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertAlmostEqual(row["since"], time.time() - 60, delta=5)
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"\nFAIL hook run: hook not running: last run \S+Z "
+                         r"\(3\d\ds ago\)")
+        self.assertIn("FAIL keepalive: ", r.stdout)
+        self.assertIn("health=abnormal (hook-not-running); the hook has not run", r.stdout)
+        self.hook_ran(age_s=hatch_cli.HOOK_VERIFY_MAX_AGE_S + 30)
+        self.assertEqual(self.health()["condition"], "healthy")
+        self.assertIn("FAIL hook run: hook not running: last run", self.cli("verify").stdout)
+
+    def test_a_hook_that_never_ran_ages_from_install(self):
+        self.installed()
+        self.keepawake_at(time.time())
+        self.assertEqual(self.health()["condition"], "healthy", "just installed: not yet late")
+        marker = self.home / ".config" / "ag2-sparrow-hatch" / "installed-script.sha256"
+        old = time.time() - keepalive.HOOK_STALE_S - 60
+        os.utime(marker, (old, old))
+        self.assertEqual(self.health()["reason"], "hook-not-running")
+        self.assertIn("FAIL hook run: hook not running: it has never run", self.cli("verify").stdout)
+
+    def test_an_old_open_task_is_abnormal_despite_a_fresh_keepawake(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        self.add_task("task-1784700000001", "$own", sender=AGENT.upper(), mtime=old - 60)
+        self.add_task("task-1784700000002", "$closed", mtime=old - 60)
+        (self.results / "task-1784700000002.txt").write_text("done\n")
+        self.add_task("task-1784700000003", "$fresh", mtime=time.time() - 60)
+        self.assertEqual(self.health()["condition"], "healthy",
+                         "own, answered and fresh tasks are not waiting")
+        self.add_task("task-blue~1784700000004", "$other-instance", mtime=old)
+        row = self.health()
+        self.assertEqual((row["alive"], row["condition"], row["reason"]),
+                         (True, "abnormal", "task-not-picked-up"))
+        self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
+                      "over 15 minutes", self.cli("verify").stdout)
 
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")

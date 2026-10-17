@@ -1,7 +1,8 @@
 """`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
-~/hooks/definitions/ and the config the script reads, where systemd runs a user
+~/hooks/definitions/ (a hook already defined is never rewritten: a change is staged for the
+agent's hooks tool) and the config the script reads, where systemd runs a user
 manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
@@ -18,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -32,6 +34,9 @@ from .task_fields import item_id, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
+# The hook script rewrites this every run: "<epoch seconds> <sha256 of the script>".
+HOOK_RUN_FILE = "hatch-hook-last-run"
+HOOK_VERIFY_MAX_AGE_S = 120
 HEARTBEAT_INTERVAL_S = 300
 # Sparrow rewrites its status file every poll round (long poll or backoff, each
 # at most about a minute), so an older file means it is not running.
@@ -79,9 +84,27 @@ def config_path() -> Path:
 
 
 def installed_marker_path() -> Path:
-    """sha256 of the hook script install last wrote, so an upgrade can tell its own
-    earlier copy from a local edit."""
+    """sha256 of each hook script install wrote, one per line, so an upgrade can tell its
+    own earlier copy from a local edit; its mtime is when install last wrote a script."""
     return config_path().with_name("installed-script.sha256")
+
+
+def staged_definition_path() -> Path:
+    """Where install puts a changed hook definition for the agent's hooks tool."""
+    return config_path().with_name("hook-definition.json")
+
+
+def hook_run_path(state_dir: Path) -> Path:
+    return state_dir / HOOK_RUN_FILE
+
+
+def hook_last_run(state_dir: Path) -> "tuple[float, str] | None":
+    """(when, script sha256) of the hook's last run, or None when it has not written one."""
+    try:
+        parts = hook_run_path(state_dir).read_text(encoding="utf-8").split()
+        return float(parts[0]), (parts[1] if len(parts) > 1 else "")
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _sha256(text: str) -> str:
@@ -90,10 +113,19 @@ def _sha256(text: str) -> str:
 
 def _ours() -> frozenset:
     try:
-        recorded = installed_marker_path().read_text(encoding="utf-8").strip()
+        recorded = installed_marker_path().read_text(encoding="utf-8").split()
     except OSError:
-        recorded = ""
-    return RELEASED_SCRIPT_SHA256 | ({recorded} if recorded else set())
+        recorded = []
+    return RELEASED_SCRIPT_SHA256 | set(recorded)
+
+
+def _record_script(sha: str) -> None:
+    try:
+        recorded = installed_marker_path().read_text(encoding="utf-8").split()
+    except OSError:
+        recorded = []
+    _write(installed_marker_path(), "".join(f"{s}\n" for s in
+                                            [r for r in recorded if r != sha] + [sha]), 0o644)
 
 
 def _diff(old: str, new: str, path: Path) -> str:
@@ -121,7 +153,9 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
     if path.exists():
         old = path.read_text(encoding="utf-8", errors="replace")
         if old == text:
-            os.chmod(path, mode)
+            # Not even a chmod when the mode is right: Hatch stops a hook whose files change.
+            if stat.S_IMODE(path.stat().st_mode) != mode:
+                os.chmod(path, mode)
             print(f"unchanged: {path}")
             return True
         if _sha256(old) in ours:
@@ -136,6 +170,94 @@ def _install_file(path: Path, text: str, mode: int, *, refuse_drift: bool, force
             return False
     _write(path, text, mode)
     print(f"installed: {path}")
+    return True
+
+
+def definition_path() -> Path:
+    return definitions_dir() / f"{HOOK_ID}.json"
+
+
+def render_definition(mxid: str, reply_command: str, script_path: str) -> str:
+    d = json.loads(_shipped("hook-definition.json").replace("<AGENT_MXID>", mxid)
+                   .replace(REPLY_PLACEHOLDER, reply_command))
+    d["script_path"] = script_path
+    return json.dumps(d, indent=2, ensure_ascii=False) + "\n"
+
+
+def registered_definition() -> "dict | None":
+    try:
+        d = json.loads(definition_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def definition_matches(registered: dict, want: dict) -> bool:
+    """Whether every field install sets has its value; the hooks tool may add others."""
+    return all(registered.get(k) == v for k, v in want.items())
+
+
+def _script_path(path: Path) -> str:
+    return f"~/hooks/scripts/{path.name}"
+
+
+def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
+    """Write the hook for hooks.add; for a hook already defined, leave its files alone and
+    stage any change for the agent's hooks tool (REQUIRED hook:). False = refused."""
+    shipped = _shipped(SCRIPT_NAME)
+    sha = _sha256(shipped)
+    canonical, def_path = scripts_dir() / SCRIPT_NAME, definition_path()
+    registered = registered_definition()
+    if registered is None:
+        fresh = not (canonical.is_file()
+                     and canonical.read_text(encoding="utf-8", errors="replace") == shipped)
+        if not _install_file(canonical, shipped, 0o755, refuse_drift=True, force=force,
+                             ours=_ours()):
+            return False
+        if fresh:
+            _record_script(sha)
+        _install_file(def_path, render_definition(mxid, reply_command, _script_path(canonical)),
+                      0o644, refuse_drift=False, force=True)
+        print(f"REQUIRED hook: register the hook through your hooks tool: hooks.add with the "
+              f"definition in {def_path}, check it with hooks.dry_run, start it with "
+              f"hooks.enable, and confirm {HOOK_ID} is in your hooks list")
+        return True
+    script_path = str(registered.get("script_path") or _script_path(canonical))
+    current = Path(os.path.expanduser(script_path))
+    try:
+        old = current.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        old = None
+    if old != shipped:
+        if old is not None and _sha256(old) not in _ours():
+            print(f"DIFF: {current} differs from the ag2-sparrow copy:")
+            print(_diff(old, shipped, current), end="")
+            if not force:
+                print(f"REFUSED: {current} was modified locally; keep it, or re-run with "
+                      "--force to stage the copy above for your hooks tool", file=sys.stderr)
+                return False
+        # A new file beside the running hook's script, which stays as it is.
+        target = scripts_dir() / f"{HOOK_ID}.{sha[:12]}.sh"
+        if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == shipped:
+            print(f"unchanged: {target}")
+        else:
+            _write(target, shipped, 0o755)
+            print(f"installed: {target} (the running hook's {current} was left as it is)")
+            _record_script(sha)
+        script_path = _script_path(target)
+    want = render_definition(mxid, reply_command, script_path)
+    if definition_matches(registered, json.loads(want)):
+        print(f"unchanged: hook {HOOK_ID} ({current} and {def_path}; install did not touch them)")
+        return True
+    staged = staged_definition_path()
+    _install_file(staged, want, 0o644, refuse_drift=False, force=True)
+    print(f"REQUIRED hook: install left the running hook {HOOK_ID} as it is; update it through "
+          f"your hooks tool to the definition in {staged} (printed below): hooks.update if your "
+          f"hooks tool has it, else hooks.remove {HOOK_ID} then hooks.add; check it with "
+          "hooks.dry_run and start it with hooks.enable. Never edit or copy files under "
+          "~/hooks yourself: a hook changed behind the hooks tool stops running. verify "
+          "fails until the hook has run the new script")
+    print(want, end="")
     return True
 
 
@@ -478,16 +600,8 @@ def install(args) -> int:
     result_dir = Path(args.result_dir) if args.result_dir else _dirs.result_dir()
     state_dir = Path(args.state_dir) if args.state_dir else _dirs.state_dir()
     activity = Path(args.activity_file) if args.activity_file else _home() / ".muse" / "last_active"
-    script = scripts_dir() / SCRIPT_NAME
-    shipped = _shipped(SCRIPT_NAME)
-    if not _install_file(script, shipped, 0o755, refuse_drift=True, force=args.force,
-                         ours=_ours()):
+    if not install_hook(args.mxid, reply_command, args.force):
         return 1
-    _write(installed_marker_path(), _sha256(shipped) + "\n", 0o644)
-    definition = (_shipped("hook-definition.json").replace("<AGENT_MXID>", args.mxid)
-                  .replace(REPLY_PLACEHOLDER, reply_command))
-    _install_file(definitions_dir() / f"{HOOK_ID}.json", definition, 0o644,
-                  refuse_drift=False, force=True)
     # Empty = resolved under the home directory when the keepalive runs.
     cron = str(Path(args.cron_dir).expanduser().resolve()) if args.cron_dir else ""
     keepalive_log = (str(Path(args.keepalive_log).expanduser().resolve())
@@ -513,9 +627,8 @@ def install(args) -> int:
         print("skipped: starting and checking Sparrow (--no-start)")
     else:
         rc = keepalive.ensure_sparrow(read_config(config_path()), not args.no_keepalive)
-    print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
-          f"test it with hooks.dry_run, start it with hooks.enable, create the {keepalive.TASK} "
-          "scheduled task as REQUIRED above, then run: ag2-sparrow-hatch verify")
+    print(f"\nNext: do each REQUIRED step above (the {keepalive.TASK} scheduled task, and the "
+          "hook when install printed a step for it), then run: ag2-sparrow-hatch verify")
     return rc
 
 
@@ -569,27 +682,38 @@ def sparrow(args) -> int:
 
 def verify(_args) -> int:
     results: list = []
-    script = scripts_dir() / SCRIPT_NAME
+    registered = registered_definition() or {}
+    script = Path(os.path.expanduser(str(registered.get("script_path") or
+                                         _script_path(scripts_dir() / SCRIPT_NAME))))
+    staged = staged_definition_path()
+    pending = (f"; update the hook through your hooks tool to the definition in {staged}, as "
+               "install's REQUIRED hook: line says" if staged.is_file() else "")
     if not script.is_file():
         _check(results, False, "hook script", f"{script} missing; run ag2-sparrow-hatch install")
     elif not os.access(script, os.X_OK):
         _check(results, False, "hook script", f"{script} is not executable")
     elif script.read_text(encoding="utf-8", errors="replace") != _shipped(SCRIPT_NAME):
-        _check(results, False, "hook script", f"{script} differs from this ag2-sparrow's copy")
+        _check(results, False, "hook script",
+               f"{script} differs from this ag2-sparrow's copy{pending}")
     else:
         _check(results, True, "hook script", str(script))
 
-    definition_path = definitions_dir() / f"{HOOK_ID}.json"
+    def_path = definition_path()
     definition: dict = {}
     try:
-        definition = json.loads(definition_path.read_text(encoding="utf-8"))
+        definition = json.loads(def_path.read_text(encoding="utf-8"))
         bad = any(p in json.dumps(definition) for p in ("<AGENT_MXID>", REPLY_PLACEHOLDER)) or \
-            Path(os.path.expanduser(definition.get("script_path", ""))) != script
-        _check(results, not bad, "hook definition",
-               str(definition_path) if not bad else f"{definition_path} has a placeholder or "
-               "a script_path that is not the installed script")
-    except (OSError, ValueError) as e:
-        _check(results, False, "hook definition", f"{definition_path}: {e}")
+            not re.fullmatch(rf"{re.escape(HOOK_ID)}(\.[0-9a-f]{{12}})?\.sh", script.name) or \
+            script.parent != scripts_dir()
+        detail = (f"{def_path} has a placeholder or a script_path that is not an installed "
+                  "hook script" if bad else str(def_path))
+        if not bad and staged.is_file():
+            want = json.loads(staged.read_text(encoding="utf-8"))
+            if not definition_matches(definition, want):
+                bad, detail = True, f"{def_path} is not the definition install staged{pending}"
+        _check(results, not bad, "hook definition", detail)
+    except (OSError, ValueError, AttributeError) as e:
+        _check(results, False, "hook definition", f"{def_path}: {e}")
 
     cfg_path = config_path()
     cfg: dict = {}
@@ -621,6 +745,22 @@ def verify(_args) -> int:
     state_dir = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     code, detail = check_sparrow(state_dir, instance=cfg.get("GATEWAY_INSTANCE"))
     _check(results, code == SPARROW_OK, "sparrow", detail)
+
+    run = hook_last_run(state_dir)
+    if run is None:
+        ok, detail = False, (f"hook not running: it has never run ({hook_run_path(state_dir)} "
+                             "missing); register and enable it through your hooks tool as "
+                             "install's REQUIRED hook: line says")
+    elif not 0 <= time.time() - run[0] <= HOOK_VERIFY_MAX_AGE_S:
+        ok, detail = False, (f"hook not running: last run "
+                             f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(run[0]))} "
+                             f"({int(time.time() - run[0])}s ago); check that your hooks tool "
+                             "lists it enabled, and its hooks.logs")
+    elif run[1] != _sha256(_shipped(SCRIPT_NAME)):
+        ok, detail = False, f"the hook runs an older script{pending or '; run install again'}"
+    else:
+        ok, detail = True, f"last run {int(time.time() - run[0])}s ago, this ag2-sparrow's script"
+    _check(results, ok, "hook run", detail)
 
     ok, detail = service_status()
     if ok is None:
@@ -657,6 +797,8 @@ def verify(_args) -> int:
     task, step = keepalive.TASK, keepalive.register_step(cfg)
     if row is None:
         print(f"NOTE keepalive: {line} (no {task} task is installed)")
+    elif row["condition"] == "abnormal" and row["reason"] != keepalive.NOT_RUNNING:
+        _check(results, False, "keepalive", f"{line}; {keepalive.REASON_HINTS[row['reason']]}")
     elif row["condition"] == "abnormal":
         _check(results, False, "keepalive", f"{line}; " + (
             f"{task} has never run: {step}" if never else

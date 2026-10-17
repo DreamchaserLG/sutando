@@ -8,7 +8,9 @@ that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
 environment) and sends the row on its heartbeat. The row is healthy while the last
 keepawake line is under two intervals old, unknown while a task that has not run yet
-is that young, else abnormal (`keepawake-not-running`).
+is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
+mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
+(`hook-not-running`) or a task has waited over TASK_PICKUP_S (`task-not-picked-up`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
@@ -24,7 +26,7 @@ import time
 from pathlib import Path
 
 from ... import _dirs
-from . import cli as _cli
+from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
 # Tasks an earlier install wrote; re-running install removes them.
@@ -32,6 +34,14 @@ OLD_TASKS = ("sparrow-watchdog", "keepalive-probe")
 TASK_MARKER = "<!-- Written by ag2-sparrow-hatch install; re-run install to update it. -->"
 STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
+HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
+TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+REASON_HINTS = {
+    HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
+                      "the hook run line above",
+    TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
+                        "the hook is not waking a worker for it, or a worker handed it off",
+}
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
 # How long a spawned Sparrow must stay up to count as started (75 = lock held elsewhere).
@@ -436,9 +446,32 @@ def _mtime(path: Path) -> float | None:
         return None
 
 
-def _within(now: float, ts: "float | None") -> bool:
-    """`ts` at most STALE_S old; one from the future (a clock stepped back) is not."""
-    return ts is not None and 0 <= now - ts <= STALE_S
+def _within(now: float, ts: "float | None", limit: float = STALE_S) -> bool:
+    """`ts` at most `limit` old; one from the future (a clock stepped back) is not."""
+    return ts is not None and 0 <= now - ts <= limit
+
+
+def hook_last_run(cfg: dict) -> "float | None":
+    """The hook's last run; one that never ran ages from install's last script write."""
+    run = _cli.hook_last_run(_state_dir(cfg))
+    return run[0] if run is not None else _mtime(_cli.installed_marker_path())
+
+
+def oldest_open_task(cfg: dict) -> "float | None":
+    """mtime of the oldest task of any instance with no result, the agent's own excepted."""
+    agent = (cfg.get("AGENT_MXID") or "").lower()
+    try:
+        items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
+                                            Path(cfg.get("RESULT_DIR") or _dirs.result_dir()),
+                                            instance=None)
+    except OSError:
+        return None
+    for item in items:
+        if (item.get("sender") or "").lower() != agent:
+            ts = _mtime(Path(item["task_file"]))
+            if ts is not None:
+                return ts
+    return None
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
@@ -455,11 +488,18 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     fresh = _within(now, last)
     alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
         else None
+    problems = [] if fresh else [(NOT_RUNNING, last + STALE_S)]
+    hook = hook_last_run(cfg)
+    if hook is not None and not _within(now, hook, HOOK_STALE_S):
+        problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
+    oldest = oldest_open_task(cfg)
+    if oldest is not None and now - oldest > TASK_PICKUP_S:
+        problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
     # Fresh but never run: no evidence either way yet.
-    condition = "abnormal" if not fresh else "healthy" if ran is not None else "unknown"
+    condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
+    reason, since = problems[0] if problems else (None, None)
     return {"alive": alive, "motion": "unknown", "condition": condition,
-            "reason": NOT_RUNNING if condition == "abnormal" else None,
-            "since": last + STALE_S if condition == "abnormal" else None}
+            "reason": reason, "since": since}
 
 
 def status_line(cfg: dict, now: float | None = None) -> "tuple[str, dict | None]":
