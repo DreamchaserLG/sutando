@@ -26,6 +26,8 @@ CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 DELIVERY_CLAIM_DIR="$WORKSPACE_DIR/state/codex-delivery-claims"
 # The running notifier's watcher: pid, start time, inbox. Written and read only under the lock.
 WATCHER_RECORD="$WORKSPACE_DIR/state/codex-notifier.watcher"
+# The lock's current owner: pid, start time. A new owner stops a still-live previous one first.
+LEADER_RECORD="$WORKSPACE_DIR/state/codex-notifier.leader"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
@@ -86,8 +88,12 @@ stop_watcher() {
 }
 
 cleanup_notifier() {
+  local mine="$watcher_pid"
   stop_watcher
-  [ -n "$LOCK_OWNER" ] && rm -f "$WATCHER_RECORD"
+  if [ -n "$LOCK_OWNER" ]; then
+    [ -n "$mine" ] && [ "$(sed -n 1p "$WATCHER_RECORD" 2>/dev/null)" = "$mine" ] && rm -f "$WATCHER_RECORD"
+    [ "$(sed -n 1p "$LEADER_RECORD" 2>/dev/null)" = "$$" ] && rm -f "$LEADER_RECORD"
+  fi
   clear_workstream_context
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -369,6 +375,42 @@ process_start() {
   start="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || return 1
   [ -n "$start" ] || return 1
   printf '%s' "$start" | tr -s ' '
+}
+
+# The pid and every descendant of it, read while it is stopped so none can be added meanwhile.
+process_tree() {
+  ps -axo pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2 } END { keep[root] = 1; n = 1
+      while (n) { n = 0; for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; n = 1 } }
+      for (p in keep) print p }'
+}
+
+process_live() {  # 0 while $1 runs with start time $2 (a zombie has finished)
+  [ -n "$2" ] && [ "$(process_start "$1" || true)" = "$2" ] || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in *Z*) return 1 ;; esac
+}
+
+# A lock owner's holder can die while the owner lives on mid-delivery; the next owner fences it
+# (stops it and its children, kill -9) before it acts, or exits without acting.
+fence_previous_leader() {
+  local pid start waited=0
+  pid="$(sed -n 1p "$LEADER_RECORD" 2>/dev/null)" || pid=""
+  start="$(sed -n 2p "$LEADER_RECORD" 2>/dev/null)" || start=""
+  if [ -n "$pid" ] && [ "$pid" != "$$" ] && process_live "$pid" "$start"; then
+    log_notifier "stopping notifier pid $pid, still running after its lock holder died"
+    kill -STOP "$pid" 2>/dev/null || true
+    # shellcheck disable=SC2046
+    kill -KILL $(process_tree "$pid") 2>/dev/null || true
+    while process_live "$pid" "$start" && [ "$waited" -lt 50 ]; do
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if process_live "$pid" "$start"; then
+      log_notifier "notifier pid $pid could not be stopped; not starting"
+      return 1
+    fi
+  fi
+  printf '%s\n%s\n' "$$" "$(process_start "$$" || true)" > "$LEADER_RECORD" 2>/dev/null || true
 }
 
 # True only when the claim names a core and a different core is running now; unknown is not gone.
@@ -654,6 +696,10 @@ submit_task() {
     clear_workstream_context
   fi
 }
+
+if [ -n "$LOCK_OWNER" ]; then
+  fence_previous_leader || exit 1
+fi
 
 if [ "${1:-}" = "--event" ]; then
   [ -n "${2:-}" ] || { echo "task-notifier: --event requires a filename" >&2; exit 2; }

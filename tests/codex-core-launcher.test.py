@@ -30,7 +30,8 @@ def _delivery_source(root):
     return "\n".join(_extract_shell_fn(text, n) for n in
                      ("has_result", "claim_delivery", "stamp_claim", "replace_stale_claim",
                       "claim_core_gone", "release_delivery", "clear_delivery_claim", "claim_abandoned",
-                      "abandon_claimed_task", "retry_owner_alerts", "queue_prompt", "deliver_task"))
+                      "abandon_claimed_task", "retry_owner_alerts", "queue_prompt", "deliver_task",
+                      "process_start", "process_tree", "process_live", "fence_previous_leader"))
 
 
 def _read_count(path):
@@ -1171,7 +1172,7 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
                    DELIVERY_CLAIM_DIR=str(claims if claims is not None else tmp / "claims"),
                    LOG=str(tmp / "log"), TYPED=str(tmp / "typed"), RESULTS_DIR=str(tmp / "results"),
                    DISPATCH_PY=str(self.root / "src/delivery/task_dispatch.py"), WORKER_INSTANCE="",
-                   CORE_ID=str(tmp / "core-id"))
+                   CORE_ID=str(tmp / "core-id"), LEADER_RECORD=str(tmp / "leader"))
         (tmp / "results").mkdir(exist_ok=True)
         return harness, env
 
@@ -1448,6 +1449,43 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         self.assertTrue((claim / "alerted").exists())
         self.assertEqual(self._lines("typed") + self._lines("sent"), [])
 
+    def test_round7_an_owner_whose_holder_died_mid_delivery_is_fenced_before_its_successor_acts(self):
+        # A pauses after its post-claim result check; only A's lock holder is killed; B takes the lock.
+        tmp = Path(self.tmp.name)
+        (tmp / "core-id").write_text("111 old")
+        os.environ["PAUSED"], os.environ["GO"] = str(tmp / "paused"), str(tmp / "go")
+        try:
+            a = self._locked("fence_previous_leader\n" + self._PAUSE_AFTER_RESULT_CHECK + "deliver_task a.txt p\n",
+                             mode="send-keys")
+            self._wait_for(tmp / "paused")
+            holder = subprocess.run(["pgrep", "-P", str(a.pid), "-f", "notifier_lock.py"],
+                                    capture_output=True, text=True).stdout.split()
+            self.assertEqual(len(holder), 1, holder)
+            os.kill(int(holder[0]), signal.SIGKILL)
+            (tmp / "core-id").write_text("222 new")
+            b = self._locked("fence_previous_leader || exit 1\ndeliver_task a.txt p\n", mode="queue")
+            b.communicate(timeout=30)
+            (tmp / "go").touch()
+            a.communicate(timeout=30)
+        finally:
+            os.environ.pop("PAUSED", None)
+            os.environ.pop("GO", None)
+        self.assertEqual(len(self._lines("typed")) + len(self._lines("sent")), 1,
+                         (self._lines("typed"), self._lines("sent")))
+        self.assertEqual(a.returncode, -signal.SIGKILL, "the old owner was fenced, not left to resume")
+        self.assertEqual(b.returncode, 0)
+        self.assertIn("still running after its lock holder died", (tmp / "log").read_text())
+
+    def test_a_fence_leaves_a_finished_or_recycled_previous_owner_alone(self):
+        tmp = Path(self.tmp.name)
+        for record in (f"{os.getpid()}\nnot its start time\n", "999999\nx\n", ""):
+            (tmp / "leader").write_text(record)
+            harness, env = self._delivery_harness("fence_previous_leader && sed -n 1p \"$LEADER_RECORD\"\n")
+            r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotEqual(r.stdout.strip(), "", "the new owner records itself")
+        self.assertFalse((tmp / "log").exists(), "nothing was stopped")
+
     def test_two_real_notifiers_on_one_workspace_never_overlap(self):
         # The shipped task-notifier.sh, run twice: the second waits on the first's lock.
         tmp = Path(self.tmp.name)
@@ -1490,7 +1528,7 @@ exit 0
                    SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", **extra)
         return env
 
-    def test_a_copied_or_forged_holder_marker_does_not_bypass_a_held_lock(self):
+    def test_a_stale_or_copied_holder_marker_does_not_bypass_a_held_lock(self):
         sys.path.insert(0, str(self.root / "src/delivery"))
         import notifier_lock
         state = self.root / "workspace" / "state"

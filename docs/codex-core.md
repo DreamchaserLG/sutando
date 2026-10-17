@@ -102,7 +102,13 @@ Only one core notifier runs per workspace. The notifier re-executes itself under
 The holder exits as soon as the notifier process is gone, `kill -9` included, and the kernel
 drops the lock with it; no process the notifier starts ever holds the lock, so a surviving
 child (tmux, a Python helper, `sleep`) cannot keep it. If the holder alone dies, the notifier
-notices within one retry interval and exits, so its supervisor starts it again under a fresh lock. That watcher leads its
+notices within one retry interval and exits, so its supervisor starts it again under a fresh lock.
+A notifier that is mid-delivery when its holder dies may not have noticed yet, so every new lock
+owner first reads `state/codex-notifier.leader` and, if the previous owner is still running, stops
+it and all its children (`kill -9`) before delivering anything; if it cannot, it exits without acting.
+The holder is found through the process table (`SUTANDO_NOTIFIER_LOCK_HOLDER` must name a running
+`notifier_lock.py` whose parent is the notifier), which rejects a stale or copied value; it is not
+a defence against local code deliberately faking such a process. That watcher leads its
 own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
 The notifier records the watcher's pid, start time and inbox in
 `state/codex-notifier.watcher`, and the next notifier, holding the lock, stops that exact
