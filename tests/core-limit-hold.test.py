@@ -309,5 +309,193 @@ class StatusSurfaces(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class EdgePaths(unittest.TestCase):
+    """The non-happy branches: odd reset text, unreadable transcripts, the CLI itself."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def test_reset_text_forms(self):
+        at = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(clh.parse_reset("usage limit, resets in 2h", at), at + 7200)
+        self.assertEqual(clh.parse_reset("usage limit, resets in 30 minutes", at), at + 1800)
+        self.assertEqual(clh.parse_reset("429 retry-after: 40", at), at + 40)
+        self.assertIsNone(clh.parse_reset("usage limit reached", at))
+        self.assertIsNone(clh.parse_reset("limit reached, resets Foo 3, 9am", at))
+        past = clh.parse_reset("resets Jan 2, 9am (UTC)", at)
+        self.assertEqual(past, datetime(2027, 1, 2, 9, 0, tzinfo=timezone.utc).timestamp())
+        self.assertIsNotNone(clh.parse_reset("resets 9am (Not/AZone)", at))
+
+    def test_record_shapes(self):
+        now = 1_800_000_000.0
+        self.assertIsNone(clh.record_evidence("not a dict", now))
+        rec = limited_record(now, rejected=False, ago=1)
+        rec["recent_rejections"].insert(0, {"ts": iso(now - 2), "status": 500})
+        rec["recent_rejections"][1]["snippet"] = "rate limited, retry-after: 90"
+        lim = clh.record_evidence(rec, now)
+        self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", now - 1 + 90))
+
+    def test_transcript_unreadable_and_odd_lines(self):
+        now = time.time()
+        proj = self.ws / "projects"
+        proj.mkdir()
+        self.assertIsNone(clh.transcript_evidence(None, now))
+        from unittest import mock
+        with mock.patch.object(Path, "glob", side_effect=OSError("denied")):
+            self.assertIsNone(clh.transcript_evidence(proj, now))
+        old = proj / "old.jsonl"
+        old.write_text("{}\n")
+        os_t = now - clh.EVIDENCE_WINDOW_S - 60
+        import os
+        os.utime(old, (os_t, os_t))
+        self.assertIsNone(clh.transcript_evidence(proj, now))
+        cur = proj / "cur.jsonl"
+        cur.write_text("not json\n" + json.dumps({"type": "user"}) + "\n")
+        self.assertIsNone(clh.transcript_evidence(proj, now))
+        stale = {"isApiErrorMessage": True, "timestamp": iso(now - clh.EVIDENCE_WINDOW_S - 60),
+                 "message": {"content": "usage limit reached"}}
+        cur.write_text(json.dumps(stale) + "\n")
+        self.assertIsNone(clh.transcript_evidence(proj, now))
+        with mock.patch("builtins.open", side_effect=OSError("denied")):
+            self.assertIsNone(clh.transcript_evidence(proj, now))
+
+    def test_mirror_failure_does_not_stop_the_hold(self):
+        from unittest import mock
+        real = clh.write_status
+
+        def fail_status(name, payload, workspace=None):
+            if name == "core-status.json":
+                raise OSError("read-only")
+            return real(name, payload, workspace=workspace)
+        with mock.patch.object(clh, "write_status", side_effect=fail_status):
+            d = clh.decide(self.ws, 1_800_000_000.0, quota=limited_record(1_800_000_000.0))
+        self.assertFalse(d.launch)
+        self.assertIsNone(clh.clear(self.ws / "nowhere"))
+
+    def test_cli_status_clear_gate(self):
+        import contextlib
+        import io
+        from unittest import mock
+        now = time.time()
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(now)))
+        out = io.StringIO()
+        with mock.patch.object(clh, "resolve_workspace", return_value=self.ws), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(clh.main(["clear"]), 0)
+            self.assertEqual(clh.main(["gate", "--cwd", str(self.ws)]), clh.HOLD_EXIT)
+            self.assertEqual(clh.main(["status"]), 0)
+            self.assertEqual(clh.main(["clear"]), 0)
+            self.assertEqual(clh.main(["gate"]), 0)
+        text = out.getvalue()
+        self.assertIn("core paused: usage limit", text)
+        self.assertIn("hold lifted", text)
+        self.assertIn("no hold in force", text)
+
+
+class ReviewFixes(unittest.TestCase):
+    """Mini's review on d2c7cbe7: each case failed before its fix."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def notices(self):
+        return sorted((self.ws / "results").glob("proactive-*.txt")) if (self.ws / "results").is_dir() else []
+
+    def test_model_switch_during_hold_launches(self):
+        now = 1_800_000_000.0
+        rec = limited_record(now, model="claude-opus-5-5")
+        self.assertFalse(clh.decide(self.ws, now, quota=rec, launch_model="claude-opus-5-5").launch)
+        d = clh.decide(self.ws, now + 60, quota=rec, launch_model="sonnet")
+        self.assertTrue(d.launch, "an Opus hold kept a Sonnet core down")
+        self.assertIsNone(clh.active_hold(self.ws, now + 61))
+
+    def test_one_owner_notice_per_hold(self):
+        now = 1_800_000_000.0
+        rec = limited_record(now, reset_in=3600)
+        for minute in range(0, 30, 2):
+            clh.decide(self.ws, now + minute * 60, quota=rec)
+        files = self.notices()
+        self.assertEqual(len(files), 1, files)
+        body = files[0].read_text()
+        self.assertTrue(body.startswith("[dm-only]\n"))
+        self.assertIn("usage limit on claude-opus-5-5", body)
+        self.assertIn("starts again by itself", body)
+        self.assertIn("Sonnet", body)
+        self.assertEqual(clh.read_hold(self.ws)["notice"], files[0].name)
+        # The retry after the hold is refused again: a longer hold, no second notice.
+        after = now + 3600 + clh.RESET_GRACE_S + 1
+        self.assertTrue(clh.decide(self.ws, after, quota=rec).launch)
+        self.assertFalse(clh.decide(self.ws, after + 30, quota=limited_record(after + 30, ago=1)).launch)
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_far_reset_is_rechecked(self):
+        now = 1_800_000_000.0
+        far = clh.Limit("usage-limit", now, now + 5 * 86400, None, "provider-record")
+        self.assertEqual(clh._hold_until(far, 1, now), now + 6 * 3600)
+        near = clh.Limit("usage-limit", now, now + 7200, None, "provider-record")
+        self.assertEqual(clh._hold_until(near, 1, now), now + 7200 + clh.RESET_GRACE_S)
+
+    def test_429_must_be_a_status(self):
+        now = time.time()
+        for text in ("see https://github.com/org/repo/pull/429 for details",
+                     "fixed in issue 429", "request id 429 failed"):
+            self.assertIsNone(clh.classify_text(text, now), text)
+        for text in ("API Error: 429 overloaded", "HTTP 429", '{"status": 429}', "status_code=429",
+                     "429 Too Many Requests"):
+            self.assertIsNotNone(clh.classify_text(text, now), text)
+
+
+class AdapterEdges(unittest.TestCase):
+    def _load(self, name, rel):
+        spec = importlib.util.spec_from_file_location(name, str(REPO / rel))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_core_input_watch_maps_paused(self):
+        ciw = self._load("ciw_limit", "src/core-input-watch.py")
+        state, _detail, prompt, kind = ciw.compose_state("", "paused", gateway_alive=False)
+        self.assertEqual((state, prompt, kind), ("blocked-known", None, None))
+
+    def test_runtime_health_probe_degrades(self):
+        from unittest import mock
+        rh = self._load("rh_limit2", "src/runtime-health.py")
+        with mock.patch.object(rh.core_limit_hold, "active_hold", side_effect=RuntimeError("x")):
+            self.assertIsNone(rh._limit_hold("/nowhere"))
+
+    def test_health_check_reads_the_hold_and_resets_observation(self):
+        from unittest import mock
+        hc = self._load("hc_limit2", "src/health-check.py")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            clh.decide(ws, time.time(), quota=limited_record(time.time()))
+            with mock.patch.object(hc, "WORKSPACE_DIR", ws):
+                self.assertEqual(hc._core_limit_hold(time.time())["status"], "held")
+            with mock.patch.object(hc, "WORKSPACE_DIR", ws / "missing"):
+                self.assertIsNone(hc._core_limit_hold(time.time()))
+            state = Path(td) / "core-recovery.json"
+            state.write_text(json.dumps({"wedge_first_seen": 1.0, "wedge_task": "t|1", "wedge_mode": "dead"}))
+            r = hc.recover_core_if_wedged(
+                state_file=state, now=1_800_000_000.0, alive_fn=lambda: False,
+                oldest_task_fn=lambda: None, status_ts_fn=lambda: None, just_booted_fn=lambda: False,
+                stopped_fn=lambda: False, restart_fn=lambda: True, sender=lambda m: True,
+                limit_hold_fn=lambda: {"until": 1.0, "reason": "r"})
+            self.assertEqual(r["action"], "limit-hold")
+            self.assertEqual(json.loads(state.read_text())["wedge_first_seen"], 0)
+        with mock.patch.dict(sys.modules, {"core_limit_hold": None}):
+            self.assertIsNone(hc._core_limit_hold(time.time()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

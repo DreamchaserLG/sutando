@@ -46,6 +46,9 @@ BACKOFF_CAP_S = 60 * 60
 RESET_GRACE_S = 60
 MAX_RESET_WAIT_S = 8 * 24 * 3600
 STRIKE_MEMORY_S = 2 * BACKOFF_CAP_S
+# A reset more than a day out is honored for 6 hours, then one launch re-reads the provider.
+LONG_RESET_S = 24 * 3600
+LONG_RESET_RECHECK_S = 6 * 3600
 TRANSCRIPT_TAIL_BYTES = 256 * 1024
 # The 429's own headers land a moment after it; only a later response says the provider served.
 SERVED_SLACK_S = 5
@@ -55,7 +58,9 @@ _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
 # The window-named banner ("5-hour limit reached") and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
                           r"|\binsufficient_quota\b", re.I)
-_RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\b429\b|\btoo many requests\b", re.I)
+# A 429 counts only as a status (API Error, HTTP, a status field), never as a number in a URL or id.
+_RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many requests\b"
+                   r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
 
 _RESET_EPOCH = re.compile(r"\|(\d{10})\b")
 _RESET_CLOCK = re.compile(r"\bresets?\s+(?:at\s+|on\s+)?(?:([A-Z][a-z]{2})[a-z]*\.?\s+(\d{1,2}),?\s+(?:at\s+)?)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)\b(?:\s*\(([A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
@@ -105,7 +110,7 @@ def parse_reset(text: str, at: float) -> Optional[float]:
             if when.timestamp() <= at:
                 when = when.replace(year=when.year + 1)
         elif when.timestamp() <= at:
-            when += timedelta(days=1)
+            when += timedelta(days=1)  # an hour off across a DST change; the grace absorbs it
         return when.timestamp()
     m = _RESET_IN.search(text)
     if m:
@@ -269,16 +274,42 @@ def _mirror_core_status(workspace: Path, status: str, step: str, now: float) -> 
         pass  # the hold record is the decision; the mirror only shows it
 
 
-def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
+def _same_family(limited_model: Optional[str], launch_model: Optional[str]) -> bool:
     """A limit on another model family does not stop a core that runs this one."""
-    if limit is None:
-        return False
-    mine, theirs = qa._model_family(launch_model), qa._model_family(limit.model)
+    mine, theirs = qa._model_family(launch_model), qa._model_family(limited_model)
     return not (mine and theirs and mine != theirs)
+
+
+def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
+    return limit is not None and _same_family(limit.model, launch_model)
+
+
+def _notify_owner(workspace: Path, hold: dict) -> Optional[str]:
+    """One DM per hold episode through the proactive path; the bridges deliver it while
+    the core is down. Returns the queued file name, or None when it could not be queued."""
+    from local_record import write_text_whole
+    from proactive_routing import proactive_filename
+    from result_markers import neutralize_markers
+    when = (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
+            else f"It tries again {_when(hold['until'])}")
+    body = "[dm-only]\n" + neutralize_markers(
+        f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]}.\n\n"
+        f"{when}, and the core starts again by itself after that. Messages you send meanwhile "
+        "wait and are answered then.\n\n"
+        "To keep working sooner, switch the core to a smaller model such as Sonnet (set "
+        '"model": "sonnet" in the core\'s Claude settings); the next revive then starts it. '
+        "python3 src/core_limit_hold.py status shows the hold.\n")
+    try:
+        name = proactive_filename(f"core-limit-hold-{int(hold['set_at'] * 1000)}")
+        return write_text_whole(Path(workspace) / "results" / name, body).name
+    except OSError:
+        return None
 
 
 def _hold_until(limit: Limit, strikes: int, now: float) -> float:
     if limit.reset_at and now < limit.reset_at <= now + MAX_RESET_WAIT_S:
+        if limit.reset_at - now > LONG_RESET_S:
+            return now + LONG_RESET_RECHECK_S
         return limit.reset_at + RESET_GRACE_S
     return now + min(BACKOFF_BASE_S * 2 ** (strikes - 1), BACKOFF_CAP_S)
 
@@ -296,7 +327,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace)
-    if active_hold(workspace, now):
+    if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model):
         return Decision(False, hold, status_line(hold))
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
@@ -315,6 +346,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
         }
         new["reason"] = status_line(new)
+        prior = hold.get("notice") if hold and recent else None
+        new["notice"] = prior or _notify_owner(workspace, new)
         _write_hold(workspace, new)
         _mirror_core_status(workspace, "paused", new["reason"], now)
         return Decision(False, new, new["reason"])
