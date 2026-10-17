@@ -254,6 +254,8 @@ check("control: the same banner on a frame that does not move is carded", got, [
 got, _ = run([banner_obs(0)] * 2 + [banner_obs(1)] * 4)
 check("a move clears the human sustain, which starts over once the frame settles",
       got, [N, N, N, N, N, HUMAN])
+got, _ = run([obs(WORK, "turn")] + [obs(GATE, "dialog")] * 3)
+check("entering a gate changes the frame, which is not progress under it", got, [N, N, N, HUMAN])
 got, _ = run([obs(LIMIT, None)] * 3)
 check("an unread frame id is no evidence of progress", got, [N, N, HUMAN])
 

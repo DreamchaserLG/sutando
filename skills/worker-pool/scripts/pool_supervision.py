@@ -134,9 +134,10 @@ def _is_watcher_loss(obs: Observation) -> bool:
 
 
 def _frame_moved(obs: Observation, ev: WorkerEvidence) -> bool:
-    """The raw frame differs from the last tick's: the session is progressing.
-    A banner left on screen after the wait ended does not make a moving pane wait."""
-    return bool(obs.pane_id and ev.last_pane_id and obs.pane_id != ev.last_pane_id)
+    """The last tick read the same gate or limit and the raw frame has changed since:
+    the session is progressing under a banner left on screen after the wait ended."""
+    return bool(ev.wedge_kind == "human" and obs.pane_id and ev.last_pane_id
+                and obs.pane_id != ev.last_pane_id)
 
 
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
