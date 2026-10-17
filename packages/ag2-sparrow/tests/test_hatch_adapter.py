@@ -2709,6 +2709,27 @@ class ReplyBinding(Base):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertEqual([p for p in self.results.rglob("*") if p.is_file()], [])
 
+    def test_a_lone_mention_closes_with_no_send_when_quoted_whole(self):
+        tid, mention = "task-1784700000009", "@sutando-sonichi:ag2.space"
+        self.add_task(tid, "$m", sender="@chi:ag2.space", mtime=1008, body=mention)
+        result = self.results / f"{tid}.txt"
+        r = self.reply(str(result), "--no-send", "--answering", "@other-agent:ag2.space")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("or the whole message exactly", r.stderr)
+        self.assertFalse(result.exists())
+        r = self.reply(str(result), "--no-send", "--answering", mention)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(hatch_cli.answers(f"[AG2Space Chi] {mention}", f" {mention.upper()} "))
+
+    def test_a_short_partial_quote_is_still_refused(self):
+        r = self.reply(str(self.dm_result), "--no-send", "--answering", "the passport")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(self.dm_result.exists())
+        for short in ("the passport", "renew", "remind me to renew the"[:9]):
+            self.assertFalse(hatch_cli.answers("remind me to renew the passport", short), short)
+        self.assertTrue(hatch_cli.answers("remind me to renew the passport",
+                                          "Remind me to renew the passport."))
+
     def test_the_message_replied_to_does_not_bind_the_reply(self):
         tid = "task-1784700000005"
         body = broker_reply_body("@ann:ag2.space", "please review the hatch pull request",
