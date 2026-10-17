@@ -1,8 +1,8 @@
 """`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive`: set up, check and answer through the Hatch hook.
 
-install writes the hook script to ~/hooks/scripts/, the hook definition to
-~/hooks/definitions/ (a hook already defined is never rewritten: a change is staged for the
-agent's hooks tool) and the config the script reads, where systemd runs a user
+install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
+rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
+tool (~/hooks/definitions/ is the tool's own), writes the config the script reads, where systemd runs a user
 manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
@@ -37,6 +37,9 @@ SCRIPT_NAME = f"{HOOK_ID}.sh"
 # The hook script rewrites this every run: "<epoch seconds> <sha256 of the script>".
 HOOK_RUN_FILE = "hatch-hook-last-run"
 HOOK_VERIFY_MAX_AGE_S = 120
+# Hatch lists a definition missing any of these as invalid and never runs it.
+HOOK_REQUIRED_KEYS = ("id", "version", "poll_interval_secs", "prompt", "script_path",
+                      "script_timeout_secs")
 HEARTBEAT_INTERVAL_S = 300
 # Sparrow rewrites its status file every poll round (long poll or backoff, each
 # at most about a minute), so an older file means it is not running.
@@ -201,9 +204,21 @@ def _script_path(path: Path) -> str:
     return f"~/hooks/scripts/{path.name}"
 
 
+def _stage_definition(want: str) -> Path:
+    staged = staged_definition_path()
+    try:
+        same = staged.read_text(encoding="utf-8") == want
+    except OSError:
+        same = False
+    if not same:
+        _write(staged, want, 0o644)
+    print(f"{'unchanged' if same else 'staged'}: {staged}")
+    return staged
+
+
 def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
-    """Write the hook for hooks.add; for a hook already defined, leave its files alone and
-    stage any change for the agent's hooks tool (REQUIRED hook:). False = refused."""
+    """Stage the hook definition for the agent's hooks tool (REQUIRED hook:); never write
+    ~/hooks/definitions, which the hooks tool owns. False = refused."""
     shipped = _shipped(SCRIPT_NAME)
     sha = _sha256(shipped)
     canonical, def_path = scripts_dir() / SCRIPT_NAME, definition_path()
@@ -216,11 +231,13 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
             return False
         if fresh:
             _record_script(sha)
-        _install_file(def_path, render_definition(mxid, reply_command, _script_path(canonical)),
-                      0o644, refuse_drift=False, force=True)
-        print(f"REQUIRED hook: register the hook through your hooks tool: hooks.add with the "
-              f"definition in {def_path}, check it with hooks.dry_run, start it with "
-              f"hooks.enable, and confirm {HOOK_ID} is in your hooks list")
+        want = render_definition(mxid, reply_command, _script_path(canonical))
+        staged = _stage_definition(want)
+        print(f"REQUIRED hook: register the hook through your hooks tool: hooks.add with every "
+              f"field of the definition in {staged} (printed below), check it with "
+              f"hooks.dry_run, start it with hooks.enable, and confirm {HOOK_ID} is listed "
+              "as valid in hooks.list")
+        print(want, end="")
         return True
     script_path = str(registered.get("script_path") or _script_path(canonical))
     current = Path(os.path.expanduser(script_path))
@@ -249,8 +266,7 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
     if definition_matches(registered, json.loads(want)):
         print(f"unchanged: hook {HOOK_ID} ({current} and {def_path}; install did not touch them)")
         return True
-    staged = staged_definition_path()
-    _install_file(staged, want, 0o644, refuse_drift=False, force=True)
+    staged = _stage_definition(want)
     print(f"REQUIRED hook: install left the running hook {HOOK_ID} as it is; update it through "
           f"your hooks tool to the definition in {staged} (printed below): hooks.update if your "
           f"hooks tool has it, else hooks.remove {HOOK_ID} then hooks.add; check it with "
@@ -707,11 +723,19 @@ def verify(_args) -> int:
             script.parent != scripts_dir()
         detail = (f"{def_path} has a placeholder or a script_path that is not an installed "
                   "hook script" if bad else str(def_path))
+        missing = [k for k in HOOK_REQUIRED_KEYS if k not in definition]
+        if missing:
+            bad, detail = True, (f"{def_path} lacks {', '.join(missing)}: Hatch marks this hook "
+                                 "invalid and never runs it; re-add it through your hooks tool "
+                                 "with every field of the definition install prints")
         if not bad and staged.is_file():
             want = json.loads(staged.read_text(encoding="utf-8"))
             if not definition_matches(definition, want):
                 bad, detail = True, f"{def_path} is not the definition install staged{pending}"
         _check(results, not bad, "hook definition", detail)
+    except FileNotFoundError:
+        _check(results, False, "hook definition", f"{def_path} missing: the hook is not "
+               "registered; add it through your hooks tool as install's REQUIRED hook: line says")
     except (OSError, ValueError, AttributeError) as e:
         _check(results, False, "hook definition", f"{def_path}: {e}")
 

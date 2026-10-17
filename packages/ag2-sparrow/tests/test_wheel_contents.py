@@ -97,7 +97,7 @@ def main():
                             "--no-start"],
                            capture_output=True, text=True, cwd=d, env=ienv, timeout=60)
         assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
-        prompt = json.loads((home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
+        prompt = json.loads((home / ".config" / "ag2-sparrow-hatch" / "hook-definition.json")
                             .read_text())["prompt"]
         named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
         assert {str(pathlib.Path(n).resolve()) for n in named} == \

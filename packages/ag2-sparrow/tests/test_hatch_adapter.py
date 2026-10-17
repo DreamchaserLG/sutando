@@ -154,6 +154,18 @@ class Base(unittest.TestCase):
         sha = sha or hatch_cli._sha256(SCRIPT.read_text())
         (state / hatch_cli.HOOK_RUN_FILE).write_text(f"{int(time.time()) - age_s} {sha}\n")
 
+    def register(self):
+        """What the hooks tool's hooks.add writes from the staged definition: its fields plus
+        the ones Hatch owns."""
+        staged = json.loads((self.home / ".config" / "ag2-sparrow-hatch" /
+                             "hook-definition.json").read_text())
+        target = self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(dict(staged, enabled=True, presentation_locale="en-US",
+                                          delivery={"surface": "side_chat", "to": "x"},
+                                          created_at_ms=1, updated_at_ms=1), indent=2))
+        return target
+
     def add_task(self, tid, event_id, sender="@bob:ag2.space", thread_root=None, mtime=None,
                  text=None, **kw):
         path = self.tasks / f"{tid}.txt"
@@ -753,11 +765,12 @@ class Cli(Base):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("REQUIRED hook: register the hook through your hooks tool: hooks.add with "
-                      f"the definition in {self.definition}", r.stdout)
+                      f"every field of the definition in {self.staged}", r.stdout)
+        self.assertFalse(self.definition.exists(), "the hooks tool owns ~/hooks/definitions")
         self.assertEqual(self.script.read_text(), SCRIPT.read_text())
         self.assertTrue(os.access(self.script, os.X_OK))
-        definition = json.loads((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
-                                .read_text())
+        definition = json.loads(self.staged.read_text())
+        self.assertIn(self.staged.read_text(), r.stdout, "the exact definition is printed")
         self.assertIn(AGENT, definition["prompt"])
         self.assertNotIn("<AGENT_MXID>", definition["prompt"])
         cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
@@ -769,13 +782,50 @@ class Cli(Base):
         self.assertIn(f"STATE_DIR={self.state.resolve()}", text)
         self.assertIn("GATEWAY_INSTANCE=''", text)
         again = self.cli("install", "--mxid", AGENT)
+        self.assertIn("REQUIRED hook: register", again.stdout, "until the hooks tool has it")
+        self.register()
+        again = self.cli("install", "--mxid", AGENT)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn(f"unchanged: hook ag2-sparrow-hatch ({self.script} and", again.stdout)
         self.assertNotIn("REQUIRED hook:", again.stdout)
 
+    def test_the_definition_has_every_field_hatch_requires(self):
+        r = self.cli("install", "--mxid", AGENT)
+        printed = r.stdout.split("(printed below)", 1)[1]
+        printed = json.loads(printed[printed.index("\n{") + 1:printed.index("\n}\n") + 2])
+        for definition in (json.loads(self.staged.read_text()), printed):
+            self.assertEqual(definition["version"], 1)
+            self.assertEqual(definition["id"], "ag2-sparrow-hatch")
+            for key in hatch_cli.HOOK_REQUIRED_KEYS:
+                self.assertIn(key, definition)
+        self.assertEqual(set(hatch_cli.HOOK_REQUIRED_KEYS),
+                         {"id", "version", "poll_interval_secs", "prompt", "script_path",
+                          "script_timeout_secs"})
+
+    def test_verify_fails_a_definition_hatch_marks_invalid(self):
+        self.cli("install", "--mxid", AGENT)
+        self.sparrow_status()
+        self.hook_ran()
+        registered = self.register()
+        self.assertIn("PASS hook definition:", self.cli("verify").stdout)
+        d = json.loads(registered.read_text())
+        del d["version"]
+        registered.write_text(json.dumps(d))
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f"FAIL hook definition: {registered} lacks version: Hatch marks this hook "
+                      "invalid", r.stdout)
+        # install stages the full definition again rather than leaving it invalid.
+        self.assertIn("REQUIRED hook: install left the running hook",
+                      self.cli("install", "--mxid", AGENT).stdout)
+        registered.unlink()
+        self.assertIn(f"FAIL hook definition: {registered} missing: the hook is not registered",
+                      self.cli("verify").stdout)
+
     def test_install_twice_touches_no_hook_or_config_file(self):
         self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
-        files = (self.script, self.definition, self.config, self.marker)
+        self.register()
+        files = (self.script, self.definition, self.config, self.marker, self.staged)
         for f in files:
             os.utime(f, (1_000_000, 1_000_000))
         before = {f: (f.stat().st_mtime_ns, f.stat().st_ctime_ns, f.stat().st_ino)
@@ -786,7 +836,6 @@ class Cli(Base):
         self.assertEqual({f: (f.stat().st_mtime_ns, f.stat().st_ctime_ns, f.stat().st_ino)
                           for f in files}, before)
         self.assertNotIn("REQUIRED hook:", r.stdout)
-        self.assertFalse(self.staged.exists())
 
     @property
     def definition(self):
@@ -816,6 +865,7 @@ class Cli(Base):
 
     def test_install_refuses_a_locally_modified_script(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         edited = self.script.read_text() + "# local edit\n"
         self.script.write_text(edited)
         r = self.cli("install", "--mxid", AGENT)
@@ -836,6 +886,7 @@ class Cli(Base):
 
     def test_install_upgrades_a_copy_it_wrote(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         self.assertEqual(self.marker.read_text().strip(),
                          hatch_cli._sha256(SCRIPT.read_text()))
         older = "#!/usr/bin/env bash\n# an earlier ag2-sparrow hook\n"
@@ -872,7 +923,7 @@ class Cli(Base):
         self.assertIn("FAIL hook definition:", v.stdout)
         self.assertIn("FAIL hook run: the hook runs an older script", v.stdout)
         # The hooks tool registered it; the hook has not run the new script yet.
-        self.definition.write_text(json.dumps(dict(staged, enabled=True)))
+        self.register()
         v = self.cli("verify")
         self.assertIn(f"PASS hook script: {self.versioned}", v.stdout)
         self.assertIn("PASS hook definition:", v.stdout)
@@ -928,6 +979,7 @@ class Cli(Base):
 
     def test_verify_passes_after_install(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         self.sparrow_status(age_s=30)
         self.hook_ran(age_s=5)
         r = self.cli("verify")
@@ -950,6 +1002,7 @@ class Cli(Base):
 
     def test_verify_fails_when_sparrow_is_not_running(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL sparrow:", r.stdout)
@@ -987,6 +1040,7 @@ class Cli(Base):
 
     def test_verify_names_each_broken_part(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         self.sparrow_status()
         self.script.chmod(0o644)
         self.assertIn("FAIL hook script:", self.cli("verify").stdout)
@@ -1037,8 +1091,7 @@ class Cli(Base):
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
-        prompt = json.loads((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json")
-                            .read_text())["prompt"]
+        prompt = json.loads(self.staged.read_text())["prompt"]
         self.assertNotIn(hatch_cli.REPLY_PLACEHOLDER, prompt)
         named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
         self.assertEqual(named, {str(self.reply_stub)})
@@ -1047,6 +1100,7 @@ class Cli(Base):
 
     def test_verify_does_not_depend_on_the_callers_path(self):
         self.cli("install", "--mxid", AGENT)
+        self.register()
         self.sparrow_status()
         env = py_env(self.home)
         env.update(AGENT_CONNECT_TASK_DIR=str(self.tasks), AGENT_CONNECT_STATE_DIR=str(self.state),
@@ -1070,7 +1124,7 @@ class Cli(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("ag2-sparrow-hatch was not found", r.stderr)
         self.assertFalse(self.script.exists())
-        self.assertFalse((self.home / "hooks" / "definitions" / "ag2-sparrow-hatch.json").exists())
+        self.assertFalse(self.staged.exists())
 
     def test_reply_command_found_beside_the_interpreter_wins(self):
         scripts = self.home / "venv-bin"
@@ -1437,6 +1491,7 @@ class Service(Base):
 
     def test_verify_reports_the_service(self):
         self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.register()
         self.sparrow_status()
         self.hook_ran()
         r = self.with_systemd(FakeSystemd(enabled=True, state="active"), "verify")

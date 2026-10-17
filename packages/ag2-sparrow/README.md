@@ -269,8 +269,9 @@ Paste this to the Hatch agent, with its MXID filled in:
 > version left running, and ends by checking Sparrow is connected; if it exits
 > non-zero, show me its output and stop. If it prints a `REQUIRED hook:` line,
 > do exactly that through your hooks tool (`hooks.add` from the definition file
-> it names on a first install; on an upgrade, update the hook to the definition
-> it prints), check it with `hooks.dry_run`, start it with `hooks.enable`; never
+> it names on a first install, with every field it prints, `version`
+> included; on an upgrade, update the hook to the definition it prints), check
+> it with `hooks.dry_run`, start it with `hooks.enable`; never
 > edit or copy files under `~/hooks` yourself. Then create a scheduled task in your scheduler: name
 > `sparrow-keepawake`, every 15 minutes, running the exact command install
 > prints on its `REQUIRED keepalive:` line (`timeout 120
@@ -291,10 +292,9 @@ relay rejects the token. Keep the `.env` file mode 600.
 
 | File | Content |
 | --- | --- |
-| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script, on a first install only (see [Upgrading the hook](#upgrading-the-hook)) |
-| `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID, on a first install only |
+| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script, while no hook is registered (see [Upgrading the hook](#upgrading-the-hook)) |
 | `~/hooks/scripts/ag2-sparrow-hatch.<sha12>.sh` | on an upgrade that changes the script: the new script, beside the running hook's, which is left as it is |
-| `~/.config/ag2-sparrow-hatch/hook-definition.json` | on an upgrade that changes the definition: the definition for your hooks tool |
+| `~/.config/ag2-sparrow-hatch/hook-definition.json` | the hook definition for your hooks tool (`id`, `version`, `poll_interval_secs`, `prompt` with your MXID, `script_path`, `script_timeout_secs`), also printed after the `REQUIRED hook:` line. `install` never writes `~/hooks/definitions/`: `hooks.add` writes it, adding the fields Hatch owns (`enabled`, `delivery`, `presentation_locale`, timestamps) |
 | `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND`, `CRON_DIR`, `KEEPALIVE_LOG` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of each hook script `install` wrote, one per line, which tells an upgrade from a local edit; its mtime is when it last wrote one |
 | `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
@@ -328,11 +328,18 @@ and watch the reply land in that thread.
 
 ### Upgrading the hook
 
-Hatch runs a hook as its hooks tool registered it. On a live agent, a re-run
-of `install` rewrote the hook script (same content) and its definition from
-outside that tool; the hook ran one more poll 24 seconds later and never
-again, while Sparrow kept queueing task files (16 open, none woken for). So
-`install` never writes a hook's files once its definition exists:
+Hatch runs a hook from the definition its hooks tool wrote to
+`~/hooks/definitions/`, and lists a definition that lacks a required field
+(`hooks.view` says `definition missing version field`) as invalid in
+`hooks.list` and never runs it. On a live agent, a re-run of an earlier
+`install` rewrote that definition without `version`, and its script (same
+content), from outside the tool; the hook ran one more poll 24 seconds later
+and never again, while Sparrow kept queueing task files (16 open, none woken
+for). Re-adding it with `hooks.add`, then `hooks.dry_run` and `hooks.enable`,
+brought it back. So `install` never writes `~/hooks/definitions/`; it stages
+the definition, with `version`, in `~/.config/ag2-sparrow-hatch/hook-definition.json`
+and prints it for your hooks tool. Once a definition is registered, `install`
+leaves the hook's files alone:
 
 - Script and definition unchanged: nothing is written, not even a `chmod`
   (`unchanged: hook ag2-sparrow-hatch ...`).
@@ -350,7 +357,17 @@ changes, each to a temporary file renamed into place. Every hook run (not a
 `hooks.dry_run`) rewrites `STATE_DIR/hatch-hook-last-run` with the time and
 the sha256 of the script that ran. `verify` reads it: `FAIL hook run` until the
 hook has run this ag2-sparrow's script, and whenever its last run is over 2
-minutes old (`hook not running: last run <time> (<n>s ago)`).
+minutes old (`hook not running: last run <time> (<n>s ago)`). `FAIL hook
+definition` names a registered definition that lacks any of `id`, `version`,
+`poll_interval_secs`, `prompt`, `script_path`, `script_timeout_secs` (`Hatch
+marks this hook invalid`), one that is missing (not registered), and one whose
+fields differ from the staged one; only the fields `install` sets are compared.
+
+Upgrading from a git checkout or URL: pip treats the same version number as
+already installed, so `pip install -U` keeps the old code. Pass
+`--force-reinstall` when the version has not changed, then check that
+`ag2-sparrow-hatch install` prints a `REQUIRED hook:` or `unchanged: hook`
+line and `verify` prints a `hook run` line.
 
 ### Keeping Sparrow running
 
