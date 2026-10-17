@@ -1533,6 +1533,32 @@ class Keepalive(Base):
         self.assertIsNone(self.health())
         self.assertRegex(self.cli("keepalive", "status").stdout, r" health=none$")
 
+    def test_the_last_keepawake_line_is_the_one_used(self):
+        self.installed()
+        now = time.time()
+        self.keepawake_at(now - 60)
+        self.keepawake_at(now - keepalive.STALE_S - 60)
+        self.assertEqual(self.health()["condition"], "abnormal")
+        self.log.write_text("")
+        self.keepawake_at(now - keepalive.STALE_S - 60)
+        self.keepawake_at(now - 60)
+        with self.log.open("a") as fh:
+            fh.write(time.strftime("%Y-%m-%dT%H:%M:%SZ") +
+                     " listener=up watchdog=down listener_restarts=0\n")
+        self.assertEqual(self.health()["condition"], "healthy")
+
+    def test_a_clock_stepped_back_does_not_read_healthy(self):
+        self.installed()
+        self.age_task(keepalive.STALE_S + 60)
+        self.keepawake_at(time.time() + 600)
+        activity = self.home / ".muse" / "last_active"
+        activity.touch()
+        ahead = time.time() + 600
+        os.utime(activity, (ahead, ahead))
+        row = self.health()
+        self.assertEqual((row["alive"], row["condition"], row["reason"]),
+                         (None, "abnormal", "keepawake-not-running"))
+
     def test_health_row_fresh_and_stale(self):
         self.installed()
         now = time.time()
@@ -1622,6 +1648,9 @@ import json
 from unittest import mock
 from ag2_sparrow import remote_gateway_bridge as m
 with mock.patch.object(m, "_req") as req:
+    m._post_heartbeat(set(), force=True)
+    if m._HEALTH_COMMAND._thread is not None:
+        m._HEALTH_COMMAND._thread.join(30)
     sent = m._post_heartbeat(set(), force=True)
 print(json.dumps(req.call_args.args[2] if sent else None))
 """
@@ -1652,11 +1681,43 @@ class HealthCommand(Base):
         self.assertEqual(hc.run(str(self.bin / "slow"), timeout=0.2)[1], "timed out after 0.2s")
         self.assertIn("FileNotFoundError", hc.run(str(self.home / "missing"))[1])
 
-    def test_the_command_is_reused_within_its_ttl_and_unset_means_no_row(self):
+    ROW = {"alive": True, "motion": "idle", "condition": "healthy", "reason": None,
+           "since": None}
+
+    def test_the_default_timeout_is_ten_seconds(self):
+        self.assertEqual(hc.TIMEOUT_S, 10.0)
+        with mock.patch.object(hc.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("x", 10)) as run:
+            self.assertEqual(hc.run("x"), (None, "timed out after 10s"))
+        self.assertEqual(run.call_args.kwargs["timeout"], 10.0)
+
+    def test_stdout_is_read_only_up_to_its_bound(self):
+        big = json.dumps({**self.ROW, "pad": "x" * hc.MAX_OUTPUT})
+        self.assertEqual(hc.run(self.stub(big)), (None, f"stdout is over {hc.MAX_OUTPUT} bytes"))
+
+    def test_row_never_waits_on_the_command(self):
+        path = self.bin / "slow-row"
+        executable(path, f"#!/bin/sh\nsleep 1\necho '{json.dumps(self.ROW)}'\n")
+        cmd = hc.HealthCommand(str(path), 60, lambda m: None)
+        start = time.monotonic()
+        self.assertIsNone(cmd.row(), "no row until the first refresh has finished")
+        self.assertIsNone(cmd.row())
+        self.assertLess(time.monotonic() - start, 0.5)
+        first = cmd._thread
+        first.join(10)
+        self.assertEqual(cmd.row(), self.ROW)
+        self.assertIs(cmd._thread, first, "within the ttl nothing is run again")
+
+    def test_an_error_clears_the_cached_row_and_is_logged_once(self):
         logs = []
-        cmd = hc.HealthCommand(self.stub("not json"), 60, logs.append)
-        self.assertIsNone(cmd.row())
-        self.assertIsNone(cmd.row())
+        path = self.stub(json.dumps(self.ROW))
+        cmd = hc.HealthCommand(path, 60, logs.append)
+        self.assertEqual(cmd.refresh(), self.ROW)
+        self.assertEqual(cmd.row(), self.ROW)
+        self.stub("not json")
+        self.assertIsNone(cmd.refresh())
+        self.assertIsNone(cmd.row(), "the old row is not sent after an error")
+        cmd.refresh()
         self.assertEqual(logs, ["health command gave no row: stdout is not JSON"])
         self.assertFalse(hc.HealthCommand("", 60, logs.append))
         self.assertIsNone(hc.HealthCommand("  ", 60, logs.append).row())

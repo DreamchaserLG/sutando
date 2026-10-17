@@ -263,6 +263,11 @@ def _mtime(path: Path) -> float | None:
         return None
 
 
+def _within(now: float, ts: "float | None") -> bool:
+    """`ts` at most STALE_S old; one from the future (a clock stepped back) is not."""
+    return ts is not None and 0 <= now - ts <= STALE_S
+
+
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     """The core row for Sparrow's heartbeat; None while no keepawake task is installed.
     `alive` also counts the hook's activity marker."""
@@ -274,10 +279,9 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     # Install leaves an unchanged task's mtime alone, so a task that never ran ages from it.
     last = ran if ran is not None else max(
         (m for m in map(_mtime, tasks) if m is not None), default=now)
-    fresh = now - last <= STALE_S
-    active = _mtime(_activity_file(cfg))
-    alive = True if (fresh and ran is not None) or (
-        active is not None and now - active <= STALE_S) else None
+    fresh = _within(now, last)
+    alive = True if (fresh and ran is not None) or _within(now, _mtime(_activity_file(cfg))) \
+        else None
     return {"alive": alive, "motion": "unknown",
             "condition": "healthy" if fresh else "abnormal",
             "reason": None if fresh else NOT_RUNNING,

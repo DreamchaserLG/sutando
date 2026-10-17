@@ -839,8 +839,10 @@ def main(argv=None) -> int:
                    "nothing; report: list the log's gaps and restarts")
     k.add_argument("--log", help="the keepalive log (default: as install recorded it, else "
                    "~/keepalive-probe.log)")
-    k.add_argument("--gap-minutes", type=float, default=16.0,
-                   help="report: a gap longer than this is a stop (default 16)")
+    from . import keepalive
+    k.add_argument("--gap-minutes", type=float, default=keepalive.GAP_MINUTES,
+                   help=f"report: a gap longer than this is a stop (default "
+                   f"{keepalive.GAP_MINUTES})")
     k.set_defaults(func=_keepalive)
     v = sub.add_parser("verify", help="check the installed hook")
     v.set_defaults(func=verify)

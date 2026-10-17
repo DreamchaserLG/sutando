@@ -204,9 +204,10 @@ Unset (the default), Sparrow behaves exactly as before.
 ### Reporting your agent's health
 
 Set `REMOTE_HEALTH_COMMAND` and Sparrow runs it (split like
-`REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 5 s
-timeout) at most once a minute, and sends the one JSON object it prints as
-the `health` row on its heartbeat, so AG2 Space's health panel shows your
+`REMOTE_TASK_ON_TASK`, no shell, the same token-free environment, a 10 s
+timeout) at most once a minute, on a thread of its own so task polling never
+waits on it. Each heartbeat sends the one JSON object (up to 4096 bytes) the
+last run printed as the `health` row, so AG2 Space's health panel shows your
 agent's core. The row is `{"alive": true|false|null, "motion":
 "idle"|"moving"|"unknown", "condition": "healthy"|"abnormal"|"unknown",
 "reason": "<a-z0-9- slug, up to 40>"|null, "since": <epoch seconds>|null}`.

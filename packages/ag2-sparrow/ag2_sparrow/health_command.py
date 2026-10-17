@@ -1,7 +1,8 @@
 """The core's health row from a command an adapter injects (REMOTE_HEALTH_COMMAND).
 
-Sparrow runs the command with no shell and a timeout, at most once per `ttl` seconds,
-and reads one JSON object from its stdout: the heartbeat's `health` row. The broker
+Sparrow runs the command with no shell and a timeout, at most once per `ttl` seconds
+and off its poll loop, and reads one JSON object (at most MAX_OUTPUT bytes) from its
+stdout: the heartbeat's `health` row. The broker
 refuses a whole heartbeat whose row is malformed, so a row that does not match its
 contract (alive: bool|null; motion: idle|moving|unknown; condition:
 healthy|abnormal|unknown; reason: a [a-z0-9-]{1,40} slug or null; since: epoch
@@ -14,6 +15,8 @@ import math
 import re
 import shlex
 import subprocess
+import tempfile
+import threading
 import time
 from collections.abc import Callable
 
@@ -22,8 +25,8 @@ MOTIONS = ("idle", "moving", "unknown")
 CONDITIONS = ("healthy", "abnormal", "unknown")
 REASON_MAX = 40
 REASON_RE = re.compile(f"[a-z0-9-]{{1,{REASON_MAX}}}")
-# The heartbeat waits on this in the poll loop.
-TIMEOUT_S = 5.0
+TIMEOUT_S = 10.0
+MAX_OUTPUT = 4096
 
 
 def slug(value) -> "str | None":
@@ -61,33 +64,42 @@ def validate(value) -> "tuple[dict | None, str | None]":
 def run(command: str, timeout: float = TIMEOUT_S,
         env: "dict[str, str] | None" = None) -> "tuple[dict | None, str | None]":
     """(row, None), (None, None) when the command printed nothing, or (None, why)."""
-    try:
-        r = subprocess.run(shlex.split(command), stdin=subprocess.DEVNULL, env=env,
-                           capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None, f"timed out after {timeout:g}s"
-    except (OSError, ValueError) as e:
-        return None, f"{type(e).__name__}: {e}"
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        try:
+            r = subprocess.run(shlex.split(command), stdin=subprocess.DEVNULL, env=env,
+                               stdout=out, stderr=err, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, f"timed out after {timeout:g}s"
+        except (OSError, ValueError) as e:
+            return None, f"{type(e).__name__}: {e}"
+        out.seek(0)
+        err.seek(0)
+        data, tail = out.read(MAX_OUTPUT + 1), err.read(MAX_OUTPUT)
     if r.returncode != 0:
-        tail = (r.stderr or "").strip().splitlines()
-        return None, f"exited {r.returncode}" + (f": {tail[-1]}" if tail else "")
-    out = r.stdout.strip()
-    if not out:
+        lines = tail.decode("utf-8", "replace").strip().splitlines()
+        return None, f"exited {r.returncode}" + (f": {lines[-1]}" if lines else "")
+    if len(data) > MAX_OUTPUT:
+        return None, f"stdout is over {MAX_OUTPUT} bytes"
+    text = data.decode("utf-8", "replace").strip()
+    if not text:
         return None, None
     try:
-        value = json.loads(out)
+        value = json.loads(text)
     except ValueError:
         return None, "stdout is not JSON"
     return validate(value)
 
 
 class HealthCommand:
-    """`run(command)` reused for `ttl` seconds; logs each new error once. `env`, when
-    given, builds the command's whole environment for each run."""
+    """The last row `run(command)` gave, refreshed off the caller's thread at most once
+    per `ttl` seconds; logs each new error once. `env`, when given, builds the
+    command's whole environment for each run."""
 
     def __init__(self, command: str, ttl: float, log: Callable[[str], None],
                  env: "Callable[[], dict[str, str]] | None" = None):
         self.command, self.ttl, self.log, self.env = command.strip(), ttl, log, env
+        self._lock = threading.Lock()
+        self._thread: "threading.Thread | None" = None
         self._at: "float | None" = None
         self._row: "dict | None" = None
         self._error: "str | None" = None
@@ -96,12 +108,23 @@ class HealthCommand:
         return bool(self.command)
 
     def row(self) -> "dict | None":
+        """The cached row at once; a due refresh starts in a daemon thread unless one
+        is still running. None until the first refresh has finished."""
         if not self.command:
             return None
-        if self._at is not None and time.monotonic() - self._at < self.ttl:
+        with self._lock:
+            due = self._at is None or time.monotonic() - self._at >= self.ttl
+            if due and not (self._thread is not None and self._thread.is_alive()):
+                self._thread = threading.Thread(target=self.refresh, name="health-command",
+                                                daemon=True)
+                self._thread.start()
             return self._row
+
+    def refresh(self) -> "dict | None":
+        """Run the command now and cache what it gave; an error clears the row."""
         row, error = run(self.command, env=self.env() if self.env else None)
-        if error and error != self._error:
-            self.log(f"health command gave no row: {error}")
-        self._at, self._row, self._error = time.monotonic(), row, error
+        with self._lock:
+            if error and error != self._error:
+                self.log(f"health command gave no row: {error}")
+            self._at, self._row, self._error = time.monotonic(), row, error
         return row
