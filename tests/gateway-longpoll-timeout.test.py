@@ -124,7 +124,7 @@ class LongPollTimeoutTest(unittest.TestCase):
 
     # ── the policy on its own ────────────────────────────────────────────
     def test_the_grace_covers_at_least_one_whole_poll_window(self):
-        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_WAIT + 10)
+        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_READ_TIMEOUT_S)
 
     def test_benign_from_zero_up_to_and_including_the_boundary(self):
         g = self.gw.POLL_TIMEOUT_GRACE_S

@@ -28,14 +28,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 _GW, _ = isolate_then_import()
 
-# The real read timeout is POLL_WAIT + 10 s; the stub holds longer than this one.
+# The stub holds longer than this read timeout; the real one is the poll budget.
 _SHORT_READ_TIMEOUT_S = 0.3
+# Wall-clock scale for a relay that answers late: a 37 s hold becomes 3.7 s.
+_TIME_SCALE = 0.1
+
+
+def _poll_budget(gw) -> float:
+    return getattr(gw, "POLL_READ_TIMEOUT_S", gw.POLL_WAIT + 10)
 
 
 class _StubRelay:
     """Holds every task poll (after `first_tasks`, served once) and answers the rest."""
 
-    def __init__(self, first_tasks=None, fail_acks=False):
+    def __init__(self, first_tasks=None, fail_acks=False, hold_s=None):
         self.release = threading.Event()
         self.hits: list[str] = []
         stub = self
@@ -64,7 +70,7 @@ class _StubRelay:
                     if pending:
                         self._send(200, {"tasks": pending.pop(0)})
                         return
-                    stub.release.wait(30)
+                    stub.release.wait(30 if hold_s is None else hold_s)
                     self._send(200, {"tasks": []})
                     return
                 self._send(200, {})
@@ -122,8 +128,10 @@ class _Bridge:
     _NOOP = ("_recover_orphan_proactive", "_maybe_start_event_channel",
              "_push_pool_advertisement", "_retry_withheld_reviews", "refresh_routing")
 
-    def __init__(self, gw, relay, root: Path):
+    def __init__(self, gw, relay, root: Path, time_scale=None):
         self.gw, self.relay, self.root = gw, relay, root
+        self.time_scale = time_scale
+        self.poll_outcomes: list[str] = []
         self.logs: list[str] = []
         self.writes: list[dict] = []
         self._saved: dict = {}
@@ -150,11 +158,16 @@ class _Bridge:
 
         def req(method, path, payload=None, timeout=gw._REQ_TIMEOUT_S):
             if path.startswith("/v1/tasks?wait="):
+                # Scaled: the loop's own budget against a real late answer; else a held poll.
+                short = timeout * self.time_scale if self.time_scale else _SHORT_READ_TIMEOUT_S
                 try:
-                    return real_req(method, path, payload, timeout=_SHORT_READ_TIMEOUT_S)
+                    resp = real_req(method, path, payload, timeout=short)
                 except TimeoutError:
-                    self.clock.offset += gw.POLL_WAIT + 10   # what the real hold costs
+                    self.poll_outcomes.append("timeout")
+                    self.clock.offset += timeout   # what the real hold costs
                     raise
+                self.poll_outcomes.append("answered")
+                return resp
             return real_req(method, path, payload, timeout=timeout)
 
         gw._req = req
@@ -227,7 +240,7 @@ class StuckRelayPollTest(unittest.TestCase):
             self.assertEqual(w["last_ok_ts"], 1_700_000_000, "a timeout stamped last_ok_ts")
             self.assertIs(w["connected"], False, "a timeout reported connected:true")
         self.assertIn("timed out", after_poll[-1]["error"])
-        self.assertEqual(b.clock.offset, 2 * (self.gw.POLL_WAIT + 10), "no back-off inside the grace")
+        self.assertEqual(b.clock.offset, 2 * _poll_budget(self.gw), "no back-off inside the grace")
 
     # (b) the stuck session is named after N timeouts, with heartbeats answering
     def test_n_timeouts_with_heartbeats_answering_is_a_stuck_poll(self):
@@ -296,6 +309,35 @@ class StuckRelayPollTest(unittest.TestCase):
         self.assertTrue(list(self.gw.TASKS_DIR.glob(f"{tid}*")), "the task file is gone")
         self.assertIn(tid, self.gw._load_inflight(), "the relaunch would not reload it in flight")
         self.assertIn(tid, self.gw._load_pending_acks(), "the relaunch would not retry its ack")
+
+
+class SlowRelayHoldTest(unittest.TestCase):
+    """#3042: the relay holds an empty poll 31-33 s whatever `wait` asks, so the old
+    35 s budget timed out on ordinary jitter. A 37 s hold must still be an answer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        for d in ("state", "tasks", "results"):
+            (self.root / d).mkdir()
+        self.relay = _StubRelay(hold_s=37 * _TIME_SCALE)
+
+    def tearDown(self):
+        self.relay.close()
+        self.tmp.cleanup()
+
+    def test_the_budget_covers_the_measured_hold_with_room_to_spare(self):
+        self.assertGreaterEqual(_poll_budget(_GW) - 33.3, 20, "under 20 s over #3042's slowest hold")
+
+    def test_a_poll_held_just_past_the_old_budget_is_answered_not_timed_out(self):
+        with _Bridge(_GW, self.relay, self.root, time_scale=_TIME_SCALE) as b:
+            rc = b.run(passes=1)
+        self.assertIsNone(rc)
+        self.assertEqual(b.poll_outcomes, ["answered"], "a 37 s hold timed out at the poll budget")
+        last = b.writes[-1]
+        self.assertIs(last["connected"], True)
+        self.assertIsNotNone(last["last_ok_ts"])
+        self.assertNotIn("consecutive_poll_timeouts", last)
 
 
 class SupervisorRelaunchTest(unittest.TestCase):

@@ -1757,10 +1757,15 @@ URL = (_env_compat("REMOTE_TASK_URL", "AG2_REMOTE_URL")
        or _URL_FROM_TOKEN or _URL_FALLBACK).rstrip("/")
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The relay holds an empty poll 31-33 s whatever `wait` asks (#3042), so the read
+# budget covers the longer of the two plus room for TLS setup and network jitter.
+_RELAY_HOLD_CEILING_S = 35
+_POLL_READ_MARGIN_S = 25
+POLL_READ_TIMEOUT_S = max(POLL_WAIT, _RELAY_HOLD_CEILING_S) + _POLL_READ_MARGIN_S
 ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
-POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+POLL_TIMEOUT_GRACE_S = 3 * POLL_READ_TIMEOUT_S
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -3041,8 +3046,8 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
-# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
-# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push runs between
+# polls, which return in ~33 s (#3042) and at worst POLL_READ_TIMEOUT_S, inside the 120 s.
 WORKERS_REFRESH_S = 20.0
 _workers_pushed_at: "float | None" = None
 _advertisement_unavailable_logged = False
@@ -6994,7 +6999,7 @@ _LOCK_HB_MUTEX = threading.Lock()
 _POLL_BACKOFF_MAX_S = 60
 # Typical worst case for one pass (a queued retry backlog can exceed it): the
 # long poll at its timeout, the largest backoff and two requests, doubled.
-_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOCK_PASS_MAX_S = 2 * (POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
 _LOOP_TICK = {"at": time.monotonic()}
 
 
@@ -7215,7 +7220,7 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
 # rest is a stuck session; every request already opens a new connection.
 STUCK_POLL_TIMEOUTS = 5
 # Shortest streak that can be judged stuck: N polls, each held to the read timeout.
-STUCK_POLL_DETECTION_WINDOW_S = STUCK_POLL_TIMEOUTS * (POLL_WAIT + 10)
+STUCK_POLL_DETECTION_WINDOW_S = STUCK_POLL_TIMEOUTS * POLL_READ_TIMEOUT_S
 STUCK_POLL_RECOVERY_INTERVAL_S = 600
 # EX_UNAVAILABLE: every supervisor relaunches it; 75 is the stand-down none relaunch.
 STUCK_POLL_EXIT_CODE = 69
@@ -7349,7 +7354,7 @@ def main() -> None:
             prev_ok = last_poll_ok
             answered = False
             try:
-                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
+                resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_READ_TIMEOUT_S)
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
