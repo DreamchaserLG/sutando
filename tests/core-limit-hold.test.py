@@ -531,6 +531,23 @@ class OwnerRecovery(unittest.TestCase):
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
         self.assertFalse((self.ws / "tasks" / "task-1.txt").exists())
 
+    def test_delivered_answer_is_not_sent_again(self):
+        for body in ("switch to sonnet", "retry now"):
+            with self.subTest(body=body):
+                self.tearDown()
+                self.setUp()
+                owner_task(self.ws / "tasks", "task-11", body)
+                self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), ["task-11"])
+                live = self.ws / "results" / "task-11.txt"
+                month = self.ws / "results" / "archive" / "2026-10"
+                month.mkdir(parents=True, exist_ok=True)
+                live.rename(month / "task-11.txt")  # the bridge delivered it and archived it
+                for minute in (2, 4):
+                    clh.handle_owner_actions(self.ws, self.now + minute * 60, switch_cmd=str(self.switch))
+                self.assertFalse(live.exists(), "a delivered answer was queued again")
+                entry = clh.read_hold(self.ws)["actions"][-1]
+                self.assertEqual((entry["answered"], entry["lifted"], entry["archived"]), (True, True, True))
+
     def test_answered_but_unarchived_reply_is_archived_not_redone(self):
         owner_task(self.ws / "tasks", "task-8", "retry now")
         (self.ws / "results").mkdir(exist_ok=True)
@@ -649,6 +666,28 @@ class OwnerActionCrash(unittest.TestCase):
                 if "switch" in body:
                     self.assertEqual(len(self.calls.read_text().splitlines()), 1, "the switch ran twice")
 
+
+    def test_crash_after_the_answer_before_it_is_marked(self):
+        # The answer landed and the bridge delivered it, but the record never said so: the
+        # replay finds the delivered copy in the archive and does not write a second one.
+        from unittest import mock
+        owner_task(self.ws / "tasks", "task-9", "retry now")
+        real_mark = clh._mark
+
+        def mark_crashing(ws, task, step):
+            if step == "answered":
+                raise Crash()
+            return real_mark(ws, task, step)
+        with mock.patch.object(clh, "_mark", side_effect=mark_crashing), self.assertRaises(Crash):
+            clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None)
+        month = self.ws / "results" / "archive" / "2026-10"
+        month.mkdir(parents=True)
+        (self.ws / "results" / "task-9.txt").rename(month / "task-9.txt")
+        for minute in (2, 4):
+            clh.handle_owner_actions(self.ws, self.now + minute * 60, switch_cmd=None)
+        self.assertFalse((self.ws / "results" / "task-9.txt").exists(), "the delivered answer was written again")
+        self.assertIsNone(clh.active_hold(self.ws, self.now + 300))
+        self.assertFalse((self.ws / "tasks" / "task-9.txt").exists())
 
     def test_crash_after_the_switch_before_the_record(self):
         # Nothing durable says the switch ran, so the next pass runs it again: the same model,

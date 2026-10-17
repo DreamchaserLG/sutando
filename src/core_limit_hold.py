@@ -415,19 +415,41 @@ def _recorded_actions(hold: Optional[dict]) -> list:
     return [a for a in acts if isinstance(a, dict) and isinstance(a.get("task"), str)]
 
 
-def _finish(workspace: Path, entry: dict, now: float) -> None:
-    """Complete a recorded action from its record alone, in order: answer, lift, archive.
-    Every step is skipped once done, so a crash at any point is finished by the next pass."""
-    import local_record
-    result = workspace / "results" / f"{entry['task']}.txt"
-    if not result.exists():
-        local_record.write_text_whole(result, entry["reply"] + "\n")
+_STEPS = ("answered", "lifted", "archived")
+
+
+def _mark(workspace: Path, task: str, step: str) -> None:
+    """Persist one finished step of a recorded action; the record, not a file, says it is done."""
     hold = read_hold(workspace)
-    if entry.get("ok") and hold and hold.get("status") == "held":
-        clear(workspace, now, by=entry["task"])
-    live = workspace / "tasks" / f"{entry['task']}.txt"
-    if live.exists():
-        _archive_task(workspace, live)
+    acts = _recorded_actions(hold)
+    for act in acts:
+        if act["task"] == task:
+            act[step] = True
+    if hold is not None:
+        _write_hold(workspace, dict(hold, actions=acts))
+
+
+def _finish(workspace: Path, entry: dict, now: float) -> None:
+    """Complete a recorded action from its record alone: answer, lift, archive, each marked
+    done in the record as it lands, so a replay skips it and never answers a second time."""
+    import local_record
+    from local_task_protocol import find_result
+    task = entry["task"]
+    if not entry.get("answered"):
+        # Unmarked means a crash may have hit after the write: a copy live or archived is that write.
+        if find_result(workspace / "results", task) is None:
+            local_record.write_text_whole(workspace / "results" / f"{task}.txt", entry["reply"] + "\n")
+        _mark(workspace, task, "answered")
+    if not entry.get("lifted"):
+        hold = read_hold(workspace)
+        if entry.get("ok") and hold and hold.get("status") == "held":
+            clear(workspace, now, by=task)
+        _mark(workspace, task, "lifted")
+    if not entry.get("archived"):
+        live = workspace / "tasks" / f"{task}.txt"
+        if live.exists():
+            _archive_task(workspace, live)
+        _mark(workspace, task, "archived")
 
 
 def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
@@ -438,7 +460,8 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
     now = time.time() if now is None else now
     workspace = Path(workspace)
     for entry in _recorded_actions(read_hold(workspace)):
-        _finish(workspace, entry, now)
+        if not all(entry.get(step) for step in _STEPS):
+            _finish(workspace, entry, now)
     done = []
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
         hold = active_hold(workspace, now)
