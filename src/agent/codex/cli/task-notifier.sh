@@ -29,9 +29,19 @@ WATCHER_RECORD="$WORKSPACE_DIR/state/codex-notifier.watcher"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
-# One core notifier per workspace: re-exec under a kernel lock that dies with this process, so
+# Set when notifier_lock.py's holder process is this process's child: ownership is read from the
+# process table, so a stale or copied SUTANDO_NOTIFIER_LOCK_HOLDER is never trusted.
+LOCK_OWNER=""
+notifier_lock_leader() {
+  local holder="${SUTANDO_NOTIFIER_LOCK_HOLDER:-}"
+  [ -n "$holder" ] || return 1
+  case "$(ps -o command= -p "$holder" 2>/dev/null || true)" in *notifier_lock.py*) ;; *) return 1 ;; esac
+  ps -o ppid= -p "$holder" 2>/dev/null | tr -d ' '
+}
+[ "$(notifier_lock_leader || true)" = "$$" ] && LOCK_OWNER=1
+# One core notifier per workspace: re-exec under a kernel lock bound to this process's life, so
 # claims only ever have one live owner. A busy lock makes a one-shot --event give up quickly.
-if [ -z "$WORKER_INSTANCE" ] && [ -z "${SUTANDO_NOTIFIER_LOCK_FD:-}" ]; then
+if [ -z "$WORKER_INSTANCE" ] && [ -z "$LOCK_OWNER" ]; then
   _lock_timeout="${SUTANDO_NOTIFIER_LOCK_TIMEOUT:-600}"
   [ "${1:-}" = "--event" ] && _lock_timeout=5
   exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock "$WORKSPACE_DIR/state/codex-notifier.lock" \
@@ -77,7 +87,7 @@ stop_watcher() {
 
 cleanup_notifier() {
   stop_watcher
-  [ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ] && rm -f "$WATCHER_RECORD"
+  [ -n "$LOCK_OWNER" ] && rm -f "$WATCHER_RECORD"
   clear_workstream_context
   if [ -n "$event_dir" ]; then
     rm -f "$event_dir/events"
@@ -657,12 +667,12 @@ queue_dir="$event_dir/queue"
 PAYLOAD_DIR="$event_dir/payload"
 mkdir -p "$queue_dir" "$PAYLOAD_DIR"
 prune_delivery_claims
-[ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ] && reap_orphaned_watcher
+[ -n "$LOCK_OWNER" ] && reap_orphaned_watcher
 "$NOTIFIER_PY" -c \
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
-  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" 9>&- &
+  "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
-if [ -n "${SUTANDO_NOTIFIER_LOCK_FD:-}" ]; then
+if [ -n "$LOCK_OWNER" ]; then
   printf '%s\n%s\n%s\n' "$watcher_pid" "$(process_start "$watcher_pid" || true)" "$TASKS_DIR" > "$WATCHER_RECORD" 2>/dev/null || true
 fi
 
@@ -789,6 +799,10 @@ process_announced_queue() {
 # `read || rc=$?`, NOT `read; rc=$?` -- under `set -e` the bare form dies before
 # the assignment runs, leaving the timeout branch below unreachable.
 while :; do
+  if [ -n "$LOCK_OWNER" ] && [ "$(notifier_lock_leader || true)" != "$$" ]; then
+    log_notifier "the notifier lock holder is gone; exiting so a restart takes the lock again"
+    exit 1
+  fi
   event="" rrc=0
   IFS= read -r -t "$RETRY_INTERVAL" event || rrc=$?
   if [ "$rrc" -eq 0 ]; then

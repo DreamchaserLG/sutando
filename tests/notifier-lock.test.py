@@ -18,6 +18,14 @@ import notifier_lock  # noqa: E402
 HELPER = REPO / "src" / "delivery" / "notifier_lock.py"
 
 
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
 class NotifierLockTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -44,7 +52,7 @@ class NotifierLockTest(unittest.TestCase):
         second.communicate(timeout=30)
         self.assertEqual(log.read_text().split(), ["first-in", "first-out", "second-in"])
 
-    def test_a_kill_9_holder_releases_at_once(self):
+    def test_a_kill_9_leader_releases_at_once(self):
         ready = self.dir / "ready"
         first = self._holder("bash", "-c", f'touch "{ready}"; exec sleep 60')
         self._wait_for(ready)
@@ -103,11 +111,54 @@ class NotifierLockTest(unittest.TestCase):
         finally:
             (self.dir / "ro").chmod(0o700)
 
-    def test_the_command_inherits_the_lock_on_fd_9(self):
+    def test_the_command_is_told_its_holder_and_is_that_holders_parent(self):
         r = subprocess.run([sys.executable, str(HELPER), "--lock", self.lock, "--", "bash", "-c",
-                            'echo "$SUTANDO_NOTIFIER_LOCK_FD"; [ -e /dev/fd/9 ] && echo open'],
+                            'echo $$; ps -o ppid= -p "$SUTANDO_NOTIFIER_LOCK_HOLDER"'],
                            capture_output=True, text=True, timeout=30)
-        self.assertEqual(r.stdout.split(), ["9", "open"], r.stderr)
+        leader, parent = r.stdout.split()
+        self.assertEqual(leader, parent, r.stderr)
+
+    def test_a_kill_9_leader_releases_at_once_though_its_child_lives_on(self):
+        # A surviving child of the killed command must not keep the lock: it never had it.
+        ready, child_pid = self.dir / "ready", self.dir / "child"
+        first = self._holder("bash", "-c", f'sleep 60 & echo $! > "{child_pid}"; touch "{ready}"; exec sleep 60')
+        self._wait_for(ready)
+        child = int(child_pid.read_text())
+        self.addCleanup(lambda: os.kill(child, signal.SIGKILL) if _alive(child) else None)
+        os.kill(first.pid, signal.SIGKILL)
+        first.wait(timeout=30)  # not communicate(): the live child still holds the pipes open
+        self.addCleanup(lambda: (first.stdout.close(), first.stderr.close()))
+        started = time.monotonic()
+        second = self._holder("true", timeout="5")
+        _, err = second.communicate(timeout=30)
+        self.assertEqual(second.returncode, 0, err)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(_alive(child), "the child must still be alive when the successor acquires")
+
+    def test_the_holder_keeps_the_lock_through_a_graceful_stop_of_its_group(self):
+        ready, stop = self.dir / "ready", self.dir / "stop"
+        first = subprocess.Popen([sys.executable, str(HELPER), "--lock", self.lock, "--", "bash", "-c",
+                                  f'trap "touch {stop}; sleep 1; exit 0" TERM; touch "{ready}"; while :; do sleep 0.05; done'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self._wait_for(ready)
+        os.killpg(first.pid, signal.SIGTERM)
+        self._wait_for(stop)
+        busy = self._holder("true", timeout="0.3")
+        busy.communicate(timeout=30)
+        self.assertEqual(busy.returncode, notifier_lock.EXIT_BUSY, "released before the command finished stopping")
+        first.communicate(timeout=30)
+        after = self._holder("true", timeout="5")
+        after.communicate(timeout=30)
+        self.assertEqual(after.returncode, 0)
+
+    def test_the_holder_waits_while_its_leader_is_its_parent(self):
+        parents = iter([7, 7, 1])
+        sleeps = []
+        notifier_lock.hold(0, 7, getppid=lambda: next(parents), sleep=sleeps.append)
+        self.assertEqual(len(sleeps), 2)
+        for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
+            signal.signal(sig, signal.SIG_DFL)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
 
     def test_acquire_logs_while_it_waits_then_gives_up(self):
         held = notifier_lock.acquire(self.lock, 1, 1)
@@ -124,10 +175,9 @@ class NotifierLockTest(unittest.TestCase):
             self.assertEqual(notifier_lock.main(["--lock", self.lock]), 2)
             self.assertEqual(notifier_lock.main(["--lock", self.lock, "--"]), 2)
         calls = []
-        rc = notifier_lock.main(["--lock", self.lock, "--", "true"],
-                                execvpe=lambda f, a, e: calls.append((f, a, e["SUTANDO_NOTIFIER_LOCK_FD"])))
-        self.assertEqual((rc, calls), (0, [("true", ["true"], "9")]))
-        os.close(notifier_lock.LOCK_FD)
+        rc = notifier_lock.main(["--lock", self.lock, "--", "true"], fork=lambda: 4242,
+                                execvpe=lambda f, a, e: calls.append((f, a, e["SUTANDO_NOTIFIER_LOCK_HOLDER"])))
+        self.assertEqual((rc, calls), (0, [("true", ["true"], "4242")]))
         held = notifier_lock.acquire(self.lock, 1, 1)
         self.addCleanup(os.close, held)
         with redirect_stderr(io.StringIO()):

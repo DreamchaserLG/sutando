@@ -97,10 +97,12 @@ for a change to take effect. Queue mode applies to the core's notifier only; a p
 worker's notifier always uses send-keys.
 
 Only one core notifier runs per workspace. The notifier re-executes itself under
-`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
-`state/codex-notifier.lock` for exactly as long as the notifier process lives. The kernel
-drops the lock when the process dies, `kill -9` included, so no lock is ever left behind.
-The lock is kept out of the long-lived watcher the notifier starts. That watcher leads its
+`src/delivery/notifier_lock.py`, which takes an exclusive `flock` on the workspace's
+`state/codex-notifier.lock` in a small holder process it forks before running the notifier.
+The holder exits as soon as the notifier process is gone, `kill -9` included, and the kernel
+drops the lock with it; no process the notifier starts ever holds the lock, so a surviving
+child (tmux, a Python helper, `sleep`) cannot keep it. If the holder alone dies, the notifier
+notices within one retry interval and exits, so its supervisor starts it again under a fresh lock. That watcher leads its
 own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
 The notifier records the watcher's pid, start time and inbox in
 `state/codex-notifier.watcher`, and the next notifier, holding the lock, stops that exact

@@ -1453,7 +1453,7 @@ echo "Error: failed to queue session message" >&2; exit {codex_rc}
         tmp = Path(self.tmp.name)
         go = tmp / "go"
         self._write_exe("tmux", f'''#!/bin/bash
-printf '%s LOCKFD=%s\\n' "$*" "${{SUTANDO_NOTIFIER_LOCK_FD:-}}" >> "$TMUX_LOG"
+printf '%s LOCKHOLDER=%s\\n' "$*" "${{SUTANDO_NOTIFIER_LOCK_HOLDER:-}}" >> "$TMUX_LOG"
 for _a in "$@"; do [ "$_a" = capture-pane ] && {{ printf '\\xe2\\x80\\xba \\n\\xe2\\x86\\x90 for agents\\n'; exit 0; }}; done
 case "$*" in *"-l -- Sutando task ready: task-1.txt"*)
   for _ in $(seq 200); do [ -e "{go}" ] && break; sleep 0.05; done ;; esac
@@ -1481,7 +1481,57 @@ exit 0
         self.assertEqual((first.returncode, second.returncode), (0, 0), err1 + err2)
         calls = self.log.read_text().splitlines()
         self.assertTrue(any("-l -- Sutando task ready: task-2.txt" in c for c in calls), err2)
-        self.assertTrue(calls and all(c.endswith("LOCKFD=9") for c in calls), calls)
+        self.assertTrue(calls and all(re.search(r"LOCKHOLDER=\d+$", c) for c in calls), calls)
+
+    def _real_notifier_env(self, **extra):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SUTANDO_")}
+        env.update(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+                   SUTANDO_TMUX_SOCKET="/tmp/test.sock", SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_POLL_INTERVAL="0.05", SUTANDO_NOTIFIER_COMPOSER_READY_TIMEOUT="1", **extra)
+        return env
+
+    def test_a_copied_or_forged_holder_marker_does_not_bypass_a_held_lock(self):
+        sys.path.insert(0, str(self.root / "src/delivery"))
+        import notifier_lock
+        state = self.root / "workspace" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        held = notifier_lock.acquire(str(state / "codex-notifier.lock"), 1, 1)
+        self.addCleanup(os.close, held)
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        for marker in (str(os.getpid()), "1", "999999", "junk"):
+            r = subprocess.run(["/bin/bash", str(script), "--event", "task-1.txt"],
+                               env=self._real_notifier_env(SUTANDO_NOTIFIER_LOCK_HOLDER=marker),
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 75, f"marker {marker}: {r.stderr}")
+        self.assertNotIn("task-1.txt", self.log.read_text() if self.log.exists() else "")
+
+    def test_a_notifier_whose_lock_holder_dies_exits_and_releases_the_inbox(self):
+        workspace = self.root / "workspace"
+        (workspace / "tasks").mkdir(parents=True, exist_ok=True)
+        (workspace / "logs").mkdir(exist_ok=True)
+        watcher = self.root / "src/watch-tasks-stream.sh"
+        watcher.write_text('#!/bin/bash\nwhile :; do sleep 1; done\n')
+        watcher.chmod(0o755)
+        self._write_exe("tmux", self._LIVE_PANE_TMUX)
+        script = self.root / "src/agent/codex/cli/task-notifier.sh"
+        proc = subprocess.Popen(["/bin/bash", str(script)],
+                                env=self._real_notifier_env(SUTANDO_NOTIFIER_RETRY_INTERVAL="1"),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            self._wait_for(workspace / "state" / "codex-notifier.watcher")
+            holders = subprocess.run(["pgrep", "-P", str(proc.pid), "-f", "notifier_lock.py"],
+                                     capture_output=True, text=True).stdout.split()
+            self.assertEqual(len(holders), 1, holders)
+            os.kill(int(holders[0]), signal.SIGKILL)
+            self.assertEqual(proc.wait(timeout=15), 1)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        self.assertIn("lock holder is gone", (workspace / "logs" / "task-notifier.log").read_text())
 
     def test_after_a_notifier_is_killed_the_next_one_serves_the_inbox_at_once(self):
         # Its watcher leads its own session, so it outlives a kill -9 and keeps holding the inbox.
@@ -1583,11 +1633,11 @@ while :; do sleep 1; done
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
 
-    def test_the_notifier_runs_under_the_inbox_lock_and_keeps_it_from_its_watcher(self):
+    def test_the_notifier_runs_under_the_workspace_lock_and_owns_it_only_as_its_holders_parent(self):
         text = (self.root / "src/agent/codex/cli/task-notifier.sh").read_text()
         self.assertIn('exec "$NOTIFIER_PY" "$REPO/src/delivery/notifier_lock.py" --lock '
                       '"$WORKSPACE_DIR/state/codex-notifier.lock"', text)
-        self.assertRegex(text, r'watch-tasks-stream\.sh"[^\n]*9>&- &')
+        self.assertIn('[ "$(notifier_lock_leader || true)" = "$$" ] && LOCK_OWNER=1', text)
 
     def test_a_claim_from_the_same_or_an_unknown_core_is_waited_on(self):
         for recorded, current in (("222 Fri Oct 16 10:00:00 2026", "222 Fri Oct 16 10:00:00 2026"),
