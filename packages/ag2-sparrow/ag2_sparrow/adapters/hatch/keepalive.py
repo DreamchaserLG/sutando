@@ -1,7 +1,8 @@
 """Keepalive for a Hatch agent: one scheduled task, and the health row Sparrow reports.
 
-Every 15 minutes Hatch's scheduler runs `keepalive keepawake` (the run is what keeps
-the agent awake). It restarts Sparrow if Sparrow is not running and appends one line
+Every 15 minutes the agent's scheduler runs `keepalive keepawake` (the run is what keeps
+the agent awake); the agent registers that task itself, since Hatch's scheduler does not
+run task files on disk. It restarts Sparrow if Sparrow is not running and appends one line
 to the keepalive log: `<utc> keepawake listener=up|down restarted=0|1`. A scheduler
 that stops running the task cannot report that itself, so Sparrow does: it runs
 `keepalive health` (REMOTE_HEALTH_COMMAND, which install puts in Sparrow's
@@ -16,6 +17,7 @@ import datetime
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -36,6 +38,8 @@ GAP_MINUTES = 16
 SPAWN_SETTLE_S = 3.0
 LOG_NAME = "keepalive-probe.log"
 TAIL_BYTES = 4096
+STOP_WAIT_S = 20.0
+START_WAIT_S = 30.0
 
 
 def default_cron_dir() -> Path:
@@ -69,12 +73,24 @@ def health_command(command: str) -> str:
     return shlex.join([command, "keepalive", "health"])
 
 
+def keepawake_command(command: str) -> str:
+    return f"timeout {RUN_TIMEOUT_S} {shlex.join([command, 'keepalive', 'keepawake'])}"
+
+
+def register_step(cfg: dict) -> str:
+    """What the agent must do: Hatch's scheduler does not run task files dropped on disk."""
+    return (f"create a scheduled task through your scheduler (a file on disk is not enough): "
+            f"name {TASK}, every {INTERVAL_MIN} minutes, running exactly: "
+            f"{keepawake_command(_command(cfg))} ; then confirm it appears in your scheduled "
+            "task list")
+
+
 def render_task(command: str) -> str:
     return (f"{TASK_MARKER}\n# {TASK} (every {INTERVAL_MIN} minutes)\n\n"
             "Run this command once, then stop. It keeps this agent awake, restarts the AG2 "
             "Space listener (Sparrow) only if it is down, and appends one line to the "
             "keepalive log. Change nothing else, retry nothing, and post nothing anywhere.\n\n"
-            f"```sh\ntimeout {RUN_TIMEOUT_S} {command} keepalive keepawake\n```\n")
+            f"```sh\n{keepawake_command(command)}\n```\n")
 
 
 def _command(cfg: dict) -> str:
@@ -152,13 +168,11 @@ def _remove_old_tasks(directory: Path, force: bool) -> None:
 def install_tasks(cfg: dict, force: bool) -> None:
     """Install the keepawake task and remove the ones it replaces. Never fails the install."""
     directory = cron_dir(cfg)
-    if not directory.is_dir():
-        print(f"NOTE keepalive: {directory} did not exist and was created; check that Hatch's "
-              "scheduler runs the tasks in it")
     if _install_task(directory, render_task(_command(cfg)), force):
-        print(f"keepalive: {TASK} scheduled every {INTERVAL_MIN} minutes; its log is "
-              f"{log_path(cfg)}")
+        print(f"keepalive: {directory / task_file()} is the install record health is timed "
+              f"from; Hatch's scheduler does not run it. The keepalive log is {log_path(cfg)}")
     _remove_old_tasks(directory, force)
+    print(f"REQUIRED keepalive: {register_step(cfg)}")
 
 
 def uninstall_tasks(cfg: dict) -> int:
@@ -194,9 +208,12 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
         env["GATEWAY_INSTANCE"] = _instance(cfg)
     out = _state_dir(cfg) / "hatch-keepalive-sparrow.log"
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("ab") as fh:
-        proc = subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL, stdout=fh,
-                                stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        with out.open("ab") as fh:
+            proc = subprocess.Popen([exe], env=env, stdin=subprocess.DEVNULL, stdout=fh,
+                                    stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as e:
+        return False, f"{exe} could not start ({e})"
     try:
         code = proc.wait(timeout=SPAWN_SETTLE_S)
     except subprocess.TimeoutExpired:
@@ -207,10 +224,7 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
 
 def restart_listener(cfg: dict) -> "tuple[bool, str]":
     """Through the user service install wrote when there is one, else a detached Sparrow."""
-    unit = _cli.service_path()
-    ours = unit.is_file() and unit.read_text(encoding="utf-8", errors="replace") \
-        .startswith(_cli.SERVICE_MARKER)
-    if ours and _cli.systemd_user_available():
+    if _service_managed():
         # A unit left failed by its start limit stays down until reset.
         _cli._systemd_run(["systemctl", "--user", "reset-failed", _cli.SERVICE_NAME])
         r = _cli._systemd_run(["systemctl", "--user", "restart", _cli.SERVICE_NAME])
@@ -218,6 +232,118 @@ def restart_listener(cfg: dict) -> "tuple[bool, str]":
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
         return False, f"systemctl --user restart {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
     return _spawn_sparrow(cfg)
+
+
+def _proc(pid: int, name: str) -> "bytes | None":
+    try:
+        return Path(f"/proc/{pid}/{name}").read_bytes()
+    except OSError:
+        return None
+
+
+def _gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    stat = _proc(pid, "stat") or b""
+    return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
+
+
+def sparrow_env(pid: int) -> "dict[str, str] | None":
+    """The environment of Sparrow process `pid`; None when it cannot be read (no /proc, or
+    another process now has that pid)."""
+    cmd, env = _proc(pid, "cmdline"), _proc(pid, "environ")
+    if cmd is None or env is None or not any(
+            m in cmd for m in (_cli.SPARROW_COMMAND.encode(), b"ag2_sparrow")):
+        return None
+    pairs = (p.split(b"=", 1) for p in env.split(b"\0") if b"=" in p)
+    return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
+
+
+def _stop(pid: int) -> bool:
+    """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError as e:
+        print(f"error: cannot stop Sparrow (pid {pid}): {e}", file=sys.stderr)
+        return False
+    deadline = time.monotonic() + STOP_WAIT_S
+    while time.monotonic() < deadline:
+        if _gone(pid):
+            return True
+        time.sleep(0.2)
+    print(f"error: Sparrow (pid {pid}) did not exit within {STOP_WAIT_S:g}s of SIGTERM",
+          file=sys.stderr)
+    return False
+
+
+def _service_managed() -> bool:
+    unit = _cli.service_path()
+    return unit.is_file() and unit.read_text(encoding="utf-8", errors="replace") \
+        .startswith(_cli.SERVICE_MARKER) and _cli.systemd_user_available()
+
+
+def ensure_sparrow(cfg: dict, health: bool) -> int:
+    """Leave a Sparrow running and connected: start one if none runs, replace one outside
+    the installed service, or (with `health`) one that lacks REMOTE_HEALTH_COMMAND."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    started = time.time()
+    holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
+    start = False
+    if _service_managed():
+        props = _cli._unit_props("ActiveState", "MainPID")
+        active = props.get("ActiveState") in ("active", "reloading")
+        if not active:
+            if holder is not None and str(holder) != props.get("MainPID"):
+                print(f"replacing: the Sparrow outside {_cli.SERVICE_NAME} (pid {holder})")
+                if not _stop(holder):
+                    return 1
+            start = True
+    elif holder is not None:
+        env = sparrow_env(holder)
+        want = health_command(_command(cfg))
+        if env is None:
+            print(f"NOTE sparrow: cannot read the environment of Sparrow (pid {holder}), so it "
+                  "was left running as it is")
+        elif health and env.get("REMOTE_HEALTH_COMMAND") != want:
+            print(f"replacing: Sparrow (pid {holder}) runs without REMOTE_HEALTH_COMMAND={want}")
+            if not _stop(holder):
+                return 1
+            start = True
+    else:
+        start = not listener_up(cfg, started)
+    if start:
+        ok, how = restart_listener(cfg)
+        if not ok:
+            print(f"error: Sparrow did not start: {how}", file=sys.stderr)
+            return 1
+        print(f"started: {how}")
+    return _await_connected(state, instance, started if start else None)
+
+
+def _await_connected(state: Path, instance: str, since: "float | None") -> int:
+    """0 once Sparrow reports running and connected (after `since`, when given), else 1."""
+    path = _cli.sparrow_status_path(state, instance)
+    deadline = time.monotonic() + START_WAIT_S
+    while True:
+        code, detail = _cli.check_sparrow(state, instance=instance)
+        try:
+            ts = float(json.loads(path.read_text(encoding="utf-8"))["ts"])
+        except (OSError, ValueError, KeyError, TypeError):
+            ts = None
+        if code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))):
+            print(f"sparrow: {detail}")
+            return 0
+        if time.monotonic() >= deadline:
+            print(f"error: Sparrow is not running and connected {START_WAIT_S:g}s after install: "
+                  f"{detail}", file=sys.stderr)
+            return 1
+        time.sleep(0.5)
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:

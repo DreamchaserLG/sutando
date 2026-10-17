@@ -2,8 +2,8 @@
 
 install writes the hook script to ~/hooks/scripts/, the hook definition to
 ~/hooks/definitions/ and the config the script reads, where systemd runs a user
-manager the ag2-sparrow user service that restarts Sparrow, and the keepalive
-as a Hatch scheduled task; verify checks that setup;
+manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
+install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it;
 keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log."""
@@ -277,25 +277,38 @@ def _unit_props(*names: str) -> dict:
     return dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
 
 
-def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -> bool:
-    """Whether a Sparrow this service does not own polls the workspace now."""
+def _lock_record(state_dir: Path, instance: str) -> "dict | None":
+    """This host's Sparrow single-instance lock record, or None when there is none to read."""
     lock = state_dir.parent / "state" / "locks" / \
         f"gateway-bridge{gateway_instance.suffix(instance)}.lock"
     try:
         holder = json.loads(lock.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        holder = None
-    if isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label():
-        pid = holder.get("pid")
-        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 or pid == main_pid:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False  # its holder crashed; the fresh status file is a corpse
-        except OSError:
-            pass
-        return workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS)
+        return None
+    ok = isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label()
+    return holder if ok else None
+
+
+def live_lock_holder(holder: "dict | None") -> "int | None":
+    """The pid of a live Sparrow holding `holder` with a fresh heartbeat, else None."""
+    pid = (holder or {}).get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None  # its holder crashed; the fresh status file is a corpse
+    except OSError:
+        pass
+    return pid if workspace_lock._is_fresh(holder, workspace_lock.DEFAULT_STALE_SECONDS) else None
+
+
+def _outside_sparrow(state_dir: Path, instance: str, main_pid: int, ran: bool) -> bool:
+    """Whether a Sparrow this service does not own polls the workspace now."""
+    holder = _lock_record(state_dir, instance)
+    if holder is not None:
+        pid = live_lock_holder(holder)
+        return pid is not None and pid != main_pid
     # No lock to read: a fresh status file is another Sparrow's only if this unit never ran.
     code, _ = check_sparrow(state_dir, instance=instance)
     return code != SPARROW_DOWN and not ran
@@ -389,8 +402,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     print(f"enabled: {SERVICE_NAME}" + (" (running)" if start or active else " (not started)"))
     if outside:
         note("Sparrow is already running outside systemd, so the service was enabled but not "
-             "started, and the running Sparrow was left alone. To switch over, stop that "
-             f"ag2-sparrow process, then run: systemctl --user start {SERVICE_NAME}")
+             "started yet; install replaces that Sparrow with the service below")
     elif not has_token:
         note(f"{device_env} is missing, so the service was not started. Put your relay token "
              f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
@@ -481,10 +493,15 @@ def install(args) -> int:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
+    if args.no_start:
+        rc = 0
+        print("skipped: starting and checking Sparrow (--no-start)")
+    else:
+        rc = keepalive.ensure_sparrow(read_config(config_path()), not args.no_keepalive)
     print(f"\nNext: register the hook with hooks.add using {definitions_dir() / f'{HOOK_ID}.json'}, "
-          "test it with hooks.dry_run, start it with hooks.enable, check that Hatch's scheduled "
-          f"tasks list {keepalive.TASK}, then run: ag2-sparrow-hatch verify")
-    return 0
+          f"test it with hooks.dry_run, start it with hooks.enable, create the {keepalive.TASK} "
+          "scheduled task as REQUIRED above, then run: ag2-sparrow-hatch verify")
+    return rc
 
 
 def _check(results: list, ok: bool, name: str, detail: str) -> None:
@@ -621,11 +638,19 @@ def verify(_args) -> int:
 
     from . import keepalive
     line, row = keepalive.status_line(cfg)
-    hint = (f" (no {keepalive.TASK} task is installed)" if row is None else
-            f" ({keepalive.TASK} has not run yet)" if row["condition"] == "unknown" else
-            f" ({keepalive.TASK} has not run in the last {keepalive.STALE_S // 60} minutes; "
-            "check Hatch's scheduled tasks)" if row["condition"] != "healthy" else "")
-    print(f"NOTE keepalive: {line}{hint}")
+    never = keepalive.last_keepawake(keepalive.log_path(cfg)) is None
+    task, step = keepalive.TASK, keepalive.register_step(cfg)
+    if row is None:
+        print(f"NOTE keepalive: {line} (no {task} task is installed)")
+    elif row["condition"] == "abnormal":
+        _check(results, False, "keepalive", f"{line}; " + (
+            f"{task} has never run: {step}" if never else
+            f"{task} has not run in the last {keepalive.STALE_S // 60} minutes; check that "
+            f"your scheduler still lists it, else {step}"))
+    elif row["condition"] == "unknown":
+        print(f"NOTE keepalive: {line} ({task} has not run yet; unless you already did, {step})")
+    else:
+        print(f"NOTE keepalive: {line}")
 
     mxid = cfg.get("AGENT_MXID") or "@your-agent:ag2.space"
     print(f"\nManual test: from another account, mention {mxid} in an AG2 Space room. Within a "
@@ -822,6 +847,8 @@ def main(argv=None) -> int:
                    "systemd user service that restarts Sparrow")
     p.add_argument("--no-keepalive", action="store_true", help="do not schedule the keepalive "
                    "task")
+    p.add_argument("--no-start", action="store_true", help="do not start, replace or check "
+                   "Sparrow (keep it running another way)")
     p.add_argument("--cron-dir", help="where Hatch reads scheduled tasks (default: "
                    "~/workspace/cron.d/minutely)")
     p.add_argument("--keepalive-log", help="the keepalive log (default: "

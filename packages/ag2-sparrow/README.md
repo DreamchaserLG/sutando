@@ -264,19 +264,20 @@ Paste this to the Hatch agent, with its MXID filled in:
 > Install the AG2 Space listener: `pip install "ag2-sparrow[hatch]"`. Put my
 > relay token in `~/.config/ag2-sparrow/relay.env` as one line
 > `REMOTE_TASK_TOKEN=<token>`, and `chmod 600` it. Run
-> `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`; where systemd is
-> available it sets Sparrow up as a user service that restarts by itself. If it
-> prints `NOTE service: systemctl --user is not available`, start Sparrow in the
-> background with `AG2_DEVICE_ENV="$HOME/.config/ag2-sparrow/relay.env"
-> REMOTE_HEALTH_COMMAND="ag2-sparrow-hatch keepalive health" ag2-sparrow` and
-> keep it running. Register the hook with `hooks.add` from the definition file
-> install names, check it with `hooks.dry_run`, start it with `hooks.enable`.
-> Install also adds one scheduled task, `sparrow-keepawake` (every 15 minutes),
-> under `~/workspace/cron.d/minutely/`, and removes the `sparrow-watchdog` and
-> `keepalive-probe` tasks an earlier install wrote; check that your scheduled
-> tasks list `sparrow-keepawake` and neither of the other two. If install prints
-> `NOTE keepalive:` about a task you made yourself, tell me before re-running
-> with `--force`. Then run `ag2-sparrow-hatch verify` and show me its output.
+> `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`. It starts Sparrow
+> (as a user service where systemd is available), replaces a Sparrow an earlier
+> version left running, and ends by checking Sparrow is connected; if it exits
+> non-zero, show me its output and stop. Register the hook with `hooks.add`
+> from the definition file install names, check it with `hooks.dry_run`, start
+> it with `hooks.enable`. Then create a scheduled task in your scheduler: name
+> `sparrow-keepawake`, every 15 minutes, running the exact command install
+> prints on its `REQUIRED keepalive:` line (`timeout 120
+> /absolute/path/to/ag2-sparrow-hatch keepalive keepawake`). A file on disk is
+> not a scheduled task: confirm `sparrow-keepawake` appears in your scheduled
+> task list, and that `sparrow-watchdog` and `keepalive-probe` do not. If
+> install prints `NOTE keepalive:` about a task you made yourself, tell me
+> before re-running with `--force`. Then run `ag2-sparrow-hatch verify` and
+> show me its output.
 
 The token stays out of the hook, its config and the wake payload. Sparrow
 reads `REMOTE_TASK_TOKEN` from its environment or, failing that, from the
@@ -293,7 +294,7 @@ relay rejects the token. Keep the `.env` file mode 600.
 | `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND`, `CRON_DIR`, `KEEPALIVE_LOG` (mode 600) |
 | `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
 | `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
-| `~/workspace/cron.d/minutely/sparrow-keepawake__interval@15m.md` | the keepalive's Hatch scheduled task (see [Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)), unless you pass `--no-keepalive`; install removes the `sparrow-watchdog` and `keepalive-probe` tasks an earlier install wrote |
+| `~/workspace/cron.d/minutely/sparrow-keepawake__interval@15m.md` | the keepalive's install record (see [Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)): health is timed from it until the first run, and it holds the command. Hatch's scheduler does not run it; the agent registers the task itself. Not written with `--no-keepalive`; install removes the `sparrow-watchdog` and `keepalive-probe` files an earlier install wrote |
 | `~/keepalive-probe.log` | one line per keepawake run, appended by the task (`--keepalive-log` moves it) |
 
 `TASK_DIR`, `RESULT_DIR` and `STATE_DIR` are resolved the way `ag2-sparrow`
@@ -310,7 +311,8 @@ instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
 script, the hook definition, the config, the task dir, Sparrow itself, the
 reply command (the absolute path `install` recorded, still executable; `install`
 refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, a `NOTE keepalive:`
-line with the keepalive state and the health row Sparrow reports (not counted), plus a `service`
+line with the keepalive state and the health row Sparrow reports (a `FAIL keepalive:` line,
+counted, once the row is abnormal, naming the command to register), plus a `service`
 line: `PASS` when `ag2-sparrow.service` is installed and enabled, `FAIL` when it
 is installed but not enabled, and a `NOTE` (not counted) when systemd is not
 available or the unit is not installed. It exits non-zero on any
@@ -376,14 +378,15 @@ stdin, so over SSH a polkit check fails at once instead of waiting for a
 password:
 
 - No systemd user manager (macOS, a container, no user bus): nothing is
-  written. Keep `ag2-sparrow` running another way.
+  written, and `install` starts Sparrow in the background itself (see below).
 - Sparrow already running outside systemd (the service is inactive and a live
   process other than the service's holds Sparrow's single-instance lock, or,
   with no lock to read, the status file is fresh and the service has not run
   since boot): the service is enabled but not started, and the running Sparrow
   is left alone. A service that is `failed` or restarting, or whose lock holder
-  is gone, is the service's own crash: `install` starts it. To switch over, stop that process, then run
-  `systemctl --user start ag2-sparrow.service`. Starting both is harmless:
+  is gone, is the service's own crash: `install` starts it. `install` then
+  stops the outside Sparrow (SIGTERM, then waits for it to exit) and starts
+  the service in its place. Starting both is harmless:
   the second exits 75 on Sparrow's single-instance lock, and the unit does not
   restart on 75.
 - The `.env` file is missing: the service is enabled but not started; create
@@ -422,6 +425,24 @@ when Sparrow is not running and 11 when it is running but not connected. The
 - Any other result (the check itself failed) logs `ag2-sparrow-hatch sparrow
   check failed` with its exit code and leaves the heartbeat as it is.
 
+### Install leaves Sparrow running
+
+An upgrade never needs Sparrow stopped by hand. After writing its files,
+`install` makes sure one Sparrow runs with the environment it wrote:
+
+- With the user service: a changed unit is restarted, as above, and an
+  inactive one is started, after stopping a Sparrow running outside it.
+- Without one: a Sparrow that runs without `REMOTE_HEALTH_COMMAND` in its
+  environment (read from `/proc`) is stopped with SIGTERM and started again the
+  way the keepawake task starts it, which sets it. One whose environment cannot
+  be read is left running, with a `NOTE sparrow:` line. If none runs, one is
+  started.
+
+It then waits up to 30 seconds for Sparrow's status file to say it is running
+and connected, and exits non-zero with an `error:` line saying why when it
+does not, for example a rejected token. `--no-start` skips this step for a
+Sparrow you keep running another way.
+
 ### Keepalive: one scheduled task and the health panel
 
 The user service restarts a Sparrow that crashes, but not one left `failed` by
@@ -429,11 +450,16 @@ its start limit, one hung with a stale status file, a stopped unit, or a
 Sparrow on a host with no systemd user manager. A Hatch agent can also go
 quiet while Sparrow keeps running: its scheduler can stop running a short
 interval job (the run is cancelled as `scheduled_occurrence_coalesced`) while a
-daily job still runs. `install` therefore adds one Hatch scheduled task,
-`sparrow-keepawake`, every 15 minutes. It is a short note telling the scheduled
-run to execute one command, under `timeout 120`, and nothing else:
-`ag2-sparrow-hatch keepalive keepawake` (the path install recorded). The run
-itself is what keeps the agent awake. The command reads the same status file
+daily job still runs. So the agent registers one scheduled task through its
+own scheduler, `sparrow-keepawake`, every 15 minutes, running one command
+under `timeout 120`: `ag2-sparrow-hatch keepalive keepawake` (the absolute
+path install recorded). `install` prints that exact command on a `REQUIRED
+keepalive:` line. Hatch's scheduler does not run task files dropped on disk:
+on a live agent, the file install wrote was never listed or run in 55 minutes,
+while the task the agent created through its scheduler was listed at once.
+`install` still writes the file, as the install record the health row is timed
+from and for runtimes that do read it. The run itself is what keeps the agent
+awake. The command reads the same status file
 as `verify`. Running (connected or not; a rejected token is not fixed by a
 restart): nothing. Not running: it restarts Sparrow with `systemctl --user
 reset-failed` and `systemctl --user restart ag2-sparrow` when the service

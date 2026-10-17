@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from ag2_sparrow import health_command as hc, outbox  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 REAL_SYSTEMD_RUN = hatch_cli._systemd_run
+REAL_ENSURE_SPARROW = keepalive.ensure_sparrow
 
 # The CLIs run in-process so repository coverage traces them.
 SCRIPT = HATCH / "ag2-sparrow-hatch.sh"
@@ -140,6 +142,10 @@ class Base(unittest.TestCase):
         systemd = mock.patch.object(hatch_cli, "_systemd_run", return_value=None)
         systemd.start()
         self.addCleanup(systemd.stop)
+        # Nor does install start a Sparrow, unless a test asks for the real step.
+        ensure = mock.patch.object(keepalive, "ensure_sparrow", return_value=0)
+        ensure.start()
+        self.addCleanup(ensure.stop)
 
     def add_task(self, tid, event_id, sender="@bob:ag2.space", thread_root=None, mtime=None,
                  text=None, **kw):
@@ -1247,7 +1253,7 @@ class Service(Base):
                                     "host": hatch_cli.workspace_lock._host_label(),
                                     "heartbeat_at": int(time.time()) - heartbeat_age}))
 
-    def test_a_sparrow_already_running_outside_systemd_is_left_alone(self):
+    def test_a_sparrow_already_running_outside_systemd_is_not_started_over(self):
         self.sparrow_status(age_s=5)
         self.lock(os.getpid())  # a live pid the unit does not own
         fake = FakeSystemd(ran=True)
@@ -1256,7 +1262,7 @@ class Service(Base):
         self.assertEqual(fake.ran("enable"), [["--user", "enable", "ag2-sparrow.service"]])
         self.assertEqual([c for c in fake.calls if c[1:2] in (["stop"], ["kill"], ["restart"])], [])
         self.assertIn("already running outside systemd", r.stdout)
-        self.assertIn("systemctl --user start ag2-sparrow.service", r.stdout)
+        self.assertIn("install replaces that Sparrow with the service below", r.stdout)
         # Without a lock file, a fresh status file counts only when the unit never ran.
         (self.state / "locks" / "gateway-bridge.lock").unlink()
         fake = FakeSystemd()
@@ -1388,7 +1394,13 @@ class Keepalive(Base):
         self.assertTrue(text.startswith(keepalive.TASK_MARKER))
         self.assertIn(f"\ntimeout {keepalive.RUN_TIMEOUT_S} {self.reply_stub} keepalive "
                       "keepawake\n", text)
-        self.assertIn("keepalive: sparrow-keepawake scheduled every 15 minutes", r.stdout)
+        self.assertIn(f"keepalive: {self.task} is the install record health is timed from; "
+                      "Hatch's scheduler does not run it.", r.stdout)
+        self.assertIn("REQUIRED keepalive: create a scheduled task through your scheduler (a "
+                      "file on disk is not enough): name sparrow-keepawake, every 15 minutes, "
+                      f"running exactly: timeout 120 {self.reply_stub} keepalive keepawake ; then "
+                      "confirm it appears in your scheduled task list\n", r.stdout)
+        self.assertIn("create the sparrow-keepawake scheduled task as REQUIRED above", r.stdout)
         self.assertIn("KEEPALIVE_LOG=''", (self.home / ".config" / "ag2-sparrow-hatch" /
                                             "config").read_text())
         self.assertIn(f"unchanged: {self.task}", self.installed().stdout)
@@ -1635,14 +1647,147 @@ class Keepalive(Base):
         self.installed()
         self.assertRegex(self.cli("verify").stdout, r"NOTE keepalive: \S+Z listener=down "
                          r"last_keepawake=never health=unknown \(sparrow-keepawake has not run "
-                         r"yet\)\n")
+                         r"yet; unless you already did, create a scheduled task through your "
+                         r"scheduler ")
         self.age_task(keepalive.STALE_S + 60)
-        self.assertRegex(self.cli("verify").stdout, r"health=abnormal \(keepawake-not-running\) "
-                         r"\(sparrow-keepawake has not run in the last 30 minutes; check")
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1)
+        self.assertRegex(r.stdout, r"\nFAIL keepalive: \S+Z listener=down last_keepawake=never "
+                         r"health=abnormal \(keepawake-not-running\); sparrow-keepawake has never "
+                         r"run: create a scheduled task through your scheduler .* running exactly: "
+                         rf"timeout 120 {re.escape(str(self.reply_stub))} keepalive keepawake ;")
+        self.keepawake_at(time.time() - keepalive.STALE_S - 60)
+        self.assertIn("sparrow-keepawake has not run in the last 30 minutes; check that your "
+                      "scheduler still lists it, else create", self.cli("verify").stdout)
         self.installed("--no-keepalive")
         self.task.unlink()
         self.assertIn("health=none (no sparrow-keepawake task is installed)",
                       self.cli("verify").stdout)
+
+
+class StartSparrow(Base):
+    """install leaves a Sparrow running and connected, with no manual stop on an upgrade."""
+    cli, state = Cli.cli, Cli.state
+    crons = Keepalive.crons
+    task = Keepalive.task
+
+    def setUp(self):
+        super().setUp()
+        self.seen = self.home / "sparrow-seen"
+        # Stands in for ag2-sparrow: reports itself connected, records its env, stays up.
+        executable(self.bin / hatch_cli.SPARROW_COMMAND,
+                   '#!/bin/sh\necho "$REMOTE_HEALTH_COMMAND" > ' + str(self.seen) + "\n"
+                   'printf \'{"connected": true, "ts": %s, "error": null}\' "$(date +%s)" > '
+                   '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
+        for name, value in (("SPAWN_SETTLE_S", 0.3), ("START_WAIT_S", 5.0), ("STOP_WAIT_S", 5.0)):
+            p = mock.patch.object(keepalive, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def install(self, *extra):
+        with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
+            return self.cli("install", "--mxid", AGENT, "--no-service", *extra)
+
+    def old_sparrow(self):
+        """A live process holding Sparrow's lock, reaped as soon as it exits."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        threading.Thread(target=proc.wait, daemon=True).start()
+        path = self.state / "locks" / "gateway-bridge.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"role": "gateway-bridge", "pid": proc.pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "heartbeat_at": int(time.time())}))
+        (self.state / "gateway-status.json").write_text(json.dumps(
+            {"connected": True, "ts": int(time.time()) - 5, "error": None}))
+        return proc
+
+    def wait_for(self, path):
+        deadline = time.monotonic() + 5
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return path.read_text().strip()
+
+    def test_nothing_running_install_starts_sparrow_with_the_health_command(self):
+        r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("started: started ", r.stdout)
+        self.assertIn("sparrow: running and connected", r.stdout)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def test_a_sparrow_without_the_health_command_is_replaced(self):
+        old = self.old_sparrow()
+        with mock.patch.object(keepalive, "sparrow_env", return_value={"HOME": "x"}):
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"replacing: Sparrow (pid {old.pid}) runs without REMOTE_HEALTH_COMMAND",
+                      r.stdout)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def test_a_sparrow_that_has_it_is_left_running(self):
+        old = self.old_sparrow()
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "sparrow_env",
+                               return_value={"REMOTE_HEALTH_COMMAND": want}):
+            r = self.install()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIsNone(old.poll())
+        self.assertFalse(self.seen.exists())
+        self.assertIn("sparrow: running and connected", r.stdout)
+
+    def test_the_outside_sparrow_is_replaced_by_the_installed_service(self):
+        old = self.old_sparrow()
+        unit = self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME
+        unit.parent.mkdir(parents=True)
+        unit.write_text(hatch_cli.SERVICE_MARKER + "\n[Service]\n")
+        fake = FakeSystemd(state="inactive")
+        real_which = shutil.which
+
+        def restarted(cmd):
+            if cmd[2:3] == ["restart"]:
+                (self.state / "gateway-status.json").write_text(json.dumps(
+                    {"connected": True, "ts": int(time.time()) + 1, "error": None}))
+            return fake(cmd)
+        with mock.patch.object(hatch_cli, "_systemd_run", side_effect=restarted), \
+                mock.patch.object(hatch_cli.shutil, "which", side_effect=lambda n, *a, **k:
+                                  "/usr/bin/systemctl" if n == "systemctl" else real_which(n)):
+            r = self.call_ensure()
+        self.assertEqual(r, 0)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+
+    def call_ensure(self):
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:{os.environ['PATH']}"}
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return REAL_ENSURE_SPARROW(hatch_cli._installed_config(), True)
+
+    def test_install_fails_loudly_when_sparrow_does_not_connect(self):
+        executable(self.bin / hatch_cli.SPARROW_COMMAND,
+                   '#!/bin/sh\nprintf \'{"connected": false, "ts": %s, "error": "401"}\' "$(date +%s)" > '
+                   '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
+        with mock.patch.object(keepalive, "START_WAIT_S", 1.0):
+            r = self.install()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("error: Sparrow is not running and connected 1s after install: Sparrow is "
+                      "running but not connected: 401", r.stderr)
+
+    def test_no_start_skips_the_step(self):
+        r = self.install("--no-start")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("skipped: starting and checking Sparrow (--no-start)", r.stdout)
+        self.assertFalse(self.seen.exists())
+
+    @unittest.skipUnless(Path("/proc/self/environ").exists(), "needs /proc")
+    def test_sparrow_env_reads_a_sparrow_process_only(self):
+        self.assertIsNone(keepalive.sparrow_env(os.getpid()), "not a Sparrow command line")
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
+                                 "ag2-sparrow"], env={"REMOTE_HEALTH_COMMAND": "x y"})
+        self.addCleanup(proc.kill)
+        time.sleep(0.2)
+        self.assertEqual(keepalive.sparrow_env(proc.pid), {"REMOTE_HEALTH_COMMAND": "x y"})
 
 
 HEARTBEAT = """
@@ -1692,6 +1837,12 @@ class HealthCommand(Base):
                                side_effect=subprocess.TimeoutExpired("x", 10)) as run:
             self.assertEqual(hc.run("x"), (None, "timed out after 10s"))
         self.assertEqual(run.call_args.kwargs["timeout"], 10.0)
+
+    def test_the_error_quotes_the_last_line_of_long_stderr(self):
+        path = self.bin / "noisy"
+        executable(path, "#!/bin/sh\nhead -c 6000 /dev/zero | tr '\\0' x >&2\n"
+                   "echo >&2\necho 'the real reason' >&2\nexit 1\n")
+        self.assertEqual(hc.run(str(path)), (None, "exited 1: the real reason"))
 
     def test_stdout_is_read_only_up_to_its_bound(self):
         big = json.dumps({**self.ROW, "pad": "x" * hc.MAX_OUTPUT})
