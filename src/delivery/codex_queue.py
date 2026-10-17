@@ -17,6 +17,7 @@ CLI (exit codes are the contract task-notifier.sh reads):
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -70,11 +71,24 @@ def resolve_thread(engine: str, socket: str, session: str, run=subprocess.run) -
     return discovery_code, discovery_err
 
 
+def lock_fds() -> tuple[int, ...]:
+    """The notifier's inherited lock fd, passed on so `codex queue` holds the lock until it exits."""
+    fd = os.environ.get("SUTANDO_NOTIFIER_LOCK_FD", "")
+    if not fd.isdigit():
+        return ()
+    try:
+        os.fstat(int(fd))
+    except OSError:
+        return ()
+    return (int(fd),)
+
+
 def send(thread: str, message: str, run=subprocess.run) -> tuple[int, str]:
     if not thread or not message:
         return QUEUE_FAILED, "empty thread or message"
     try:
-        r = run(queue_argv(thread, message), capture_output=True, text=True, timeout=TIMEOUT_S)
+        r = run(queue_argv(thread, message), capture_output=True, text=True, timeout=TIMEOUT_S,
+                pass_fds=lock_fds())
     except OSError as exc:
         return QUEUE_FAILED, f"codex queue did not start: {exc}"
     except subprocess.TimeoutExpired:

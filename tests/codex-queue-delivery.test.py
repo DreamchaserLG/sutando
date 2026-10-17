@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -213,6 +214,73 @@ class CliTests(unittest.TestCase):
         self.assertEqual(codex_queue.send("", "m", run=run)[0], codex_queue.QUEUE_FAILED)
         self.assertEqual(codex_queue.send("t", "", run=run)[0], codex_queue.QUEUE_FAILED)
         self.assertEqual(run.calls, [])
+
+
+class LockFdTests(unittest.TestCase):
+    def _send_kwargs(self, env_value):
+        old = os.environ.get("SUTANDO_NOTIFIER_LOCK_FD")
+        try:
+            if env_value is None:
+                os.environ.pop("SUTANDO_NOTIFIER_LOCK_FD", None)
+            else:
+                os.environ["SUTANDO_NOTIFIER_LOCK_FD"] = env_value
+            run = Recorder(Done(0, "ok"))
+            codex_queue.send("t", "m", run=run)
+            return run.calls[0][1]
+        finally:
+            if old is None:
+                os.environ.pop("SUTANDO_NOTIFIER_LOCK_FD", None)
+            else:
+                os.environ["SUTANDO_NOTIFIER_LOCK_FD"] = old
+
+    def test_codex_queue_is_handed_the_inherited_lock_fd(self):
+        r, w = os.pipe()
+        self.addCleanup(os.close, r)
+        self.addCleanup(os.close, w)
+        self.assertEqual(self._send_kwargs(str(r))["pass_fds"], (r,))
+
+    def test_no_lock_fd_is_passed_when_none_is_inherited(self):
+        r, w = os.pipe()
+        os.close(r)
+        os.close(w)
+        for value in (None, "", "junk", str(r)):
+            self.assertEqual(self._send_kwargs(value)["pass_fds"], (), value)
+
+    def test_a_codex_queue_outliving_the_notifier_holds_off_a_successor(self):
+        # The notifier and codex_queue.py are killed; the `codex queue` child they left must keep the lock.
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", "--", str(tmp)]))
+        started, release, lock = tmp / "started", tmp / "release", str(tmp / "notifier.lock")
+        (tmp / "bin").mkdir()
+        fake = tmp / "bin" / "codex"
+        fake.write_text(f'#!/bin/bash\necho $$ > "{started}"\n'
+                        f'while [ ! -e "{release}" ]; do sleep 0.05; done\necho "Queued message"\n')
+        fake.chmod(0o755)
+        env = {"PATH": f"{tmp / 'bin'}:/usr/bin:/bin", "HOME": str(tmp)}
+        helper = REPO / "src" / "delivery" / "notifier_lock.py"
+        queue = REPO / "src" / "delivery" / "codex_queue.py"
+        first = subprocess.Popen(
+            [sys.executable, str(helper), "--lock", lock, "--", "bash", "-c",
+             f'"{sys.executable}" "{queue}" send --thread t --message m'],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 15
+        while not started.exists():
+            self.assertLess(time.monotonic(), deadline, "codex queue never started")
+            time.sleep(0.02)
+        codex_pid = int(started.read_text())
+        py_pid = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(codex_pid)], capture_output=True,
+                                    text=True).stdout.strip())
+        self.addCleanup(lambda: release.touch())
+        for pid in (first.pid, py_pid):
+            os.kill(pid, 9)
+        first.wait(timeout=30)
+        successor = subprocess.run([sys.executable, str(helper), "--lock", lock, "--timeout", "1", "--", "true"],
+                                   env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(successor.returncode, 75, "a successor ran while the old codex queue held the lock")
+        release.touch()
+        successor = subprocess.run([sys.executable, str(helper), "--lock", lock, "--timeout", "15", "--", "true"],
+                                   env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(successor.returncode, 0, successor.stderr)
 
 
 if __name__ == "__main__":

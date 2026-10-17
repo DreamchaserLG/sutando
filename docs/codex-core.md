@@ -100,8 +100,9 @@ Only one core notifier runs per workspace. The notifier re-executes itself under
 `src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
 `state/codex-notifier.lock` on fd 9. The notifier and every child it starts inherit that fd, so
 the lock is held until the last of them exits, `kill -9` included, and the kernel then drops it;
-no lock is ever left behind. A child that outlives a killed notifier (a `tmux` call, a Python
-helper, a `codex queue` send) could still deliver, so the next notifier waits for it on purpose:
+no lock is ever left behind. `codex_queue.py` passes fd 9 on to the `codex queue` it starts. A
+child that outlives a killed notifier (a `tmux` call, a Python helper, a `codex queue` send) could
+still deliver, so the next notifier waits for it on purpose:
 the lock is the fence, with no pid records and nothing killed. Those children are short-lived and
 bounded by their own timeouts. A wait is logged, and `health-check.py` reports one that lasts.
 At startup the notifier confirms that the inherited fd really holds this workspace's lock before
