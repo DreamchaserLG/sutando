@@ -15,7 +15,7 @@
     "secrets": ["GEMINI_API_KEY", "GEMINI_VOICE_API_KEY"]
   },
   "config": {
-    "IMAGE_MODEL": "gemini-nano-banana-2.1",
+    "IMAGE_MODEL": "gemini-3.1-flash-image",
     "VIDEO_MODEL": "veo-3.1-generate-preview"
   },
   "provenance": {

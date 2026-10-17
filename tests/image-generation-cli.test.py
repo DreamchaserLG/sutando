@@ -447,26 +447,28 @@ class InputsAndOutputs(Base):
         self.assertEqual(Path(line["path"]).suffix, ".png", "an unknown extension is never a mislabel")
 
     def test_a_jpeg_response_to_the_default_png_output_is_never_mislabelled(self):
-        """gemini-nano-banana-2.1 (the default, no --model) returns image/jpeg; the default output
-        path is always .png (output_path(None, ".png")). Without this, save_image's wanted/returned
-        branching skipped PNG entirely and wrote raw JPEG bytes under a .png name. Uses real JPEG
-        bytes (not the PNG fixture mislabelled) so the no-Pillow branch's byte check is meaningful,
-        and pins the literal model id in the captured request URL, not the mutable DEFAULT_IMAGE_MODEL
-        symbol, so this test still fails if the default is accidentally changed."""
+        """gemini-nano-banana-2.1 (opt-in via --model; it genuinely returns image/jpeg regardless of
+        the requested extension, unlike the default gemini-3.1-flash-image) with the default output
+        path .png (output_path(None, ".png")). Without this, save_image's wanted/returned branching
+        skipped PNG entirely and wrote raw JPEG bytes under a .png name. Uses real JPEG bytes (not the
+        PNG fixture mislabelled) so the no-Pillow branch's byte check is meaningful, and pins the
+        literal model id in the --model flag and the captured request URL, not the mutable
+        DEFAULT_IMAGE_MODEL/NANO_BANANA_IMAGE_MODEL symbols, so this test still fails if either
+        constant is accidentally changed."""
         FakeImage.saved.clear()
         parts = [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(JPEG).decode()}}]
         with mock.patch.dict(sys.modules, fake_pil()):
-            rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+            rc, line = self.run_main("--prompt", "x", "--model", "gemini-nano-banana-2.1", opener=self.opener(response(parts)))
         self.assertEqual(rc, 0)
         self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"),
-                          "pin the literal default model id, not the DEFAULT_IMAGE_MODEL symbol")
+                          "pin the literal model id, not the mutable symbols")
         path = Path(line["path"])
         self.assertEqual(path.suffix, ".png")
         self.assertEqual(path.read_bytes(), b"FAKE-PNG", "converted to real PNG bytes, not raw JPEG under .png")
         self.assertEqual(FakeImage.saved, [("PNG", None)])
         self.calls.clear()
         with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
-            rc, line = self.run_main("--prompt", "x", opener=self.opener(response(parts)))
+            rc, line = self.run_main("--prompt", "x", "--model", "gemini-nano-banana-2.1", opener=self.opener(response(parts)))
         self.assertEqual(self.calls[0].full_url, gen.ENDPOINT.format(model="gemini-nano-banana-2.1"))
         path = Path(line["path"])
         self.assertEqual(path.suffix, ".jpg", "no Pillow: suffix follows the returned bytes, never .png")

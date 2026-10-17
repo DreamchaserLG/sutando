@@ -35,7 +35,8 @@ SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution:
 # makes); a copied install has no core tree, and every import below degrades to env-only.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
-DEFAULT_IMAGE_MODEL = "gemini-nano-banana-2.1"
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
+NANO_BANANA_IMAGE_MODEL = "gemini-nano-banana-2.1"  # newer release than the default; genuinely returns JPEG, not PNG — select via --model/IMAGE_MODEL
 PRO_IMAGE_MODEL = "gemini-3-pro-image"  # higher quality/cost tier ("Nano Banana Pro"); select via --model/IMAGE_MODEL
 DEFAULT_VIDEO_MODEL = "veo-3.1-generate-preview"
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -344,7 +345,7 @@ def main(argv: list[str] | None = None, opener=None) -> int:
     ap.add_argument("--prompt", "-p", required=True, help="Text prompt")
     ap.add_argument("--input", "-i", action="append", default=[], help="Input image path(s) to edit or reference")
     ap.add_argument("--output", "-o", default=None, help="Output file path (default: <workspace>/results/media/generated-<ts>.png|.mp4)")
-    ap.add_argument("--model", "-m", default=None, help=f"Model id (default: IMAGE_MODEL / VIDEO_MODEL from env or the manifest; pass {PRO_IMAGE_MODEL!r} for the higher quality/cost image tier)")
+    ap.add_argument("--model", "-m", default=None, help=f"Model id (default: IMAGE_MODEL / VIDEO_MODEL from env or the manifest; pass {NANO_BANANA_IMAGE_MODEL!r} for the newer Nano Banana 2.1 release, or {PRO_IMAGE_MODEL!r} for the higher quality/cost image tier)")
     ap.add_argument("--quality", "-q", type=int, default=90, help="JPEG/WEBP quality 1-100 when converting with Pillow (default: 90)")
     ap.add_argument("--video", "-v", action="store_true", help="Generate a video instead of an image (needs google-genai)")
     ap.add_argument("--aspect", default=None, help="Video aspect ratio: 16:9 (default) or 9:16")
