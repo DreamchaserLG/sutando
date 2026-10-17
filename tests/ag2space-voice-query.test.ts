@@ -385,6 +385,17 @@ describe('to_me without the owner\'s inbox: what mentions or answers the owner i
 		assert.equal(limits.length, 1);
 	});
 
+	it('a message the server withholds (body null, a conversation this agent is not in) is counted, said as not shown, and matches no word', async () => {
+		// 2026-10-16: Yixuan's direct message to the owner came with body null and was dropped as malformed.
+		const dm = item(1, { room_id: '!dm:ag2.space', room_name: null, reason: 'dm', body: null, sender: { user_id: '@yixuan:ag2.space', display_name: 'Yixuan Zhai' } });
+		const f = fake((_n, a) => (a.action === 'mentions.inbox' ? ok({ result: { mentions: [dm], next_cursor: null, has_more: false, rooms_skipped: 0 } }) : ok({ result: { messages: [], cursor: null, owner: null } })), ROOMS3, { ownerId: OWNER, ownerScope: true });
+		const r = await queryMessages({ since: 'day' }, f.deps, () => NOW);
+		assert.ok(r.ok && r.count === 1);
+		if (r.ok) assert.deepEqual([r.latest[0].from, r.latest[0].why, r.latest[0].text], ['Yixuan Zhai', 'dm', '(not shown: you are not in that conversation)']);
+		const w = await queryMessages({ since: 'day', contains: 'conversation' }, f.deps, () => NOW);
+		assert.ok(w.ok && w.count === 0);
+	});
+
 	it('one malformed inbox item is skipped, never a crash', async () => {
 		const f = fake(() => ok({ result: { mentions: [null, 7, { sender: null }, item(1)], next_cursor: null, has_more: false, rooms_skipped: 0 } }));
 		const r = await queryMessages({}, f.deps, () => NOW);

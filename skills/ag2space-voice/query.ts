@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { fetchInbox, ownerInboxSupported, toInboxItems, type InboxWhose } from './inbox.js';
+import { INBOX_HIDDEN_TEXT, fetchInbox, ownerInboxSupported, toInboxItems, type InboxWhose } from './inbox.js';
 import { statusPath } from '../../src/workspace_default.js';
 import { listRooms, roomRead, targetRoom, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS, ROOM_READ_BODY_MAX, ROOM_READ_CALL_TIMEOUT_MS, type McpClient, type ReadRoomDeps, type RoomRef } from './room-read.js';
 
@@ -96,7 +96,7 @@ export function windowStart(since: QuerySince, key: string, now: number): number
 	}
 }
 
-interface Msg { ts: number; room: string; from: string; fromId: string; body: string; event_id: string; why?: string; mentions?: string[]; replyTo?: string }
+interface Msg { ts: number; room: string; from: string; fromId: string; body: string; event_id: string; why?: string; mentions?: string[]; replyTo?: string; hidden?: boolean }
 
 /** Why a room message is addressed to `owner`, by the rule the server's inbox uses: named in its mentions, or (with none) its id in the body; or a reply to the owner. */
 export function addressedTo(m: Pick<Msg, 'body' | 'mentions' | 'replyTo'>, owner: string): 'mention' | 'reply' | null {
@@ -324,13 +324,14 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 			const it = raw as { room_id?: unknown; sender?: { user_id?: unknown } | null; sent_at?: unknown; body?: unknown; replied?: unknown };
 			const ts = typeof it.sent_at === 'string' ? Date.parse(it.sent_at) : NaN;
 			const [line] = toInboxItems([raw]);
-			if (!line || !Number.isFinite(ts) || typeof it.body !== 'string') continue;
+			if (!line || !Number.isFinite(ts)) continue;
 			if (it.replied === true) replied.add(line.event_id);
 			if (typeof it.room_id === 'string' && scannedRooms.has(it.room_id)) continue;
 			if (args.unanswered_only && it.replied === true) continue;
 			const name = line.room.startsWith('!') ? names.get(line.room) ?? (line.why === 'dm' ? 'a direct message' : line.room) : line.room;
 			const sender = it.sender && typeof it.sender === 'object' && typeof it.sender.user_id === 'string' ? it.sender.user_id : '';
-			msgs.push({ ts, room: name, from: line.from, fromId: sender, body: it.body, event_id: line.event_id, why: line.why });
+			// A withheld message counts, and matches no word: its body is not known.
+			msgs.push({ ts, room: name, from: line.from, fromId: sender, body: typeof it.body === 'string' ? it.body : '', event_id: line.event_id, why: line.why, ...(line.hidden ? { hidden: true } : {}) });
 		}
 		return { ok: true, replied };
 	};
@@ -391,7 +392,7 @@ export async function queryMessages(args: QueryArgs, deps: ReadRoomDeps, now: ()
 	for (const m of msgs) { const k = groupKey(m, groupBy); counts.set(k, (counts.get(k) ?? 0) + 1); }
 	const groups = [...counts.entries()].sort((a, b) => (rank === 'most' ? b[1] - a[1] : a[1] - b[1])).slice(0, QUERY_MAX_GROUPS).map(([key, count]) => ({ key, count }));
 	const hit = (m: Msg): QueryHit => {
-		const text = m.body.replace(/\s+/g, ' ').trim();
+		const text = m.hidden ? INBOX_HIDDEN_TEXT : m.body.replace(/\s+/g, ' ').trim();
 		return { at: fmt(m.ts), room: m.room, from: m.from, text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text, event_id: m.event_id, ...(m.why ? { why: m.why } : {}) };
 	};
 	const latest = msgs.slice(0, latestN).map(hit);

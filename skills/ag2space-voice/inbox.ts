@@ -9,28 +9,34 @@ export const INBOX_MAX_PAGES = 5;
 /** How long the server's answer to "can a linked agent read its owner's inbox" is trusted. */
 export const OWNER_SCOPE_TTL_MS = 10 * 60_000;
 
-export interface InboxItem { at: string; room: string; from: string; text: string; why: string; event_id: string; answered?: boolean }
+export interface InboxItem { at: string; room: string; from: string; text: string; why: string; event_id: string; answered?: boolean; hidden?: boolean }
+
+/** Said in place of a message the server withholds: it reads no body from a room this agent is not in (a direct message to the owner). */
+export const INBOX_HIDDEN_TEXT = '(not shown: you are not in that conversation)';
 
 const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
 
-/** mentions.inbox items (oldest first) → newest-first lines the model can retell; malformed items are skipped. */
+/** mentions.inbox items (oldest first) → newest-first lines the model can retell; malformed items are skipped, a withheld body is said as hidden. */
 export function toInboxItems(items: unknown[], tz?: string): InboxItem[] {
 	const out: InboxItem[] = [];
 	for (const m of items) {
 		if (!m || typeof m !== 'object') continue;
 		const it = m as { room_id?: unknown; room_name?: unknown; event_id?: unknown; sender?: unknown; sent_at?: unknown; body?: unknown; reason?: unknown; replied?: unknown };
 		const eventId = str(it.event_id);
-		if (!eventId || typeof it.body !== 'string' || !it.body.trim()) continue;
+		// body null is the server withholding it (2026-10-16: a direct message from Yixuan was dropped as malformed); still a message.
+		const hidden = it.body === null;
+		if (!eventId || (!hidden && (typeof it.body !== 'string' || !it.body.trim()))) continue;
 		const sender = (it.sender && typeof it.sender === 'object' ? it.sender : {}) as { user_id?: unknown; display_name?: unknown };
 		const from = str(sender.display_name) ?? (str(sender.user_id) ?? '?').replace(/^@/, '').replace(/:.*$/, '');
 		const t = str(it.sent_at) ? Date.parse(it.sent_at as string) : NaN;
 		const at = Number.isFinite(t) ? new Date(t).toLocaleString('en-US', { timeZone: tz, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false, timeZoneName: 'short' }) : '';
-		const text = it.body.replace(/\s+/g, ' ').trim();
+		const text = hidden ? INBOX_HIDDEN_TEXT : (it.body as string).replace(/\s+/g, ' ').trim();
 		out.push({
 			at, room: str(it.room_name) ?? str(it.room_id) ?? '?', from,
 			text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text,
 			why: str(it.reason) ?? 'mention', event_id: eventId,
 			...(it.replied === true ? { answered: true } : {}),
+			...(hidden ? { hidden: true } : {}),
 		});
 	}
 	return out.reverse();
