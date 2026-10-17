@@ -23,6 +23,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+import owner_reply  # noqa: E402
 import runtime_compat as rc  # noqa: E402
 
 CLAUDE_FLAGS = " ".join(rc.RUNTIMES["claude"].required_flags)
@@ -119,11 +120,17 @@ class Discovery(Base):
         self.env["SUTANDO_RUNTIME_SYSTEM_DIRS"] = str(self.tmp / "sys")
         self.assertEqual(self.discover().selected.path, p)
 
-    def test_known_location_never_replaces_a_path_install(self):
+    def test_known_location_used_when_path_install_is_broken(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
-        fake_cli(self.home / ".local" / "bin" / "claude", "2.1.0")
+        good = fake_cli(self.home / ".local" / "bin" / "claude", "2.1.0")
         r = self.discover()
-        self.assertIsNone(r.selected)
+        self.assertEqual((r.selected.path, r.selected.source), (good, "known"))
+
+    def test_working_path_install_is_never_overridden_by_a_known_location(self):
+        first = fake_cli(self.bin1 / "claude", "2.0.5")
+        fake_cli(self.home / ".local" / "bin" / "claude", "2.9.0")
+        r = self.discover()
+        self.assertEqual(r.selected.path, first)
         self.assertEqual([c.source for c in r.candidates], ["PATH"])
 
     def test_too_old(self):
@@ -273,7 +280,7 @@ class Planner(Base):
         p = fake_cli(self.bin1 / "claude", "1.5.0")
         s = self.plan()
         self.assertEqual(s.command, f"{p} update")
-        self.assertIn(str(self.root), s.touches)
+        self.assertIn(str(self.root), s.assisted_touches)
 
     def test_plan_too_old_npm_install_updates_that_prefix(self):
         prefix = self.tmp / "npmprefix"
@@ -323,16 +330,43 @@ chmod +x "$PREFIX/bin/claude"
         self.assertEqual(self.discover().selected.source, "managed")
         self.assertEqual(list((self.root / "claude").glob(".staging-*")), [])
 
-    def test_reinstall_of_same_version_replaces_it(self):
+    def test_reinstall_of_same_version_keeps_the_live_target(self):
+        self.good_npm("2.3.0")
+        self.assertTrue(self.install().ok)
+        live = self.root / "claude" / "versions" / "2.3.0" / "bin" / "claude"
+        before = live.stat().st_ino
+        self.assertTrue(self.install().ok)
+        self.assertEqual(live.stat().st_ino, before)
+        self.assertTrue(any("reusing it" in m for m in self.said))
+
+    def test_reinstall_replaces_a_broken_copy_of_the_same_version(self):
+        broken = self.root / "claude" / "versions" / "2.3.0" / "bin" / "claude"
+        write_exe(broken, "exit 1\n")
+        self.good_npm("2.3.0")
+        r = self.install()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(self.discover().selected.version, "2.3.0")
+        self.assertEqual(list((self.root / "claude").glob(".replaced-*")), [])
+
+    def test_concurrent_installs_are_serialized(self):
+        import threading
+        sys.path.insert(0, str(REPO / "src"))
+        from file_lock import locked_file
         self.good_npm()
-        self.assertTrue(self.install().ok)
-        self.assertTrue(self.install().ok)
+        done = threading.Event()
+        (self.root / "claude").mkdir(parents=True)
+        with locked_file(self.root / "claude" / ".lock"):
+            t = threading.Thread(target=lambda: (self.install(), done.set()))
+            t.start()
+            self.assertFalse(done.wait(1.5))
+        t.join(30)
+        self.assertTrue(done.is_set())
 
     def test_npm_missing(self):
         self.env["PATH"] = str(self.tmp / "empty")
         r = self.install()
-        self.assertEqual(r.reason, "npm-missing")
-        self.assertIn("Node.js", r.user_action)
+        self.assertEqual(r.reason, "no-installer")
+        self.assertIn("claude.ai/install.sh", r.user_action)
 
     def test_disk_full_checked_before_download(self):
         marker = self.tmp / "npm-ran"
@@ -435,6 +469,27 @@ chmod +x "$PREFIX/bin/claude"
             rc.probe = orig
         self.assertEqual(r.reason, "verify-failed")
         self.assertIn("would not start", r.detail)
+        self.assertFalse(os.path.lexists(self.root / "bin" / "claude"))
+
+    def test_failed_post_swap_verify_restores_the_previous_link(self):
+        old = self.managed_version("2.1.0")
+        self.good_npm("2.3.0")
+        real = rc.probe
+
+        def probe(path, spec, **kw):
+            c = real(path, spec, **kw)
+            if kw.get("source") == "managed":
+                c.status, c.detail = rc.BROKEN, "would not start"
+            return c
+        orig, rc.probe = rc.probe, probe
+        try:
+            r = self.install()
+        finally:
+            rc.probe = orig
+        self.assertEqual(r.reason, "verify-failed")
+        self.assertIn("previous version was restored", r.detail)
+        self.assertEqual(os.readlink(self.root / "bin" / "claude"), str(old))
+        self.assertEqual(self.discover().selected.version, "2.1.0")
 
     def test_swap_link_replaces_stale_temp(self):
         target = self.tmp / "t"
@@ -560,6 +615,287 @@ class Ensure(Base):
         self.assertEqual(code, 0)
 
 
+class OwnerReply(Base):
+    """Off a terminal: one DM per incident, the owner's bare reply repairs, and the launch goes on."""
+
+    def setUp(self):
+        super().setUp()
+        self.ws = self.tmp / "ws"
+        for d in ("tasks", "results", "state"):
+            (self.ws / d).mkdir(parents=True)
+        self.repairs = 0
+
+    def notices(self):
+        return sorted((self.ws / "results").glob("proactive-runtime-compat-*.txt"))
+
+    def reply(self, text, name="task-100", tier="owner"):
+        path = self.ws / "tasks" / f"{name}.txt"
+        path.write_text(f"source: ag2space\nchannel_id: !dm:x\naccess_tier: {tier}\ntask: {text}\n")
+        return path
+
+    def ensure(self, runtime="claude", **kw):
+        kw.setdefault("say", self.said.append)
+        return rc.ensure(runtime, env=self.env, workspace=self.ws, notify_owner=True,
+                         repair=True, consent=lambda _q: False, **kw)
+
+    def counting_repair(self, *a, **k):
+        self.repairs += 1
+        return rc.assisted_install(*a, disk_usage=lambda _p: PLENTY, sleep=self.sleeps.append, **k)
+
+    def incident(self, runtime="claude"):
+        return json.loads((self.ws / "state" / f"runtime-compat-{runtime}.json").read_text())
+
+    def test_off_tty_queues_one_dm_per_incident(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.assertEqual(self.ensure()[0], rc.EXIT_UNUSABLE)
+        self.assertEqual(self.ensure()[0], rc.EXIT_UNUSABLE)
+        notices = self.notices()
+        self.assertEqual(len(notices), 1)
+        body = notices[0].read_text()
+        self.assertTrue(body.startswith("[dm-only]\n"))
+        self.assertIn('Reply "install compatible claude"', body)
+        self.assertIn(str(self.root), body)
+        self.assertIn("claude.ai/install.sh", body)
+        self.assertIn('"retry now"', body)
+        self.assertEqual(self.incident()["notice"], notices[0].name)
+
+    def test_dm_is_retried_under_the_same_name_until_queued(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        (self.ws / "results").rmdir()
+        (self.ws / "results").write_text("not a directory")
+        self.ensure()
+        self.assertFalse(self.incident()["notice_queued"])
+        name = self.incident()["notice"]
+        (self.ws / "results").unlink()
+        (self.ws / "results").mkdir()
+        self.ensure()
+        self.assertEqual([p.name for p in self.notices()], [name])
+        self.assertTrue(self.incident()["notice_queued"])
+
+    def test_owner_install_reply_repairs_answers_archives_and_continues(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        self.ensure(repair_fn=self.counting_repair)
+        task = self.reply("Install compatible claude.")
+        code, path = self.ensure(repair_fn=self.counting_repair)
+        self.assertEqual((code, path), (0, str(self.root / "bin" / "claude")))
+        self.assertEqual(self.repairs, 1)
+        answer = (self.ws / "results" / task.name).read_text()
+        self.assertIn("Installed claude 2.3.0", answer)
+        self.assertFalse(task.exists())
+        self.assertEqual(len(list((self.ws / "tasks" / "archive").rglob(task.name))), 1)
+        self.assertEqual(self.incident()["status"], "resolved")
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_reply_during_the_wait_continues_the_same_launch(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        clock = [0.0]
+
+        def sleep(s):
+            clock[0] += s
+            if not (self.ws / "tasks" / "task-200.txt").exists():
+                self.reply("install compatible claude", name="task-200")
+        code, path = self.ensure(repair_fn=self.counting_repair, wait_s=60, sleep=sleep,
+                                 now=lambda: clock[0])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.repairs, 1)
+        self.assertTrue((self.ws / "results" / "task-200.txt").exists())
+
+    def test_a_reply_is_acted_on_once(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self)
+        self.ensure()
+        task = self.reply("install compatible claude")
+        rec = self.incident()
+        rec["actions"] = [task.stem]
+        (self.ws / "state" / "runtime-compat-claude.json").write_text(json.dumps(rec))
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], rc.EXIT_UNUSABLE)
+        self.assertEqual(self.repairs, 0)
+
+    def test_retry_now_after_a_manual_fix(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        fake_cli(self.bin1 / "claude", "2.1.0")
+        task = self.reply("retry now")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], 0)
+        self.assertEqual(self.repairs, 0)
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
+
+    def test_failed_repair_is_answered_with_the_next_step(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        task = self.reply("install compatible claude")
+        blocked = rc.RepairResult(False, "blocked-download", "ENOTFOUND", "Check your network")
+        self.assertEqual(self.ensure(repair_fn=lambda *a, **k: blocked)[0], rc.EXIT_UNUSABLE)
+        text = (self.ws / "results" / task.name).read_text()
+        self.assertIn("That did not fix it", text)
+        self.assertIn("Check your network", text)
+
+    def test_retry_that_still_fails_says_why(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        task = self.reply("retry now")
+        self.ensure()
+        self.assertIn("still cannot start", (self.ws / "results" / task.name).read_text())
+
+    def test_other_text_non_owner_and_no_incident_are_ignored(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        early = self.reply("install compatible claude", name="task-001")
+        self.assertEqual(rc.Incident(self.ws, "claude").take_replies(), [])
+        self.ensure()
+        early.unlink()
+        self.reply("please install compatible claude", name="task-002")
+        self.reply("install compatible claude", name="task-003", tier="guest")
+        self.reply("install compatible codex", name="task-004")
+        self.ensure(repair_fn=self.counting_repair)
+        self.assertEqual(self.repairs, 0)
+        self.assertEqual(sorted(p.name for p in (self.ws / "results").glob("task-*.txt")), [])
+
+    def test_codex_login_dm_then_retry_now(self):
+        fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="", login_rc=1)
+        self.assertEqual(self.ensure("codex", enforce_auth=True)[0], rc.EXIT_LOGIN)
+        body = self.notices()[0].read_text()
+        self.assertIn("not logged in", body)
+        self.assertIn("codex login", body)
+        fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="")
+        task = self.reply("retry now")
+        self.assertEqual(self.ensure("codex", enforce_auth=True)[0], 0)
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
+        self.assertEqual(self.incident("codex")["status"], "resolved")
+
+    def test_owner_reply_helpers(self):
+        self.assertEqual(owner_reply.normalize("  Retry   NOW!! "), "retry now")
+        unreadable = self.ws / "tasks" / "task-9.txt"
+        self.assertIsNone(owner_reply.owner_reply_text(unreadable))
+        sys.path.insert(0, str(REPO / "src"))
+        orig = owner_reply.Path.read_text
+
+        def boom(self_, *a, **k):
+            if self_.name == "task-8.txt":
+                raise OSError("gone")
+            return orig(self_, *a, **k)
+        self.reply("retry now", name="task-8")
+        owner_reply.Path.read_text = boom
+        try:
+            self.assertIsNone(owner_reply.owner_reply_text(self.ws / "tasks" / "task-8.txt"))
+        finally:
+            owner_reply.Path.read_text = orig
+        self.assertTrue(str(owner_reply._ws(None)))
+
+    def test_main_workspace_fallback(self):
+        orig = rc._workspace
+        self.assertTrue(rc._workspace() is None or rc._workspace().name)
+        import workspace_default
+        real = workspace_default.resolve_workspace
+
+        def boom():
+            raise RuntimeError("no config")
+        workspace_default.resolve_workspace = boom
+        try:
+            self.assertIsNone(orig())
+        finally:
+            workspace_default.resolve_workspace = real
+
+
+class NoNode(Base):
+    """A clean machine: no npm and no Node on PATH, only the shell tools an installer uses."""
+
+    def setUp(self):
+        super().setUp()
+        self.tools = self.tmp / "tools"
+        self.tools.mkdir()
+        for name in ("bash", "sh", "mkdir", "chmod", "cat", "cp", "dirname", "printf"):
+            found = shutil.which(name)
+            if found:
+                os.symlink(found, str(self.tools / name))
+        self.env["PATH"] = f"{self.bin1}:{self.tools}"
+        self.bin1.mkdir()
+        self.native = self.home / ".local" / "bin" / "claude"
+
+    def fake_native_curl(self, version="2.4.0"):
+        """curl stub that prints an installer script; bash runs it the way the docs pipe it."""
+        script = (f'mkdir -p "$HOME/.local/bin"\n'
+                  f"cat > \"$HOME/.local/bin/claude\" <<'EOS'\n#!/bin/sh\n"
+                  f'case "$1" in --version) echo "{version} (Claude Code)";; --help) echo "{CLAUDE_FLAGS}";; esac\n'
+                  "EOS\nchmod +x \"$HOME/.local/bin/claude\"\necho \"channel=$1\" >> \"$HOME/install.log\"\n")
+        write_exe(self.bin1 / "curl", f'echo "$*" >> "$HOME/curl.log"\ncat <<\'EOF\'\n{script}EOF\n')
+
+    def test_no_installer_at_all_gives_a_manual_step(self):
+        s = rc.plan(self.discover(), root=self.root, env=self.env)
+        self.assertIsNone(s.assisted)
+        self.assertIn("claude.ai/install.sh", s.command)
+        c = rc.plan(self.discover("codex"), root=self.root, env=self.env)
+        self.assertIsNone(c.assisted)
+        self.assertIn("chatgpt.com/codex/install.sh", c.command)
+        self.assertIn("brew install --cask codex", c.command)
+
+    def test_claude_plan_without_npm_uses_the_native_installer_and_names_what_it_touches(self):
+        self.fake_native_curl()
+        s = rc.plan(self.discover(), root=self.root, env=self.env)
+        self.assertIsNotNone(s.assisted)
+        self.assertIn(str(self.native), s.assisted_touches)
+        self.assertIn(str(self.home / ".local" / "share" / "claude"), s.assisted_touches)
+        self.assertIn(str(self.root), s.assisted_touches)
+
+    def test_claude_native_install_without_node(self):
+        self.fake_native_curl("2.4.0")
+        r = self.install()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(os.readlink(self.root / "bin" / "claude"), str(self.native))
+        self.assertIn("https://claude.ai/install.sh", (self.home / "curl.log").read_text())
+        self.assertIn("channel=stable", (self.home / "install.log").read_text())
+        self.assertEqual(self.discover().selected.version, "2.4.0")
+
+    def test_native_install_that_does_not_run_is_not_success(self):
+        self.fake_native_curl("1.0.0")
+        r = self.install()
+        self.assertEqual(r.reason, "verify-failed")
+        self.assertFalse(os.path.lexists(self.root / "bin" / "claude"))
+
+    def test_native_install_blocked_download(self):
+        write_exe(self.bin1 / "curl", 'echo "curl: (6) Could not resolve host: claude.ai" >&2; exit 6\n')
+        r = self.install(attempts=2)
+        self.assertEqual((r.reason, r.attempts), ("blocked-download", 2))
+        self.assertIn("vendor's download site", r.user_action)
+
+    def test_codex_without_npm_uses_homebrew_when_present(self):
+        write_exe(self.bin1 / "brew", f"""[ "$*" = "install --cask codex" ] || exit 2
+d="$(dirname "$0")"
+printf '#!/bin/sh\\ncase "$1" in --version) echo "codex-cli 0.160.1";; --help) echo "{CODEX_FLAGS}";; esac\\n' > "$d/codex"
+chmod +x "$d/codex"
+""")
+        s = rc.plan(self.discover("codex"), root=self.root, env=self.env)
+        self.assertIn("Homebrew", s.assisted_touches)
+        r = self.install("codex")
+        self.assertTrue(r.ok, r)
+        self.assertEqual(os.readlink(self.root / "bin" / "codex"), str(self.bin1 / "codex"))
+
+
+class ConcurrentRepair(Base):
+    def test_two_racing_repairs_install_once_and_both_see_the_result(self):
+        import threading
+        count = self.tmp / "npm-runs"
+        AssistedRepair.good_npm(self, "2.3.0")
+        body = (self.bin1 / "npm").read_text()
+        (self.bin1 / "npm").write_text(body.replace(
+            '\nmkdir -p "$PREFIX/bin"', f'\necho run >> "{count}"; sleep 1\nmkdir -p "$PREFIX/bin"', 1))
+        results = []
+
+        def go():
+            results.append(rc.assisted_install("claude", env=self.env, disk_usage=lambda _p: PLENTY,
+                                               sleep=lambda _s: None))
+        threads = [threading.Thread(target=go) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(r.ok for r in results), results)
+        self.assertEqual(count.read_text().count("run"), 1)
+        self.assertEqual(results[0].path, results[1].path)
+
+
 class Cli(Base):
     def main(self, *argv, consent=lambda _q: False):
         out, err = io.StringIO(), io.StringIO()
@@ -593,7 +929,7 @@ class Cli(Base):
         self.env["PATH"] = str(self.tmp / "empty")
         code, _, err = self.main("repair", "--runtime", "claude", "--yes")
         self.assertEqual(code, rc.EXIT_UNUSABLE)
-        self.assertIn("npm-missing", err)
+        self.assertIn("no-installer", err)
 
     def test_repair_success(self):
         AssistedRepair.good_npm(self)
@@ -669,7 +1005,7 @@ class HealthCheck(unittest.TestCase):
 
 
 AssistedRepair.good_npm.__doc__ = "Shared with Cli: an npm stub that installs a working CLI."
-Cli.npm = AssistedRepair.npm
+Cli.npm = OwnerReply.npm = ConcurrentRepair.npm = AssistedRepair.npm
 
 
 if __name__ == "__main__":

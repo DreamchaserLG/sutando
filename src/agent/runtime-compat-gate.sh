@@ -21,12 +21,12 @@ sutando_runtime_compat_gate() {
     echo "runtime-compat: no runnable python3, so the $runtime version check was skipped" >&2
     return 0
   fi
-  wait_s="${SUTANDO_RUNTIME_WAIT_S:-}"
-  if [ -z "$wait_s" ]; then
-    if [ -t 0 ] && [ -t 2 ]; then wait_s=600; else wait_s=0; fi
-  fi
+  # Off a terminal nobody can answer a prompt, so the owner is asked in their DM instead.
+  local tty_args=(--notify-owner)
+  if [ -t 0 ] && [ -t 2 ]; then tty_args=(); fi
+  wait_s="${SUTANDO_RUNTIME_WAIT_S:-600}"
   out="$("$py" "$repo/src/runtime_compat.py" ensure --runtime "$runtime" --wait "$wait_s" \
-    --repair --resume-hint "bash $repo/src/agent/start-cli.sh" "$@")" || rc=$?
+    --repair --resume-hint "bash $repo/src/agent/start-cli.sh" ${tty_args[@]+"${tty_args[@]}"} "$@")" || rc=$?
   [ "$rc" -eq 0 ] || return "$rc"
   # Healthy hosts keep the exact command they launched before; only a fallback changes it.
   first="$(command -v "$runtime" 2>/dev/null || true)"

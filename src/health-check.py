@@ -987,7 +987,7 @@ def check_core_runtime_compat(runtime: Optional[str] = None, discover=None) -> d
     if node.get("path"):
         env["PATH"] = env.get("PATH", "") + os.pathsep + os.path.dirname(node["path"])
     report = (discover or runtime_compat.discover)(runtime, env=env)
-    step = runtime_compat.plan(report)
+    step = runtime_compat.plan(report, env=env)
     status = {"ok": "ok", "newer-untested": "warn"}.get(report.status, "down")
     detail = step.reason if status == "ok" else f"{step.reason} Fix: {step.command}"
     if step.assisted:

@@ -112,6 +112,11 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/runtime-compat-gate.sh",
             "src/runtime_compat.py",
             "src/auth_preflight.py",
+            "src/owner_reply.py",
+            "src/local_record.py",
+            "src/policy/__init__.py",
+            "src/policy/egress/__init__.py",
+            "src/policy/egress/result.py",
             "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             # cli_wedge imports sutando_platform; without it every classify
@@ -324,6 +329,7 @@ exit 0
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
             "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
@@ -361,6 +367,7 @@ exit 0
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
             "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
@@ -871,6 +878,39 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("not authenticated", result.stderr)
         calls = self._tmux_calls()
         self.assertNotIn("new-session", calls)
+
+    def test_off_tty_broken_cli_asks_the_owner_then_their_reply_repairs_and_launches(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        first = self.run_launcher()
+        self.assertEqual(first.returncode, 3, first.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertEqual(self.run_launcher().returncode, 3)
+        notices = sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))
+        self.assertEqual(len(notices), 1, "one DM per incident, however often the launch is retried")
+        self.assertIn('Reply "install compatible codex"', notices[0].read_text())
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-900.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        done = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", (ws / "results" / "task-900.txt").read_text())
+        self.assertFalse(reply.exists())
+        self.assertEqual(len(list((ws / "tasks" / "archive").rglob("task-900.txt"))), 1)
+        again = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
 
     def test_notifier_supervisor_restarts_after_child_exit(self):
         count = Path(self.tmp.name) / "notifier-count"
