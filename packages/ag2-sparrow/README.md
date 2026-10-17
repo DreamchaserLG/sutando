@@ -267,9 +267,11 @@ Paste this to the Hatch agent, with its MXID filled in:
 > `ag2-sparrow-hatch install --mxid @my-agent:ag2.space`. It starts Sparrow
 > (as a user service where systemd is available), replaces a Sparrow an earlier
 > version left running, and ends by checking Sparrow is connected; if it exits
-> non-zero, show me its output and stop. Register the hook with `hooks.add`
-> from the definition file install names, check it with `hooks.dry_run`, start
-> it with `hooks.enable`. Then create a scheduled task in your scheduler: name
+> non-zero, show me its output and stop. If it prints a `REQUIRED hook:` line,
+> do exactly that through your hooks tool (`hooks.add` from the definition file
+> it names on a first install; on an upgrade, update the hook to the definition
+> it prints), check it with `hooks.dry_run`, start it with `hooks.enable`; never
+> edit or copy files under `~/hooks` yourself. Then create a scheduled task in your scheduler: name
 > `sparrow-keepawake`, every 15 minutes, running the exact command install
 > prints on its `REQUIRED keepalive:` line (`timeout 120
 > /absolute/path/to/ag2-sparrow-hatch keepalive keepawake`). A file on disk is
@@ -289,10 +291,12 @@ relay rejects the token. Keep the `.env` file mode 600.
 
 | File | Content |
 | --- | --- |
-| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script (a copy an earlier `install` wrote is replaced, so re-run `install` after upgrading ag2-sparrow; a locally modified copy is shown as a diff and kept unless you pass `--force`) |
-| `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID |
+| `~/hooks/scripts/ag2-sparrow-hatch.sh` | the hook script, on a first install only (see [Upgrading the hook](#upgrading-the-hook)) |
+| `~/hooks/definitions/ag2-sparrow-hatch.json` | parameters for `hooks.add`, with your MXID, on a first install only |
+| `~/hooks/scripts/ag2-sparrow-hatch.<sha12>.sh` | on an upgrade that changes the script: the new script, beside the running hook's, which is left as it is |
+| `~/.config/ag2-sparrow-hatch/hook-definition.json` | on an upgrade that changes the definition: the definition for your hooks tool |
 | `~/.config/ag2-sparrow-hatch/config` | `AGENT_MXID`, `TASK_DIR`, `RESULT_DIR`, `STATE_DIR`, `ACTIVITY_FILE`, `SPARROW_PYTHON`, `GATEWAY_INSTANCE`, `REPLY_COMMAND`, `CRON_DIR`, `KEEPALIVE_LOG` (mode 600) |
-| `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of the hook script `install` wrote, which tells an upgrade from a local edit |
+| `~/.config/ag2-sparrow-hatch/installed-script.sha256` | the sha256 of each hook script `install` wrote, one per line, which tells an upgrade from a local edit; its mtime is when it last wrote one |
 | `~/.config/systemd/user/ag2-sparrow.service` | the Sparrow user service (see [Keeping Sparrow running](#keeping-sparrow-running)), only where `systemctl --user` works and unless you pass `--no-service` |
 | `~/workspace/cron.d/minutely/sparrow-keepawake__interval@15m.md` | the keepalive's install record (see [Keepalive](#keepalive-one-scheduled-task-and-the-health-panel)): health is timed from it until the first run, and it holds the command. Hatch's scheduler does not run it; the agent registers the task itself. Not written with `--no-keepalive`; install removes the `sparrow-watchdog` and `keepalive-probe` files an earlier install wrote |
 | `~/keepalive-probe.log` | one line per keepawake run, appended by the task (`--keepalive-log` moves it) |
@@ -309,6 +313,9 @@ instance's are `task-<instance>~<id>`), and the outbox `reply` waits on
 
 `ag2-sparrow-hatch verify` prints one `PASS` or `FAIL` line each for the hook
 script, the hook definition, the config, the task dir, Sparrow itself, the
+hook run (`FAIL` while the hook has never run, has not run in the last 2
+minutes, or runs a script other than this ag2-sparrow's; see
+[Upgrading the hook](#upgrading-the-hook)), the
 reply command (the absolute path `install` recorded, still executable; `install`
 refuses to run when it finds none beside its Python or on `PATH`), the tools the script needs (`jq`, `flock`, `timeout`) and the heartbeat, a `NOTE keepalive:`
 line with the keepalive state and the health row Sparrow reports (a `FAIL keepalive:` line,
@@ -318,6 +325,32 @@ is installed but not enabled, and a `NOTE` (not counted) when systemd is not
 available or the unit is not installed. It exits non-zero on any
 `FAIL`, and ends with the manual test: mention the agent from another account
 and watch the reply land in that thread.
+
+### Upgrading the hook
+
+Hatch runs a hook as its hooks tool registered it. On a live agent, a re-run
+of `install` rewrote the hook script (same content) and its definition from
+outside that tool; the hook ran one more poll 24 seconds later and never
+again, while Sparrow kept queueing task files (16 open, none woken for). So
+`install` never writes a hook's files once its definition exists:
+
+- Script and definition unchanged: nothing is written, not even a `chmod`
+  (`unchanged: hook ag2-sparrow-hatch ...`).
+- A change: the new script goes to `~/hooks/scripts/ag2-sparrow-hatch.<sha12>.sh`
+  and the new definition, naming that script, to
+  `~/.config/ag2-sparrow-hatch/hook-definition.json`. The running hook keeps
+  running its old script. `install` prints a `REQUIRED hook:` line and the
+  definition: update the hook through your hooks tool (`hooks.update` if it has
+  one, else `hooks.remove ag2-sparrow-hatch` then `hooks.add`), check it with
+  `hooks.dry_run`, start it with `hooks.enable`. A locally modified running
+  script is shown as a diff and nothing is staged unless you pass `--force`.
+
+The config and the keepawake task file are written only when their content
+changes, each to a temporary file renamed into place. Every hook run (not a
+`hooks.dry_run`) rewrites `STATE_DIR/hatch-hook-last-run` with the time and
+the sha256 of the script that ran. `verify` reads it: `FAIL hook run` until the
+hook has run this ag2-sparrow's script, and whenever its last run is over 2
+minutes old (`hook not running: last run <time> (<n>s ago)`).
 
 ### Keeping Sparrow running
 
@@ -496,6 +529,19 @@ panel shows this agent's core instead of asking you to update:
 | older | `abnormal` | `keepawake-not-running` | `true` if the hook's activity marker (`--activity-file`, default `~/.muse/last_active`) changed in the last 30 minutes, else unknown |
 | none yet | timed from when install wrote the task: `unknown` for its first 30 minutes (neither red nor green), then `abnormal` / `keepawake-not-running` (a task the scheduler never runs) | | |
 | no `sparrow-keepawake` task installed | no row: the panel shows the basic status, as before | | |
+
+Two more checks turn the row `abnormal` whatever the keepawake line says, so a
+fresh keepawake line never hides a stopped hook:
+
+| Check | `reason` |
+| --- | --- |
+| the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
+| a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
+
+When more than one applies, `reason` names the first of
+`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`, and `since`
+is when that one went bad. A task a worker handed off to the main session
+stays open, so it also reads `task-not-picked-up` until it is answered.
 
 `motion` is always `unknown`. Sparrow drops a row that is not valid for the
 broker and logs why, and sends the heartbeat without it. The row feeds the
