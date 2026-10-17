@@ -107,6 +107,15 @@ the lock is the fence, with no pid records and nothing killed. Those children ar
 bounded by their own timeouts. A wait is logged, and `health-check.py` reports one that lasts.
 At startup the notifier confirms that the inherited fd really holds this workspace's lock before
 acting as its owner; a stale or copied `SUTANDO_NOTIFIER_LOCK_FD` makes it wait for the lock instead.
+Never delete or replace `state/codex-notifier.lock`: a holder keeps the old file, so a new file at the
+same path would admit a second notifier. Nothing in the repo removes it, and a waiter that finds the
+path replaced while it waited reopens the new file rather than trusting the old one.
+
+The trade-off is deliberate: a child that hangs while holding fd 9 stalls delivery until it exits,
+because a hung child cannot be told from a slow one that is about to type. The waiting notifier
+logs every 30 s, health-check warns at 180 s, and a managed notifier exits 75 at 600 s and is retried
+by its supervisor while the warning stays up. This rests on two invariants: the watcher is started
+with `9>&-`, and no long-lived background job the notifier starts may inherit fd 9.
 The lock is kept out of the long-lived watcher the notifier starts. That watcher leads its
 own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
 The notifier records the watcher's pid, start time and inbox in

@@ -49,7 +49,12 @@ def acquire(path: str, timeout: float, log_every: float, *, clock=time.monotonic
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return fd
+                if _same_file(fd, path):
+                    return fd
+                # The path was replaced while we waited: a lock on the old file guards nothing.
+                os.close(fd)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                continue
             except BlockingIOError:
                 now = clock()
                 if not announced:
@@ -72,6 +77,14 @@ def acquire(path: str, timeout: float, log_every: float, *, clock=time.monotonic
             pass
 
 
+def _same_file(fd: int, path: str) -> bool:
+    try:
+        a, b = os.fstat(fd), os.stat(path)
+    except OSError:
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
 def _write_waiting(waiting: str) -> None:
     try:
         with open(waiting, "w") as fh:
@@ -82,9 +95,9 @@ def _write_waiting(waiting: str) -> None:
 
 def holds(fd: int, path: str) -> bool:
     """`fd` is open on `path` and its open file description holds the exclusive lock."""
+    if not _same_file(fd, path):
+        return False
     try:
-        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != (os.stat(path).st_dev, os.stat(path).st_ino):
-            return False
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         return False

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """src/delivery/notifier_lock.py: one holder at a time, released by the kernel when it dies."""
+import fcntl
 import io
 import os
 import signal
@@ -136,6 +137,29 @@ class NotifierLockTest(unittest.TestCase):
                             'echo "$SUTANDO_NOTIFIER_LOCK_FD"; [ -e /dev/fd/9 ] && echo open'],
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.stdout.split(), ["9", "open"], r.stderr)
+
+    def test_a_lock_file_replaced_while_waiting_is_reopened_not_trusted(self):
+        # A waits on the old file; the path is replaced and the old lock released. A lock on the
+        # old inode would guard nothing, so acquire must end up holding the file now at the path.
+        old = notifier_lock.acquire(self.lock, 1, 1)
+        replaced = []
+
+        def sleep(_):
+            if not replaced:
+                os.unlink(self.lock)
+                Path(self.lock).write_text("")
+                os.close(old)
+                replaced.append(True)
+
+        got = notifier_lock.acquire(self.lock, 5, 5, sleep=sleep)
+        self.assertIsNotNone(got)
+        self.addCleanup(os.close, got)
+        self.assertEqual(replaced, [True])
+        self.assertTrue(notifier_lock.holds(got, self.lock))
+        rival = os.open(self.lock, os.O_RDWR)
+        self.addCleanup(os.close, rival)
+        with self.assertRaises(BlockingIOError):
+            fcntl.flock(rival, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_acquire_logs_while_it_waits_then_gives_up(self):
         held = notifier_lock.acquire(self.lock, 1, 1)
