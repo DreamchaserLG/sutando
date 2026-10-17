@@ -421,4 +421,6 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 `python3 skills/quota-tracker/scripts/read-quota.py` prints the same with remaining percentages and
 `--gate` exits non-zero when the core is not routed through the proxy or the state is stale. A
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
-model (above) is the way to keep going before then.
+model (above) is the way to keep going before then. A core that died on a limit is not relaunched
+until the reset (or a backoff of 5 to 60 minutes when none is given): `python3 src/core_limit_hold.py
+status` prints the hold and its reason, and `... clear` lifts it so the next revive launches.
