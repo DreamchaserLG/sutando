@@ -97,18 +97,16 @@ for a change to take effect. Queue mode applies to the core's notifier only; a p
 worker's notifier always uses send-keys.
 
 Only one core notifier runs per workspace. The notifier re-executes itself under
-`src/delivery/notifier_lock.py`, which takes an exclusive `flock` on the workspace's
-`state/codex-notifier.lock` in a small holder process it forks before running the notifier.
-The holder exits as soon as the notifier process is gone, `kill -9` included, and the kernel
-drops the lock with it; no process the notifier starts ever holds the lock, so a surviving
-child (tmux, a Python helper, `sleep`) cannot keep it. If the holder alone dies, the notifier
-notices within one retry interval and exits, so its supervisor starts it again under a fresh lock.
-A notifier that is mid-delivery when its holder dies may not have noticed yet, so every new lock
-owner first reads `state/codex-notifier.leader` and, if the previous owner is still running, stops
-it and all its children (`kill -9`) before delivering anything; if it cannot, it exits without acting.
-The holder is found through the process table (`SUTANDO_NOTIFIER_LOCK_HOLDER` must name a running
-`notifier_lock.py` whose parent is the notifier), which rejects a stale or copied value; it is not
-a defence against local code deliberately faking such a process. That watcher leads its
+`src/delivery/notifier_lock.py`, which holds an exclusive `flock` on the workspace's
+`state/codex-notifier.lock` on fd 9. The notifier and every child it starts inherit that fd, so
+the lock is held until the last of them exits, `kill -9` included, and the kernel then drops it;
+no lock is ever left behind. A child that outlives a killed notifier (a `tmux` call, a Python
+helper, a `codex queue` send) could still deliver, so the next notifier waits for it on purpose:
+the lock is the fence, with no pid records and nothing killed. Those children are short-lived and
+bounded by their own timeouts. A wait is logged, and `health-check.py` reports one that lasts.
+At startup the notifier confirms that the inherited fd really holds this workspace's lock before
+acting as its owner; a stale or copied `SUTANDO_NOTIFIER_LOCK_FD` makes it wait for the lock instead.
+The lock is kept out of the long-lived watcher the notifier starts. That watcher leads its
 own session, so it outlives a `kill -9` of its notifier and would keep the inbox to itself.
 The notifier records the watcher's pid, start time and inbox in
 `state/codex-notifier.watcher`, and the next notifier, holding the lock, stops that exact

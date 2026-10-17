@@ -2,11 +2,12 @@
 """Run one command holding an exclusive kernel lock, so at most one copy runs per lock file.
 
     notifier_lock.py --lock PATH [--timeout S] [--log-every S] [--log-file F] -- CMD [ARGS...]
+    notifier_lock.py --lock PATH --check-held FD    # exit 0 only if inherited FD holds PATH's lock
 
-The lock is fcntl.flock(LOCK_EX) on PATH, held by a forked holder process and never by CMD, so
-nothing CMD starts can inherit it. CMD runs in this process (exec), the holder's parent; the holder
-exits once that parent is gone, kill -9 included, and the kernel drops the lock with it.
-SUTANDO_NOTIFIER_LOCK_HOLDER=<holder pid> in CMD's environment names the holder.
+The lock is fcntl.flock(LOCK_EX) on PATH, moved to fd 9 and inherited across exec, with
+SUTANDO_NOTIFIER_LOCK_FD=9 in the environment. It is held by CMD and by every descendant that still
+has fd 9 open, so it lasts until the last of them exits, kill -9 included; a successor cannot run
+while any process that could still act for CMD is alive.
 A second caller waits, logging every --log-every seconds (to stderr and --log-file), and exits 75
 after --timeout. While it waits, PATH.waiting holds "<pid> <epoch it began waiting>", for health-check.
 """
@@ -15,10 +16,10 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
-import signal
 import sys
 import time
 
+LOCK_FD = 9
 EXIT_BUSY = 75
 POLL_S = 0.1
 
@@ -79,25 +80,25 @@ def _write_waiting(waiting: str) -> None:
         pass
 
 
-def hold(fd: int, leader: int, *, getppid=os.getppid, sleep=time.sleep) -> None:
-    """Keep `fd`'s lock while `leader` is this process's parent; signals that stop the leader
-    gracefully must not drop the lock before the leader has actually exited."""
-    for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM, signal.SIGPIPE):
-        signal.signal(sig, signal.SIG_IGN)
-    while getppid() == leader:
-        sleep(POLL_S)
+def holds(fd: int, path: str) -> bool:
+    """`fd` is open on `path` and its open file description holds the exclusive lock."""
+    try:
+        if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != (os.stat(path).st_dev, os.stat(path).st_ino):
+            return False
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
-def _detach_stdio(keep: int) -> None:
-    null = os.open(os.devnull, os.O_RDWR)
-    for std in (0, 1, 2):
-        os.dup2(null, std)
-    os.closerange(3, keep)
-    os.closerange(keep + 1, 65536)
-
-
-def main(argv: "list[str] | None" = None, *, execvpe=os.execvpe, fork=os.fork) -> int:
+def main(argv: "list[str] | None" = None, *, execvpe=os.execvpe) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if "--check-held" in argv and "--" not in argv:
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--lock", required=True)
+        ap.add_argument("--check-held", type=int, required=True)
+        args = ap.parse_args(argv)
+        return 0 if holds(args.check_held, args.lock) else 1
     if "--" not in argv:
         print(__doc__, file=sys.stderr)
         return 2
@@ -117,16 +118,11 @@ def main(argv: "list[str] | None" = None, *, execvpe=os.execvpe, fork=os.fork) -
     if fd is None:
         log(f"notifier-lock: {args.lock} still held after {args.timeout:.0f}s; not starting")
         return EXIT_BUSY
-    leader = os.getpid()
-    holder = fork()
-    if holder == 0:
-        try:
-            _detach_stdio(fd)
-            hold(fd, leader)
-        finally:
-            os._exit(0)
-    os.close(fd)
-    execvpe(cmd[0], cmd, dict(os.environ, SUTANDO_NOTIFIER_LOCK_HOLDER=str(holder)))
+    if fd != LOCK_FD:
+        os.dup2(fd, LOCK_FD)
+        os.close(fd)
+    os.set_inheritable(LOCK_FD, True)
+    execvpe(cmd[0], cmd, dict(os.environ, SUTANDO_NOTIFIER_LOCK_FD=str(LOCK_FD)))
     return 0  # only reached with a test's execvpe
 
 
