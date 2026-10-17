@@ -423,7 +423,8 @@ class HookScript(Base):
         self.assertTrue(p["heartbeat"])
         self.assertIn("Sparrow is not running", p["sparrow_down"])
         self.assertNotIn("sparrow_not_connected", p)
-        self.assertIn("systemctl --user restart ag2-sparrow", p["worker_note"])
+        self.assertIn(" keepalive keepawake", p["worker_note"])
+        self.assertNotIn("systemctl", p["worker_note"])
         self.assertIn("Restart Sparrow as that says, then exit; post nothing.", p["worker_note"])
         self.assertNotIn("Do that", p["worker_note"])
         self.assertIn(str(self.home / "absent"), p["worker_note"])
@@ -1029,13 +1030,24 @@ class Cli(Base):
         self.assertIn("FAIL task_dir:", r.stdout)
         self.assertIn("PASS hook script:", r.stdout)
 
+    def test_the_restart_hint_runs_keepawake_never_a_bare_sparrow(self):
+        self.cli("install", "--mxid", AGENT)
+        env = {"HOME": str(self.home), "PATH": f"{self.bin}:{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            _, detail = hatch_cli.check_sparrow(self.state)
+        hint = detail.rsplit("; ", 1)[1]
+        self.assertEqual(hint, f"restart it: run {self.reply_stub} keepalive keepawake")
+        words = shlex.split(hint.split(": run ", 1)[1])
+        self.assertNotIn(hatch_cli.SPARROW_COMMAND, [os.path.basename(w) for w in words])
+        self.assertNotIn("systemctl", hint)
+
     def test_verify_fails_when_sparrow_is_not_running(self):
         self.cli("install", "--mxid", AGENT)
         self.register()
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL sparrow:", r.stdout)
-        self.assertIn("start ag2-sparrow again", r.stdout)
+        self.assertIn(f"restart it: run {self.reply_stub} keepalive keepawake", r.stdout)
         self.sparrow_status(age_s=600)
         r = self.cli("verify")
         self.assertEqual(r.returncode, 1)
@@ -1056,7 +1068,7 @@ class Cli(Base):
     def test_sparrow_subcommand(self):
         r = self.cli("sparrow")
         self.assertEqual(r.returncode, hatch_cli.SPARROW_DOWN)
-        self.assertIn("systemctl --user restart ag2-sparrow", r.stdout)
+        self.assertIn(" keepalive keepawake", r.stdout)
         self.sparrow_status(connected=False, error="401 token rejected")
         r = self.cli("sparrow")
         self.assertEqual(r.returncode, hatch_cli.SPARROW_NOT_CONNECTED)

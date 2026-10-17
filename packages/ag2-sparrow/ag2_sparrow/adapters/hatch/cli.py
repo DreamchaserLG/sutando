@@ -653,9 +653,10 @@ def _check(results: list, ok: bool, name: str, detail: str) -> None:
     print(f"{'PASS' if ok else 'FAIL'} {name}: {detail}")
 
 
-RESTART_HINT = ("restart it: systemctl --user reset-failed ag2-sparrow; systemctl --user "
-                "restart ag2-sparrow under the user service install sets up, else start "
-                "ag2-sparrow again as at install")
+def restart_hint() -> str:
+    """keepawake restarts Sparrow with REMOTE_HEALTH_COMMAND; a bare ag2-sparrow lacks it."""
+    command = _installed_config().get("REPLY_COMMAND") or find_reply_command() or REPLY_COMMAND
+    return f"restart it: run {shlex.join([command, 'keepalive', 'keepawake'])}"
 
 
 def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
@@ -675,11 +676,11 @@ def check_sparrow(state_dir: Path, now: float | None = None,
         ts = float(status["ts"])
     except (OSError, ValueError, KeyError, TypeError) as e:
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
-                       f"this state dir; {RESTART_HINT}")
+                       f"this state dir; {restart_hint()}")
     age = int((time.time() if now is None else now) - ts)
     if age > SPARROW_STATUS_MAX_AGE_S:
         return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
-                       f"reaches the hook; {RESTART_HINT}")
+                       f"reaches the hook; {restart_hint()}")
     if not status.get("connected"):
         return SPARROW_NOT_CONNECTED, (
             f"Sparrow is running but not connected: {status.get('error') or 'no error given'}; "

@@ -459,10 +459,10 @@ when Sparrow is not running and 11 when it is running but not connected. The
 5-minute heartbeat runs it too:
 
 - Not running: the hook logs `ag2-sparrow-hatch sparrow down`, and the
-  heartbeat wake carries `sparrow_down` and tells the worker to restart it
-  (`systemctl --user reset-failed ag2-sparrow; systemctl --user restart
-  ag2-sparrow` under the service `install` set up, or start `ag2-sparrow` again
-  as at install).
+  heartbeat wake carries `sparrow_down` and tells the worker to restart it by
+  running `ag2-sparrow-hatch keepalive keepawake` (the path install recorded),
+  which restarts the service `install` set up, or else starts Sparrow with
+  `REMOTE_HEALTH_COMMAND`; a hand-run `ag2-sparrow` would lack it.
 - Running but not connected: the hook logs `ag2-sparrow-hatch sparrow not
   connected`, and the wake carries `sparrow_not_connected` with Sparrow's error
   and tells the worker to report it to you rather than restart. A rejected
