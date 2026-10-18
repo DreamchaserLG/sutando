@@ -773,6 +773,59 @@ class OwnerReply(OwnerReplyBase):
         self.assertIn("works now", (self.ws / "results" / task.name).read_text())
         self.assertEqual(self.incident("codex")["status"], "resolved")
 
+    def install_codex(self, login_rc):
+        """A repair that succeeds and leaves a working codex whose login check returns login_rc."""
+        def repair(*_a, **_k):
+            self.repairs += 1
+            fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="", login_rc=login_rc)
+            return rc.RepairResult(True, "installed", "codex 0.160.0")
+        return repair
+
+    def test_install_reply_on_a_logged_out_cli_names_the_login_not_starting(self):
+        fake_cli(self.bin1 / "codex", version_rc=1, flags=CODEX_FLAGS, label="")
+        AssistedRepair.npm(self, "exit 0")
+        self.ensure("codex", enforce_auth=True)
+        task = self.reply("install compatible codex")
+        code, _ = self.ensure("codex", enforce_auth=True, repair_fn=self.install_codex(1))
+        self.assertEqual((code, self.repairs), (rc.EXIT_LOGIN, 1))
+        answer = (self.ws / "results" / task.name).read_text()
+        self.assertIn("Installed codex 0.160.0", answer)
+        self.assertIn("codex login", answer)
+        self.assertIn('"retry now"', answer)
+        self.assertNotIn("starting", answer)
+        self.assertEqual(self.incident("codex")["status"], "open")
+
+    def test_install_reply_on_a_logged_in_cli_says_starting(self):
+        fake_cli(self.bin1 / "codex", version_rc=1, flags=CODEX_FLAGS, label="")
+        AssistedRepair.npm(self, "exit 0")
+        self.ensure("codex", enforce_auth=True)
+        task = self.reply("install compatible codex")
+        code, _ = self.ensure("codex", enforce_auth=True, repair_fn=self.install_codex(0))
+        self.assertEqual(code, 0)
+        answer = (self.ws / "results" / task.name).read_text()
+        self.assertIn("Installed codex 0.160.0 in Sutando's own folder", answer)
+        self.assertIn("The core is starting.", answer)
+        self.assertEqual(self.incident("codex")["status"], "resolved")
+
+    def test_crash_between_install_and_answer_answers_with_the_login_on_the_next_run(self):
+        fake_cli(self.bin1 / "codex", version_rc=1, flags=CODEX_FLAGS, label="")
+        AssistedRepair.npm(self, "exit 0")
+        self.ensure("codex", enforce_auth=True)
+        task = self.reply("install compatible codex")
+
+        def dying_auth(*_a, **_k):
+            raise Crash()
+        with self.assertRaises(Crash):
+            self.ensure("codex", enforce_auth=True, repair_fn=self.install_codex(1),
+                        auth_fn=dying_auth)
+        self.assertEqual(rc.Incident(self.ws, "codex").pending(), {"install compatible codex"})
+        self.assertFalse((self.ws / "results" / task.name).exists())
+        code, _ = self.ensure("codex", enforce_auth=True, repair_fn=self.install_codex(1))
+        self.assertEqual((code, self.repairs), (rc.EXIT_LOGIN, 1))
+        answer = (self.ws / "results" / task.name).read_text()
+        self.assertIn("codex login", answer)
+        self.assertNotIn("starting", answer)
+
     def test_owner_reply_helpers(self):
         self.assertEqual(owner_reply.normalize("  Retry   NOW!! "), "retry now")
         unreadable = self.ws / "tasks" / "task-9.txt"

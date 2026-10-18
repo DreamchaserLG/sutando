@@ -893,9 +893,13 @@ def notice_body(runtime: str, step: RepairStep) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _login_step(remedy: str, sep: str = ", ") -> str:
+    return f'Log in: {remedy}{sep}then reply "{RETRY_PHRASE}" and the core starts.'
+
+
 def login_notice_body(runtime: str, auth: dict) -> str:
     return (f"Your Sutando core could not start: {RUNTIMES[runtime].binary} is not logged in.\n\n"
-            f"Log in: {auth['remedy']}\nthen reply \"{RETRY_PHRASE}\" and the core starts.\n")
+            f"{_login_step(auth['remedy'], sep=chr(10))}\n")
 
 
 def ensure(runtime: str, *, env: Optional[dict] = None, wait_s: float = 0.0,
@@ -921,17 +925,28 @@ def ensure(runtime: str, *, env: Optional[dict] = None, wait_s: float = 0.0,
                        resume_hint, inc, notify_owner, outcome, say, discover_fn,
                        repair_fn, auth_fn, sleep, now)
     if inc is not None:
-        inc.apply(None, f"{RUNTIMES[runtime].binary} works now. The core is starting."
-                  if rc == EXIT_OK else f"The core still cannot start: {outcome['why']}")
+        inc.apply(None, _final_reply(runtime, rc, outcome))
         inc.finish()
         if rc == EXIT_OK:
             inc.close()
     return rc, path
 
 
-def _repair_reply(result: RepairResult) -> str:
-    if result.ok:
-        return f"Installed {result.detail} in Sutando's own folder. The core is starting now."
+def _final_reply(runtime: str, rc: int, outcome: dict) -> str:
+    """The one answer every pending reply gets, from the launch's full verdict."""
+    binary = RUNTIMES[runtime].binary
+    installed = outcome.get("installed")
+    done = f"Installed {installed} in Sutando's own folder" if installed else ""
+    if rc == EXIT_OK:
+        return (f"{done}. " if done else "") + f"{binary} works now. The core is starting."
+    if rc == EXIT_LOGIN and done:
+        return f"{done}, but {binary} is not logged in. {_login_step(outcome['login_remedy'])}"
+    why = f"{done}, but the core" if done else "The core"
+    why = f"{why} still cannot start: {outcome['why']}"
+    return f"{why}. {_login_step(outcome['login_remedy'])}" if rc == EXIT_LOGIN else why
+
+
+def _failed_repair_reply(result: RepairResult) -> str:
     return f"That did not fix it: {result.detail}. Next: {result.user_action}"
 
 
@@ -948,8 +963,11 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
 
     def repair_now() -> None:
         result = repair_fn(runtime, env=env, log=say)
-        if inc is not None:
-            inc.apply(install_phrase(runtime), _repair_reply(result))
+        if result.ok:
+            # Answered once the launch's outcome is known: a logged-out install does not start.
+            outcome["installed"] = result.detail
+        elif inc is not None:
+            inc.apply(install_phrase(runtime), _failed_repair_reply(result))
         say(f"repair {'succeeded' if result.ok else 'failed'}: {result.detail}")
         if not result.ok:
             say(f"next: {result.user_action}")
@@ -980,7 +998,8 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
         def recheck() -> Report:
             said = replies()
             r = discover_fn(runtime, env=env)
-            if r.selected is None and install_phrase(runtime) in said and plan(r, env=env).assisted:
+            if (r.selected is None and install_phrase(runtime) in said and "installed" not in outcome
+                    and plan(r, env=env).assisted):
                 repair_now()
                 r = discover_fn(runtime, env=env)
             return r
@@ -996,6 +1015,7 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
     auth = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
     if auth["login"] == "logged-out":
         outcome["why"] = f"{spec.binary} is not logged in"
+        outcome["login_remedy"] = auth["remedy"]
         say(f"{spec.binary} is not logged in: {auth['detail']}")
         say(f"fix: {auth['remedy']}")
         if enforce_auth and notify_owner and inc is not None and inc.notify(login_notice_body(runtime, auth)):
@@ -1005,6 +1025,7 @@ def _ensure(runtime, env, wait_s, repair, consent, enforce_auth, claude_config_d
         def recheck_auth() -> dict:
             replies()
             holder["auth"] = auth_fn(runtime, sel.path, env=env, claude_config_dir=claude_config_dir)
+            outcome["login_remedy"] = holder["auth"].get("remedy") or outcome["login_remedy"]
             return holder["auth"]
         _wait(auth, wait_s, recheck_auth, lambda a: a["login"] != "logged-out", say, sleep, now,
               f"waiting up to {int(wait_s)}s for the login; the launch continues on its own.")

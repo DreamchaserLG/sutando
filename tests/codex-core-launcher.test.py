@@ -916,6 +916,44 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
 
+    def _owner_reply_installs(self, installed_stub):
+        """Broken codex, one launch to open the incident, then the owner's install reply."""
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        self.assertEqual(self.run_launcher().returncode, 3)
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(installed_stub)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-901.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        return result, (ws / "results" / "task-901.txt").read_text()
+
+    def test_owner_install_reply_on_a_logged_out_codex_answers_with_the_login_step(self):
+        logged_out = CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0")
+        result, answer = self._owner_reply_installs(logged_out)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("codex login", answer)
+        self.assertIn('"retry now"', answer)
+        self.assertNotIn("starting", answer)
+
+    def test_owner_install_reply_on_a_logged_in_codex_answers_that_it_starts(self):
+        result, answer = self._owner_reply_installs(CODEX_STUB)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("The core is starting.", answer)
+
     def test_no_codex_anywhere_with_consent_installs_and_launches(self):
         (self.bin / "codex").unlink()
         good = Path(self.tmp.name) / "codex-good"
