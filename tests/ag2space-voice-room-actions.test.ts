@@ -308,9 +308,8 @@ describe('a long result keeps its short fields', () => {
 		assert.match(r.text as string, /…$/);
 	});
 
-	it('the prompt sends a project edit straight from read_page to changes.apply', () => {
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /read it once with read_page, which gives its page_id and content_hash/);
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /no find_room_actions, describe_room_action, second read or changes\.list/);
+	it('the prompt sends a project edit to edit_project_file, never a changes.apply the model writes out', () => {
+		assert.match(ROOM_ACTIONS_PROMPT_RULE, /it goes through edit_project_file \(see PROJECT FILES\), never run_room_action room\.commons\.changes\.apply with text you wrote out yourself/);
 	});
 });
 
@@ -410,8 +409,6 @@ describe('the tools as the voice model sees them', () => {
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /^- none:/);
 		// Writing into a project right after it was made is the assistant's own, not the core's.
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /Writing or changing what a LaTeX or Typst project's files say .* is yours too, never work/);
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /read_page.* room\.commons\.changes\.apply/);
-		assert.match(ROOM_ACTIONS_PROMPT_RULE, /read and write its main file the same way, never a new page/);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /writing or changing what its files say/);
 		// Finding a room's project by name is the assistant's own too, not the core's.
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /finding or reading a page, project or file that lives in an AG2 Space room by its name/);
