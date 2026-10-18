@@ -5,14 +5,21 @@ CLI can be in, how Sutando detects it, and how to get from that state back to
 a running core.
 
 The code is `src/runtime_compat.py`. Both launchers call it before they replace
-a core, through `src/agent/runtime-compat-gate.sh`. `health-check.py` reports the
-same verdict as `core-cli-compat`.
+a core, through `src/agent/runtime-compat-gate.sh`. Startup calls the same gate
+before any service starts (`src/startup-runtime.sh`), and its own prerequisite
+check and `src/verify-setup.sh` ask `runtime_compat.py which`, so a managed
+install off `PATH` counts everywhere
+(`test_codex_only_managed_startup_passes_its_cli_checks`,
+`test_claude_only_managed_startup_passes_its_cli_checks`,
+`test_verify_setup_finds_the_managed_codex_and_its_login`).
+`health-check.py` reports the same verdict as `core-cli-compat`.
 
 ## Check your install
 
 ```bash
 python3 src/runtime_compat.py doctor            # both CLIs, with the fix for each
 python3 src/runtime_compat.py doctor --json     # the same, for tools
+python3 src/runtime_compat.py which --runtime codex --enforce-auth   # the binary a launch would use
 ```
 
 ## How Sutando picks a binary
@@ -156,8 +163,6 @@ record for the owner DM is `<workspace>/state/runtime-compat-<cli>.json`.
 ## Not covered yet
 
 - The desktop installer's own flow (slice 2, in the desktop repo).
-- `src/startup-runtime.sh` and `src/verify-setup.sh` still run their own Codex
-  presence and login checks. Moving them onto this module is #5699.
 - A Claude token that has expired but is still on disk passes the static
   `auth_preflight` check, so this gate does not catch it; only the live probe
   (`auth_preflight.py --live`, one model call) does.

@@ -2,6 +2,25 @@
 # Shared by both runtime launchers: check the core CLI before a launch replaces a core.
 # The verdict, repair plan and repair live in src/runtime_compat.py; this file only calls it.
 
+# The python3 the gate runs the module with; empty when none can run.
+_sutando_runtime_compat_py() {
+  [ -f "$1/src/runtime_compat.py" ] && [ -r "$1/scripts/python-binary.sh" ] || return 0
+  bash -c '. "$1/scripts/python-binary.sh" && resolve_python "$1"' gate "$1"
+}
+
+# $1 repo, $2 runtime, then extra `which` args. Prints the binary a launch would use,
+# the managed install off PATH included, and acts on nothing; 3 none usable, 4 login.
+sutando_core_cli_path() {
+  local repo="$1" runtime="$2" py
+  shift 2
+  py="$(_sutando_runtime_compat_py "$repo")"
+  if [ -z "$py" ] || [ "${SUTANDO_SKIP_RUNTIME_COMPAT:-0}" = "1" ]; then
+    command -v "$runtime" || return 3
+    return 0
+  fi
+  "$py" "$repo/src/runtime_compat.py" which --runtime "$runtime" "$@"
+}
+
 # $1 repo, $2 runtime, then extra `ensure` args. Sets SUTANDO_CORE_CLI_BIN to the
 # binary to launch. Returns non-zero (3 unusable, 4 login) when the core must not start.
 sutando_runtime_compat_gate() {
@@ -14,9 +33,7 @@ sutando_runtime_compat_gate() {
   fi
   [ -f "$repo/src/runtime_compat.py" ] || return 0
   # Resolved in a child shell so the launcher's own resolver state stays untouched.
-  if [ -r "$repo/scripts/python-binary.sh" ]; then
-    py="$(bash -c '. "$1/scripts/python-binary.sh" && resolve_python "$1"' gate "$repo")"
-  fi
+  py="$(_sutando_runtime_compat_py "$repo")"
   if [ -z "$py" ]; then
     echo "runtime-compat: no runnable python3, so the $runtime version check was skipped" >&2
     return 0

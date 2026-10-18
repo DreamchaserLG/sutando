@@ -30,7 +30,8 @@ CLI:
   python3 src/runtime_compat.py doctor [--runtime claude|codex|all] [--json]
   python3 src/runtime_compat.py ensure --runtime R [--wait S] [--repair] [--yes]
   python3 src/runtime_compat.py repair --runtime R --yes
-Exit codes for ensure: 0 usable (prints the binary path), 3 binary unusable,
+  python3 src/runtime_compat.py which --runtime R [--enforce-auth]
+Exit codes for ensure and which: 0 usable (prints the binary path), 3 binary unusable,
 4 login required, 2 usage error. The repair matrix:
 docs/runtime-compat-repair-matrix.md.
 """
@@ -1092,6 +1093,10 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
     e.add_argument("--resume-hint", default="")
     e.add_argument("--notify-owner", action="store_true",
                    help="off a terminal: DM the owner once and act on their reply")
+    w = sub.add_parser("which", help="print the binary a launch would use; acts on nothing")
+    w.add_argument("--runtime", choices=tuple(RUNTIMES), required=True)
+    w.add_argument("--enforce-auth", action="store_true")
+    w.add_argument("--claude-config-dir", default="")
     r = sub.add_parser("repair")
     r.add_argument("--runtime", choices=tuple(RUNTIMES), required=True)
     r.add_argument("--yes", action="store_true")
@@ -1109,6 +1114,19 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
                         if rep.selected else None)
                 print("\n".join(_doctor_lines(rep, auth, env)))
         return 0 if all(rep.selected for rep in reports) else EXIT_UNUSABLE
+    if a.cmd == "which":
+        rep = discover(a.runtime, env=env)
+        if rep.selected is None:
+            _say(f"no usable {RUNTIMES[a.runtime].binary}: {plan(rep, env=env).reason}")
+            return EXIT_UNUSABLE
+        print(rep.selected.path)
+        if a.enforce_auth:
+            auth = auth_status(a.runtime, rep.selected.path, env=env,
+                              claude_config_dir=a.claude_config_dir or None)
+            if auth["login"] == "logged-out":
+                _say(f"{RUNTIMES[a.runtime].binary} is not logged in: {auth['remedy']}")
+                return EXIT_LOGIN
+        return 0
     if a.cmd == "repair":
         if not a.yes:
             _say("the assisted repair changes files; pass --yes to consent.")

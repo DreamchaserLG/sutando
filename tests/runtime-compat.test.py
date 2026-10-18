@@ -1586,6 +1586,20 @@ class Cli(Base):
     def test_ensure_unusable_exit_code(self):
         self.assertEqual(self.main("ensure", "--runtime", "codex")[0], rc.EXIT_UNUSABLE)
 
+    def test_which_finds_the_managed_install_off_path_and_acts_on_nothing(self):
+        code, out, err = self.main("which", "--runtime", "codex")
+        self.assertEqual(code, rc.EXIT_UNUSABLE)
+        self.assertIn("no usable codex", err)
+        target = self.managed_version("0.160.1", CODEX_FLAGS, name="codex")
+        code, out, _ = self.main("which", "--runtime", "codex", "--enforce-auth")
+        self.assertEqual((code, out.strip()), (0, str(self.root / "bin" / "codex")))
+        fake_cli(target, "0.160.1", CODEX_FLAGS, login_rc=1, label="")
+        code, out, err = self.main("which", "--runtime", "codex", "--enforce-auth")
+        self.assertEqual(code, rc.EXIT_LOGIN)
+        self.assertIn("codex login", err)
+        self.assertEqual(self.main("which", "--runtime", "codex")[0], 0)
+        self.assertFalse((self.root / "codex" / ".lock").exists())
+
 
 class HealthCheck(unittest.TestCase):
     """health-check reports the same verdict and names the fix."""
