@@ -182,7 +182,7 @@ describe('the edits and the editor\'s answer', () => {
 		assert.deepEqual(parseEditPlan('{"edits":[{"old_text":"a","new_text":"b"}],"summary":"s"}'), { ok: true, edits: [{ old_text: 'a', new_text: 'b' }], summary: 's' });
 		assert.deepEqual(parseEditPlan('{"error":"no title"}'), { ok: false, error: 'no title' });
 		assert.equal(parseEditPlan('not json').ok, false);
-		assert.equal(parseEditPlan('{"edits":[]}').ok, false);
+		assert.match((parseEditPlan('{"edits":[]}') as { error: string }).error, /this tool only changes the file. To answer a question about it, read it with read_page/);
 		assert.equal(parseEditPlan('{"edits":[{"old_text":"a"}]}').ok, false);
 	});
 
@@ -192,6 +192,7 @@ describe('the edits and the editor\'s answer', () => {
 		assert.match(p, /<<<FILE\n#set text/);
 		assert.match(p, /could not be applied: edit 1/);
 		assert.match(p, /Never reference a file the project may not have/);
+		assert.match(p, /When the instruction asks you to draw something .* draw it in the file with the language's own shapes/);
 		assert.match(p, /\{"error":"<which file is missing/);
 	});
 
@@ -225,7 +226,9 @@ describe('the tool as the voice model sees it', () => {
 		assert.match(t.description, /do not read the change back or ask for a yes/);
 		assert.match(EDIT_FILE_PROMPT_RULE, /search_commons for the file, then edit_project_file/);
 		assert.match(EDIT_FILE_PROMPT_RULE, /never write its text out yourself/);
-		assert.match(EDIT_FILE_PROMPT_RULE, /submit work once with the whole request \(generate it, put it in that room\\?'s project, change the file\), never only "generate an image"/);
+		assert.match(EDIT_FILE_PROMPT_RULE, /submit work once with the whole request \(make it, put it in that room\\?'s project, change the file\), never only "generate an image"/);
+		assert.match(EDIT_FILE_PROMPT_RULE, /a question about what a project file holds .* → search_commons, then read_page, and answer from it; edit_project_file only changes files/);
+		assert.match(EDIT_FILE_PROMPT_RULE, /including a figure the user asks you to draw/);
 		assert.match(t.description, /"missing_file" — .* submit work with the whole request in one task/);
 	});
 });

@@ -76,6 +76,7 @@ export function editPlanPrompt(input: Parameters<PlanEdits>[0]): string {
 		'Each old_text is copied exactly from the file (whitespace included), long enough to occur exactly once, and no longer than that needs.',
 		'Never reference a file the project may not have (an image, a .bib, an #include or #import) unless this file already references it or the instruction gives its exact name: an invented file name breaks the build.',
 		'If the instruction needs such a file (a picture of something, a new bibliography), reply {"error":"<which file is missing, in the instruction\'s language>"}: the user uploads it first. Do not put a drawing, a shape or a placeholder in its place unless the instruction asks you to draw it.',
+		'When the instruction asks you to draw something ("draw a mushroom", "画一个蘑菇"), draw it in the file with the language\'s own shapes (Typst: circle, ellipse, rect, polygon, path, curve with fill colors; LaTeX: TikZ when the file loads it), recognisable and simple, inside the figure the instruction names.',
 		'If the instruction cannot be done on this file for another reason: {"error":"<one sentence why>"}.',
 		`File "${input.title}":`,
 		'<<<FILE',
@@ -89,7 +90,7 @@ export function parseEditPlan(raw: string): EditPlan {
 	try { v = JSON.parse(raw); } catch { return { ok: false, error: 'the editor gave no usable answer' }; }
 	const o = (v ?? {}) as { edits?: unknown; summary?: unknown; error?: unknown };
 	if (typeof o.error === 'string' && o.error.trim()) return { ok: false, error: o.error.trim() };
-	if (!Array.isArray(o.edits) || o.edits.length === 0) return { ok: false, error: 'the editor proposed no change' };
+	if (!Array.isArray(o.edits) || o.edits.length === 0) return { ok: false, error: 'no change was made: this tool only changes the file. To answer a question about it, read it with read_page' };
 	const edits = o.edits.filter((e): e is Edit => !!e && typeof (e as Edit).old_text === 'string' && typeof (e as Edit).new_text === 'string');
 	if (edits.length !== o.edits.length) return { ok: false, error: 'the editor gave a malformed edit' };
 	return { ok: true, edits, summary: typeof o.summary === 'string' ? o.summary.trim() : '' };
@@ -270,4 +271,4 @@ export function createEditFileTool(deps: ReadRoomDeps, plan: PlanEdits = geminiP
 }
 
 /** The rule the voice model reads: a project file is changed through this tool, never by writing it out. */
-export const EDIT_FILE_PROMPT_RULE = '- PROJECT FILES: to change what a LaTeX or Typst project file says ("make the title green", "add an abstract", "改一下引言", even "write the paper") → search_commons for the file, then edit_project_file with its kind and the user\'s instruction, at once. Never read the file first and never write its text out yourself: the tool does both. After ok:true say what you changed ("I have …"). Never submit work for it — except a change that needs a picture or file the project does not have and the user wants it generated: submit work once with the whole request (generate it, put it in that room\'s project, change the file), never only "generate an image".';
+export const EDIT_FILE_PROMPT_RULE = '- PROJECT FILES: a question about what a project file holds ("how many figures are there", "what does the abstract say") → search_commons, then read_page, and answer from it; edit_project_file only changes files and answers no questions. To change what a LaTeX or Typst project file says ("make the title green", "add an abstract", "改一下引言", even "write the paper"), including a figure the user asks you to draw ("add figure 3, draw a mushroom", "画一个蘑菇": it is drawn with the language\'s own shapes) → search_commons for the file, then edit_project_file with its kind and the user\'s instruction, at once. For a change, never read the file first and never write its text out yourself: the tool does both. After ok:true say what you changed ("I have …"). Never submit work for it — except a photo or generated image, or another file the project does not have: submit work once with the whole request (make it, put it in that room\'s project, change the file), never only "generate an image".';

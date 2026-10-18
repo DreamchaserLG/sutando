@@ -894,7 +894,7 @@ export function createReadPageTool(deps: ReadRoomDeps): ToolDefinition {
 			'Read one page of an AG2 Space room\'s Commons — a document or HTML page found by search_commons — right now (a few seconds). ' +
 			'Pass `kind` exactly as the search hit gave it (e.g. "markdown-4m8ay3mg"), and `room` = the same room; leave `room` out for the room this session is in. ' +
 			`Returns {ok:true, room, title, page_id, content_hash, text, more} — the page's text, cut after ${ROOM_PAGE_MAX_CHARS} characters (more:true when there is more); summarize it in a few sentences, never read it out. ` +
-			'To change a project file (.typ, .tex, .bib…), do not read it here: call edit_project_file with its kind. ' +
+			'To answer a question about a project file (.typ, .tex, .bib…), read it here; to change one, do not read it first: call edit_project_file with its kind. ' +
 			'Errors: "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; ' + ROOM_NAME_ERRORS +
 			'"INTERNAL", "not_connected", "timeout" or "unavailable" — say the page cannot be read right now.',
 		parameters: z.object({
