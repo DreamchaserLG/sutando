@@ -153,7 +153,7 @@ const OWNER_TZ = process.env.OWNER_TZ ?? 'America/Los_Angeles';
 // template is copied into place so the operator has a file to edit. If the
 // copy fails (or the template is gone), loadVoiceConfig falls back to its
 // built-in defaults (schema: src/voice-config.ts). Phone ships with the
-// package default 2.5+search:true.
+// package default 3.8 Live + search:true.
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
 const _phoneSkillDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const PHONE_VOICE_CONFIG_PATH = join(WORKSPACE_DIR, 'config', 'phone-conversation.json');
@@ -223,7 +223,7 @@ const _CONF_HEADER_RE = new RegExp(
 	'thread_root|source_room_id|channel_kind|' +
 	'receiving_instance|' +
 	'call_sid|hint|instructions|transcript|schedule_name|schedule_slot|content_modalities|media_form|' +
-	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout)\\s*:',
+	'attachments|platform_card|instance_id|collaborator|requested_worker|wire_source|picker_command|picker_args|hitl_click|owner_mentioned|task_layout|local_time)\\s*:',
 	'i',
 );
 const _CONF_FENCE_RE = /^={3,}/;
