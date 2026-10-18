@@ -956,6 +956,12 @@ class WitnessFindings(unittest.TestCase):
                         "task: > <@core> Paused: the model limit was reached.\n>\n\nswitch to sonnet\n")
         self.assertEqual(clh._owner_action(path, self.ws), ("switch", "sonnet"))
 
+    def test_a_reply_that_quotes_the_notice_acts_only_on_its_answer(self):
+        path = self.ws / "tasks" / "task-q2.txt"
+        path.write_text("id: task-q2\nsource: discord\naccess_tier: owner\n"
+                        "task: > <@core> Paused. Reply retry now, or switch to sonnet.\n>\n\nthanks\n")
+        self.assertIsNone(clh._owner_action(path, self.ws))
+
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
             "orphan_classify_w", REPO / "skills" / "task-orphan-check" / "scripts" / "classify.py")
