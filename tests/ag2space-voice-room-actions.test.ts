@@ -16,7 +16,7 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 
 if (PRESENT) {
 const {
-	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke, armSpeechGate,
+	voicePolicy, findActions, describeAction, runAction, compactResult, canonicalJson, resetPendingConfirmations, noteUserSpoke, armSpeechGate, NOT_DONE_NEXT, YES_HOLDS_NEXT, YES_HOLDS_MS, YES_HOLDS_TRIES,
 	createFindActionsTool, createDescribeActionTool, createRunActionTool,
 	ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, ACTION_RESULT_MAX_CHARS, CONFIRM_MIN_AGE_MS, CONFIRM_TTL_MS,
 } = await import('../skills/ag2space-voice/room-actions.ts');
@@ -259,10 +259,11 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		const r1 = await runAction({ ...RUN, confirm_token: a.confirm_token }, prose.deps, now) as { error: string; detail?: string };
 		assert.equal(r1.error, 'write_failed');
 		assert.match(r1.detail ?? '', /unknown variable `apple`/);
+		resetPendingConfirmations(); // the refused prose try left a standing yes for this action and room
 		const bare = change(() => err('FORBIDDEN'));
 		const b = await first(bare);
 		t += CONFIRM_MIN_AGE_MS;
-		assert.deepEqual(await runAction({ ...RUN, confirm_token: b.confirm_token }, bare.deps, now), { ok: false, error: 'FORBIDDEN' });
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: b.confirm_token }, bare.deps, now), { ok: false, error: 'FORBIDDEN', done: false, next: NOT_DONE_NEXT });
 	});
 
 	it('the detail is cut so a long server message cannot flood the model', async () => {
@@ -271,6 +272,55 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		t += CONFIRM_MIN_AGE_MS;
 		const r = await runAction({ ...RUN, confirm_token }, f.deps, now) as { detail?: string };
 		assert.ok((r.detail ?? '').length <= 601, `detail length ${(r.detail ?? '').length}`);
+	});
+
+	it('asked once: after the yes, a refused try is fixed and run again without asking, until it succeeds', async () => {
+		// Live: three refusals in a row (wrong file reference, upstream error, stale_base) meant three more questions.
+		let n = 0;
+		const f = change(() => (++n < 3 ? { isError: true, structuredContent: { code: n === 1 ? 'INVALID_INPUT' : 'stale_base', message: 'fix it' } } : ok({ status: 'completed', result: {} })));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r1 = await runAction({ ...RUN, confirm_token }, f.deps, now) as { ok: boolean; done?: boolean; next?: string };
+		assert.equal(r1.ok, false);
+		assert.equal(r1.next, YES_HOLDS_NEXT, 'the model is told the yes still holds');
+		// Corrected arguments, no token: runs at once, no needs_confirmation.
+		const r2 = await runAction({ ...RUN, arguments_json: '{"root_event_id":"$a","fixed":1}' }, f.deps, now) as { ok: boolean; error?: string };
+		assert.equal(r2.error, 'stale_base');
+		const r3 = await runAction({ ...RUN, arguments_json: '{"root_event_id":"$a","fixed":2}' }, f.deps, now);
+		assert.ok(r3.ok, 'the third try succeeds without a second question');
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 3);
+		// The yes ends with the success: the next change is asked about again.
+		const r4 = await runAction(RUN, f.deps, now) as { error?: string };
+		assert.equal(r4.error, 'needs_confirmation');
+	});
+
+	it('the standing yes is for that action in that room only, for a few tries and a few minutes', async () => {
+		const f = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT' } }));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		await runAction({ ...RUN, confirm_token }, f.deps, now);
+		assert.equal(((await runAction({ ...RUN, room: '!other:ag2.space' }, f.deps, now)) as { error?: string }).error, 'needs_confirmation', 'another room is asked about');
+		for (let i = 1; i < YES_HOLDS_TRIES; i++) await runAction(RUN, f.deps, now);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, YES_HOLDS_TRIES);
+		assert.equal(((await runAction(RUN, f.deps, now)) as { error?: string }).error, 'needs_confirmation', 'out of tries: asked again');
+		const g = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT' } }));
+		resetPendingConfirmations();
+		const second = await first(g);
+		t += CONFIRM_MIN_AGE_MS;
+		await runAction({ ...RUN, confirm_token: second.confirm_token }, g.deps, now);
+		t += YES_HOLDS_MS;
+		assert.equal(((await runAction(RUN, g.deps, now)) as { error?: string }).error, 'needs_confirmation', 'too late: asked again');
+	});
+
+	it('a refusal corrected arguments cannot fix, or an unknown outcome, ends the yes', async () => {
+		for (const code of ['FORBIDDEN', 'ACTION_OUTCOME_UNKNOWN']) {
+			resetPendingConfirmations();
+			const f = change(() => ({ isError: true, structuredContent: { code } }));
+			const { confirm_token } = await first(f);
+			t += CONFIRM_MIN_AGE_MS;
+			await runAction({ ...RUN, confirm_token }, f.deps, now);
+			assert.equal(((await runAction({ ...RUN, arguments_json: '{"root_event_id":"$b"}' }, f.deps, now)) as { error?: string }).error, 'needs_confirmation', code);
+		}
 	});
 
 	it('an unknown outcome keeps the token; a retry reuses the operation_id, so it cannot run twice', async () => {
@@ -409,7 +459,7 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		const f = change(() => ok({ status: 'pending_approval', approval_id: 'ap1' }));
 		const { confirm_token } = await first(f);
 		t += CONFIRM_MIN_AGE_MS;
-		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'needs_approval' });
+		assert.deepEqual(await runAction({ ...RUN, confirm_token }, f.deps, now), { ok: false, error: 'needs_approval', done: false, next: NOT_DONE_NEXT });
 	});
 
 	it('the arguments are bound whatever their key order', () => {
