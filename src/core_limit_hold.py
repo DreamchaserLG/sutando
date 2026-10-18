@@ -336,9 +336,9 @@ def _notice_body(hold: dict) -> str:
         f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]}.\n\n"
         f"{when}, and the core starts again by itself after that. Messages you send meanwhile "
         "wait and are answered then.\n\n"
-        'To keep working now, reply "switch to sonnet" (or another model: haiku, opus, fable), '
-        "or pick a model in the core-model card under Agent Settings, Runtime, Model. "
-        'Reply "retry now" to try the current model again at once.\n')
+        'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
+        "haiku, opus, fable), or pick a model in the core-model card under Agent Settings, Runtime, Model. "
+        'Send "retry now" to try the current model again at once.\n')
 
 
 def _ensure_notice(workspace: Path, hold: dict) -> bool:
@@ -347,11 +347,13 @@ def _ensure_notice(workspace: Path, hold: dict) -> bool:
     if hold.get("notice_queued"):
         return False
     from local_record import write_text_whole
+    body = _notice_body(hold)
     try:
-        write_text_whole(Path(workspace) / "results" / hold["notice"], _notice_body(hold))
+        write_text_whole(Path(workspace) / "results" / hold["notice"], body)
     except OSError:
         return False
     hold["notice_queued"] = True
+    hold["notice_line"] = body.split("\n", 1)[1].split("\n", 1)[0]
     return True
 
 
@@ -408,7 +410,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         new["reason"] = status_line(new)
         # An incident runs until the core is let out; a hold after a release is a new one.
         if hold and hold.get("status") == "held" and hold.get("notice"):
-            for key in ("started_at", "notice", "notice_queued", "present_at_hold", "held_tasks"):
+            for key in ("started_at", "notice", "notice_queued", "notice_line", "present_at_hold", "held_tasks"):
                 new[key] = hold.get(key)
             new["started_at"] = new["started_at"] or hold.get("set_at") or now
         else:
@@ -454,10 +456,10 @@ _RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
 
 
 def _quotes_notice(reply: dict, hold: dict, agent: Optional[str]) -> bool:
-    """Whether a quoted message is this hold's notice: its opening line, sent by the agent."""
-    if agent and str(reply.get("sender") or "").strip() != agent.strip():
+    """Whether a quoted message is the notice this incident sent: its opening line, from the agent."""
+    first = hold.get("notice_line")
+    if not agent or not first or str(reply.get("sender") or "").strip() != agent.strip():
         return False
-    first = _notice_body(hold).split("\n", 1)[1].split("\n", 1)[0]
     flat = lambda t: " ".join(str(t).split())
     return flat(first) in flat(reply.get("body") or "")
 

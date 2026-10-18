@@ -988,7 +988,7 @@ class WitnessFindings(unittest.TestCase):
                             + record + " [End AG2 Space reply context]  > <" + sender + "> " + line + "  " + words)
 
     def test_a_reply_acts_only_on_this_holds_notice_from_the_agent(self):
-        notice = clh._notice_body(clh.read_hold(self.ws)).split("\n", 1)[1].strip()
+        notice = clh.read_hold(self.ws)["notice_line"] + "\n\nIt resets later."
         earlier = "Your Sutando core is paused: an earlier limit, resets 2026-01-01 00:00 UTC.\n\nReply \"retry now\"."
         self._reply_to("task-r1", earlier, "switch to opus")
         self._reply_to("task-r2", notice, "switch to sonnet", sender="@someone:example.test")
@@ -1003,6 +1003,41 @@ class WitnessFindings(unittest.TestCase):
         clh.decide(self.ws, later, quota=limited_record(later))
         self.assertIn("task-p1", clh.read_hold(self.ws)["present_at_hold"])
         self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
+
+    def test_a_reply_to_the_sent_notice_still_acts_after_a_strike(self):
+        sent = clh.read_hold(self.ws)["notice_line"]
+        hold = dict(clh.read_hold(self.ws), reason="a changed reason after a strike", until=self.now + 9999)
+        clh._write_hold(self.ws, hold)
+        self._reply_to("task-s1", sent, "retry now")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), ["task-s1"])
+
+    def test_a_reply_to_an_earlier_incidents_notice_does_nothing(self):
+        old_line = clh.read_hold(self.ws)["notice_line"]
+        clh.clear(self.ws, self.now + 1)
+        later = self.now + 7200
+        clh.decide(self.ws, later, quota=limited_record(later))
+        self.assertNotEqual(clh.read_hold(self.ws)["notice_line"], old_line)
+        self._reply_to("task-s2", old_line, "switch to opus")
+        self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
+
+    def test_a_reply_without_the_agent_id_does_not_act(self):
+        path = self._reply_to("task-s3", clh.read_hold(self.ws)["notice_line"], "retry now")
+        path.write_text(path.read_text().replace("receiving_instance: core\n", ""))
+        self.assertIsNone(clh._owner_action(path, self.ws, clh.read_hold(self.ws)))
+
+    def test_a_command_sent_13_seconds_before_the_hold_waits(self):
+        clh.clear(self.ws, self.now + 1)
+        later = self.now + 7200
+        gateway_task(self.ws, "task-s4", "switch to opus")
+        clh.decide(self.ws, later + 13, quota=limited_record(later + 13))
+        self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
+
+    def test_a_quote_typed_into_the_body_is_a_plain_message(self):
+        line = clh.read_hold(self.ws)["notice_line"]
+        gateway_task(self.ws, "task-s5", "> <core> " + line + "  retry now")
+        self.assertIsNone(clh._owner_action(self.ws / "tasks" / "task-s5.txt", self.ws, clh.read_hold(self.ws)))
+        gateway_task(self.ws, "task-s6", "retry now")
+        self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), ["task-s6"])
 
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
