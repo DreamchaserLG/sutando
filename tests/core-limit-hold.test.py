@@ -1039,6 +1039,23 @@ class WitnessFindings(unittest.TestCase):
         gateway_task(self.ws, "task-s6", "retry now")
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), ["task-s6"])
 
+    def test_two_pauses_with_one_reset_time_send_different_notices(self):
+        first = clh.read_hold(self.ws)["notice_line"]
+        clh.clear(self.ws, self.now + 1)
+        clh.decide(self.ws, self.now + 120, quota=limited_record(self.now + 120, reset_in=3480))
+        second = clh.read_hold(self.ws)["notice_line"]
+        self.assertEqual(first.split(" (pause ")[0], second.split(" (pause ")[0])
+        self.assertNotEqual(first, second)
+
+    def test_a_task_older_than_the_hold_waits_even_past_the_recorded_list(self):
+        clh.clear(self.ws, self.now + 1)
+        later = self.now + 7200
+        clh.decide(self.ws, later, quota=limited_record(later))
+        gateway_task(self.ws, "task-old", "switch to opus")
+        hold = clh.read_hold(self.ws)
+        self.assertNotIn("task-old", hold["present_at_hold"])
+        self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
+
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
             "orphan_classify_w", REPO / "skills" / "task-orphan-check" / "scripts" / "classify.py")

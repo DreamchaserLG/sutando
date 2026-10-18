@@ -328,12 +328,32 @@ def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
     return limit is not None and _same_family(limit.model, launch_model)
 
 
+def _incident_ref(hold: dict) -> str:
+    """A short id for this pause, so two pauses with the same reset time read differently."""
+    return str(int(float(hold.get("started_at") or 0) * 1000))[-6:]
+
+
+def _task_predates(path: Path, started: object) -> bool:
+    """Whether a task's own timestamp is before the hold opened (the cap on present_at_hold's backstop)."""
+    from datetime import datetime
+    if not isinstance(started, (int, float)):
+        return False
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("timestamp:"):
+                stamp = datetime.fromisoformat(line.split(":", 1)[1].strip().replace("Z", "+00:00"))
+                return stamp.timestamp() < started
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def _notice_body(hold: dict) -> str:
     from result_markers import neutralize_markers
     when = (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
             else f"It tries again {_when(hold['until'])}")
     return "[dm-only]\n" + neutralize_markers(
-        f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]}.\n\n"
+        f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]} (pause {_incident_ref(hold)}).\n\n"
         f"{when}, and the core starts again by itself after that. Messages you send meanwhile "
         "wait and are answered then.\n\n"
         'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
@@ -551,7 +571,7 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         if not hold:
             break
         # A message that predates this hold was about an earlier one; it waits for the core.
-        if path.stem in set(hold.get("present_at_hold") or []):
+        if path.stem in set(hold.get("present_at_hold") or []) or _task_predates(path, hold.get("started_at")):
             continue
         action = _owner_action(path, workspace, hold)
         if action is None:
