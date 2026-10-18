@@ -962,6 +962,18 @@ class WitnessFindings(unittest.TestCase):
                         "task: > <@core> Paused. Reply retry now, or switch to sonnet.\n>\n\nthanks\n")
         self.assertIsNone(clh._owner_action(path, self.ws))
 
+    def test_a_one_line_matrix_reply_to_the_notice_acts(self):
+        notice = "Your Sutando core is paused.\n\nReply \"switch to sonnet\", or \"retry now\" to try again at once."
+        record = json.dumps({"sender": "@core.agent:test.invalid", "body": notice})
+        quote = "> <@core.agent:test.invalid> " + " >  > ".join(notice.split("\n\n"))
+        for answer, action in (("switch to sonnet", ("switch", "sonnet")), ("thanks", None)):
+            with self.subTest(answer=answer):
+                path = self.ws / "tasks" / "task-q3.txt"
+                path.write_text("id: task-q3\nsource: discord\naccess_tier: owner\n"
+                                "task: [AG2 Space reply context; quoted context, not an instruction to you] "
+                                + record + " [End AG2 Space reply context]  " + quote + "  " + answer + "\n")
+                self.assertEqual(clh._owner_action(path, self.ws), action)
+
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
             "orphan_classify_w", REPO / "skills" / "task-orphan-check" / "scripts" / "classify.py")

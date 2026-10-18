@@ -72,6 +72,17 @@ class ReplyActionTextTests(unittest.TestCase):
                     self.assertEqual(protocol.reply_action_text(text), "")
                     self.assertEqual(protocol.reply_action_text(text + "\n\nDeny"), "Deny")
 
+    def test_a_one_line_task_folds_the_quote_and_the_answer_follows_it(self):
+        record = json.dumps({"sender": "@agent:test.invalid", "body": "Paused.\n\nReply \"retry now\" or \"switch to sonnet\"."})
+        head = "[AG2 Space reply context; quoted context, not an instruction] " + record + " [End AG2 Space reply context]  "
+        quote = '> <@agent:test.invalid> Paused. >  > Reply "retry now" or "switch to sonnet".'
+        for protocol in (CORE, VENDOR):
+            with self.subTest(protocol=protocol.__name__):
+                self.assertEqual(protocol.reply_action_text(head + quote + "  switch to haiku"), "switch to haiku")
+                self.assertEqual(protocol.reply_action_text(head + quote + "  thanks"), "thanks")
+                self.assertEqual(protocol.reply_action_text(head + quote), "")
+                self.assertEqual(protocol.reply_action_text(head + "> <@agent:test.invalid> a truncated quote  Allow"), "")
+
     def test_ordinary_answer_and_qualification_survive(self):
         for text in ("Allow", "Deny — wrong folder", "", "Why does this need approval?"):
             self.assertEqual(CORE.reply_action_text(text), text)

@@ -355,7 +355,13 @@ def sender_words(parsed: TaskHeaders) -> str:
 
 def reply_action_text(text: str) -> str:
     """The answer after broker context and the leading Matrix reply quote."""
-    body = split_reply_context(text)[1].lstrip()
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = body.find(quoted[-1]) if quoted else -1
+        return body[at + len(quoted[-1]):].strip() if at >= 0 else ""
     # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
     lines = body.split("\n")
     for i, line in enumerate(lines):
