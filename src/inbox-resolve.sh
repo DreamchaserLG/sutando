@@ -8,15 +8,12 @@
 # The resolver MUST print an ABSOLUTE path: checked with `-f` against the
 # watcher's cwd, not the resolver's, so a relative one fails safe, silently.
 
-# An optional second line names the task (a bare `*.txt`) when the payload's
-# basename is not its identity; it is passed on as this function's second line.
-
 # Bounded (SUTANDO_INBOX_RESOLVER_TIMEOUT, 5s): this runs inline in the
 # single-threaded dispatch loop, so a hung resolver would hang every future dispatch.
 # shellcheck source=bounded-wait.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bounded-wait.sh"
 resolve_inbox_entry() {
-	local entry="$1" out rc resolved not_absolute out_file name
+	local entry="$1" out rc resolved not_absolute out_file
 	if [ -z "${SUTANDO_INBOX_RESOLVER:-}" ]; then
 		printf '%s\n' "$entry"
 		return 0
@@ -47,15 +44,6 @@ resolve_inbox_entry() {
 		# rc 3 is the resolver's typed verdict (no payload behind the sentinel);
 		# everything else is a failure of this run and says nothing about the entry.
 		[ "$rc" -eq 3 ] && [ -z "$resolved" ] && return 4
-		return 3
-	fi
-	name="$(printf '%s\n' "$out" | sed -n '2p')"
-	if [ -n "$name" ]; then
-		case "$name" in
-			*/*|.*|*[!A-Za-z0-9._~-]*) ;;
-			?*.txt) printf '%s\n%s\n' "$resolved" "$name"; return 0 ;;
-		esac
-		echo "watch-tasks-stream: resolver $SUTANDO_INBOX_RESOLVER named no usable task name for $entry (second line: $name); not dispatching it" >&2
 		return 3
 	fi
 	printf '%s\n' "$resolved"

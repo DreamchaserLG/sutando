@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A routed task's payload lives beside its sentinel, not in tasks/ (#4836).
+"""A routed task's payload lives in its recipient's folder, not in tasks/ (#4836).
 
 The core's readers list tasks/*.txt and treat every entry as the core's; a
 payload left there after routing is adopted, answered, and the outbox item is
@@ -53,7 +53,7 @@ class T(unittest.TestCase):
         out = rt.route(self.ws, self.task, roster({ROOM: A}))
         self.assertEqual(out["delivered"], [A])
         body = pd.body_path(self.ws, A, "task-1")
-        self.assertTrue(body.is_file(), "body beside the sentinel")
+        self.assertTrue(body.is_file(), "body in the recipient's folder")
         self.assertEqual(body.read_text(), TEXT)
         self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file(), "sentinel")
         self.assertEqual(sorted(p.name for p in (self.ws / "tasks").glob("task-*.txt")), [],
@@ -63,7 +63,7 @@ class T(unittest.TestCase):
         out = rt.route(self.ws, self.task, roster({}))
         self.assertEqual(out["targets"], [pr.CORE])
         self.assertTrue((self.ws / "tasks" / "task-1.txt").is_file())
-        self.assertFalse(list((self.ws / "deliveries").glob("*/task-1.body")))
+        self.assertFalse(list((self.ws / "deliveries").glob(f"*/{pd.BODY_DIR}/task-1.txt")))
 
     def test_fan_out_gives_every_recipient_a_body_before_the_copy_goes(self):
         out = rt.route(self.ws, self.task, roster({ROOM: [A, B]}))
@@ -76,7 +76,7 @@ class T(unittest.TestCase):
         # A pass died after staging the body: no sentinel, no tasks/ copy either
         # (a later pass may have retired it). The replay must still deliver.
         folder = self.ws / "deliveries" / A
-        folder.mkdir()
+        pd.body_path(self.ws, A, "task-1").parent.mkdir(parents=True)
         pd.body_path(self.ws, A, "task-1").write_text(TEXT)
         (self.ws / "tasks" / "task-1.txt").unlink()
         out = rt.route(self.ws, self.task, roster({ROOM: A}))
@@ -84,7 +84,8 @@ class T(unittest.TestCase):
         self.assertEqual(out["skipped"], [])
         out2 = rt.route(self.ws, self.task, roster({ROOM: A}))
         self.assertEqual(out2["already"], [A])
-        self.assertEqual(len(list(folder.glob("task-1.*"))), 2, "one body, one sentinel")
+        self.assertEqual([p.name for p in folder.glob("task-1.*")], ["task-1.txt"], "one sentinel")
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT, "one body")
 
     def test_no_payload_anywhere_is_still_no_payload(self):
         (self.ws / "tasks" / "task-1.txt").unlink()
@@ -101,9 +102,8 @@ class T(unittest.TestCase):
         p = subprocess.run([sys.executable, str(SCRIPTS / "resolve_inbox_entry.py"), entry],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.splitlines(),
-                         [os.path.abspath(pd.body_path(self.ws, A, "task-1")), "task-1.txt"],
-                         "the payload is the body; the task's name stays task-1.txt")
+        self.assertEqual(p.stdout.splitlines(), [os.path.abspath(pd.body_path(self.ws, A, "task-1"))],
+                         "the payload is the body, named for its task")
 
     def test_resolver_still_finds_a_pre_move_payload_in_tasks(self):
         folder = self.ws / "deliveries" / A
@@ -137,14 +137,31 @@ class T(unittest.TestCase):
     def test_body_is_never_a_sentinel(self):
         rt.route(self.ws, self.task, roster({ROOM: A}))
         self.assertEqual(rt.holders(self.ws, "task-1"), [A])
-        names = pd.sentinel_names("task-1")
-        self.assertNotIn("task-1" + pd.BODY_SUFFIX, names)
-        self.assertIsNone(pd.parse_sentinel("task-1" + pd.BODY_SUFFIX))
+        self.assertIsNone(pd.parse_sentinel(pd.BODY_DIR))
+        self.assertEqual([p.name for p in pd.pending(self.ws, A)], ["task-1.txt"], "the body folder is not listed")
+
+    def test_a_symlinked_body_folder_is_refused_not_read(self):
+        outside = Path(tempfile.mkdtemp(dir=self.td.name, prefix="outside-"))
+        (outside / "task-1.txt").write_text("OUTSIDE-SECRET\n")
+        folder = self.ws / "deliveries" / A
+        folder.mkdir()
+        (folder / "task-1.txt").touch()
+        os.symlink(outside, folder / pd.BODY_DIR)
+        (self.ws / "tasks" / "task-1.txt").unlink()
+        with self.assertRaises(pd.RecipientAliasError):
+            pd.payload_location(self.ws, "task-1", A)
+        with self.assertRaises(pd.NotDelivered):
+            rie.resolve(str(folder / "task-1.txt"))
+        (self.ws / "tasks" / "task-2.txt").write_text(TEXT.replace("task-1", "task-2"))
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, {**self.task, "id": "task-2"}, roster({ROOM: A}))
+        self.assertFalse((outside / "task-2.txt").exists(), "nothing staged through the alias")
 
     # A recipient folder that is a symlink must never lead a lookup outside deliveries/.
     def _alias(self):
         outside = Path(tempfile.mkdtemp(dir=self.td.name, prefix="outside-"))
-        (outside / "task-1.body").write_text("OUTSIDE-SECRET\n")
+        (outside / pd.BODY_DIR).mkdir()
+        (outside / pd.BODY_DIR / "task-1.txt").write_text("OUTSIDE-SECRET\n")
         (outside / "task-1.txt").touch()
         os.symlink(outside, self.ws / "deliveries" / A)
         (self.ws / "tasks" / "task-1.txt").unlink()
@@ -189,8 +206,8 @@ class T(unittest.TestCase):
     # An existing body counts as an earlier pass only when it IS the payload.
     def _plant(self, make):
         folder = self.ws / "deliveries" / A
-        folder.mkdir()
-        make(folder / "task-1.body")
+        (folder / pd.BODY_DIR).mkdir(parents=True)
+        make(folder / pd.BODY_DIR / "task-1.txt")
         return folder
 
     def _refused_and_untouched(self, folder):
@@ -215,10 +232,10 @@ class T(unittest.TestCase):
         self.assertFalse((self.ws / "tasks" / "task-1.txt").exists())
 
     def _stage(self, existing):
-        folder = self.ws / "deliveries" / A
-        folder.mkdir()
+        folder = self.ws / "deliveries" / A / pd.BODY_DIR
+        folder.mkdir(parents=True)
         if existing is not None:
-            existing(folder / "task-1.body")
+            existing(folder / "task-1.txt")
         dfd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
         self.addCleanup(os.close, dfd)
         return folder, dfd
@@ -226,8 +243,8 @@ class T(unittest.TestCase):
     def test_stage_eexist_on_the_same_inode_is_a_prior_pass(self):
         src = self.ws / "tasks" / "task-1.txt"
         folder, dfd = self._stage(lambda b: os.link(src, b))
-        rt._stage_body(src, "task-1.body", dfd)
-        self.assertTrue(os.path.samefile(src, folder / "task-1.body"))
+        rt._stage_body(src, "task-1.txt", dfd)
+        self.assertTrue(os.path.samefile(src, folder / "task-1.txt"))
 
     def test_a_failed_copy_leaves_no_temp_name_behind(self):
         src = self.ws / "tasks" / "task-1.txt"
@@ -237,7 +254,7 @@ class T(unittest.TestCase):
                 with mock.patch.object(rt.os, "link", side_effect=OSError(18, "cross-device")), \
                         mock.patch.object(target, boom, side_effect=OSError(28, "no space")):
                     with self.assertRaises(OSError):
-                        rt._stage_body(src, "task-1.body", dfd)
+                        rt._stage_body(src, "task-1.txt", dfd)
                 self.assertEqual(list(folder.iterdir()), [], "no temp name, no body")
 
     def test_a_planted_symlink_body_with_no_core_copy_gets_no_sentinel(self):
@@ -253,31 +270,31 @@ class T(unittest.TestCase):
         src = self.ws / "tasks" / "task-1.txt"
         folder, dfd = self._stage(None)
         with mock.patch.object(rt.os, "link", side_effect=OSError(18, "cross-device")):
-            rt._stage_body(src, "task-1.body", dfd)
-        self.assertEqual((folder / "task-1.body").read_text(), TEXT)
-        self.assertFalse(os.path.samefile(src, folder / "task-1.body"), "a copy, not a link")
-        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["task-1.body"], "no temp name left")
+            rt._stage_body(src, "task-1.txt", dfd)
+        self.assertEqual((folder / "task-1.txt").read_text(), TEXT)
+        self.assertFalse(os.path.samefile(src, folder / "task-1.txt"), "a copy, not a link")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["task-1.txt"], "no temp name left")
 
     def test_stage_eexist_on_other_bytes_fails_loudly(self):
         src = self.ws / "tasks" / "task-1.txt"
         folder, dfd = self._stage(lambda b: b.write_text("OTHER\n"))
         with self.assertRaises(rt.ConflictingDelivery):
-            rt._stage_body(src, "task-1.body", dfd)
-        self.assertEqual((folder / "task-1.body").read_text(), "OTHER\n")
+            rt._stage_body(src, "task-1.txt", dfd)
+        self.assertEqual((folder / "task-1.txt").read_text(), "OTHER\n")
 
     def test_stage_eexist_on_a_fifo_fails_loudly(self):
         src = self.ws / "tasks" / "task-1.txt"
         _, dfd = self._stage(lambda b: os.mkfifo(b))
         with self.assertRaises(rt.ConflictingDelivery):
-            rt._stage_body(src, "task-1.body", dfd)
+            rt._stage_body(src, "task-1.txt", dfd)
 
     def test_same_body_check_refuses_what_it_cannot_open_or_compare(self):
         src = self.ws / "tasks" / "task-1.txt"
         _, dfd = self._stage(lambda b: b.write_text(TEXT))
         with self.assertRaises(rt.UnreadableEvidence):
-            rt._require_same_body(src, "task-missing.body", dfd, "task-1")
+            rt._require_same_body(src, "task-missing.txt", dfd, "task-1")
         with self.assertRaises(rt.UnreadableEvidence):
-            rt._require_same_body(self.ws / "tasks" / "gone.txt", "task-1.body", dfd, "task-1")
+            rt._require_same_body(self.ws / "tasks" / "gone.txt", "task-1.txt", dfd, "task-1")
 
     # A sentinel is retired only once its body reached tasks/archive/.
     def _finished(self):
@@ -346,25 +363,63 @@ class T(unittest.TestCase):
         arch = self._collide(lambda a: os.symlink(twin, a))
         self.assertTrue(arch.is_symlink())
 
-    def test_without_hard_links_the_body_is_moved_or_compared(self):
+    def _kept_with_archive(self, expect):
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT, "body kept")
+        self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file(), "sentinel kept")
+        arch = pd.archived_payload(self.ws, "task-1")
+        self.assertEqual(arch.read_text() if arch.exists() else None, expect)
+
+    def test_without_hard_links_the_body_and_sentinel_are_kept(self):
         self._finished()
         with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
-            self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
-        self.assertEqual(pd.archived_payload(self.ws, "task-1").read_text(), TEXT)
-        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+            self.assertIn("task-1", pd.prune_spent(self.ws, A)["kept"])
+        self._kept_with_archive(None)
 
-    def test_without_hard_links_a_colliding_archive_still_keeps_the_body(self):
+    def test_an_archive_planted_between_a_probe_and_a_publish_is_never_replaced(self):
         self._finished()
         arch = pd.archived_payload(self.ws, "task-1")
         arch.parent.mkdir(parents=True)
-        arch.write_text("OTHER\n")
-        with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
-            self.assertIn("task-1", pd.prune_spent(self.ws, A)["kept"])
-        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT)
-        arch.write_text(TEXT)
-        with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
-            self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
-        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+
+        real_lexists, real_link = os.path.lexists, os.link
+
+        def probe(path):
+            # The plant lands right after a probe that saw nothing there.
+            if Path(path) == arch:
+                arch.write_text("FOREIGN\n")
+                return False
+            return real_lexists(path)
+
+        def plant_then_link(src, dst, **kw):
+            if not arch.exists():
+                arch.write_text("FOREIGN\n")
+            return real_link(src, dst, **kw)
+
+        for link in (mock.DEFAULT, plant_then_link):
+            with self.subTest(link="no hard links" if link is mock.DEFAULT else "link loses the race"):
+                with contextlib.suppress(FileNotFoundError):
+                    arch.unlink()
+                link_kw = ({"side_effect": OSError(18, "cross-device")} if link is mock.DEFAULT
+                           else {"side_effect": plant_then_link})
+                with mock.patch.object(pd.os, "link", **link_kw), \
+                        mock.patch.object(pd.os.path, "lexists", side_effect=probe):
+                    self.assertIn("task-1", pd.prune_spent(self.ws, A)["kept"])
+                self.assertIn(arch.read_text() if arch.exists() else None, (None, "FOREIGN\n"),
+                              "a foreign archive is never overwritten by the body")
+                self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT)
+                self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file())
+
+    def test_a_symlinked_body_folder_is_not_archived(self):
+        self._finished()
+        folder = self.ws / "deliveries" / A
+        real = Path(tempfile.mkdtemp(dir=self.td.name, prefix="real-"))
+        os.rename(folder / pd.BODY_DIR, real / pd.BODY_DIR)
+        os.symlink(real / pd.BODY_DIR, folder / pd.BODY_DIR)
+        with self.assertRaises(pd.RecipientAliasError):
+            pd.prune_spent(self.ws, A)
+        self.assertFalse(pd.archived_payload(self.ws, "task-1").exists())
+        self.assertTrue((folder / "task-1.txt").is_file(), "sentinel kept")
+        self.assertFalse(pd._archive_body(self.ws, A, "task-1"), "the archiver refuses it on its own too")
+        self.assertEqual((real / pd.BODY_DIR / "task-1.txt").read_text(), TEXT)
 
     def test_a_non_regular_body_is_not_archived_and_the_sentinel_stays(self):
         self._finished()
@@ -381,9 +436,24 @@ class T(unittest.TestCase):
         self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
 
 
-class ResolvedIdentity(unittest.TestCase):
-    """The watcher keys results, claims, held and dedupe on the task's name: the
-    resolver's second line, never the payload's basename."""
+def _main_tree(dest: Path) -> "Path | None":
+    """origin/main's own src/ and scripts/, unpacked: the artifacts a host runs until it
+    restarts them. None when this checkout has no main ref to read them from."""
+    for ref in ("origin/main", "main"):
+        if subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref + "^{commit}"],
+                          capture_output=True).returncode == 0:
+            arc = subprocess.run(["git", "-C", str(REPO), "archive", ref, "src", "scripts"], capture_output=True)
+            if arc.returncode != 0:
+                return None
+            dest.mkdir(parents=True)
+            subprocess.run(["tar", "-x", "-C", str(dest)], input=arc.stdout, check=True)
+            return dest
+    return None
+
+
+class ResolvedAnnouncement(unittest.TestCase):
+    """A routed task's body is `<inbox>/bodies/<id>.txt`: named for its task, outside the
+    folder a watcher lists, so every watcher announces it by an absolute path."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -398,34 +468,24 @@ class ResolvedIdentity(unittest.TestCase):
     def tearDown(self):
         self.td.cleanup()
 
-    def shim(self, entry, resolver):
+    def test_the_shim_passes_the_body_path_on(self):
         script = (f'WORKSPACE_DIR="{self.ws}"; source "{REPO}/src/inbox-resolve.sh"; '
                   f'resolve_inbox_entry "$1"; echo "rc=$?"')
-        env = dict(os.environ, SUTANDO_INBOX_RESOLVER=str(resolver))
-        return subprocess.run(["bash", "-c", script, "_", str(entry)], capture_output=True, text=True,
-                              env=env, timeout=30)
+        env = dict(os.environ, SUTANDO_INBOX_RESOLVER=str(SCRIPTS / "resolve-inbox-entry"))
+        r = subprocess.run(["bash", "-c", script, "_", str(self.inbox / "task-1.txt")], capture_output=True,
+                           text=True, env=env, timeout=30)
+        self.assertEqual(r.stdout.splitlines(), [str(self.body), "rc=0"], r.stderr)
 
-    def test_the_shim_passes_the_task_name_on_beside_the_payload(self):
-        r = self.shim(self.inbox / "task-1.txt", SCRIPTS / "resolve-inbox-entry")
-        self.assertEqual(r.stdout.splitlines(), [str(self.body), "task-1.txt", "rc=0"], r.stderr)
-
-    def test_the_shim_refuses_an_unusable_task_name(self):
-        for bad in ("../task-1.txt", ".task-1.txt", "task-1.body", "task 1.txt"):
-            fake = Path(self.td.name) / "fake.sh"
-            fake.write_text(f"#!/bin/sh\nprintf '%s\\n%s\\n' '{self.body}' '{bad}'\n")
-            fake.chmod(0o755)
-            r = self.shim(self.inbox / "task-1.txt", fake)
-            self.assertEqual(r.stdout.splitlines(), ["rc=3"], f"{bad!r}: {r.stdout} {r.stderr}")
-
-    def sweep(self, role="standby"):
-        """One worker watcher over the inbox, with the shipped resolver, until it
-        has decided about the sentinel (an announce or a refusal)."""
-        out, err = Path(self.td.name) / "w.out", Path(self.td.name) / "w.err"
+    def sweep(self, role="standby", repo=REPO):
+        """One worker watcher (this tree's, or another's) over the inbox, with the shipped
+        resolver, until it has decided about the sentinel (an announce or a refusal)."""
+        out = Path(tempfile.mkstemp(dir=self.td.name, suffix=".out")[1])
+        err = Path(tempfile.mkstemp(dir=self.td.name, suffix=".err")[1])
         env = dict(os.environ, SUTANDO_INBOX_RESOLVER=str(SCRIPTS / "resolve-inbox-entry"),
                    SUTANDO_WORKSPACE_DIR=str(self.ws), SUTANDO_RESULTS_DIR=str(self.ws / "results"),
                    SUTANDO_INSTANCE=A)
         with open(out, "w") as fo, open(err, "w") as fe:
-            proc = subprocess.Popen(["bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(self.inbox),
+            proc = subprocess.Popen(["bash", str(repo / "src" / "watch-tasks-stream.sh"), str(self.inbox),
                                      "--role", role, "--inbox", str(self.inbox)],
                                     stdout=fo, stderr=fe, env=env, start_new_session=True)
         try:
@@ -441,26 +501,13 @@ class ResolvedIdentity(unittest.TestCase):
             proc.wait(timeout=30)
         return out.read_text(), err.read_text()
 
-    def test_an_unanswered_routed_task_is_announced_by_its_name_with_its_body(self):
-        out, err = self.sweep()
-        self.assertEqual(out.splitlines(), ["TASK_NAME: task-1.txt", f"TASK_FILE: {self.body}"], err[-800:])
-
-    def test_a_session_role_watcher_names_a_file_that_holds_the_body(self):
-        out, err = self.sweep(role="session")
-        lines = out.splitlines()
-        files = [ln[len("TASK_FILE: "):] for ln in lines if ln.startswith("TASK_FILE: ")]
-        self.assertEqual(len(files), 1, err[-800:])
-        self.assertEqual(Path(files[0]).read_text(), TEXT, "a session reading the named file gets the task")
-        self.assertEqual(lines[lines.index(f"TASK_FILE: {files[0]}") - 1], "TASK_NAME: task-1.txt")
-
-    def test_a_notifier_that_predates_task_name_types_nothing_rather_than_the_sentinel(self):
-        events, err = self.sweep()
-        old = "".join(ln + "\n" for ln in events.splitlines() if not ln.startswith("TASK_NAME: "))
-        self.assertIn("TASK_FILE: ", old, err[-800:])
-        for runtime in ("claude", "codex"):
-            with self.subTest(runtime=runtime):
-                lines, _ = self.notify(runtime, old)
-                self.assertFalse([ln for ln in lines if ln.startswith(("KEY ", "PAYLOAD "))], lines)
+    def test_every_role_announces_a_readable_body_named_for_its_task(self):
+        for role in ("standby", "session"):
+            with self.subTest(role=role):
+                out, err = self.sweep(role)
+                self.assertEqual(out.splitlines(), [f"TASK_FILE: {self.body}"], err[-800:])
+                self.assertEqual(self.body.name, "task-1.txt")
+                self.assertEqual(self.body.read_text(), TEXT, "a session reading the named file gets the task")
 
     def test_an_answered_routed_task_is_not_dispatched_again_after_a_restart(self):
         (self.ws / "results" / "task-1.txt").write_text("answered already\n")
@@ -468,10 +515,10 @@ class ResolvedIdentity(unittest.TestCase):
         self.assertNotIn("TASK_FILE:", out, err[-800:])
         self.assertIn(f"already answered, not dispatching again: {self.body}", err, err[-800:])
 
-    # Resolver -> watcher announcement -> each shipped notifier's own event loop and key derivation.
-    def notify(self, runtime, events):
+    # Watcher announcement -> a notifier's own event loop and key derivation (this tree's or another's).
+    def notify(self, runtime, events, repo=REPO):
         import re
-        script = REPO / "src" / "agent" / runtime / "cli" / "task-notifier.sh"
+        script = repo / "src" / "agent" / runtime / "cli" / "task-notifier.sh"
         text = script.read_text()
         fns = [re.search(rf"^{n}\(\) \{{.*?^\}}", text, re.S | re.M).group(0)
                for n in ("has_result", "task_payload", "enqueue_announced_task")
@@ -495,30 +542,33 @@ class ResolvedIdentity(unittest.TestCase):
         ])
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", self.td.name),
                "TASKS_DIR": str(self.inbox), "WORKSPACE_DIR": str(self.ws), "RESULTS_DIR": str(self.ws / "results"),
-               "REPO": str(REPO), "queue_dir": str(tmp / "queue"), "PAYLOAD_DIR": str(tmp / "payload"),
+               "REPO": str(repo), "queue_dir": str(tmp / "queue"), "PAYLOAD_DIR": str(tmp / "payload"),
                "INFLIGHT_DIR": str(tmp / "inflight"), "STAGE_LOG": str(tmp / "stages"),
                "event_dir": str(tmp), "RETRY_POLL_SEC": "1", "RETRY_INTERVAL": "1",
-               "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(REPO / "src" / "delivery" / "task_dispatch.py"),
+               "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(repo / "src" / "delivery" / "task_dispatch.py"),
                "SUTANDO_INBOX_RESOLVER": str(SCRIPTS / "resolve-inbox-entry"), "SUTANDO_INBOX_KIND": "deliveries"}
         r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, r.stderr)
         stages = (tmp / "stages").read_text() if (tmp / "stages").exists() else ""
         return r.stdout.splitlines(), stages
 
+    def assert_keyed_and_read(self, lines, runtime, stages=""):
+        self.assertIn("KEY task-1.txt", lines, stages)
+        self.assertEqual([ln for ln in lines if ln.startswith("KEY ")], ["KEY task-1.txt"])
+        payload = [ln[len("PAYLOAD "):] for ln in lines if ln.startswith("PAYLOAD ")]
+        self.assertEqual(payload, [str(self.body)])
+        self.assertEqual(Path(payload[0]).read_text(), TEXT, "the body is what the session reads")
+        if runtime == "claude":
+            self.assertIn(f"write the result to {self.ws / 'results'}/task-1.txt.",
+                          next(ln for ln in lines if ln.startswith("PROMPT ")))
+
     def test_both_notifiers_key_a_routed_task_by_its_name_and_read_its_body(self):
         events, err = self.sweep()
-        self.assertIn("TASK_NAME: task-1.txt", events, err[-800:])
+        self.assertIn(f"TASK_FILE: {self.body}", events, err[-800:])
         for runtime in ("claude", "codex"):
             with self.subTest(runtime=runtime):
                 lines, stages = self.notify(runtime, events)
-                self.assertIn("KEY task-1.txt", lines, stages)
-                self.assertNotIn("KEY task-1.body", lines)
-                payload = [ln[len("PAYLOAD "):] for ln in lines if ln.startswith("PAYLOAD ")]
-                self.assertEqual(payload, [str(self.body)])
-                self.assertEqual(Path(payload[0]).read_text(), TEXT, "the body is what the session reads")
-                if runtime == "claude":
-                    self.assertIn(f"write the result to {self.ws / 'results'}/task-1.txt.",
-                                  next(ln for ln in lines if ln.startswith("PROMPT ")))
+                self.assert_keyed_and_read(lines, runtime, stages)
 
     def test_both_notifiers_see_results_under_the_tasks_name_as_its_answer(self):
         events, err = self.sweep()
@@ -529,6 +579,34 @@ class ResolvedIdentity(unittest.TestCase):
                 self.assertFalse([ln for ln in lines if ln.startswith("KEY ")], "answered: nothing queued")
                 if runtime == "codex":
                     self.assertEqual(stages, "task-1.txt done\n")
+
+    # Rolling upgrade: main's own watcher and notifiers beside this tree's, in both directions.
+    def main_tree(self):
+        tree = _main_tree(Path(self.td.name) / "main")
+        if tree is None:
+            self.skipTest("no main ref in this checkout to unpack main's watcher and notifiers from")
+        return tree
+
+    def test_mains_watcher_with_this_resolver_announces_the_body_by_its_task_name(self):
+        main = self.main_tree()
+        for role in ("standby", "session"):
+            with self.subTest(role=role):
+                out, err = self.sweep(role, repo=main)
+                self.assertEqual(out.splitlines(), [f"TASK_FILE: {self.body}"], err[-800:])
+                for runtime in ("claude", "codex"):
+                    lines, stages = self.notify(runtime, out)
+                    self.assert_keyed_and_read(lines, runtime, stages)
+
+    def test_mains_notifiers_refuse_this_watchers_body_and_never_type_the_sentinel(self):
+        main = self.main_tree()
+        events, err = self.sweep()
+        self.assertIn(f"TASK_FILE: {self.body}", events, err[-800:])
+        for runtime in ("claude", "codex"):
+            with self.subTest(runtime=runtime):
+                lines, _ = self.notify(runtime, events, repo=main)
+                self.assertFalse([ln for ln in lines if ln.startswith(("KEY ", "PAYLOAD "))], lines)
+                lines, stages = self.notify(runtime, events)
+                self.assert_keyed_and_read(lines, runtime, stages)
 
 
 if __name__ == "__main__":

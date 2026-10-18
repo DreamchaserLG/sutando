@@ -81,37 +81,34 @@ class AnnouncedEntry(_Workspace):
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
             self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
-    def test_a_named_body_keys_by_the_name_and_reads_the_announced_file(self):
-        body = self.inbox / "task-abc.body"
+    def test_a_body_in_a_real_folder_directly_under_the_inbox_keys_by_its_name(self):
+        (self.inbox / "bodies").mkdir()
+        body = self.inbox / "bodies" / "task-abc.txt"
         body.write_text("id: task-abc\n")
-        self.assertEqual(td.announced_entry(self.inbox, str(body), name="task-abc.txt"), ("task-abc.txt", body))
-        self.assertEqual(td.announced_entry(self.inbox, str(self.payload), name="task-abc.txt",
-                                            payload_dir=self.ws / "tasks"), ("task-abc.txt", self.payload))
+        self.assertEqual(td.announced_entry(self.inbox, str(body), payload_dir=self.ws / "tasks"),
+                         ("task-abc.txt", body))
+        self.assertIsNone(td.announced_entry(self.inbox, str(body)), "absolute needs a resolver-backed caller")
 
-    def test_a_named_announcement_is_refused_unless_name_and_file_are_both_sound(self):
-        body = self.inbox / "task-abc.body"
-        body.write_text("id: task-abc\n")
-        link = self.inbox / "task-link.body"
-        link.symlink_to(body)
-        other = self.ws / "elsewhere"
-        other.mkdir()
-        (other / "task-abc.body").write_text("x\n")
-        cases = [("task-abc.body", str(body)), ("sub/task-abc.txt", str(body)), (".task-abc.txt", str(body)),
-                 ("..txt", str(body)), ("task-abc.txt", "task-abc.body"),
-                 ("task-abc.txt", f"{self.inbox}/../w1/task-abc.body"),
-                 ("task-abc.txt", str(link)), ("task-abc.txt", str(self.inbox / "task-none.body")),
-                 ("task-abc.txt", str(self.inbox)), ("task-abc.txt", str(other / "task-abc.body")),
-                 ("task-abc.txt", str(self.payload))]  # tasks/ is accepted only with payload_dir
-        for name, announced in cases:
-            self.assertIsNone(td.announced_entry(self.inbox, announced, name=name), (name, announced))
+    def test_only_a_regular_txt_one_level_under_a_real_inbox_folder_is_accepted(self):
+        (self.inbox / "bodies" / "deeper").mkdir(parents=True)
+        (self.inbox / "bodies" / "deeper" / "task-abc.txt").write_text("x\n")
+        (self.inbox / "bodies" / "task-abc.body").write_text("x\n")
+        real = self.ws / "elsewhere"
+        real.mkdir()
+        (real / "task-abc.txt").write_text("x\n")
+        (self.inbox / "alias").symlink_to(real)
+        (self.inbox / "bodies" / "task-link.txt").symlink_to(real / "task-abc.txt")
+        other = self.ws / "deliveries" / "w2" / "bodies"
+        other.mkdir(parents=True)
+        (other / "task-abc.txt").write_text("x\n")
+        for bad in (self.inbox / "bodies" / "deeper" / "task-abc.txt", self.inbox / "bodies" / "task-abc.body",
+                    self.inbox / "alias" / "task-abc.txt", self.inbox / "bodies" / "task-link.txt",
+                    self.inbox / "bodies" / "task-none.txt", other / "task-abc.txt", self.inbox / "bodies"):
+            self.assertIsNone(td.announced_entry(self.inbox, str(bad), payload_dir=self.ws / "tasks"), bad)
 
-    def test_the_cli_passes_a_task_name_through(self):
-        body = self.inbox / "task-abc.body"
-        body.write_text("id: task-abc\n")
-        self.assertEqual(self._cli(str(body), "--name", "task-abc.txt"), (0, f"task-abc.txt\t{body}\n"))
-        self.assertEqual(self._cli(str(self.payload), "--name", "task-abc.txt", "--resolved", str(self.ws / "tasks")),
-                         (0, f"task-abc.txt\t{self.payload}\n"))
-        self.assertEqual(self._cli(str(body), "--name", "task-abc.txt", "--name", "task-abc.txt"), (2, ""))
+    def test_a_bare_name_that_is_not_a_task_file_is_refused(self):
+        for bad in ("task-abc.body", "task-abc", "bodies"):
+            self.assertIsNone(td.announced_entry(self.inbox, bad), bad)
 
     def _cli(self, *argv: str) -> tuple[int, str]:
         # In-process, so the entry point's own branch is what runs (and is measured).
@@ -196,12 +193,13 @@ class ShippedEnqueue(_Workspace):
                 self.assertEqual(self._log(), "")
                 self._reset()
 
-    def test_the_same_announcement_from_a_watcher_without_a_resolver_types_nothing_quietly(self):
+    def test_the_same_announcement_from_a_watcher_without_a_resolver_is_refused_visibly(self):
         for runtime in NOTIFIERS:
             with self.subTest(runtime=runtime):
                 self._enqueue(runtime, str(self.payload), inbox=self.inbox, resolver="", kind="deliveries")
                 self.assertEqual(self._queued(), [])
-                self.assertEqual(self._log(), "")
+                self.assertEqual(self._log(), f"announcement refused: {self.payload}; not queuing\n")
+                self._reset()
 
     def test_on_the_cores_inbox_a_worker_held_task_is_still_refused(self):
         core = self.ws / "tasks"

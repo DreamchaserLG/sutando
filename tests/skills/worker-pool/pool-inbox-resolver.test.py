@@ -59,7 +59,7 @@ class TestTheShippedProgram(Base):
         want = self.payload()
         r = self.run_resolver(self.deliver("task-1.txt"))
         self.assertEqual(r.returncode, 0, r.stderr)
-        got = r.stdout.splitlines()[0]
+        got = r.stdout.strip()
         self.assertTrue(got.startswith("/"), f"not absolute: {got!r}")
         self.assertEqual(Path(got).resolve(), want.resolve())
 
@@ -67,10 +67,10 @@ class TestTheShippedProgram(Base):
         """A claimed sentinel spells the same task; neither name implies a
         different body, and the watcher announces whichever it saw."""
         want = self.payload()
-        a = self.run_resolver(self.deliver("task-1.accepted")).stdout
-        b = self.run_resolver(self.deliver("task-1.txt")).stdout
+        a = self.run_resolver(self.deliver("task-1.accepted")).stdout.strip()
+        b = self.run_resolver(self.deliver("task-1.txt")).stdout.strip()
         self.assertEqual(a, b)
-        self.assertEqual(Path(a.splitlines()[0]).resolve(), want.resolve())
+        self.assertEqual(Path(a).resolve(), want.resolve())
 
     def test_the_pending_name_resolves_after_the_sentinel_was_accepted(self):
         """The watcher saw `.txt`; by the time it asks, the folder may hold only
@@ -81,15 +81,14 @@ class TestTheShippedProgram(Base):
         self.assertFalse(Path(entry).exists())
         r = self.run_resolver(entry)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(Path(r.stdout.splitlines()[0]).resolve(), want.resolve())
+        self.assertEqual(Path(r.stdout.strip()).resolve(), want.resolve())
 
-    def test_stdout_carries_the_path_then_the_task_name_and_nothing_else(self):
-        # The caller reads the FIRST line as the payload and requires it to BE a
-        # file; the second is the task's name, whichever file holds the payload.
-        want = self.payload()
-        for sentinel in ("task-1.txt", "task-1.accepted"):
-            r = self.run_resolver(self.deliver(sentinel))
-            self.assertEqual(r.stdout.splitlines(), [str(want), "task-1.txt"], r.stdout)
+    def test_stdout_carries_the_path_and_nothing_else(self):
+        # The caller reads the FIRST line and requires it to BE a file, so a
+        # banner ahead of the answer would make the answer unusable.
+        self.payload()
+        r = self.run_resolver(self.deliver("task-1.txt"))
+        self.assertEqual(len(r.stdout.strip().splitlines()), 1, r.stdout)
 
 
 class TestItFailsClosed(Base):
@@ -173,7 +172,7 @@ class TestItResolvesTheAssignedTree(Base):
         entry = self.deliver("task-1.txt")
         r = self.run_resolver(entry, "--workspace", str(self.root))
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(Path(r.stdout.splitlines()[0]), want)
+        self.assertEqual(Path(r.stdout.strip()), want)
 
     def test_omitted_falls_back_to_the_entrys_own_tree(self):
         # The control that keeps the two above honest: with no assignment passed,
@@ -182,7 +181,7 @@ class TestItResolvesTheAssignedTree(Base):
         entry = self.deliver("task-1.txt")
         r = self.run_resolver(entry)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(Path(r.stdout.splitlines()[0]), want)
+        self.assertEqual(Path(r.stdout.strip()), want)
 
     def test_the_watcher_passes_the_workspace_it_was_assigned(self):
         """The two halves are one contract: a resolver that requires the flag and
@@ -261,7 +260,7 @@ class TestTheWorkersResolvedInterpreter(Base):
                 os.symlink(src, bare / t)
         r = self.run_resolver(entry, env={"PATH": str(bare), "SUTANDO_PY": sys.executable})
         self.assertEqual(r.returncode, 0, f"rc={r.returncode} err={r.stderr}")
-        self.assertEqual(Path(r.stdout.splitlines()[0]).resolve(), want.resolve())
+        self.assertEqual(Path(r.stdout.strip()).resolve(), want.resolve())
 
     def test_no_interpreter_at_all_fails_loudly_and_prints_no_path(self):
         self.payload()
@@ -315,7 +314,7 @@ class TestMainInProcess(Base):
         want = self.payload()
         rc, out, _ = self._main(self.deliver("task-1.txt"))
         self.assertEqual(rc, 0)
-        self.assertEqual(Path(out.splitlines()[0]).resolve(), want.resolve())
+        self.assertEqual(Path(out.strip()).resolve(), want.resolve())
 
     def test_an_absent_payload_returns_the_typed_no_payload_code(self):
         """Exit 3 is a verdict about the ENTRY (nothing behind the sentinel), so
@@ -363,7 +362,7 @@ class TestTheseBranchesInProcess(Base):
         want = self.payload()
         rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", str(self.root))
         self.assertEqual(rc, 0)
-        self.assertEqual(Path(out.splitlines()[0]), want)
+        self.assertEqual(Path(out.strip()), want)
 
     def test_a_workspace_flag_with_no_value_is_a_usage_error(self):
         rc, out, err = self._main(self.deliver("task-1.txt"), "--workspace")
@@ -376,7 +375,7 @@ class TestTheseBranchesInProcess(Base):
         want = self.payload()
         rc, out, _ = self._main(self.deliver("task-1.txt"), "--workspace", "  ")
         self.assertEqual(rc, 0)
-        self.assertEqual(Path(out.splitlines()[0]), want)
+        self.assertEqual(Path(out.strip()), want)
 
     def test_a_disagreeing_workspace_returns_one_in_process(self):
         self.payload()

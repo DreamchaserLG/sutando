@@ -261,7 +261,7 @@ class TestIntentionLayer(Base):
 
 
 class TestDelivery(Base):
-    def test_the_real_run_delivers_and_moves_the_payload_beside_the_sentinel(self):
+    def test_the_real_run_delivers_and_moves_the_payload_to_the_recipient(self):
         # The payload leaves tasks/ once every recipient holds it, so no reader of
         # tasks/*.txt adopts a routed task; the worker reads the body via the resolver.
         self.roster()
@@ -271,8 +271,8 @@ class TestDelivery(Base):
         s = self.ws / "deliveries" / W / "task-1.txt"
         self.assertTrue(s.exists())
         self.assertEqual(s.stat().st_size, 0)
-        body = self.ws / "deliveries" / W / "task-1.body"
-        self.assertEqual(body.read_text(), text, "the body sits beside the sentinel")
+        body = self.ws / "deliveries" / W / "bodies" / "task-1.txt"
+        self.assertEqual(body.read_text(), text, "the body sits in the recipient's own folder")
         self.assertFalse(Path(t).exists(), "tasks/ no longer lists a routed task")
         # A replay on the path the watcher saw still settles: the text is read
         # from the body, the route reports already, rc 0.

@@ -49,7 +49,7 @@ def read_task(task_file: str, workspace=None) -> dict:
     so a body cannot forge it. `channel_id`/`source` are read leniently: the gateway stamps them
     below `task:`, where the strict parse never looks.
 
-    A file the watcher saw may since have moved beside its recipient's sentinel
+    A file the watcher saw may since have moved into its recipient's body folder
     (a routed payload leaves tasks/); a replay then reads the same text there.
     """
     try:

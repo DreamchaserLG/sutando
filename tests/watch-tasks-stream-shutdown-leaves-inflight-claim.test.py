@@ -176,7 +176,7 @@ class Workspace:
         return p
 
     def sentinels(self, tid: str) -> list[str]:
-        # Sentinels only: the delivered payload sits beside them as <tid>.body (#4836).
+        # Sentinels only, never the delivered payload in the folder's body directory.
         return sorted(str(p.relative_to(self.ws)) for p in (self.ws / "deliveries").glob(f"*/{tid}.*")
                       if p.suffix in (".txt", ".accepted", ".claimed"))
 
@@ -309,7 +309,7 @@ def expect_settled(w: Workspace, w2: Watcher, name: str, runs: int, recipient: s
     tid = name[:-4]
     # "claim absent" and "sentinel present" can both be true BEFORE the replay
     # runs: wait for the router's Nth completion, then for the release after it.
-    # A route that completed before the kill moved the payload beside the sentinel:
+    # A route that completed before the kill moved the payload to its recipient:
     # the successor finds no file, retires the dead claim and replays nothing.
     check("the next watcher's sweep replayed the router to completion",
           wait_for(lambda: router_runs(w) >= runs, 30.0), str(w.log()))

@@ -50,7 +50,9 @@ ACCEPTED_SUFFIX = ".accepted"
 # Sentinels written before the rename. Recognised so work already accepted under
 # the old name is never re-delivered; nothing writes this suffix.
 LEGACY_ACCEPTED_SUFFIX = ".claimed"
-BODY_SUFFIX = ".body"   # the delivered payload, beside the sentinel; never a sentinel
+# The delivered payload, `<dir>/<id>.txt` under the sentinel's folder: named for its task, so
+# any watcher announces it by an absolute path, and never in a folder a watcher lists.
+BODY_DIR = "bodies"
 
 # Not a sentinel: the regex below never matches it, so listings skip it.
 LOCK_NAME = ".lock"
@@ -100,9 +102,27 @@ def archived_payload(workspace: Path, task_id: str) -> Path:
 
 
 def body_path(workspace: Path, recipient: str, task_id: str) -> Path:
-    """The payload as delivered: beside the recipient's sentinel, so ownership is
+    """The payload as delivered: under the recipient's folder, so ownership is
     the directory and no reader of tasks/ sees a routed task."""
-    return deliveries_dir(workspace, recipient) / f"{task_id}{BODY_SUFFIX}"
+    return deliveries_dir(workspace, recipient) / BODY_DIR / f"{task_id}{PENDING_SUFFIX}"
+
+
+def require_body_dir(folder: Path) -> None:
+    """A symlink at the body folder would let a planted link decide which body is read."""
+    if (Path(folder) / BODY_DIR).is_symlink():
+        raise RecipientAliasError(errno.ELOOP, "body directory is a symlink alias", str(Path(folder) / BODY_DIR))
+
+
+def open_body_dir(dfd: int, create: bool = False) -> "int | None":
+    """The body folder opened relative to its recipient's folder fd, never followed;
+    None when it is absent and not created."""
+    if create:
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(BODY_DIR, 0o755, dir_fd=dfd)
+    try:
+        return os.open(BODY_DIR, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+    except FileNotFoundError:
+        return None
 
 
 def payload_location(workspace: Path, task_id: str, recipient: str | None = None) -> Path | None:
@@ -124,7 +144,8 @@ def payload_location(workspace: Path, task_id: str, recipient: str | None = None
         d = root / name
         if d.is_symlink():
             raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias", str(d))
-        b = d / f"{task_id}{BODY_SUFFIX}"
+        require_body_dir(d)
+        b = d / BODY_DIR / f"{task_id}{PENDING_SUFFIX}"
         if is_regular_file(b):
             return b
     return None
@@ -135,29 +156,22 @@ def _archive_body(ws: Path, recipient: str, task_id: str) -> bool:
     True once no body remains here; False (reason on stderr) when it could not be moved, or when
     the archive already holds something that is not provably this same body."""
     b = body_path(ws, recipient, task_id)
-    state = regular_file_state(b)
-    if state == "absent":
-        return True
     try:
+        require_body_dir(b.parent.parent)
+        state = regular_file_state(b)
+        if state == "absent":
+            return True
         if state != "regular":
             raise OSError(errno.EINVAL, f"body is {state}", str(b))
         dst = archived_payload(ws, task_id)
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # Only a link publishes: it never replaces what is there. Where links fail, nothing
+        # else is tried, since a rename can overwrite an archive planted after any check.
         try:
-            # A link never replaces what is there, so a destination that appears meanwhile is compared.
             os.link(b, dst, follow_symlinks=False)
         except FileExistsError:
             if not _same_regular_body(b, dst):
                 raise OSError(errno.EEXIST, "archive holds a different file", str(dst))
-        except OSError as e:
-            if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV):
-                raise
-            if os.path.lexists(dst):
-                if not _same_regular_body(b, dst):
-                    raise OSError(errno.EEXIST, "archive holds a different file", str(dst))
-            else:
-                os.rename(b, dst)
-                return True
         with contextlib.suppress(FileNotFoundError):
             b.unlink()
     except OSError as e:
@@ -292,7 +306,7 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
     if not is_done_flag(done_flag(workspace, recipient, task_id)):
         # The core owns the payload again: a body left here would be a task nobody
         # lists, so it goes back to tasks/ unless a copy is already there.
-        body = task_id + BODY_SUFFIX
+        body = task_id + PENDING_SUFFIX
         core_copy = payload_path(workspace, task_id)
         restore = regular_file_state(core_copy) == "absent"
         # Decide under the lock accept/release rename under; the flag check above is
@@ -302,9 +316,14 @@ def clear_pending(workspace, recipient: str, task_id: str) -> Path:
             if name is not None:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(name, dir_fd=dfd)
-            if restore and regular_file_state(body, dir_fd=dfd) == "regular":
-                with contextlib.suppress(OSError):
-                    os.rename(body, str(core_copy), src_dir_fd=dfd)
+            bfd = open_body_dir(dfd) if restore else None
+            if bfd is not None:
+                try:
+                    if regular_file_state(body, dir_fd=bfd) == "regular":
+                        with contextlib.suppress(OSError):
+                            os.rename(body, str(core_copy), src_dir_fd=bfd)
+                finally:
+                    os.close(bfd)
     return pend
 
 

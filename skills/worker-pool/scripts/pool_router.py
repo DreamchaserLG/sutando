@@ -223,18 +223,27 @@ def deliver_one(workspace, recipient: str, task_id: str,
             if not src.is_file():
                 return "no-payload"
         else:
-            # The body lands beside the sentinel BEFORE the sentinel exists, so a
-            # sentinel never names nothing; a body from an earlier pass is the payload.
-            body = task_id + pd.BODY_SUFFIX
-            state = pd.regular_file_state(body, dir_fd=dfd)
-            if state == "absent":
-                if not src.is_file():
-                    return "no-payload"
-                _stage_body(src, body, dfd)
-            elif state != "regular":
-                raise UnreadableEvidence(f"{task_id}: {recipient}/{body} is {state}; refusing to deliver")
-            elif src.is_file():
-                _require_same_body(src, body, dfd, task_id)
+            # The body lands BEFORE the sentinel exists, so a sentinel never names
+            # nothing; a body from an earlier pass is the payload.
+            try:
+                bfd = pd.open_body_dir(dfd, create=src.is_file())
+            except OSError as e:
+                raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR} cannot be opened ({e}); refusing to deliver") from e
+            if bfd is None:
+                return "no-payload"
+            try:
+                body = task_id + pd.PENDING_SUFFIX
+                state = pd.regular_file_state(body, dir_fd=bfd)
+                if state == "absent":
+                    if not src.is_file():
+                        return "no-payload"
+                    _stage_body(src, body, bfd)
+                elif state != "regular":
+                    raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR}/{body} is {state}; refusing to deliver")
+                elif src.is_file():
+                    _require_same_body(src, body, bfd, task_id)
+            finally:
+                os.close(bfd)
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -249,7 +258,7 @@ def deliver_one(workspace, recipient: str, task_id: str,
 
 
 def _stage_body(src: Path, name: str, dfd: int) -> None:
-    """The payload beside the sentinel: a link when the filesystem allows it, else a
+    """The payload in the recipient's body folder: a link when the filesystem allows it, else a
     copy through a temporary name. EEXIST is a prior pass that got this far."""
     try:
         os.link(str(src), name, dst_dir_fd=dfd)
