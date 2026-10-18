@@ -1032,7 +1032,7 @@ class WitnessFindings(unittest.TestCase):
         clh.decide(self.ws, later + 13, quota=limited_record(later + 13))
         self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
 
-    def test_a_quote_typed_into_the_body_is_a_plain_message(self):
+    def test_a_quote_typed_into_the_body_does_not_act(self):
         line = clh.read_hold(self.ws)["notice_line"]
         gateway_task(self.ws, "task-s5", "> <core> " + line + "  retry now")
         self.assertIsNone(clh._owner_action(self.ws / "tasks" / "task-s5.txt", self.ws, clh.read_hold(self.ws)))
