@@ -229,6 +229,15 @@ class T(unittest.TestCase):
         rt._stage_body(src, "task-1.body", dfd)
         self.assertTrue(os.path.samefile(src, folder / "task-1.body"))
 
+    def test_stage_copies_through_a_temp_name_when_a_link_is_refused(self):
+        src = self.ws / "tasks" / "task-1.txt"
+        folder, dfd = self._stage(None)
+        with mock.patch.object(rt.os, "link", side_effect=OSError(18, "cross-device")):
+            rt._stage_body(src, "task-1.body", dfd)
+        self.assertEqual((folder / "task-1.body").read_text(), TEXT)
+        self.assertFalse(os.path.samefile(src, folder / "task-1.body"), "a copy, not a link")
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["task-1.body"], "no temp name left")
+
     def test_stage_eexist_on_other_bytes_fails_loudly(self):
         src = self.ws / "tasks" / "task-1.txt"
         folder, dfd = self._stage(lambda b: b.write_text("OTHER\n"))
