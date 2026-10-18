@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { injectSilentContext } from '../src/browser-tools.js';
+import { localTimeValue } from '../src/local_time.js';
 
 // The AG2 Space voice plugin against the real task bridge: the client announces its
 // room with a `session.context` frame, the plugin binds it as the session's origin on
@@ -562,6 +563,63 @@ describe('bindSessionContextFrame — a forged but valid room id never becomes a
 	});
 });
 
+describe('a session.context frame during the transcription wait', () => {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const delegate = async (task: string) => (await (workTool.execute as any)({ task }, null)) as { taskId: string };
+	const bodyOf = (taskId: string) => readFileSync(join(TASK_DIR, `${taskId}.txt`), 'utf-8');
+	const frame = (room: string) => ({ type: 'session.context', version: 1, room_id: room, room_name: 'Docked', surface: 'room' });
+	const OTHER = '!next-room:ag2.space';
+	const written: string[] = [];
+	// The owner spoke just now and no words have landed, so the call waits; `read` resolves on its first read.
+	function lateSpeech() {
+		let input = '';
+		let signal!: () => void;
+		const read = new Promise<void>((r) => { signal = r; });
+		bridge.setVoiceTurnsProvider(() => {
+			signal();
+			return { items: [{ role: 'assistant', content: 'Previous turn.' }], pendingInput: input, lastUserSpeechAt: Date.now() };
+		});
+		return { read, say(words: string) { input = words; } };
+	}
+
+	after(() => {
+		bridge.setVoiceTurnsProvider(null);
+		setVoiceRoomVerifier(null);
+		setVoiceSessionRoom(null);
+		for (const id of written) { try { rmSync(join(TASK_DIR, `${id}.txt`), { force: true }); } catch {} }
+	});
+
+	it('the same room re-announced keeps the owner\'s late words in the task', { timeout: 5000 }, async () => {
+		setVoiceSessionRoom(null);
+		setVoiceRoomVerifier(async (room) => verdictFor(room, true));
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'entered');
+		const speech = lateSpeech();
+		const pending = delegate('room probe: re-announce during the wait');
+		await speech.read;
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'none');
+		speech.say('summarise the launch thread');
+		const { taskId } = await pending;
+		written.push(taskId);
+		assert.match(bodyOf(taskId), new RegExp(`^source_room_id: ${VERIFIED}$`, 'm'));
+		assert.match(bodyOf(taskId), /--- spoken[\s\S]*user: summarise the launch thread/);
+	});
+
+	it('a switch to another room still drops words read after it', { timeout: 5000 }, async () => {
+		setVoiceSessionRoom(null);
+		setVoiceRoomVerifier(async (room) => verdictFor(room, true));
+		assert.equal((await bindSessionContextFrame(frame(VERIFIED)))?.change, 'entered');
+		const speech = lateSpeech();
+		const pending = delegate('room probe: switch during the wait');
+		await speech.read;
+		assert.equal((await bindSessionContextFrame(frame(OTHER)))?.change, 'entered');
+		speech.say('words said in the next room');
+		const { taskId } = await pending;
+		written.push(taskId);
+		assert.match(bodyOf(taskId), new RegExp(`^source_room_id: ${VERIFIED}$`, 'm'));
+		assert.doesNotMatch(bodyOf(taskId), /words said in the next room|--- spoken/);
+	});
+});
+
 describe('the result leg re-checks the room: a forged source_room_id never becomes a [channel:] destination', () => {
 	const forgedTask = 'task-1700000000900';
 	const verifiedTask = 'task-1700000000901';
@@ -667,7 +725,7 @@ describe('what the core is handed for a room: the origin, its header keys and th
 		assert.equal(o.contextLine, voiceRoomTaskGuidance(VERIFIED));
 		assert.equal(o.dmOnlyNote, DM_ONLY_DELIVERY_NOTE);
 		assert.equal(bridge.buildVoiceTaskHeader('task-2', '2026-09-18T10:00:00.000Z', 'owner-1', o), [
-			'id: task-2', 'timestamp: 2026-09-18T10:00:00.000Z', 'source: voice', 'interaction_type: realtime_audio', 'media_form: live_stream',
+			'id: task-2', 'timestamp: 2026-09-18T10:00:00.000Z', `local_time: ${localTimeValue(new Date('2026-09-18T10:00:00.000Z'))}`, 'source: voice', 'interaction_type: realtime_audio', 'media_form: live_stream',
 			`channel_id: ${VERIFIED}`, 'channel_kind: room', `source_room_id: ${VERIFIED}`, 'user_id: owner-1', 'access_tier: owner', 'priority: urgent', '',
 		].join('\n'));
 	});

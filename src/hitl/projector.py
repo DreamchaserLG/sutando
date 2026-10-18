@@ -46,6 +46,8 @@ _STATUS_LINES = {
     STATUS_EXPIRED: "— Expired, no longer applicable.",
     STATUS_CANCELLED: "— Cancelled.",
 }
+# A cleared Claude login is a sign-in; "reconnect" names restoring an AG2 Space agent token.
+_KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has continued its work."}
 
 
 def fallback_body(req: HumanRequirement) -> str:
@@ -56,7 +58,7 @@ def fallback_body(req: HumanRequirement) -> str:
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
     head = f"{lead} — {req.message}{where}"
-    closer = _STATUS_LINES.get(req.status)
+    closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
     return head
@@ -74,10 +76,26 @@ def pending_ids(manager: HitlManager, clock: Clock = time.time) -> List[str]:
 
     A caller owning retry cadence needs to tell "nothing to send" from "every
     send was refused"; `project()` returns an empty list for both.
+
+    This WRITES: every terminal record that owes nothing is moved to the
+    archive on the way, so the per-pulse scan stays the size of the live set.
+    A failed move is skipped, warned once per id, and counted in the status
+    health-check reads (`archive_health`); cleanup never blocks delivery.
     """
-    owed = {r.id for n in _notices(manager, clock()) for r, _ in n.members}
-    return [r.id for r in manager.store.all()
-            if manager.needs_projection(r.id) or r.id in owed]
+    now = clock()
+    owed = {r.id for n in _notices(manager, now) for r, _ in n.members}
+    out: List[str] = []
+    failed: Dict[str, BaseException] = {}
+    for r in manager.store.all():
+        if manager.needs_projection(r.id) or r.id in owed:
+            out.append(r.id)
+        elif r.terminal:
+            try:
+                manager.archive_if_settled(r.id, now)
+            except OSError as e:
+                failed[r.id] = e
+    manager.store.report_archive_failures(failed, now)
+    return out
 
 
 def project(manager: HitlManager, send: Sender, room_id: str,
