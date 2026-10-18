@@ -21,6 +21,8 @@ never held, so it is revived as before.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
+Tasks that arrive during a hold are listed in its record (`held_tasks`), so the orphan check
+on the next boot leaves them for the core; each hold incident sends its own notice.
 """
 from __future__ import annotations
 
@@ -49,6 +51,7 @@ BACKOFF_CAP_S = 60 * 60
 RESET_GRACE_S = 60
 MAX_RESET_WAIT_S = 8 * 24 * 3600
 STRIKE_MEMORY_S = 2 * BACKOFF_CAP_S
+HELD_TASKS_MAX = 256
 # A reset more than a day out is honored for 6 hours, then one launch re-reads the provider.
 LONG_RESET_S = 24 * 3600
 LONG_RESET_RECHECK_S = 6 * 3600
@@ -285,6 +288,28 @@ def _write_hold(workspace: Path, hold: dict) -> None:
     write_status(HOLD_FILE, hold, workspace=Path(workspace))
 
 
+def _live_tasks(workspace: Path) -> list:
+    try:
+        return sorted(p.stem for p in (Path(workspace) / "tasks").glob("*.txt") if p.is_file())
+    except OSError:
+        return []
+
+
+def _admit_arrivals(workspace: Path, hold: dict) -> dict:
+    """The hold with every task that arrived since it opened added to `held_tasks`.
+    Those wait for the core, so the next boot's orphan check must leave them."""
+    before = set(hold.get("present_at_hold") or [])
+    held = [t for t in hold.get("held_tasks") or [] if isinstance(t, str)]
+    new = [t for t in _live_tasks(workspace) if t not in before and t not in held]
+    return dict(hold, held_tasks=(held + new)[-HELD_TASKS_MAX:]) if new else hold
+
+
+def held_task_ids(workspace: Path) -> frozenset:
+    """Ids of the tasks the last hold took in; they wait for the core, never orphans. Read-only."""
+    hold = read_hold(workspace) or {}
+    return frozenset(t for t in hold.get("held_tasks") or [] if isinstance(t, str))
+
+
 def _mirror_core_status(workspace: Path, status: str, step: str, now: float) -> None:
     try:
         write_status("core-status.json", {"status": status, "step": step, "ts": int(now)},
@@ -351,6 +376,11 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     now = time.time() if now is None else now
     workspace = Path(workspace)
     hold = read_hold(workspace)
+    if hold and hold.get("status") == "held":
+        admitted = _admit_arrivals(workspace, hold)
+        if admitted is not hold:
+            hold = admitted
+            _write_hold(workspace, hold)
     if active_hold(workspace, now) and _same_family(hold.get("model"), launch_model):
         if _ensure_notice(workspace, hold):
             _write_hold(workspace, hold)
@@ -372,12 +402,21 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
             "until": _hold_until(limit, strikes, now), "strikes": strikes,
         }
         new["reason"] = status_line(new)
-        if hold and recent and hold.get("notice"):
-            new["notice"], new["notice_queued"] = hold["notice"], bool(hold.get("notice_queued"))
+        # An incident runs until the core is let out; a hold after a release is a new one.
+        if hold and hold.get("status") == "held" and hold.get("notice"):
+            for key in ("started_at", "notice", "notice_queued", "present_at_hold", "held_tasks"):
+                new[key] = hold.get(key)
+            new["started_at"] = new["started_at"] or hold.get("set_at") or now
         else:
             from proactive_routing import proactive_filename
+            live = _live_tasks(workspace)
+            # Tasks a previous hold took in that the core has not answered still wait.
+            carried = [t for t in (hold or {}).get("held_tasks") or [] if t in live]
+            new["started_at"] = now
             new["notice"] = proactive_filename(f"core-limit-hold-{int(now * 1000)}")
             new["notice_queued"] = False
+            new["held_tasks"] = carried
+            new["present_at_hold"] = [t for t in live if t not in carried][-HELD_TASKS_MAX:]
         _ensure_notice(workspace, new)
         _write_hold(workspace, new)
         _mirror_core_status(workspace, "paused", new["reason"], now)
@@ -394,7 +433,7 @@ def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None
     hold = read_hold(workspace)
     if not hold or hold.get("status") != "held":
         return hold
-    hold = dict(hold, status="cleared", released_at=time.time() if now is None else now)
+    hold = dict(_admit_arrivals(workspace, hold), status="cleared", released_at=time.time() if now is None else now)
     if by:
         hold["cleared_by"] = by
     _write_hold(workspace, hold)
@@ -410,17 +449,21 @@ _SWITCH = re.compile(r"^(?:please\s+)?(?:switch|change)\s+(?:the\s+core\s+)?(?:m
 _RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
 
 
-def _owner_action(path: Path) -> Optional[tuple]:
+def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
     """("switch", model) or ("retry", None) for an owner's bare reply, else None."""
-    from local_task_protocol import parse_task_headers_lenient, split_reply_context
-    from policy.egress.result import resolve_access_tier
-    if resolve_access_tier(path) != "owner":
-        return None
+    from local_task_protocol import canonical_access_tier, sender_words, split_reply_context
+    from task_envelope import attested_task_headers
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    body = split_reply_context(parse_task_headers_lenient(text).body)[1].strip()
+    parsed = attested_task_headers(text, workspace)
+    # A gateway file states its tier after `task:`; read without a verified envelope it has none.
+    mid = (parsed.headers.get("task_layout") or "").strip() == "mid"
+    tier = parsed.headers.get("access_tier") or (None if mid else "owner")
+    if tier is None or canonical_access_tier(tier) != "owner":
+        return None
+    body = split_reply_context(sender_words(parsed))[1].strip()
     m = _SWITCH.match(body)
     if m:
         return ("switch", m.group(1).lower())
@@ -484,7 +527,7 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         hold = active_hold(workspace, now)
         if not hold:
             break
-        action = _owner_action(path)
+        action = _owner_action(path, workspace)
         if action is None:
             continue
         if (workspace / "results" / path.name).exists():

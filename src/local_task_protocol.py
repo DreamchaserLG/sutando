@@ -339,6 +339,20 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
 def parse_task_headers(text: str) -> TaskHeaders:
     """Parse a **task-last** file: collect `key: value` lines strictly BEFORE
     the first `task:` line; everything from `task:` onward is untrusted body.
