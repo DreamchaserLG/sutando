@@ -6,10 +6,14 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool, armSpeechGate, noteUserSpoke } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
 
 let _binding: RoomBinding | null = null;
+let _mcp: McpClient | null = null;
+let _rooms: RoomIndex | null = null;
 
 const ts = () => new Date().toISOString().slice(11, 19);
 
@@ -28,6 +32,11 @@ export async function handleSessionContextFrame(ctx: Pick<SkillSetupCtx, 'sendCl
 }
 
 export function setup(ctx: SkillSetupCtx): void {
+	// A change held for a spoken yes needs the user to have spoken since it was held.
+	if (typeof ctx?.onUserSpoke === 'function') {
+		ctx.onUserSpoke(noteUserSpoke);
+		armSpeechGate();
+	}
 	// A host that predates the client-frame seam gets no room binding rather than a throw.
 	if (typeof ctx?.onClientFrame !== 'function' || typeof ctx.clientAttached !== 'function' || typeof ctx.setVoiceSessionOrigin !== 'function') {
 		console.warn('[ag2space-voice] host has no client-frame seam — room binding disabled');
@@ -61,12 +70,49 @@ export function setup(ctx: SkillSetupCtx): void {
 	});
 }
 
+/** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
+function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; turnCheckRules: string[]; contextLines: () => string[] } {
+	const entry = findAg2SpaceMcpEntry();
+	if (!entry) return { tools: [], promptRules: [], turnCheckRules: [], contextLines: () => [] };
+	const log = (m: string) => console.log(`${ts()} ${m}`);
+	if (!_mcp) {
+		_mcp = createMcpStdioClient(entry, { log });
+		// The room index doubles as the warm-up: the token is minted and the model's first prompt has the room names.
+		_rooms = createRoomIndex({ client: () => _mcp, log });
+		_rooms.refresh().then(
+			() => console.log(`${ts()} [RoomRead] ag2-space MCP ready`),
+			(err) => console.warn(`${ts()} [RoomRead] ag2-space MCP warm-up failed: ${err instanceof Error ? err.message : err}`),
+		);
+	}
+	const index = _rooms!;
+	const deps = { client: () => _mcp, currentRoom: () => _binding?.current() ?? null, index, log };
+	const read = createReadRoomTool(deps);
+	const search = createSearchRoomTool(deps);
+	const commons = createSearchCommonsTool(deps);
+	const page = createReadPageTool(deps);
+	const write = createWritePageTool(deps);
+	const comment = createAddCommentTool(deps);
+	const message = createSendMessageTool(deps);
+	const list = createListRoomsTool({ index, log });
+	// Any other catalog action: found, described and run by name, gated by the server's own effect and risk.
+	const open = [createFindActionsTool(deps), createDescribeActionTool(deps), createRunActionTool(deps)];
+	return {
+		tools: [read, search, commons, page, write, comment, message, list, ...open],
+		promptRules: [ROOM_READ_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
+		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
+		contextLines: () => roomIndexContextLines(index),
+	};
+}
+
 export function voiceSurface(): VoiceSurfaceContribution {
 	// navigate_ui is declared only where a client can answer it: the gateway channel is provisioned.
 	const navigate = navigateUiAvailable();
+	const roomRead = roomReadSurface();
 	return {
-		tools: navigate ? [navigateUiTool] : [],
-		promptRules: navigate ? [NAVIGATION_PROMPT_RULE] : [],
-		contextLines: () => roomContextLines(_binding?.current() ?? null),
+		tools: [...(navigate ? [navigateUiTool] : []), ...roomRead.tools],
+		promptRules: [...(navigate ? [NAVIGATION_PROMPT_RULE] : []), ...roomRead.promptRules],
+		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
+		answeringTools: roomRead.tools.map((t) => t.name),
+		turnCheckRules: roomRead.turnCheckRules,
 	};
 }

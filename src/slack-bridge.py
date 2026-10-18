@@ -64,13 +64,25 @@ from optional_script import run_optional_script as _run_optional_script_shared  
 from presenter_mode import presenter_mode_active  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
-from proactive_routing import body_claimable_by, fallback_claims_name  # noqa: E402
+from proactive_routing import (body_claimable_by, claims_unless_routed_elsewhere,  # noqa: E402
+                               other_bridges_configured)
 
 
-def _slack_claims_name(name: str) -> bool:
+def _other_bridges_configured() -> bool:
+    """Another bridge installed beside Slack on this host (channels/<bridge>/)."""
+    try:
+        return other_bridges_configured("slack", claude_home_path("channels"))
+    except Exception:
+        return False
+
+
+def _slack_claims_name(name: str, body=None) -> bool:
     """Filename-level claim decision — the policy lives in proactive_routing;
-    this adapter only binds its channel."""
-    return fallback_claims_name(name, "slack")
+    this adapter only binds its channel. A tag outranks; a body addressed to
+    Slack outranks activity routing; an untagged file is Slack's when the
+    owner was last active here, or with no record on a Slack-only install."""
+    return claims_unless_routed_elsewhere(name, OWNER_ACTIVITY_FILE, "slack",
+                                          body=body, other_bridges_configured=_other_bridges_configured())
 from owner_activity import write_owner_activity as _write_owner_activity_shared  # noqa: E402
 import slack_access  # noqa: E402
 
@@ -83,7 +95,7 @@ except Exception:  # pragma: no cover — best-effort telemetry
         return None
 from result_markers import parse_markers  # noqa: E402
 from delivery.readiness import read_ready_result  # noqa: E402
-from dedup_recovery import plan_dedup_recovery, report_disposition  # noqa: E402
+from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
 import local_task_protocol  # noqa: E402
@@ -556,7 +568,7 @@ def _dedup_recover(task_id: str, holder_id, target) -> str:
     try:
         action, payload = plan_dedup_recovery(
             RESULTS_DIR, TASKS_DIR, task_id, holder_id,
-            (target or {}).get("channel", ""), f"task-{int(time.time() * 1000)}")
+            (target or {}).get("channel", ""), fresh_reask_id())
         if action == "requeue":
             _set_pending_reply(payload, dict(target or {}))
             print(f"  [dedup] re-queued {task_id} as {payload}", flush=True)
@@ -1244,6 +1256,7 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
     task_content = (
         f"id: {task_id}\n"
         f"timestamp: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n"
+        f"local_time: {local_task_protocol.local_time_value()}\n"
         f"source: slack\n"
         f"interaction_type: message\n"
         f"{media_headers}"
@@ -1783,8 +1796,8 @@ def result_watcher():
                         continue
                     if not body_claimable_by(peek, "slack"):
                         continue
-                    # Explicit filename destination outranks the race.
-                    if not _slack_claims_name(f.name):
+                    # Tag, then a Slack address in the body, then activity routing.
+                    if not _slack_claims_name(f.name, peek):
                         continue
                     # Resolve the owner BEFORE claiming: a claim this bridge
                     # cannot deliver hides the file from the poller that can.

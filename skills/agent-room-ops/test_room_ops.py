@@ -1304,15 +1304,16 @@ class EventAccumulatorTests(unittest.TestCase):
         lines = open(paths[0]).read().split("\n")
         self.assertEqual(lines[0], f"id: {base[:-4]}")
         self.assertTrue(lines[1].startswith("timestamp: ") and lines[1].endswith("Z"))
+        self.assertTrue(lines[2].startswith("local_time: "))
         # Origin must be explicit at a glance: the [taskify] marker leads the
         # task line and the promoted-from suffix names the room.
-        self.assertTrue(lines[2].startswith("task: [taskify] "))
-        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[2])
-        self.assertEqual(lines[3], "source: events-promotion")
-        self.assertEqual(lines[4], f"channel_id: {ROOM}")
-        self.assertEqual(lines[5], "priority: low")          # never outranks humans
-        self.assertEqual(lines[6], "model_hint: efficient")  # cheap-model eligible
-        self.assertEqual(lines[7], "access_tier: ambient")  # trust boundary: never owner
+        self.assertTrue(lines[3].startswith("task: [taskify] "))
+        self.assertIn(f"(promoted from 3 subscribed events in {ROOM})", lines[3])
+        self.assertEqual(lines[4], "source: events-promotion")
+        self.assertEqual(lines[5], f"channel_id: {ROOM}")
+        self.assertEqual(lines[6], "priority: low")          # never outranks humans
+        self.assertEqual(lines[7], "model_hint: efficient")
+        self.assertEqual(lines[8], "access_tier: ambient")  # trust boundary: never owner
         prov_line = next(ln for ln in lines if ln.startswith("provenance: "))
         prov = json.loads(prov_line.split("provenance: ", 1)[1])
         self.assertEqual(prov["source_event_ids"], ["$a", "$b", "$c"])
@@ -1585,9 +1586,12 @@ class CitationCLITests(EnvCase):
         self.assertEqual(cap["kw"], {"reply_to": None, "extra_content": {"space.ag2.k": {"v": 1}}})
 
     def test_say_extra_content_that_is_not_an_object_is_refused_before_the_function(self):
+        out = io.StringIO()
         with mock.patch.object(room_ops._say, "say", side_effect=AssertionError("called")):
-            with self.assertRaises(SystemExit):
-                room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+            with contextlib.redirect_stdout(out):
+                rc = room_ops._main(["say", ROOM, "hi", "--extra-content", '["not", "an", "object"]'])
+        self.assertEqual(rc, 1)
+        self.assertIs(json.loads(out.getvalue())["ok"], False)
 
     def test_mention_flag_reaches_the_function(self):
         cap = {}

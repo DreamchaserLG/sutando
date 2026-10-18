@@ -64,6 +64,7 @@ from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
+import session_runtime  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
     find_pids,
@@ -73,8 +74,14 @@ from sutando_platform import (  # noqa: E402
 )
 from workspace_layout import inspect_layout  # noqa: E402
 import cron_task_id  # noqa: E402
+from loop_completion import completion_path, read_completion  # noqa: E402
+from cron_loop_policy import (  # noqa: E402
+    _cron_field_values, _cron_can_never_fire, _entry_marked_parked, main_loop_problem, core_loop_is_parked,
+)
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import pool_suspension  # noqa: E402
+import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
@@ -838,6 +845,21 @@ def check_cli_wedge() -> dict:
                           "observation_runs", "median_gap_s", "work_outstanding", "work_detail")}
     return check
 
+def check_pane_key_fence(socket: "str | None" = None) -> dict:
+    # This host's socket: the freshest synced heartbeat may belong to another machine.
+    sock = Path(socket or _local_core_socket() or os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"))
+    sockets = {str(sock)} | {str(lock)[:-len(".pane-keys-lock")]
+                            for lock in sock.parent.glob("*.pane-keys-lock")}
+    states = {path: tmux_pane_keys.fence_status(path) for path in sockets}
+    fenced = sorted(path for path, state in states.items() if state == "uncertain")
+    if fenced:
+        return {"name": "pane-key-fence", "status": "fail", "detail": (
+            f"automated sends blocked on {', '.join(fenced)}; stop the old server and reconcile "
+            "delivery before explicit recovery (docs/codex-core.md)")}
+    return {"name": "pane-key-fence", "status": "ok",
+            "detail": "busy" if "busy" in states.values() else "clear"}
+
+
 def check_secret_scanner_mode() -> dict:
     """Report the secret scanner's DEGRADED mode as standing status.
 
@@ -1071,6 +1093,10 @@ def check_launchd(label: str) -> dict:
         return {"name": label, "status": "error", "detail": str(e)}
 
 
+# A core restart briefly removes .alive; a hold that outlives one is an outage, not a restart.
+CRON_HOLD_DOWN_AFTER_S = 300
+
+
 def check_cron_runner(
     workspace_dir: Optional[Path] = None,
     host_label: Optional[str] = None,
@@ -1082,11 +1108,14 @@ def check_cron_runner(
     workspace = Path(workspace_dir or WORKSPACE_DIR)
     host = host_label or _host_label()
     crons_file = workspace / "hosts" / host / "crons.json"
+    runtime = runtime or resolve_core_runtime(repo_root=REPO_DIR)
     name = "cron-runner"
     try:
         crons = json.loads(crons_file.read_text())
     except FileNotFoundError:
-        return {"name": name, "status": "ok", "detail": "no schedules configured"}
+        problem = main_loop_problem([], runtime)
+        return {"name": name, "status": "down" if problem else "ok",
+                "detail": problem or "no schedules configured"}
     except (OSError, json.JSONDecodeError) as exc:
         return {"name": name, "status": "fail", "detail": f"cannot read crons.json ({exc})"}
     if not isinstance(crons, list):
@@ -1112,6 +1141,9 @@ def check_cron_runner(
             "status": "down",
             "detail": f"{orphaned} configured schedule(s) have no durable Codex owner",
         }
+    problem = main_loop_problem(crons, runtime)
+    if problem:
+        return {"name": name, "status": "down", "detail": problem}
     if not launchd_count:
         return {"name": name, "status": "ok", "detail": "no launchd-owned schedules"}
 
@@ -1158,99 +1190,27 @@ def check_cron_runner(
             "status": "down",
             "detail": f"runner state is stale ({int(age)}s; expected <=180s)",
         }
+    # A runner that ticks on time can still emit nothing: it holds every prompt-backed fire
+    # while the core heartbeat is missing, and records that hold here.
+    try:
+        hold = json.loads((workspace / "state" / "cron-runner-hold.json").read_text())
+    except (OSError, ValueError):
+        hold = None
+    if isinstance(hold, dict) and isinstance(hold.get("since"), (int, float)):
+        held_for = max(0, int(float(time.time() if now is None else now) - hold["since"]))
+        names = ", ".join(str(n) for n in hold.get("held", [])) or "due schedules"
+        return {
+            "name": name,
+            "status": "down" if held_for >= CRON_HOLD_DOWN_AFTER_S else "warn",
+            "detail": (f"cron-runner has held {names} for {held_for}s and emitted no task: "
+                       f"{hold.get('reason', 'core heartbeat not fresh')}"),
+        }
     return {
         "name": name,
         "status": "ok",
         "detail": f"{launchd_count} durable schedule(s), state {int(age)}s old",
     }
 
-
-_MONTH_MAX_DAYS = {1: 31, 2: 29, 3: 31, 4: 30, 5: 31, 6: 30,
-                   7: 31, 8: 31, 9: 30, 10: 31, 11: 30, 12: 31}
-
-
-def _cron_field_values(field: str, lo: int, hi: int) -> "set[int] | None":
-    """Expand one numeric cron field to its value set, or None if not understood.
-
-    None means "do not reason about this expression" — every caller below treats
-    an unparseable field as schedulable, so a parser gap can never invent a
-    never-fires verdict.
-    """
-    out: "set[int]" = set()
-    for part in field.split(","):
-        part = part.strip()
-        if not part:
-            return None
-        step = 1
-        if "/" in part:
-            part, _, raw_step = part.partition("/")
-            if not raw_step.isdigit() or int(raw_step) < 1:
-                return None
-            step = int(raw_step)
-        if part in ("*", "?"):
-            start, end = lo, hi
-        elif "-" in part.lstrip("-"):
-            start_s, _, end_s = part.partition("-")
-            if not (start_s.isdigit() and end_s.isdigit()):
-                return None
-            start, end = int(start_s), int(end_s)
-        elif part.isdigit():
-            start = end = int(part)
-        else:
-            return None  # names (JAN/MON), L, W, # — not our business
-        if start > end or start < lo or end > hi:
-            return None
-        out.update(range(start, end + 1, step))
-    return out or None
-
-
-def _cron_can_never_fire(expr: str) -> bool:
-    """True only when a 5-field cron's day-of-month/month pair is impossible.
-
-    A deliberately-parked entry is the real case: this host carries
-    `wire-newsroom-nightly-DISABLED-...` at `0 0 31 2 *` — February 31st, which
-    is syntactically valid and can never occur. /schedule-crons cannot register
-    it, so it was counted as expected-but-missing and the session-crons guard
-    warned on every run, permanently. A guard that always warns is a guard
-    nobody reads, and this one exists to catch a SILENT failure (a peer
-    instance registered 2/18 with no error) — so a standing false positive
-    disables exactly the signal it was built to raise.
-
-    Deliberately conservative: day-of-week must be unrestricted, because cron
-    ORs day-of-month with day-of-week — `0 0 31 2 MON` still fires on Mondays.
-    Anything unparseable returns False (schedulable).
-    """
-    parts = expr.split()
-    if len(parts) != 5:
-        return False
-    _, _, dom_f, month_f, dow_f = parts
-    if dow_f.strip() not in ("*", "?"):
-        return False  # OR-semantics with day-of-week — it can still fire
-    doms = _cron_field_values(dom_f, 1, 31)
-    months = _cron_field_values(month_f, 1, 12)
-    if doms is None or months is None:
-        return False
-    return not any(d <= _MONTH_MAX_DAYS[m] for m in months for d in doms)
-
-
-def _entry_marked_parked(entry: dict) -> bool:
-    """True when the entry carries an explicit "deliberately disabled" signal.
-
-    An impossible date alone must NOT qualify. `0 0 31 2 *` is equally the
-    signature of a parked job and of an active typo — someone meaning "the 31st,
-    monthly" and writing February. Excluding on the date alone would let a
-    mistyped ACTIVE schedule vanish from `expected`, so CronCreate silently
-    omits it and this guard reports green forever: the precise silent-miss class
-    the check exists to surface.
-
-    Two accepted signals: an explicit `disabled: true` field, and the
-    established convention of DISABLED in the entry name (used by this host's
-    `wire-newsroom-nightly-DISABLED-2026-06-09-...`, which also records why).
-    """
-    if entry.get("disabled") is True:
-        return True
-    name = entry.get("name")
-    return isinstance(name, str) and "DISABLED" in name
 
 
 def check_session_cron_registration(
@@ -1570,6 +1530,7 @@ WORKSPACE_ROOT_ALLOWED = frozenset({
     "session-state.md",      # written by src/session-handoff.sh on compaction
     ".gitkeep",              # git placeholder, not state
     ".env",                  # sutando_config.resolve_dotenv's 2nd tier (#1871)
+    "sutando.config.local.json",  # sutando_config's workspace config layer
     # The two lock guards that legitimately sit at the ROOT, by name. Exempt
     # until they migrate to state/locks/ the way workspace_lock.py already
     # writes <workspace>/state/locks/<role>.lock.guard.
@@ -2041,11 +2002,16 @@ def _carrier_target_verdict(workspace: Path, rep: Path) -> str:
     # `-z` makes git read NUL-separated input, which is the only delimiter a
     # POSIX filename cannot contain.
     rels = "\0".join(str(t.relative_to(workspace)) for t in targets)
+    # stdin is a file, not `input=`: with macOS's pipe pool spent, poll() calls a full pipe writable,
+    # communicate() blocks in os.write while git blocks on stdout, and timeout= never fires.
     try:
-        proc = subprocess.run(
-            git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
-            input=rels, capture_output=True, text=True, timeout=60,
-        )
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write(rels.encode("utf-8"))
+            stdin.seek(0)
+            proc = subprocess.run(
+                git_argv("-C", str(workspace), "check-ignore", "--no-index", "-v", "-z", "--stdin"),
+                stdin=stdin, capture_output=True, text=True, timeout=60,
+            )
     except (GitUnavailable, OSError, subprocess.SubprocessError):
         return "unmeasured"
     # `-v` names the RULE that decided each path, and that is the whole point:
@@ -2429,11 +2395,15 @@ def _index_growth_note(index: Path, effective_bytes: int,
             stamps.append((sha, int(at)))
         if not stamps:
             return _TREND_UNAVAILABLE
-        batch = subprocess.run(
-            git_argv("-C", str(repo), "cat-file", "--batch"),
-            input="".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode(),
-            capture_output=True, timeout=20,
-        )
+        # Defensive: this stdin (<= 12 short specs) is too small to deadlock, but it stays
+        # off `input=` like `_carrier_target_verdict`, whose larger stdin can.
+        with tempfile.TemporaryFile() as stdin:
+            stdin.write("".join(f"{sha}:./{rel}\n" for sha, _ in stamps).encode())
+            stdin.seek(0)
+            batch = subprocess.run(
+                git_argv("-C", str(repo), "cat-file", "--batch"),
+                stdin=stdin, capture_output=True, timeout=20,
+            )
         if batch.returncode != 0:
             return _TREND_UNAVAILABLE
         points: "list[tuple[int, int]]" = []
@@ -2897,6 +2867,40 @@ def check_onboarding_status() -> "dict | None":
         }
     return {"name": name, "status": "ok",
             "detail": f"all checklist rows satisfied ({_age_phrase(age_s)})"}
+
+
+#: A live HITL store this large means settled records stopped being archived;
+#: the gateway re-reads every live record each second.
+HITL_LIVE_WARN = 200
+
+
+def check_hitl_archive() -> "dict | None":
+    """Warn when the HITL archive step is failing or the live store regrew.
+
+    None when this host has no HITL store. Read-only; never raises.
+    """
+    name = "hitl-archive"
+    try:
+        from hitl.manager import ARCHIVE_STATUS_STALE_S, archive_health, default_store
+        h = archive_health(default_store(WORKSPACE_DIR))
+    except Exception as e:  # noqa: BLE001 — an optional tier never breaks the report
+        return {"name": name, "status": "warn", "detail": f"hitl store unreadable ({e})"}
+    if h is None:
+        return None
+    problems = []
+    if h["stale"]:
+        problems.append(f"archive status stale: not refreshed in over "
+                        f"{ARCHIVE_STATUS_STALE_S // 60} min (last reported "
+                        f"{h['failures']} failure(s)); is the gateway pulsing?")
+    elif h["failures"]:
+        problems.append(f"{h['failures']} settled record(s) failing to archive ({h['error']})")
+    if h["live"] > HITL_LIVE_WARN:
+        problems.append(f"{h['live']} live records (> {HITL_LIVE_WARN}); the gateway re-reads "
+                        f"each one every second")
+    if problems:
+        return {"name": name, "status": "warn", "detail": "; ".join(problems)}
+    state = "archive healthy" if h["reported"] else "no archive report yet"
+    return {"name": name, "status": "ok", "detail": f"{h['live']} live records, {state}"}
 
 
 def check_host_subtrees() -> dict:
@@ -4591,6 +4595,63 @@ def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
         service, lstart_by_pid, time.time())
 
 
+def _phone_server_active_calls(health_url: str = "http://127.0.0.1:3100/health") -> int:
+    """Live calls the phone server reports, 0 when it does not answer (nothing to protect)."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(health_url, timeout=2) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        n = d.get("activeCalls") if isinstance(d, dict) else 0
+        return int(n) if isinstance(n, (int, float)) and n > 0 else 0
+    except Exception:
+        return 0
+
+
+def _phone_server_launch_argv() -> list:
+    """The bundled artifact when it exists (no tsx in a packaged install), else the source."""
+    bundled = REPO_DIR / "dist" / "conversation-server.js"
+    if bundled.exists():
+        return ["node", str(bundled)]
+    return ["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"]
+
+
+def fix_conversation_server(c: dict, *, settle_s: float = 1.0) -> str:
+    """Restart the phone server, never mid-call: a stale server with live calls is
+    deferred (it drains on SIGTERM, but the owner's call comes first); a stale one
+    is killed only after a re-check right before the kill; the launch is the
+    bundled artifact when it exists."""
+    stale = c.get("status") == "stale"
+    live = _phone_server_active_calls()
+    if stale and live:
+        return f"stale but {live} call(s) active — deferred, run --fix again later"
+    if stale:
+        # Old PIDs first so the new process neither bind-fails nor lands beside a zombie.
+        try:
+            old_pids = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "conversation-server"],
+                capture_output=True, text=True
+            ).stdout.strip().split("\n")
+            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
+            if _phone_server_active_calls():
+                return "a call started — deferred"
+            for pid in old_pids:
+                if pid:
+                    subprocess.run(["/bin/kill", pid], check=False)
+            time.sleep(settle_s)
+        except Exception:
+            pass
+    subprocess.Popen(_phone_server_launch_argv(),
+                     cwd=str(REPO_DIR),
+                     stdout=open("/tmp/conversation-server.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    return "restarted (stale code)" if stale else "restarted"
+
+
+def _C_LOCALE_ENV() -> dict:
+    """The environment for a `ps -o lstart` whose output is parsed in English."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
 def _proc_lstarts(pgrep_pattern: str) -> tuple:
     """(start timestamps, {pid: lstart}) for THIS checkout's matching processes.
 
@@ -4618,9 +4679,11 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         pids = _filter_pids_this_checkout(pids)
         if not pids:
             return [], {}
+        # LC_ALL=C: macOS formats lstart in the locale's %c, and a non-English
+        # one broke the English strptime below (P1-19).
         _ps = subprocess.run(
             ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
         )
         if _ps.returncode != 0:
             return [], None
@@ -5863,7 +5926,7 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
 
     # Every limit window can page (7d_oi can be the one rejected while 5h/7d sit
     # low); overage is shown but never pages, it is purchase eligibility.
-    from quota_availability import limit_windows as _limit_windows, quota_windows as _quota_windows
+    from quota_availability import classify_limit_state, limit_windows as _limit_windows, quota_windows as _quota_windows
     windows = _quota_windows(headers)
     full = [w for w, (u, st) in _limit_windows(headers).items()
             if st == "rejected" or (u is not None and u >= 0.9)]
@@ -5877,6 +5940,11 @@ def check_core_quota_exhausted(fresh_sec: int = 1800) -> dict:
             "not paging. If THIS core were stuck, its own passes would stop and "
             "quota-telemetry would go stale."
         )
+        return check
+
+    if classify_limit_state(data) == "overage":
+        # A rejected window with extra usage allowed is served, not stuck.
+        check["detail"] = f"core serving on extra usage (status={status}, {_window_summary(windows)})"
         return check
 
     reset = _fmt_quota_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
@@ -6271,7 +6339,7 @@ def check_bodhi_dist() -> dict:
     exercised until a client connects — so existing probes silently let
     it through. This probe catches that case on every health tick.
 
-    Fix when this check fails: `npm install github:sonichi/bodhi_realtime_agent`
+    Fix when this check fails: `npm install` (installs the package.json pin)
     then `launchctl kickstart -k gui/$(id -u)/com.sutando.voice-agent`.
 
     Scans whichever artifact the voice-agent ACTUALLY loads, because that
@@ -6346,7 +6414,7 @@ def check_bodhi_dist() -> dict:
         check["status"] = "fail"
         check["detail"] = (
             f"bodhi dist stale: {'/'.join(stale)} still uses deprecated `media` key — "
-            "Gemini 3.1 rejects with 1007. Run `npm install github:sonichi/bodhi_realtime_agent`."
+            "Gemini 3.1 rejects with 1007. Run `npm install`."
         )
     return check
 
@@ -6523,31 +6591,11 @@ def check_memory() -> dict:
 # re-armed). Each check is a *consequence* signal that fires regardless of
 # which underlying mechanism died.
 
-def _state_in_use_age_h(state_dir: "Path") -> "float | None":
-    """Age of the OLDEST top-level file in state/, or None when unknowable.
-
-    Top level only: state/cores/ is synced across hosts, so a peer's file would
-    date a workspace this host created minutes ago.
-    """
-    try:
-        ages = [time.time() - p.stat().st_mtime
-                for p in state_dir.iterdir() if p.is_file()]
-    except OSError:
-        return None
-    return max(ages) / 3600 if ages else None
-
-
-def _stamper_age_h() -> "float | None":
-    """Hours since the marker-WRITING code was installed here, or None if it is
-    not installed at all.
-
-    A missing marker only indicts the loop once the code that writes it has been
-    present long enough for a pass to close. At merge that code is younger than
-    every existing workspace, so workspace age alone convicts every host.
-    """
+def _stamper_age_h() -> Optional[float]:
+    """Bound first-proof migration grace by installation of the explicit writer."""
     p = REPO_DIR / "scripts" / "core-status.sh"
     try:
-        if "last-loop-ok" not in p.read_text(encoding="utf-8", errors="replace"):
+        if "--loop-complete" not in p.read_text(encoding="utf-8", errors="replace"):
             return None
         return (time.time() - p.stat().st_mtime) / 3600
     except OSError:
@@ -6555,68 +6603,55 @@ def _stamper_age_h() -> "float | None":
 
 
 def check_cron_schedule() -> dict:
-    """Smoke detector for a session cron schedule that stopped firing.
-
-    CronCreate jobs expire 7 days after registration, and the mechanism that
-    would re-register them (/schedule-crons via /proactive-loop) is itself one of
-    the expiring crons, so nothing self-heals.
-
-    The signal is `state/last-loop-ok`, stamped by scripts/core-status.sh on
-    `idle`. Deliberately NOT core-status.json, which owner turns also refresh and
-    which would therefore stay fresh through any conversation — masking a dead
-    schedule exactly when someone is around to be misled.
-    """
+    """Detect absent or stale host-specific proof of a completed proactive pass."""
     name = "cron-schedule"
-    marker = Path(WORKSPACE_DIR) / "state" / "last-loop-ok"
+    workspace = Path(WORKSPACE_DIR)
+    host = _host_label()
+    try:
+        entries = json.loads((workspace / "hosts" / host / "crons.json").read_text())
+    except (OSError, ValueError):
+        entries = []
+    if isinstance(entries, list) and core_loop_is_parked(entries):
+        return {"name": name, "status": "ok", "detail": "core loop deliberately parked; completion not expected"}
 
     def _h(env_name: str, default: float) -> float:
         try:
-            return float(os.environ.get(env_name, str(default)))
+            value = float(os.environ.get(env_name, str(default)))
+            return value if 0 < value < float("inf") else default
         except ValueError:
             return default
 
     warn_h = _h("SUTANDO_CRON_STALE_WARN_H", 7.0)
-    fail_h = _h("SUTANDO_CRON_STALE_FAIL_H", 26.0)
-
-    try:
-        age_h = (time.time() - marker.stat().st_mtime) / 3600
-    except OSError:
-        # Absence has two opposite meanings: a genuinely fresh workspace, or a loop
-        # that NEVER STARTED — the deadlock above, which writes no marker at all.
-        in_use_h = _state_in_use_age_h(marker.parent)
-        stamper_h = _stamper_age_h()
-        if stamper_h is None:
-            # This build cannot stamp the marker, so its absence says nothing at all.
-            return {"name": name, "status": "ok",
-                    "detail": "no loop marker, and this build does not stamp one"}
-        if stamper_h <= warn_h:
-            # A writer younger than the warn band cannot have had a pass close since
-            # it arrived, so its absence is explained without indicting the loop.
-            return {"name": name, "status": "ok",
-                    "detail": (f"no loop marker yet, but the stamping code is only "
-                               f"{stamper_h:.1f}h old (<{warn_h:.0f}h) — no pass has had "
-                               f"time to close since it was installed")}
-        if in_use_h is not None and in_use_h > warn_h:
+    fail_h = max(warn_h, _h("SUTANDO_CRON_STALE_FAIL_H", 26.0))
+    completed_at = read_completion(workspace, host)
+    if completed_at is None:
+        if completion_path(workspace, host).exists():
             return {"name": name, "status": "warn",
-                    "detail": (f"no loop marker in the {stamper_h:.1f}h since the stamping code "
-                               f"was installed, and state/ has been written for {in_use_h:.1f}h "
-                               f"(>{warn_h:.0f}h) — a pass should have closed by now, so the loop "
-                               f"may never have STARTED. Check CronList against crons.json")}
-        # Nothing rules out "fresh", and a missing marker must never be louder
-        # than a stale one.
-        return {"name": name, "status": "ok",
-                "detail": "no loop marker yet (fresh install, or no pass closed since restore)"}
+                    "detail": f"invalid or unreadable loop completion record for {host}"}
+        stamper_h = _stamper_age_h()
+        if stamper_h is not None and 0 <= stamper_h <= warn_h:
+            return {"name": name, "status": "ok",
+                    "detail": (f"awaiting first loop completion for {host}; writer installed "
+                               f"{stamper_h:.1f}h ago (grace <= {warn_h:.0f}h)")}
+        return {"name": name, "status": "warn",
+                "detail": (f"no loop completion proof for {host}; the loop may never have STARTED. "
+                           "Check the configured driver and complete one proactive pass")}
 
+    age_h = (time.time() - completed_at) / 3600
+    if age_h < 0:
+        return {"name": name, "status": "warn",
+                "detail": f"loop completion for {host} is future-dated; cannot verify liveness"}
     if age_h > fail_h:
         return {"name": name, "status": "fail",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{fail_h:.0f}h) — the model "
-                           f"cron schedule is almost certainly dead. CronCreate jobs expire after 7d; "
-                           f"re-register from hosts/<host>/crons.json via /schedule-crons")}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{fail_h:.0f}h). Check the configured driver; Claude CronCreate "
+                           "jobs expire after 7d")}
     if age_h > warn_h:
         return {"name": name, "status": "warn",
-                "detail": (f"no proactive-loop pass has closed in {age_h:.1f}h (>{warn_h:.0f}h). "
-                           f"Check CronList against crons.json")}
-    return {"name": name, "status": "ok", "detail": f"last loop pass closed {age_h:.1f}h ago"}
+                "detail": (f"no proactive-loop pass has closed for {host} in {age_h:.1f}h "
+                           f"(>{warn_h:.0f}h). Check the configured driver")}
+    return {"name": name, "status": "ok",
+            "detail": f"last loop pass for {host} closed {age_h:.1f}h ago"}
 
 
 def check_core_proactive_loop(threshold_sec: int = 600) -> dict:
@@ -8268,6 +8303,24 @@ def _pool_held_stuck(pooled: "list", now: float, stuck_age_sec: int) -> "list":
     return out
 
 
+def check_pool_suspended() -> dict:
+    """A pool suspension never expires; only resuming the pool lifts it. One still present
+    while a core runs means the host never resumed it, and no worker is being healed."""
+    name = "pool-suspended"
+    try:
+        rec = pool_suspension.read(WORKSPACE_DIR)
+    except OSError as e:
+        return {"name": name, "status": "warn", "detail": f"pool-suspended unreadable: {e}"}
+    if rec is None:
+        return {"name": name, "status": "ok", "detail": "pool not suspended"}
+    what = rec["reason"][:80] + (f" since {rec['at']}" if rec["at"] is not None else "")
+    if not _any_core_alive():
+        return {"name": name, "status": "ok", "detail": f"pool suspended ({what}) while no core runs"}
+    return {"name": name, "status": "warn",
+            "detail": f"pool suspended ({what}) while a core is running, so no worker is being "
+                      "healed; repair: resume the worker pool"}
+
+
 def check_pool_advertisement() -> dict:
     """The picker follows the roster only through the advertisement the bridge
     sends; a roster version that file does not carry is a pin nobody was told."""
@@ -8909,6 +8962,14 @@ def _is_watcher_argv(argv: str, pid: "int | None" = None) -> "bool | None":
     return watcher_identity.is_watcher_argv(argv, pid, argv_vector=_proc_argv_vector)
 
 
+def _watcher_role_and_inbox(argv: str, pid: "int | None" = None) -> tuple:
+    """(`--role`, `--inbox`) of a proven watcher, (None, None) when its operands
+    cannot be read. A sentinel proves a watcher holds the inbox; only the role
+    says whether the SESSION does, or merely the supervisor's standby."""
+    ops = watcher_identity.classify_argv(argv, pid, argv_vector=_proc_argv_vector).operands
+    return watcher_identity.watcher_role(ops), watcher_identity.watcher_inbox(ops)
+
+
 # Read from the module that defines the precedence; a copy here is how this
 # reader and `rundir.agent_id` come to disagree about the same process.
 
@@ -9052,6 +9113,23 @@ def extras_present(trees, live) -> bool:
     """Any watcher tree not claimed by a live sentinel."""
     tracked = {str(x) for x in live}
     return any(not (members & tracked) for members in trees.values())
+
+
+def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
+    """The runtime whose notifier armed this watcher: the worker's roster row
+    (spawn_worker records it; a Claude core can host a Codex worker), else the core's."""
+    try:
+        rows = json.loads((WORKSPACE_DIR / "state" / "roster.json")
+                          .read_text(encoding="utf-8")).get("workers") or {}
+    except (OSError, ValueError, AttributeError):
+        rows = {}
+    parts = set(Path(inbox).parts) if inbox else set()
+    for wid, row in rows.items():
+        if wid and (wid in sentinel.name or wid in parts):
+            if isinstance(row, dict) and row.get("runtime") in ("claude", "codex"):
+                return row["runtime"]
+            break
+    return "claude" if _claude_runtime_selected() else "other"
 
 
 def check_task_watcher() -> dict:
@@ -9216,6 +9294,7 @@ def check_task_watcher() -> dict:
     # single-sentinel host takes exactly the branches it always did.
     live, dead_pids, reused, unreadable, unprovable = {}, [], [], [], []
     collided = []
+    live_argv = {}
     for sp in sentinels:
         try:
             spid = int(sp.read_text().strip())
@@ -9239,6 +9318,7 @@ def check_task_watcher() -> dict:
                 if spid in live:
                     collided.append((spid, live[spid], sp))
                 live[spid] = sp
+                live_argv[spid] = sargv
 
     if not live:
         # Aggregate EVERY record class before advising: a per-class early
@@ -9387,6 +9467,37 @@ def check_task_watcher() -> dict:
                           f"sentinel(s) name no provable live watcher — {'; '.join(faults)}. "
                           f"Each is a separate instance's "
                           "record; a live peer does not clear it"}
+    # The standby stamps the same sentinel as the session watcher it stands in
+    # for, so a live sentinel proves an announcer, never that the session works.
+    _roles = {_p: _watcher_role_and_inbox(live_argv[_p], _p) for _p in live}
+    # Per resolved inbox: a standby beside a live session watcher of it is the handoff.
+    _held = {watcher_identity.canonical_inbox(_i) for _r, _i in _roles.values()
+             if _r == "session" and _i}
+    standby_only, standby_note = [], []
+    for _p in sorted(live):
+        _role, _inbox = _roles[_p]
+        if _role != "standby" or watcher_identity.canonical_inbox(_inbox) in _held:
+            continue
+        _entry = f"{live[_p].name} -> pid {_p} (inbox {_inbox or 'unstated'})"
+        # Only a Claude runtime runs Monitor; Codex's notifier always arms the
+        # standby (src/agent/codex/cli/start-cli.sh), so there it IS the delivery path.
+        _held_by = standby_only if _watcher_runtime(live[_p], _inbox) == "claude" else standby_note
+        _held_by.append(_entry)
+    standby_note = (f"; {len(standby_note)} sentinel(s) name the standby watcher, "
+                    f"the delivery path on a runtime that is not Claude (no session "
+                    f"watcher is expected there): {'; '.join(standby_note)}"
+                    if standby_note else "")
+    if standby_only:
+        return {"name": name, "status": "warn",
+                "detail": f"{len(standby_only)} sentinel(s) name only the STANDBY watcher: "
+                          f"{'; '.join(standby_only)}. No session-role watcher holds that "
+                          "inbox, so its session is not draining tasks itself — a worker "
+                          "whose turn ended logged out (\"Login expired · Please run /login\") "
+                          "never re-arms its Monitor, and the standby only announces through "
+                          "the pane. Degraded, not clear: run /login in that session if it "
+                          "asks, then re-arm via the Monitor tool: "
+                          "bash src/watch-tasks-stream.sh --role session --inbox <inbox>"
+                          f"{standby_note}"}
     # A watcher holds its inbox whether or not anything consumes what it
     # announces; the reader is the only difference visible from outside.
     unread = []
@@ -9402,9 +9513,11 @@ def check_task_watcher() -> dict:
                           "a session start will exit naming the holder, so clearing it "
                           "needs `watch-tasks-stream.sh --force-restart` on the owner's word"}
     if len(live) == 1:
-        return {"name": name, "status": "ok", "detail": f"streaming watcher alive (pid {alive})"}
+        return {"name": name, "status": "ok",
+                "detail": f"streaming watcher alive (pid {alive}){standby_note}"}
     return {"name": name, "status": "ok",
-            "detail": f"{len(live)} streaming watchers alive, one per instance (pids {alive})"}
+            "detail": f"{len(live)} streaming watchers alive, one per instance "
+                      f"(pids {alive}){standby_note}"}
 
 
 #: Track session-worker.py's own SUTANDO_TIER_HARD_TIMEOUT (default 900s,
@@ -9597,6 +9710,28 @@ def check_a_fallback_hits(workspace_dir: Optional[Path] = None) -> dict:
 
 
 
+def check_withheld_reviews_readable(workspace_dir: Optional[Path] = None) -> dict:
+    """A withheld-review record the bridge cannot read as a record makes every owner Yes/No
+    in the DM answer "please reply again" until it is inspected or removed."""
+    name = "withheld-reviews-readable"
+    workspace = Path(workspace_dir or WORKSPACE_DIR)
+    try:
+        from policy.egress import result as guard  # noqa: PLC0415 - the bridge's own strict rule
+    except ImportError as exc:
+        return {"name": name, "status": "warn", "detail": f"cannot load the review guard ({exc})"}
+    base = workspace / "state" / guard.WITHHELD_RESULT_DIR
+    bad = []
+    for path, reason in guard.namespace_problems(base):
+        shown = path.relative_to(workspace) if path.is_relative_to(workspace) else path.name
+        bad.append(f"{shown} ({reason})")
+    if bad:
+        shown = ", ".join(bad[:4]) + (f" (+{len(bad) - 4} more)" if len(bad) > 4 else "")
+        return {"name": name, "status": "warn",
+                "detail": f"{len(bad)} withheld-review record(s) unreadable; owner replies get "
+                          f"'please reply again' until each is inspected or removed: {shown}"}
+    return {"name": name, "status": "ok", "detail": "every withheld-review record reads"}
+
+
 def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     """A PARKED outbound item is a reply the owner never received, and nothing
     retries it: `outbox_cli`'s own header calls PARKED a durable terminal state
@@ -9621,7 +9756,7 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
     except ImportError as exc:
         return {"name": name, "status": "warn",
                 "detail": f"cannot read the outbox ({exc}) — parked replies unjudged"}
-    parked: list[tuple[str, str]] = []  # (root.name, item_id) -- roots differ, see below
+    parked: list[tuple[str, str, str]] = []  # (root.name, item_id, reason) -- roots differ, see below
     unreadable: list[str] = []
     for root in roots:
         # An unreadable ROOT reaches here too, and a raise would abort every
@@ -9635,20 +9770,31 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             unreadable.append(f"{root.name} ({exc})")
             continue
         for d in outbox.list_items(root, status="PARKED"):
-            parked.append((root.name, str(d.get("item_id") or "?")))
+            parked.append((root.name, str(d.get("item_id") or "?"), str(d.get("reason") or "")))
     if unreadable:
         return {"name": name, "status": "warn",
                 "detail": "outbox root(s) unreadable, so parked replies are unjudged: "
                           + "; ".join(unreadable)}
     if parked:
         parked.sort()
-        shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
-                           for root_name, item_id in parked[:4])
-        more = f" (+{len(parked) - 4} more)" if len(parked) > 4 else ""
+
+        def listing(items):
+            shown = ", ".join(f"{item_id} (--root <ws>/results/{root_name})"
+                               for root_name, item_id, _reason in items[:4])
+            return shown + (f" (+{len(items) - 4} more)" if len(items) > 4 else "")
+        # An outcome-unknown park may have landed: a requeue sends again and can post twice.
+        unknown = [p for p in parked if p[2] == "outcome-unknown"]
+        undelivered = [p for p in parked if p[2] != "outcome-unknown"]
+        parts = []
+        if undelivered:
+            parts.append(f"{len(undelivered)} never delivered — nothing retries them: "
+                         f"{listing(undelivered)}")
+        if unknown:
+            parts.append(f"{len(unknown)} may have been delivered — do not requeue without "
+                         f"checking the room: {listing(unknown)}")
         return {"name": name, "status": "warn",
-                "detail": f"{len(parked)} reply/replies PARKED and never delivered — "
-                          f"nothing retries them: {shown}{more}. Recover with "
-                          f"`python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
+                "detail": f"{len(parked)} reply/replies PARKED; " + "; ".join(parts) + ". "
+                          f"Recover with `python3 src/outbox_cli.py --root <shown-above> requeue <id>` "
                           f"(the root varies per item; a single hardcoded root under-reports)"}
     return {"name": name, "status": "ok",
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
@@ -9977,18 +10123,7 @@ def _local_codex_core_target(target: "dict | None" = None) -> "dict | None":
     exists = _run_tmux(socket_path, "has-session", "-t", f"={session}")
     if exists is None or exists.returncode != 0:
         return None
-    runtime = _run_tmux(
-        socket_path,
-        "show-environment",
-        "-t",
-        f"={session}",
-        "SUTANDO_CORE_RUNTIME",
-    )
-    if (
-        runtime is None
-        or runtime.returncode != 0
-        or runtime.stdout.strip() != "SUTANDO_CORE_RUNTIME=codex"
-    ):
+    if session_runtime.read(session, lambda *a: _run_tmux(socket_path, *a)) != "codex":
         return None
     return target
 
@@ -10325,6 +10460,68 @@ def check_claude_task_notifier() -> dict:
     supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
     notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
     return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+
+
+def _process_alive(pid: int) -> bool:
+    """Whether `pid` is a running process we may signal (kill -0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def fix_claude_task_notifier() -> str:
+    """Notifier-only recovery for the Claude core, mirroring the Codex one: the
+    canonical launcher, run without --restart, recreates a missing `<session>-watcher`
+    and leaves the live core alone (P1-23: the standby notifier went missing and
+    only a full relaunch brought it back)."""
+    if not _claude_runtime_selected():
+        return "not repaired — Claude runtime is not selected"
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return "not repaired — no fresh local Claude core heartbeat"
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return "not repaired — the live Claude core session could not be verified"
+    # The shared launcher injects --restart when the session records another
+    # runtime, and spawns a new core when the heartbeat's process is gone.
+    recorded = session_runtime.read(target["session"], lambda *a: _run_tmux(target["socket"], *a))
+    if recorded != "claude":
+        return f"not repaired — the live core records a different runtime ({recorded or 'unreadable'})"
+    core_pid = heartbeat.get("pid")
+    if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
+        return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
+    if check_claude_task_notifier()["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "claude"
+    try:
+        launched = subprocess.run(["/bin/bash", str(launcher)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+    if _local_claude_notifier_target(_fresh_local_core_record()) != target:
+        return "not repaired — local Claude core changed during repair"
+    after = check_claude_task_notifier()
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
 
 
 def fix_codex_task_notifier() -> str:
@@ -11755,6 +11952,7 @@ def _runs_a_script(command: str) -> bool:
 _HOOK_FAMILY_INSTALLERS = {
     "personal-claude-compact-hint.sh": "scripts/install-personal-claude-hook.sh",
     "schedule-crons-session-hint.sh": "scripts/install-session-start-hook.sh",
+    "watcher-rearm-session-hint.sh": "scripts/install-watcher-rearm-hook.sh",
 }
 
 
@@ -11788,6 +11986,10 @@ def check_claude_hook_registration(
         failure that looks healthiest.
     """
     name = "claude-hooks"
+    # These hooks only fire inside a Claude core; under Codex there is nothing to register.
+    if _codex_runtime_selected():
+        return {"name": name, "status": "ok",
+                "detail": "not applicable — core runtime is codex; Claude hooks are not used"}
     repo = Path(repo_dir or REPO_DIR)
     installer = repo / "src" / "install-claude-hooks.sh"
     if not installer.is_file():
@@ -12225,15 +12427,9 @@ def _live_core_runtime(socket: str, sessions) -> "str | None":
     """
     seen = set()
     for sess in sessions:
-        res = _run_tmux(socket, "show-environment", "-t", f"={sess}",
-                        "SUTANDO_CORE_RUNTIME")
-        if res is None or res.returncode != 0:
-            continue
-        out = (res.stdout or "").strip()
-        if out.startswith("SUTANDO_CORE_RUNTIME="):
-            val = out.split("=", 1)[1].strip()
-            if val:
-                seen.add(val)
+        val = session_runtime.read(sess, lambda *a: _run_tmux(socket, *a))
+        if val:
+            seen.add(val)
     return seen.pop() if len(seen) == 1 else None
 
 
@@ -12438,6 +12634,48 @@ def proxy_liveness_status(proxy_check: dict) -> str:
     return proxy_check.get("status")
 
 
+def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
+    """Escalate `check` to 'warn' when the proxy's own last-recorded credential
+    state (quota-state.json, written by recordCredentialState()) is 'exhausted'
+    and was recorded by the current process (a record older than the process
+    start is ignored). Advisory: silent on any read/parse failure, and never
+    runs unless the caller's own gate already proved the port is 'ok'/'stale'.
+    """
+    if check["status"] not in ("ok", "stale"):
+        return
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or state.get("credential_state") != "exhausted":
+        return
+    detail = state.get("credential_state_detail") or "no detail recorded"
+    at = state.get("credential_state_at")
+    age = ""
+    at_ts = None
+    if isinstance(at, str):
+        from datetime import datetime as _dt  # local: not at module scope in this file
+        try:
+            at_ts = _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age_s = time.time() - at_ts
+            age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
+        except ValueError:
+            pass
+    # Written only on a transition, never reset at startup: a restart inherits
+    # a stale 'exhausted' record, which predates the process that would prove it.
+    starts, _ = _proc_lstarts("credential-proxy")
+    if at_ts is not None and starts and at_ts < max(starts):
+        return
+    check["status"] = "warn"
+    check["detail"] = (
+        f"listening, but its own last-recorded credential state is 'exhausted'{age}: "
+        f"{detail} — requests are likely 401ing/502ing despite the port being open"
+    )
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -12458,6 +12696,7 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+        _credential_proxy_wedge_from_quota_state(check)
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
@@ -12693,6 +12932,7 @@ def run_all_checks() -> list[dict]:
     # Advisory CLI progress detector (pane static with work outstanding / retry
     # loop); reads the pane, never the process, and drives no recovery.
     checks.append(check_cli_wedge())
+    checks.append(check_pane_key_fence())
 
     # macOS TCC — must come before critical-file checks so if TCC is blocking
     # everything, the operator sees the root cause before the downstream failures.
@@ -12773,6 +13013,9 @@ def run_all_checks() -> list[dict]:
     checks.append(check_skills_driver_code_drift())
     checks.append(check_sync_conflicts_unmerged())
     checks.append(check_engine_revision_drift())
+    hitl_archive_check = check_hitl_archive()
+    if hitl_archive_check is not None:
+        checks.append(hitl_archive_check)
     onboarding_check = check_onboarding_status()
     if onboarding_check is not None:
         checks.append(onboarding_check)
@@ -12795,10 +13038,13 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             else:
+                # The bundled desktop runs dist/conversation-server.js: an engine
+                # update refreshes that artifact without touching the source.
                 mark_stale_if_outdated(
                     c,
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
+                    binary_path=REPO_DIR / "dist" / "conversation-server.js",
                 )
             # Compose after BOTH branches — the non-ok rewrite replaces check_port's
             # diagnosis, and the healthy branch never composed a pin at all.
@@ -12930,7 +13176,7 @@ def run_all_checks() -> list[dict]:
         try:
             _psb = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
             )
             ps_out = _psb.stdout.strip()
             if _psb.returncode == 0 and ps_out:
@@ -13143,6 +13389,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_core_supervisor())
     checks.append(check_task_queue(threshold_count=queue_count, threshold_age_sec=queue_age_sec))
     checks.append(check_pool_advertisement())
+    checks.append(check_pool_suspended())
     checks.append(check_orphaned_results())
     checks.append(check_held_no_consumer())
     checks.append(check_proactive_quarantine())
@@ -13152,6 +13399,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
+    checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
     checks.append(check_codex_presence())
@@ -14417,14 +14665,15 @@ def _default_cron_nudge(
     env = _resolve_launch_env()
     try:
         has = subprocess.run(
-            [tmux_bin, "-S", sock, "has-session", "-t", session],
+            [tmux_bin, "-S", sock, "has-session", "-t", f"={session}"],
             env=env, capture_output=True, timeout=15,
         )
         if has.returncode != 0:
             return False
         send = subprocess.run(
-            [tmux_bin, "-S", sock, "send-keys", "-t", session, "/schedule-crons", "Enter"],
-            env=env, capture_output=True, timeout=15,
+            # Exact name: a bare target prefix-matches the core's `-watcher` session once the core is gone.
+            tmux_pane_keys.argv(sock, f"={session}:", "/schedule-crons", "Enter", tmux=tmux_bin),
+            env=env, capture_output=True, timeout=tmux_pane_keys.TIMEOUT_S,
         )
         return send.returncode == 0
     except Exception:
@@ -14711,6 +14960,11 @@ def main():
         if do_fix
         else None
     )
+    claude_notifier = (
+        next((c for c in checks if c["name"] == "claude-task-notifier" and c["status"] == "warn"), None)
+        if do_fix
+        else None
+    )
 
     # skill-symlinks is warn-level, so it is never in `issues`. Its fix pass has
     # to sit ABOVE both gates that follow, because each one independently made
@@ -14804,7 +15058,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        elif codex_notifier is None:
+        elif codex_notifier is None and claude_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -14920,25 +15174,7 @@ def main():
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    # If stale, kill old PIDs first so the new process doesn't
-                    # bind-fail or end up alongside a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
-                                capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
-                                     cwd=str(REPO_DIR),
-                                     stdout=open("/tmp/conversation-server.log", "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    print(f"  {c['name']}: {fix_conversation_server(c)}")
 
     # Screen-capture (:7845) is optional, so a down server is downgraded to
     # warn and never enters `issues` — the fix loop above can't reach it. An
@@ -14962,6 +15198,8 @@ def main():
     # local Codex session and delegates topology to the canonical launcher.
     if codex_notifier:
         print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
+    if claude_notifier:
+        print(f"  claude-task-notifier: {fix_claude_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead
