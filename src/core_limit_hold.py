@@ -453,9 +453,19 @@ _SWITCH = re.compile(r"^(?:please\s+)?(?:switch|change)\s+(?:the\s+core\s+)?(?:m
 _RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
 
 
-def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
-    """("switch", model) or ("retry", None) for an owner's bare reply, else None."""
-    from local_task_protocol import canonical_access_tier, reply_action_text, sender_words
+def _quotes_notice(reply: dict, hold: dict, agent: Optional[str]) -> bool:
+    """Whether a quoted message is this hold's notice: its opening line, sent by the agent."""
+    if agent and str(reply.get("sender") or "").strip() != agent.strip():
+        return False
+    first = _notice_body(hold).split("\n", 1)[1].split("\n", 1)[0]
+    flat = lambda t: " ".join(str(t).split())
+    return flat(first) in flat(reply.get("body") or "")
+
+
+def _owner_action(path: Path, workspace: Path, hold: Optional[dict] = None) -> Optional[tuple]:
+    """("switch", model) or ("retry", None) for an owner's bare reply, else None.
+    Given `hold`, a quoted reply counts only when it quotes that hold's notice, from the agent."""
+    from local_task_protocol import canonical_access_tier, reply_action_text, sender_words, split_reply_context
     from policy.egress.result import resolve_access_tier
     from task_envelope import attested_task_headers
     try:
@@ -469,7 +479,12 @@ def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
     if (parsed.headers.get("task_layout") or "").strip() == "mid" and \
             canonical_access_tier(parsed.headers.get("access_tier") or "") != "owner":
         return None
-    body = reply_action_text(sender_words(parsed))
+    words = sender_words(parsed)
+    if hold is not None:
+        reply = split_reply_context(words)[0]
+        if reply is not None and not _quotes_notice(reply, hold, parsed.headers.get("receiving_instance")):
+            return None
+    body = reply_action_text(words)
     m = _SWITCH.match(body)
     if m:
         return ("switch", m.group(1).lower())
@@ -533,7 +548,10 @@ def handle_owner_actions(workspace: Path, now: Optional[float] = None, *,
         hold = active_hold(workspace, now)
         if not hold:
             break
-        action = _owner_action(path, workspace)
+        # A message that predates this hold was about an earlier one; it waits for the core.
+        if path.stem in set(hold.get("present_at_hold") or []):
+            continue
+        action = _owner_action(path, workspace, hold)
         if action is None:
             continue
         if (workspace / "results" / path.name).exists():
