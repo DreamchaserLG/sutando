@@ -2,7 +2,8 @@
 """Resolve one delivery sentinel to the task payload it stands for.
 
 The pool is the only layer that knows a sentinel in a recipient's delivery
-folder names a body in `tasks/`, so the mapping lives here and the core runs
+folder names a body in its `bodies/` folder (or, for a sentinel delivered before
+bodies existed, in `tasks/`), so the mapping lives here and the core runs
 this as an opaque executable (`SUTANDO_INBOX_RESOLVER`) and verifies the answer.
 
 Contract, because the caller enforces it and a violation fails closed there:

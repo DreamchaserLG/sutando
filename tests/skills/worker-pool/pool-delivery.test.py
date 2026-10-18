@@ -443,7 +443,7 @@ class TestCliDispatch(Base):
         rc, out = self._main("sweep")
         got = json.loads(out)
         self.assertEqual(rc, 0)
-        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale"})
+        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale", "kept"})
         self.assertEqual(got["ready"], ["task-1"])
 
 

@@ -215,35 +215,19 @@ def deliver_one(workspace, recipient: str, task_id: str,
         if marker != "absent":
             raise ConflictingDelivery(
                 f"{task_id}: {recipient} carries {pd.NON_EXCLUSIVE_MARKER} ({marker}); refusing to deliver into it")
+        src = pd.payload_path(Path(workspace), task_id)
         if pd.find_in(dfd, task_id) is not None:
+            # A sentinel delivered before bodies existed names only the tasks/ copy:
+            # it gets its body now, so the route can retire that copy.
+            if recipient != pr.CORE and src.is_file():
+                _hold_body(src, recipient, task_id, dfd)
             _attribute(workspace, recipient, task_id)
             return "already"
-        src = pd.payload_path(Path(workspace), task_id)
         if recipient == pr.CORE:
             if not src.is_file():
                 return "no-payload"
-        else:
-            # The body lands BEFORE the sentinel exists, so a sentinel never names
-            # nothing; a body from an earlier pass is the payload.
-            try:
-                bfd = pd.open_body_dir(dfd, create=src.is_file())
-            except OSError as e:
-                raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR} cannot be opened ({e}); refusing to deliver") from e
-            if bfd is None:
-                return "no-payload"
-            try:
-                body = task_id + pd.PENDING_SUFFIX
-                state = pd.regular_file_state(body, dir_fd=bfd)
-                if state == "absent":
-                    if not src.is_file():
-                        return "no-payload"
-                    _stage_body(src, body, bfd)
-                elif state != "regular":
-                    raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR}/{body} is {state}; refusing to deliver")
-                elif src.is_file():
-                    _require_same_body(src, body, bfd, task_id)
-            finally:
-                os.close(bfd)
+        elif _hold_body(src, recipient, task_id, dfd) is None:
+            return "no-payload"
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -255,6 +239,31 @@ def deliver_one(workspace, recipient: str, task_id: str,
         # fact. Recording earlier attributed refusals that never delivered.
         _attribute(workspace, recipient, task_id)
     return "delivered"
+
+
+def _hold_body(src: Path, recipient: str, task_id: str, dfd: int) -> "str | None":
+    """Make sure the recipient holds the body, staged from `src` when absent; a body
+    from an earlier pass must BE the payload. None when there is neither."""
+    try:
+        bfd = pd.open_body_dir(dfd, create=src.is_file())
+    except OSError as e:
+        raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR} cannot be opened ({e}); refusing to deliver") from e
+    if bfd is None:
+        return None
+    try:
+        body = task_id + pd.PENDING_SUFFIX
+        state = pd.regular_file_state(body, dir_fd=bfd)
+        if state == "absent":
+            if not src.is_file():
+                return None
+            _stage_body(src, body, bfd)
+        elif state != "regular":
+            raise UnreadableEvidence(f"{task_id}: {recipient}/{pd.BODY_DIR}/{body} is {state}; refusing to deliver")
+        elif src.is_file():
+            _require_same_body(src, body, bfd, task_id)
+        return body
+    finally:
+        os.close(bfd)
 
 
 def _stage_body(src: Path, name: str, dfd: int) -> None:

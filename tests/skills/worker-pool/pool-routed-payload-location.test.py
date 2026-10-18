@@ -9,6 +9,7 @@ where history readers look; a withdrawn hold puts the body back in tasks/.
 """
 import contextlib
 import importlib
+import json
 import os
 import signal
 import subprocess
@@ -418,8 +419,92 @@ class T(unittest.TestCase):
             pd.prune_spent(self.ws, A)
         self.assertFalse(pd.archived_payload(self.ws, "task-1").exists())
         self.assertTrue((folder / "task-1.txt").is_file(), "sentinel kept")
-        self.assertFalse(pd._archive_body(self.ws, A, "task-1"), "the archiver refuses it on its own too")
+        self.assertFalse(pd._archive_and_retire(self.ws, A, "task-1"), "the archiver refuses it on its own too")
         self.assertEqual((real / pd.BODY_DIR / "task-1.txt").read_text(), TEXT)
+
+    # A withdrawn hold retires nothing until its body is provably back in tasks/.
+    def _held(self):
+        rt.route(self.ws, self.task, roster({ROOM: A}))
+        pd.mark_done(self.ws, A, "task-1", published=False)
+        return self.ws / "tasks" / "task-1.txt"
+
+    def _all_kept(self):
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT, "body kept")
+        self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file(), "sentinel kept")
+        self.assertTrue(pd.pending_flag(self.ws, A, "task-1").is_file(), "hold kept")
+
+    def test_a_withdrawn_hold_that_cannot_link_back_keeps_everything(self):
+        self._held()
+        with mock.patch.object(pd.os, "link", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(OSError):
+                pd.clear_pending(self.ws, A, "task-1")
+        self._all_kept()
+        self.assertFalse((self.ws / "tasks" / "task-1.txt").exists())
+
+    def test_a_withdrawn_hold_never_takes_a_foreign_core_copy_for_its_own(self):
+        core = self._held()
+        core.write_text("FOREIGN\n")
+        with self.assertRaises(OSError):
+            pd.clear_pending(self.ws, A, "task-1")
+        self._all_kept()
+        self.assertEqual(core.read_text(), "FOREIGN\n")
+
+    def test_a_core_copy_created_after_the_check_is_never_overwritten(self):
+        core = self._held()
+        real_link = os.link
+
+        def plant_then_link(src, dst, **kw):
+            Path(dst).write_text("FOREIGN\n")
+            return real_link(src, dst, **kw)
+
+        with mock.patch.object(pd.os, "link", side_effect=plant_then_link):
+            with self.assertRaises(OSError):
+                pd.clear_pending(self.ws, A, "task-1")
+        self._all_kept()
+        self.assertEqual(core.read_text(), "FOREIGN\n")
+
+    def test_a_core_copy_holding_the_same_bytes_completes_the_withdrawal(self):
+        core = self._held()
+        core.write_text(TEXT)
+        pd.clear_pending(self.ws, A, "task-1")
+        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+        self.assertFalse((self.ws / "deliveries" / A / "task-1.txt").exists())
+        self.assertFalse(pd.pending_flag(self.ws, A, "task-1").exists())
+        self.assertEqual(core.read_text(), TEXT)
+
+    # The archiver reads the body through the folder fd it locked, so a swap never redirects it.
+    def test_a_body_folder_swapped_before_the_link_never_archives_a_decoy(self):
+        self._finished()
+        folder = self.ws / "deliveries" / A
+        real_link = os.link
+
+        def swap_then_link(src, dst, **kw):
+            os.rename(folder / pd.BODY_DIR, folder / "moved")
+            (folder / pd.BODY_DIR).mkdir()
+            (folder / pd.BODY_DIR / "task-1.txt").write_text("DECOY\n")
+            return real_link(src, dst, **kw)
+
+        with mock.patch.object(pd.os, "link", side_effect=swap_then_link):
+            self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
+        self.assertEqual(pd.archived_payload(self.ws, "task-1").read_text(), TEXT, "the real body is archived")
+        self.assertFalse((folder / "moved" / "task-1.txt").exists(), "and nothing real is stranded")
+        self.assertEqual((folder / pd.BODY_DIR / "task-1.txt").read_text(), "DECOY\n")
+
+    def test_boot_sweep_archives_a_finished_body_before_retiring_its_sentinel(self):
+        self._finished()
+        out = pd.sweep(self.ws, A)
+        self.assertEqual(out["retired"], ["task-1"])
+        self.assertEqual(pd.archived_payload(self.ws, "task-1").read_text(), TEXT)
+        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+        self.assertFalse((self.ws / "deliveries" / A / "task-1.txt").exists())
+
+    def test_boot_sweep_keeps_what_it_cannot_archive(self):
+        self._finished()
+        with mock.patch.object(pd.os, "link", side_effect=PermissionError(13, "denied")):
+            out = pd.sweep(self.ws, A)
+        self.assertEqual((out["retired"], out["kept"]), ([], ["task-1"]))
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT)
+        self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file())
 
     def test_a_non_regular_body_is_not_archived_and_the_sentinel_stays(self):
         self._finished()
@@ -437,13 +522,13 @@ class T(unittest.TestCase):
 
 
 def _main_tree(dest: Path) -> "Path | None":
-    """origin/main's own src/ and scripts/, unpacked: the artifacts a host runs until it
+    """origin/main's own src/, scripts/ and worker-pool skill, unpacked: the artifacts a host runs until it
     restarts them. None when this checkout has no main ref to read them from."""
     for ref in ("origin/main", "main"):
         sha = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref + "^{commit}"],
                              capture_output=True, text=True)
         if sha.returncode == 0:
-            arc = subprocess.run(["git", "-C", str(REPO), "archive", ref, "src", "scripts"], capture_output=True)
+            arc = subprocess.run(["git", "-C", str(REPO), "archive", ref, "src", "scripts", "skills/worker-pool"], capture_output=True)
             if arc.returncode != 0:
                 return None
             dest.mkdir(parents=True)
@@ -613,6 +698,67 @@ class ResolvedAnnouncement(unittest.TestCase):
                 self.assertFalse([ln for ln in lines if ln.startswith(("KEY ", "PAYLOAD "))], lines)
                 lines, stages = self.notify(runtime, events)
                 self.assert_keyed_and_read(lines, runtime, stages)
+
+
+class LegacyInFlight(unittest.TestCase):
+    """A task main's own router delivered (sentinel only, payload left in tasks/) gets its
+    body on the next pass, and tasks/ stops listing it."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name).resolve() / "ws"
+        for d in ("tasks", "results", "state", "deliveries"):
+            (self.ws / d).mkdir(parents=True)
+        (self.ws / "state" / "roster.json").write_text(json.dumps(roster({ROOM: A})))
+        self.text = TEXT.replace("task-1", "task-legacy")
+        self.core = self.ws / "tasks" / "task-legacy.txt"
+        self.core.write_text(self.text)
+        self.main = _main_tree(Path(self.td.name) / "main")
+        if self.main is None:
+            if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+                self.fail("no main ref to unpack main's router from (CI must fetch it)")
+            self.skipTest("no main ref in this checkout to unpack main's router from")
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def handler(self, repo):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", self.td.name)}
+        r = subprocess.run([sys.executable, str(repo / "skills" / "worker-pool" / "scripts" / "pool_route_handler.py"),
+                            "--task-file", str(self.core), "--workspace", str(self.ws)],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def core_lists(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("task_dispatch_t", REPO / "src" / "delivery" / "task_dispatch.py")
+        tdm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tdm)
+        listed = sorted(p.name for p in (self.ws / "tasks").glob("*.txt"))
+        pending = [Path(str(c)).name for c in tdm.pending_candidates(self.ws / "tasks", self.ws / "results")]
+        return listed, pending
+
+    def test_a_main_era_delivery_gets_its_body_and_leaves_tasks_under_every_sentinel_name(self):
+        folder = self.ws / "deliveries" / A
+        for suffix in (".txt", ".accepted", ".claimed"):
+            with self.subTest(sentinel=suffix):
+                self.core.write_text(self.text)
+                for p in folder.glob("task-legacy.*"):
+                    p.unlink()
+                with contextlib.suppress(FileNotFoundError):
+                    pd.body_path(self.ws, A, "task-legacy").unlink()
+                self.handler(self.main)
+                self.assertTrue((folder / "task-legacy.txt").is_file(), "main's router delivered it")
+                self.assertTrue(self.core.is_file(), "and left its payload in tasks/")
+                self.assertFalse(pd.body_path(self.ws, A, "task-legacy").exists())
+                if suffix != ".txt":
+                    os.rename(folder / "task-legacy.txt", folder / ("task-legacy" + suffix))
+                self.handler(REPO)
+                self.assertEqual(pd.body_path(self.ws, A, "task-legacy").read_text(), self.text)
+                self.assertTrue((folder / ("task-legacy" + suffix)).is_file(), "the delivery itself is unchanged")
+                self.assertEqual(self.core_lists(), ([], []), "the core no longer lists the task")
+                self.assertEqual(rie.resolve(str(folder / "task-legacy.txt")),
+                                 Path(os.path.abspath(pd.body_path(self.ws, A, "task-legacy"))))
 
 
 if __name__ == "__main__":

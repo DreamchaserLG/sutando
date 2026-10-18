@@ -238,7 +238,8 @@ class TestMain(Base):
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=3", out)
-        self.assertEqual(list(d.iterdir()), [])
+        # The folder's lock file is not a sentinel; retiring takes that lock.
+        self.assertEqual([p for p in d.iterdir() if p.name != pd.LOCK_NAME], [])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
         """The same task can sit in the folder as `.accepted` and `.txt`; the
@@ -268,7 +269,7 @@ class TestMain(Base):
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=1", out)
         self.assertIn("kept=1", out)
-        self.assertEqual([p.name for p in d.iterdir()], ["task-fin.txt"])
+        self.assertEqual([p.name for p in d.iterdir() if p.name != pd.LOCK_NAME], ["task-fin.txt"])
 
     def test_a_sweep_failure_is_reported_and_never_changes_the_decision(self):
         """A prune that raises must leave the decision, its exit code and its first
