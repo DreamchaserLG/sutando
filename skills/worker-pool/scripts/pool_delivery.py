@@ -41,8 +41,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from pool_record import (RECIPIENT, DONE_STAGE, PENDING_STAGE,  # noqa: E402
-                         RecipientAliasError, RecordState, read_record_state, record_path, require_own_dir,
-                         require_recipient, workers_root)
+                         RecipientAliasError, RecordState, iter_recipients, read_record_state, record_path,
+                         require_own_dir, require_recipient, workers_root)
 
 # `.txt` because the watcher that wakes a worker emits for no other extension.
 PENDING_SUFFIX = ".txt"
@@ -112,33 +112,45 @@ def payload_location(workspace: Path, task_id: str, recipient: str | None = None
     p = payload_path(ws, task_id)
     if p.is_file():
         return p
+    root = _root(ws) / "deliveries"
     if recipient:
-        folders = [deliveries_dir(ws, recipient)]
+        names = [require_recipient(recipient)]
     else:
         try:
-            folders = sorted(d for d in (_root(ws) / "deliveries").iterdir() if d.is_dir())
-        except OSError:
-            folders = []
-    for d in folders:
+            names = iter_recipients(root)   # raises RecipientAliasError on an aliased folder
+        except FileNotFoundError:
+            names = []
+    for name in names:
+        d = root / name
+        if d.is_symlink():
+            raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias", str(d))
         b = d / f"{task_id}{BODY_SUFFIX}"
         if is_regular_file(b):
             return b
     return None
 
 
-def _archive_body(ws: Path, recipient: str, task_id: str) -> None:
-    """A finished body leaves the folder for tasks/archive/, the one place history readers look."""
+def _archive_body(ws: Path, recipient: str, task_id: str) -> bool:
+    """A finished body leaves the folder for tasks/archive/, the one place history readers look.
+    True once no body remains here; False (reason on stderr) when it could not be moved."""
     b = body_path(ws, recipient, task_id)
-    if not is_regular_file(b):
-        return
-    dst = archived_payload(ws, task_id)
-    if dst.exists():
-        with contextlib.suppress(FileNotFoundError):
-            b.unlink()
-        return
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with contextlib.suppress(OSError):
+    state = regular_file_state(b)
+    if state == "absent":
+        return True
+    try:
+        if state != "regular":
+            raise OSError(errno.EINVAL, f"body is {state}", str(b))
+        dst = archived_payload(ws, task_id)
+        if dst.exists():
+            with contextlib.suppress(FileNotFoundError):
+                b.unlink()
+            return True
+        dst.parent.mkdir(parents=True, exist_ok=True)
         os.rename(b, dst)
+    except OSError as e:
+        print(f"pool_delivery: cannot archive {b}: {e}; keeping its sentinel", file=sys.stderr)
+        return False
+    return True
 
 
 def results_dir(workspace) -> Path:
@@ -462,7 +474,9 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
             p.unlink()
             actions["stale"].append(task_id)
         elif state == "finished" and _nothing_can_re_queue(ws, task_id):
-            _archive_body(ws, recipient, task_id)
+            if not _archive_body(ws, recipient, task_id):
+                actions["kept"].append(task_id)
+                continue
             p.unlink()
             actions["retired"].append(task_id)
         else:

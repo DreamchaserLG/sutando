@@ -6,8 +6,9 @@ folder names a body in `tasks/`, so the mapping lives here and the core runs
 this as an opaque executable (`SUTANDO_INBOX_RESOLVER`) and verifies the answer.
 
 Contract, because the caller enforces it and a violation fails closed there:
-stdout is the payload's ABSOLUTE path and nothing else; any other outcome is a
-non-zero exit with the reason on stderr and an empty stdout. Exit 3 is typed:
+stdout is the payload's ABSOLUTE path, then the task's name (`<id>.txt`) on a
+second line, since the payload's own basename is not the task's identity; any
+other outcome is a non-zero exit with the reason on stderr and an empty stdout. Exit 3 is typed:
 the sentinel names no payload (absent, a directory, a symlink), a verdict about
 the entry; every other failure (an access error, a timeout, a crash, a bad
 workspace) says nothing about the entry and is worth retrying (exit 1).
@@ -37,10 +38,10 @@ def resolve(entry: str, workspace=None) -> Path:
     and its validation belong to pool_delivery; this reads the payload it names.
     """
     ws, _recipient, task_id, _accepted = pd.parse_entry(entry, workspace)
-    # abspath, NOT resolve(): resolving would follow a symlink at the payload
-    # name, and the caller adopts the returned basename as the task's identity.
-    # The delivered body sits beside the sentinel; the tasks/ copy is the
-    # pre-move layout and the core's own tasks, and stays the fallback.
+    if Path(entry).parent.is_symlink():
+        raise pd.NotDelivered(f"sentinel {task_id}: its recipient folder is a symlink alias")
+    # abspath, NOT resolve(): resolving would follow a symlink at the payload name.
+    # The body beside the sentinel first; the tasks/ copy is the pre-move fallback.
     body = Path(os.path.abspath(Path(entry).with_name(task_id + pd.BODY_SUFFIX)))
     if pd.regular_file_state(body) == "regular":
         return body
@@ -52,6 +53,12 @@ def resolve(entry: str, workspace=None) -> Path:
         # A failure of THIS call (EACCES, EIO, ...), not a fact about the entry.
         raise pd.NotDelivered(f"sentinel {task_id}: payload at {path} could not be opened; retry")
     raise NoPayload(f"sentinel {task_id} names no payload at {path} ({state})")
+
+
+def task_name(entry: str) -> str:
+    """The task's identity, whichever file holds its payload: what results,
+    claims and dedupe are keyed on."""
+    return pd.parse_sentinel(Path(entry).name)[0] + pd.PENDING_SUFFIX
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,7 +79,8 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     try:
-        print(resolve(args[0], workspace))
+        payload = resolve(args[0], workspace)
+        print(f"{payload}\n{task_name(args[0])}")
     except NoPayload as e:
         print(f"resolve_inbox_entry: {e}", file=sys.stderr)
         return NO_PAYLOAD_RC

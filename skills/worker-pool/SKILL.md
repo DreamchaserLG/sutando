@@ -42,7 +42,8 @@ Codex assigns new conversation IDs itself. Until its assigned ID is captured,
 the worker's `runtime_session_id` is `null`, `--resume` refuses, and recovery
 starts a fresh Codex conversation with the same worker ID and inbox. The
 notifier resolves delivery sentinels to their payloads (the `<task id>.body` the
-router wrote beside the sentinel), writes results to shared `results/`, and records
+router wrote beside the sentinel) and keys the task by its `<task id>.txt` name, never the body's;
+it writes results to shared `results/<task id>.txt`, and records
 the worker's done flag.
 If the worker dies mid-turn, recovery re-delivers the task in that fresh
 conversation without memory of any partial work from the previous turn.

@@ -21,6 +21,7 @@ import contextlib
 import fcntl
 import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -225,10 +226,15 @@ def deliver_one(workspace, recipient: str, task_id: str,
             # The body lands beside the sentinel BEFORE the sentinel exists, so a
             # sentinel never names nothing; a body from an earlier pass is the payload.
             body = task_id + pd.BODY_SUFFIX
-            if pd.regular_file_state(body, dir_fd=dfd) != "regular":
+            state = pd.regular_file_state(body, dir_fd=dfd)
+            if state == "absent":
                 if not src.is_file():
                     return "no-payload"
                 _stage_body(src, body, dfd)
+            elif state != "regular":
+                raise UnreadableEvidence(f"{task_id}: {recipient}/{body} is {state}; refusing to deliver")
+            elif src.is_file():
+                _require_same_body(src, body, dfd, task_id)
         try:
             os.close(os.open(task_id + pd.PENDING_SUFFIX, os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd))
         except FileExistsError:
@@ -249,6 +255,7 @@ def _stage_body(src: Path, name: str, dfd: int) -> None:
         os.link(str(src), name, dst_dir_fd=dfd)
         return
     except FileExistsError:
+        _require_same_body(src, name, dfd, name)
         return
     except OSError:
         pass
@@ -257,6 +264,28 @@ def _stage_body(src: Path, name: str, dfd: int) -> None:
     with open(src, "rb") as fh, os.fdopen(fd, "wb") as out:
         shutil.copyfileobj(fh, out)
     os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
+def _require_same_body(src: Path, name: str, dfd: int, task_id: str) -> None:
+    """An existing body counts as a prior pass only when it IS the payload: a regular
+    file, never followed, that is the same inode or holds the same bytes."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+    except OSError as e:
+        raise UnreadableEvidence(f"{task_id}: existing body {name} cannot be opened ({e}); refusing to deliver") from e
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ConflictingDelivery(f"{task_id}: existing body {name} is not a regular file; refusing to deliver")
+        try:
+            sst = os.stat(src)
+            if (sst.st_dev, sst.st_ino) == (st.st_dev, st.st_ino):
+                return
+            same = fh.read() == src.read_bytes()
+        except OSError as e:
+            raise UnreadableEvidence(f"{task_id}: cannot compare body {name} with {src} ({e})") from e
+    if not same:
+        raise ConflictingDelivery(f"{task_id}: existing body {name} differs from the payload; refusing to deliver")
 
 
 def _retire_core_copy(workspace, task_id: str, targets: list) -> None:

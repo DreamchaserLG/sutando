@@ -93,6 +93,8 @@ class Asking(Base):
         self.assertTrue((self.ws / "deliveries" / self.alpha / f"{tid}.txt").exists(),
                         "the real router did not deliver the sentinel")
         self.assertIn(self.alpha, out["route"].get("delivered") or [])
+        self.assertEqual(Path(out["task_file"]).read_text(), text,
+                         "the returned task_file is where the payload is now, not a deleted path")
 
     def test_the_watchers_own_pass_finds_it_already_delivered(self):
         out = pa.ask(self.ws, "alpha", "again?")

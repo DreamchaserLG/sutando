@@ -857,9 +857,13 @@ dispatch_task() {
     fi
     sleep 0.2
   done
+  # Line 2, when present, is the task's name: results, claims, held and dedupe key on it,
+  # never on the payload's basename.
+  filename="$(printf '%s\n' "$resolved" | sed -n '2p')"
+  resolved="$(printf '%s\n' "$resolved" | sed -n '1p')"
   announce="$(task_announce "$resolved")"
   task_path="$resolved"
-  filename="$(basename "$task_path")"
+  [ -n "$filename" ] || filename="$(basename "$task_path")"
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
