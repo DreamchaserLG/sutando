@@ -353,6 +353,17 @@ def sender_words(parsed: TaskHeaders) -> str:
     return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
 
 
+def reply_action_text(text: str) -> str:
+    """The answer after broker context and the leading Matrix reply quote."""
+    body = split_reply_context(text)[1].lstrip()
+    # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r") == ">"):
+            return "\n".join(lines[i:]).strip()
+    return ""
+
+
 def parse_task_headers(text: str) -> TaskHeaders:
     """Parse a **task-last** file: collect `key: value` lines strictly BEFORE
     the first `task:` line; everything from `task:` onward is untrusted body.
@@ -726,10 +737,9 @@ def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]
                 if not name.endswith(".txt"):
                     continue
                 stem = name[:-4]
-                if stem in wanted:
-                    if e.is_file():
-                        out[stem].append(directory / name)
-                    continue
+                # One file can be one id's exact result AND another queued id's epoch re-archive.
+                if stem in wanted and e.is_file():
+                    out[stem].append(directory / name)
                 if epoch_forms:
                     cut = stem.rfind("-")
                     if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():

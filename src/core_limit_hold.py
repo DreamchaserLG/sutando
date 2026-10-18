@@ -451,7 +451,7 @@ _RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
 
 def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
     """("switch", model) or ("retry", None) for an owner's bare reply, else None."""
-    from local_task_protocol import canonical_access_tier, sender_words, split_reply_context
+    from local_task_protocol import canonical_access_tier, reply_action_text, sender_words
     from policy.egress.result import resolve_access_tier
     from task_envelope import attested_task_headers
     try:
@@ -465,7 +465,7 @@ def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
     if (parsed.headers.get("task_layout") or "").strip() == "mid" and \
             canonical_access_tier(parsed.headers.get("access_tier") or "") != "owner":
         return None
-    body = split_reply_context(sender_words(parsed))[1].strip()
+    body = reply_action_text(sender_words(parsed))
     m = _SWITCH.match(body)
     if m:
         return ("switch", m.group(1).lower())
