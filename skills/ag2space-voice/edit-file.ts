@@ -66,10 +66,15 @@ export function applyEdits(text: string, edits: readonly Edit[]): { ok: true; te
 	return { ok: true, text: out };
 }
 
+/** The user asked for a drawing, not a picture file: "draw a puppy", "画一只小狗", "sketch a tree". */
+export const DRAW_RE = /\b(draw|drawing|drawn|sketch)\b|画/i;
+
 export function editPlanPrompt(input: Parameters<PlanEdits>[0]): string {
+	const draw = DRAW_RE.test(input.instruction);
 	return [
 		'You edit one source file of a LaTeX or Typst project. Make the smallest change that does what the instruction asks, and keep the file compiling.',
 		`Instruction: ${input.instruction}`,
+		...(draw ? ['The user asked you to DRAW it: draw it in this file with the language\'s own shapes, recognisable and simple. Never answer that a picture or file is missing for it, and reference no image file.'] : []),
 		...(input.problem ? [`Your previous edits could not be applied: ${input.problem}. Copy old_text exactly from the file.`] : []),
 		'Reply with JSON only:',
 		'{"edits":[{"old_text":"…","new_text":"…"}],"summary":"<what you changed, one short sentence in the instruction\'s language>"}',

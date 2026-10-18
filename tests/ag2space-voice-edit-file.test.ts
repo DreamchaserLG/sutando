@@ -186,6 +186,11 @@ describe('the edits and the editor\'s answer', () => {
 		assert.equal(parseEditPlan('{"edits":[{"old_text":"a"}]}').ok, false);
 	});
 
+	it('a request to draw is told to draw, never to ask for a picture file', () => {
+		for (const i of ['draw another figure, a puppy', '画一只小狗', 'sketch a tree in figure 4']) assert.match(editPlanPrompt({ title: 't.typ', text: FILE, instruction: i }), /The user asked you to DRAW it/, i);
+		assert.doesNotMatch(editPlanPrompt({ title: 't.typ', text: FILE, instruction: 'add a figure of a puppy' }), /asked you to DRAW/);
+	});
+
 	it('the prompt carries the instruction, the file and the last problem', () => {
 		const p = editPlanPrompt({ title: 'typst.typ', text: FILE, instruction: 'make the title green', problem: 'edit 1: old_text does not occur in the file' });
 		assert.match(p, /Instruction: make the title green/);
