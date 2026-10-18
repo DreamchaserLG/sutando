@@ -410,6 +410,7 @@ describe('the tools as the voice model sees them', () => {
 		// Writing into a project right after it was made is the assistant's own, not the core's.
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /Writing or changing what a LaTeX or Typst project's files say .* is yours too, never work/);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /writing or changing what its files say/);
+		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /generating an image or picture, or any new file a change needs .* is work — the core makes it, puts it into the project and changes the file/);
 		// Finding a room's project by name is the assistant's own too, not the core's.
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /finding or reading a page, project or file that lives in an AG2 Space room by its name/);
 	});
