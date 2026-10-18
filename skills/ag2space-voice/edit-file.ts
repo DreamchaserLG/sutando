@@ -11,7 +11,7 @@ import { resolveCredential } from '../../src/credential-resolver.js';
 import { WORK_CHECK_MODEL } from '../../src/work-request-check.js';
 import {
 	OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
-	roomExecute, roomRead, targetRoom, type ReadRoomDeps,
+	roomExecute, roomRead, targetRoom, type McpClient, type ReadRoomDeps, type RoomRef,
 } from './room-read.js';
 
 /** The most of a file read in one call; a longer file is refused rather than edited from a part. */
@@ -24,10 +24,11 @@ export type EditPlan = { ok: true; edits: Edit[]; summary: string } | { ok: fals
 export type PlanEdits = (input: { title: string; text: string; instruction: string; problem?: string }) => Promise<EditPlan>;
 
 export type EditFileResult =
-	| { ok: true; room: string; title: string; summary: string; edits: number; ms: number; next: string }
+	| { ok: true; room: string; title: string; summary: string; edits: number; build: string; problem?: string; ms: number; next: string }
 	| { ok: false; error: string; detail?: string; done?: false; next?: string; candidates?: string[]; rooms?: string[] };
 
 export const EDIT_DONE_NEXT = 'Done. Tell the user in one sentence what you changed ("I have …"), in which file.';
+export const EDIT_REVERTED_NEXT = 'Nothing was kept: the change broke the build, so it was undone. Tell the user in a sentence which error it caused (`detail`), and offer to try it another way.';
 export const EDIT_NOT_DONE_NEXT = 'Nothing was changed. Tell the user in a sentence what went wrong; do not say it is done.';
 
 /** Files a Typst or LaTeX source pulls in: image("…"), #include/#import "…", bibliography("…"), \\includegraphics{…}, \\input{…}… */
@@ -117,6 +118,46 @@ export const geminiPlanEdits: PlanEdits = async (input) => {
 	}
 };
 
+/** Where a file builds: its folder (and the folder's main file and images), or the file alone. */
+export interface BuildTarget { project: string; main: string; tool: 'typst' | 'latex'; media: Array<{ id: string; path: string }> }
+
+export async function buildTarget(client: McpClient, room: RoomRef, kind: string, deps: ReadRoomDeps): Promise<{ folder: string | null; target: BuildTarget | null }> {
+	const pages = await roomRead(client, room, 'room.commons.pages.list', { surface: 'doc' }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	const page = pages.ok ? ((pages.result.pages ?? []) as Array<{ kind: string; title: string; folder_id: string | null }>).find((p) => p.kind === kind) : undefined;
+	const folder = page?.folder_id ?? null;
+	const toolOf = (title: string) => /\.typ$/i.test(title) ? 'typst' as const : /\.tex$/i.test(title) ? 'latex' as const : null;
+	if (!folder) {
+		const tool = page ? toolOf(page.title) : null;
+		return { folder, target: tool ? { project: kind, main: kind, tool, media: [] } : null };
+	}
+	const folders = await roomRead(client, room, 'room.commons.folders.list', {}, deps, ROOM_COMMONS_TIMEOUT_MS);
+	if (!folders.ok) return { folder, target: null };
+	const f = ((folders.result.folders ?? []) as Array<{ id: string; main?: string | null }>).find((x) => x.id === folder);
+	const siblings = pages.ok ? ((pages.result.pages ?? []) as Array<{ kind: string; title: string; folder_id: string | null }>).filter((p) => p.folder_id === folder) : [];
+	const main = f?.main || (page && toolOf(page.title) ? kind : siblings.find((p) => /^main\.(typ|tex)$/i.test(p.title))?.kind);
+	const mainTitle = siblings.find((p) => p.kind === main || p.kind === `markdown-${main}`)?.title ?? page?.title ?? '';
+	const tool = toolOf(mainTitle);
+	if (!main || !tool) return { folder, target: null };
+	const inFolder = ((folders.result.placements ?? []) as Array<{ surface: string; item_id: string; folder_id: string }>).filter((p) => p.surface === 'media' && p.folder_id === folder).map((p) => p.item_id);
+	let media: BuildTarget['media'] = [];
+	if (inFolder.length) {
+		const list = await roomRead(client, room, 'room.media.list', {}, deps, ROOM_COMMONS_TIMEOUT_MS);
+		const names = new Map(list.ok ? ((list.result.files ?? []) as Array<{ id: string; name: string | null }>).map((m) => [m.id, m.name ?? ''] as const) : []);
+		media = inFolder.filter((id) => names.get(id)).map((id) => ({ id, path: names.get(id)! }));
+	}
+	return { folder, target: { project: folder, main, tool, media } };
+}
+
+/** One server build: its error messages, or null when it could not run (budget, timeout…), which blocks nothing. */
+export async function buildErrors(client: McpClient, room: RoomRef, t: BuildTarget, deps: ReadRoomDeps): Promise<string[] | null> {
+	const action = t.tool === 'typst' ? 'room.commons.typst.compile' : 'room.commons.latex.compile';
+	const r = await roomExecute(client, room, action, { project: t.project, main: t.main, trigger: 'manual', ...(t.tool === 'typst' && t.media.length ? { media: t.media } : {}) }, deps, { operationId: randomUUID() });
+	if (!r.ok) return null;
+	const status = String(r.result.status ?? '');
+	if (status !== 'ok' && status !== 'errors') return null;
+	return ((r.result.problems ?? []) as Array<{ severity: string; message: string }>).filter((p) => p.severity === 'error').map((p) => p.message);
+}
+
 export async function editProjectFile(
 	args: { kind: string; instruction: string; room?: string; project?: string },
 	deps: ReadRoomDeps,
@@ -132,7 +173,8 @@ export async function editProjectFile(
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
 	const room = target.room;
-	const project = (args.project ?? '').trim() || kind;
+	const where = await buildTarget(client, room, kind, deps);
+	const project = (args.project ?? '').trim() || where.folder || kind;
 	const operationId = randomUUID();
 	let problem: string | undefined;
 	// A second round only after a plan that did not fit the file, or a file changed under us.
@@ -162,13 +204,42 @@ export async function editProjectFile(
 		}, deps, { operationId });
 		if (r.ok) {
 			deps.log?.(`[EditFile] ${title || kind} in ${room.name}: ${p.edits.length} edit(s) in ${Date.now() - t0}ms: ${editsForLog(p.edits)}`);
-			return { ok: true, room: room.name, title, summary, edits: p.edits.length, ms: Date.now() - t0, next: EDIT_DONE_NEXT };
+			const done = (build: string, problem?: string): EditFileResult => ({ ok: true, room: room.name, title, summary, edits: p.edits.length, build, ...(problem ? { problem } : {}), ms: Date.now() - t0, next: EDIT_DONE_NEXT });
+			if (!where.target) return done('not_checked');
+			// Build once; a change that adds an error is undone, so a broken file is never left behind.
+			const after = await buildErrors(client, room, where.target, deps);
+			if (after === null) return done('not_checked');
+			if (after.length === 0) return done('ok');
+			const undone = await writeWhole(client, room, project, kind, text, deps);
+			if (!undone.ok) {
+				deps.log?.(`[EditFile] ${title || kind}: the change breaks the build and could not be undone: ${undone.error}`);
+				return { ok: false, error: 'breaks_build_not_undone', detail: after[0], done: false, next: 'The change was applied but breaks the build, and undoing it failed. Tell the user which error (`detail`), and that the file needs fixing in the app.' };
+			}
+			const before = await buildErrors(client, room, where.target, deps);
+			const added = before === null ? after : after.filter((m) => !before.includes(m));
+			if (added.length === 0) {
+				// The errors were there before the change: it is not the cause, so it goes back in.
+				const again = await writeWhole(client, room, project, kind, fit.text, deps);
+				if (again.ok) { deps.log?.(`[EditFile] ${title || kind}: build already had errors; change kept`); return done('errors', after[0]); }
+			}
+			deps.log?.(`[EditFile] ${title || kind}: undone, it broke the build: ${added[0] ?? after[0]}`);
+			return { ok: false, error: 'breaks_build', detail: added[0] ?? after[0], done: false, next: EDIT_REVERTED_NEXT };
 		}
 		if (r.error === OUTCOME_UNKNOWN) return r;
 		if (/stale_base/i.test(r.error) && round === 0) { problem = undefined; continue; }
 		return { ...r, done: false, next: EDIT_NOT_DONE_NEXT };
 	}
 	return { ok: false, error: 'cannot_edit', detail: problem, done: false, next: EDIT_NOT_DONE_NEXT };
+}
+
+/** The whole file written back on its current hash (to undo a change, or redo one). */
+async function writeWhole(client: McpClient, room: RoomRef, project: string, kind: string, text: string, deps: ReadRoomDeps): Promise<{ ok: true } | { ok: false; error: string }> {
+	const read = await roomRead(client, room, 'room.commons.pages.read', { kind, max_bytes: EDIT_FILE_MAX_BYTES }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	if (!read.ok) return read;
+	const hash = typeof read.result.content_hash === 'string' ? read.result.content_hash : '';
+	if (!hash) return { ok: false, error: 'no_content_hash' };
+	const r = await roomExecute(client, room, 'room.commons.changes.apply', { project, message: 'Undo a change that broke the build', files: [{ page_id: kind, base_hash: hash, text }] }, deps, { operationId: randomUUID() });
+	return r.ok ? { ok: true } : r;
 }
 
 export function createEditFileTool(deps: ReadRoomDeps, plan: PlanEdits = geminiPlanEdits): ToolDefinition {
@@ -179,7 +250,9 @@ export function createEditFileTool(deps: ReadRoomDeps, plan: PlanEdits = geminiP
 			'Pass `kind` = the file\'s kind from search_commons (e.g. "markdown-qop83g48"), `instruction` = what to change, in the user\'s words, and `room` = the same room. ' +
 			'Never pass the file\'s text: this tool reads the file and writes the change itself. Call it at once: do not read the change back or ask for a yes. ' +
 			'Pass `project` (the folder id) only when a previous call\'s `detail` says the file belongs to a folder project. ' +
-			'Returns {ok:true, title, summary} — then tell the user in one sentence what you changed ("I have …"); never say it is done before ok:true. ' +
+			'It compiles the project after the change; a change that adds a build error is undone at once. ' +
+			'Returns {ok:true, title, summary, build} — then tell the user in one sentence what you changed ("I have …"); if build is "errors", also say the build already had `problem`; never say it is done before ok:true. ' +
+			'"breaks_build" — the change caused `detail` and was undone: say so and offer another way; ' +
 			'Errors: "cannot_edit" — `detail` says why: say it to the user; "missing_file" — the change needs a file (a picture…) the project may not have: say which; they can upload it, ask you to draw it instead, or have it generated — then submit work with the whole request in one task: what to generate, the room and project to put it in, and what to change in which file (e.g. "Generate a picture of a pineapple, add it to the TypeScript test project in susan\'s agents, and replace figure 3 in typst.typ with it"); "file_too_long" — too long to change by voice; "no_file" — the kind is not a file kind; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" — you may not change it there; "not_connected", "timeout" or "unavailable" — it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({

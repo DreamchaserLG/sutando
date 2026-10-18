@@ -13,7 +13,7 @@ const PRESENT = existsSync(join(process.cwd(), 'skills', 'ag2space-voice', 'edit
 if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 if (PRESENT) {
-const { applyEdits, editsForLog, fileRefs, newFileRefs, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
+const { applyEdits, editsForLog, fileRefs, newFileRefs, EDIT_REVERTED_NEXT, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
 type PlanEdits = Parameters<typeof editProjectFile>[2];
 
 const FILE = '#set text(fill: black)\n= My Title\nBody text.\n';
@@ -26,6 +26,7 @@ function fake(exec: (args: Record<string, unknown>, n: number) => unknown = () =
 	const client = {
 		async callTool(name: string, args: Record<string, unknown>) {
 			calls.push({ name, args });
+			if (name === 'room.action.read' && args.action !== 'room.commons.pages.read') return ok({}) as never;
 			if (name === 'room.action.read') {
 				const p = pages[Math.min(reads++, pages.length - 1)];
 				return ok({ kind: 'markdown-qop83g48', title: 'typst.typ', text: p.text, offset: 0, next_offset: null, content_hash: p.hash }) as never;
@@ -108,6 +109,65 @@ describe('edit_project_file', () => {
 		const f = fake();
 		await editProjectFile({ ...ARGS, project: 'ab12cd34' }, f.deps, greenTitle);
 		assert.equal((f.calls.find(c => c.name === 'room.action.execute')!.args.arguments as { project: string }).project, 'ab12cd34');
+	});
+});
+
+describe('a change that breaks the build is undone', () => {
+	// A folder project: main.typ in folder a499a739 with one image; the file's text changes with each write.
+	function project(compile: (text: string) => string[]) {
+		let text = FILE, hash = 0;
+		const calls: Array<{ action: string; args: Record<string, unknown> }> = [];
+		const client = {
+			async callTool(_n: string, a: Record<string, unknown>) {
+				const action = String(a.action); const args = (a.arguments ?? {}) as Record<string, unknown>;
+				calls.push({ action, args });
+				switch (action) {
+					case 'room.commons.pages.list': return ok({ pages: [{ kind: 'markdown-qop83g48', title: 'main.typ', folder_id: 'a499a739' }] }) as never;
+					case 'room.commons.folders.list': return ok({ folders: [{ id: 'a499a739', main: 'qop83g48' }], placements: [{ surface: 'media', item_id: 'img00001', folder_id: 'a499a739' }] }) as never;
+					case 'room.media.list': return ok({ files: [{ id: 'img00001', name: 'apple.jpg' }] }) as never;
+					case 'room.commons.pages.read': return ok({ title: 'main.typ', text, next_offset: null, content_hash: `h${hash}` }) as never;
+					case 'room.commons.changes.apply': {
+						const f = (args.files as Array<{ text?: string; edits?: Array<{ old_text: string; new_text: string }> }>)[0];
+						if (typeof f.text === 'string') text = f.text; else for (const e of f.edits ?? []) text = text.replace(e.old_text, e.new_text);
+						hash++;
+						return ok({ status: 'completed', result: {} }) as never;
+					}
+					case 'room.commons.typst.compile': {
+						const errs = compile(text);
+						return ok({ status: 'completed', result: { build_id: 'b', status: errs.length ? 'errors' : 'ok', problems: errs.map(m => ({ severity: 'error', message: m })) } }) as never;
+					}
+				}
+				return ok({}) as never;
+			},
+			close() {},
+		};
+		const deps = { client: () => client, currentRoom: () => ({ id: '!r:ag2.space', name: 'susan’s agents' }), index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 0 }, log: () => {} };
+		return { calls, deps, text: () => text };
+	}
+	const compiles = (f: { calls: Array<{ action: string }> }) => f.calls.filter(c => c.action === 'room.commons.typst.compile').length;
+
+	it('a change that builds is kept, after one compile with the folder\'s main file and images', async () => {
+		const f = project(() => []);
+		const r = await editProjectFile(ARGS, f.deps, greenTitle);
+		assert.ok(r.ok && r.build === 'ok', JSON.stringify(r));
+		assert.equal(compiles(f), 1);
+		assert.deepEqual(f.calls.find(c => c.action === 'room.commons.typst.compile')!.args, { project: 'a499a739', main: 'qop83g48', trigger: 'manual', media: [{ id: 'img00001', path: 'apple.jpg' }] });
+		assert.equal((f.calls.find(c => c.action === 'room.commons.changes.apply')!.args as { project: string }).project, 'a499a739');
+		assert.match(f.text(), /fill: green/);
+	});
+
+	it('a change that adds an error is undone: the file is as it was, and the error is said', async () => {
+		const f = project((t) => t.includes('fill: green') ? ['unknown variable: green'] : []);
+		const r = await editProjectFile(ARGS, f.deps, greenTitle) as { error: string; detail?: string; next?: string };
+		assert.deepEqual([r.error, r.detail, r.next], ['breaks_build', 'unknown variable: green', EDIT_REVERTED_NEXT]);
+		assert.equal(f.text(), FILE);
+	});
+
+	it('errors the file already had do not undo a change that did not cause them', async () => {
+		const f = project(() => ['file not found (searched at orange.png)']);
+		const r = await editProjectFile(ARGS, f.deps, greenTitle);
+		assert.ok(r.ok && r.build === 'errors' && r.problem === 'file not found (searched at orange.png)', JSON.stringify(r));
+		assert.match(f.text(), /fill: green/);
 	});
 });
 
