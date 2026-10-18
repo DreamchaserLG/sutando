@@ -53,6 +53,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 [[ "$PR" =~ ^[0-9]+$ ]] || { echo "review-pr: '$PR' is not a PR number" >&2; exit 2; }
+# A non-owner may only name a PR in this checkout's own repo, never another (possibly private) one.
+if [[ $NON_OWNER -eq 1 && -n "$REPO" ]]; then
+    echo "review-pr: --non-owner reviews only this checkout's repo; '$REPO' (owner/repo#N or --repo) is refused" >&2
+    exit 2
+fi
 GH_R=()
 [[ -n "$REPO" ]] && GH_R=(-R "$REPO")
 
@@ -88,7 +93,7 @@ fi
 if [[ $NON_OWNER -eq 1 ]]; then
     DIFF_FILE="$(mktemp -t review-pr-diff.XXXXXX)"
     printf '%s' "$DIFF" > "$DIFF_FILE"
-    python3 "$HERE/review_pr_sandbox.py" --pr "$PR" ${REPO:+--repo "$REPO"} \
+    python3 "$HERE/review_pr_sandbox.py" --pr "$PR" \
         --diff-file "$DIFF_FILE" --out "$OUT" --max "$MAX" < /dev/null
     rc=$?
 else

@@ -167,6 +167,10 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--max", type=int, default=240)
     a = ap.parse_args(argv)
+    if a.repo:
+        print(f"review-pr: --non-owner reviews only this checkout's repo; '{a.repo}' is refused",
+              file=sys.stderr)
+        return 2
     diff = Path(a.diff_file).read_text(encoding="utf-8")
     return run(a.pr, a.repo, diff, Path(a.out), a.max)
 

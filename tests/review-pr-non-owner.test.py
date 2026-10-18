@@ -201,6 +201,17 @@ class InProcess(unittest.TestCase):
                                        "--out", str(self.out)]), 0)
         run.assert_called_once_with("7", "", SPEC["diff"], self.out, 240)
 
+    def test_main_refuses_a_repo(self):
+        diff = self.tmp / "d.diff"
+        diff.write_text(SPEC["diff"])
+        with mock.patch.object(rps, "run", return_value=0) as run, \
+                mock.patch("sys.stderr") as err:
+            rc = rps.main(["--pr", "7", "--repo", "other/private", "--diff-file", str(diff),
+                           "--out", str(self.out)])
+        self.assertEqual(rc, 2)
+        run.assert_not_called()
+        self.assertIn("other/private", "".join(c.args[0] for c in err.write.call_args_list))
+
     def test_populate_stops_at_the_byte_cap(self):
         root = rps.review_dir()
         self.addCleanup(shutil.rmtree, root, True)
@@ -223,7 +234,7 @@ class Script(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="review-pr-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         bindir = tmp / "bin"
-        review_pr_fixture.install(bindir, SPEC)
+        self.gh_log = review_pr_fixture.install(bindir, SPEC)
         self.claude_log, self.codex_log = tmp / "claude.json", tmp / "codex.log"
         (bindir / "claude").write_text(FAKE_CLAUDE.format(log=str(self.claude_log)))
         (bindir / "codex").write_text(FAKE_CODEX.format(log=str(self.codex_log)))
@@ -249,6 +260,32 @@ class Script(unittest.TestCase):
         self.assertEqual(rec["argv"][rec["argv"].index("--tools") + 1], "Read,Grep,Glob")
         self.assertIn("--restricted", rec["argv"])
         self.assertFalse(cwd.exists(), "the review dir was not removed")
+
+    def test_non_owner_refuses_another_repo(self):
+        for target, extra in (("other/private#7", ()), ("7", ("--repo", "other/private"))):
+            with self.subTest(target=target):
+                argv = ["bash", str(SCRIPT), target, *extra, "--non-owner"]
+                p = self.run_script(command=" ".join(f"'{a}'" for a in argv))
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("--non-owner reviews only this checkout's repo", p.stderr)
+                self.assertIn("other/private", p.stderr)
+                self.assertNotIn("VERDICT-MARKER", p.stdout)
+                self.assertFalse(self.gh_log.exists(), "gh was called for a refused repo")
+                self.assertFalse(self.claude_log.exists())
+                self.assertFalse(self.codex_log.exists())
+
+    def test_non_owner_bare_number_uses_the_checkout_repo(self):
+        p = self.run_script("--non-owner")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        calls = self.gh_log.read_text().splitlines()
+        self.assertTrue(calls)
+        self.assertFalse(any("-R" in c.split() for c in calls), calls)
+
+    def test_owner_may_still_name_another_repo(self):
+        p = self.run_script(command=f"bash '{SCRIPT}' other/repo#7")
+        self.assertNotIn("reviews only this checkout's repo", p.stderr)
+        self.assertIn("pr diff -R other/repo 7", self.gh_log.read_text())
+        self.assertTrue(self.codex_log.exists())
 
     def test_owner_path_still_runs_codex(self):
         self.run_script()
