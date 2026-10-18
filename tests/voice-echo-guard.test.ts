@@ -1,7 +1,5 @@
-/**
- * The voice session turns on bodhi's echo guard unless VOICE_ECHO_GUARD=0: without it, the model's own
- * voice from the speakers reaches the client VAD and fires false barge-ins, so it interrupts itself.
- */
+// The voice session turns on bodhi's echo guard unless VOICE_ECHO_GUARD=0, so the model's own voice
+// from the speakers does not fire false barge-ins.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';

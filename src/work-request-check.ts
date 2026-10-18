@@ -45,7 +45,7 @@ export function workCheckPrompt(i: WorkCheckInput, ownRules: readonly string[] =
 		'- A bare number is identified when the recent words show what kind of thing the numbers are (e.g. the user has been asking about PRs).',
 		'- The same request as one of the open tasks (same thing, same ask, maybe worded differently or misheard) = duplicate.',
 		...(ownRules.length ? [
-			'- own: one of these rules says the voice assistant does it itself with its own tools (the rule calls it the assistant\'s own, never work). It is not sent, however the request is worded:',
+			'- own: one of these rules says the voice assistant does it itself with its own tools (the rule calls it the assistant\'s own, never work), and that covers the whole request; a request that also needs the core (an email, code, a lookup elsewhere) is submit. It is not sent, however the request is worded:',
 			...ownRules.map((r) => `  ${r}`),
 		] : []),
 		'Reply with JSON only:',

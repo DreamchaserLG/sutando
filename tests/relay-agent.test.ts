@@ -187,7 +187,7 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		const out = await Promise.race([relay.invoke('w', { task: "Write the content for 'The Best Paper' in susan's agents" }), tick(3_000).then(() => 'timed out')]);
 		assert.deepEqual(submitted, [], 'nothing submitted');
 		assert.match(out, /Nothing was submitted: this is done with your own tools/);
-		assert.match(out, /find_room_actions, describe_room_action, then run_room_action/);
+		assert.doesNotMatch(out, /find_room_actions|AG2 Space/, 'core names no skill: the surface\'s own tools do it');
 		assert.ok(logs.some((l) => l.includes('the voice model does this with its own tools')));
 	});
 

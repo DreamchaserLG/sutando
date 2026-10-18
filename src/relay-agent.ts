@@ -680,7 +680,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			} else if (verdict.action === 'own') {
 				this.ownAt = Date.now();
 				this.deps.log?.('[RelayAgent] not submitted: the voice model does this with its own tools');
-				return framedSystem('Nothing was submitted: this is done with your own tools, not by the core. Do it now yourself — an AG2 Space action you have no tool for is find_room_actions, describe_room_action, then run_room_action — and tell the user from the result. Do not say it is being worked on.');
+				return framedSystem('Nothing was submitted: this is done with your own tools, not by the core. Do it now yourself with them, and tell the user from the result. Do not say it is being worked on.');
 			}
 			if (verdict.action === 'duplicate') {
 				// The same request is already with the core (2026-10-12: PR 5333 was sent twice). This call
