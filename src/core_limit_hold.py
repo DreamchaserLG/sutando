@@ -52,6 +52,7 @@ RESET_GRACE_S = 60
 MAX_RESET_WAIT_S = 8 * 24 * 3600
 STRIKE_MEMORY_S = 2 * BACKOFF_CAP_S
 HELD_TASKS_MAX = 256
+CLOCK_SKEW_S = 30
 # A reset more than a day out is honored for 6 hours, then one launch re-reads the provider.
 LONG_RESET_S = 24 * 3600
 LONG_RESET_RECHECK_S = 6 * 3600
@@ -330,11 +331,12 @@ def _relevant(limit: Optional[Limit], launch_model: Optional[str]) -> bool:
 
 def _incident_ref(hold: dict) -> str:
     """A short id for this pause, so two pauses with the same reset time read differently."""
-    return str(int(float(hold.get("started_at") or 0) * 1000))[-6:]
+    return str(int(float(hold.get("started_at") or 0) * 1000))[-6:].zfill(6)
 
 
 def _task_predates(path: Path, started: object) -> bool:
-    """Whether a task's own timestamp is before the hold opened (the cap on present_at_hold's backstop)."""
+    """Whether a task's server timestamp is before the hold opened, beyond the clock-skew margin.
+    A missing or unreadable timestamp reads as predating, so the task waits for the core."""
     from datetime import datetime
     if not isinstance(started, (int, float)):
         return False
@@ -342,10 +344,10 @@ def _task_predates(path: Path, started: object) -> bool:
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("timestamp:"):
                 stamp = datetime.fromisoformat(line.split(":", 1)[1].strip().replace("Z", "+00:00"))
-                return stamp.timestamp() < started
+                return stamp.timestamp() < started - CLOCK_SKEW_S
     except (OSError, ValueError):
-        return False
-    return False
+        return True
+    return True
 
 
 def _notice_body(hold: dict) -> str:

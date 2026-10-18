@@ -60,9 +60,10 @@ def limited_record(now: float, *, reset_in: float = 3600, rejected: bool = True,
     }
 
 
-def owner_task(tasks: Path, name: str, body: str, tier: str = "owner") -> Path:
+def owner_task(tasks: Path, name: str, body: str, tier: str = "owner",
+               stamp: str = "2099-01-01T00:00:00Z") -> Path:
     path = tasks / f"{name}.txt"
-    path.write_text(f"id: {name}\nsource: ag2space\naccess_tier: {tier}\ntask: {body}\n")
+    path.write_text(f"id: {name}\nsource: ag2space\ntimestamp: {stamp}\naccess_tier: {tier}\ntask: {body}\n")
     return path
 
 
@@ -1055,6 +1056,18 @@ class WitnessFindings(unittest.TestCase):
         hold = clh.read_hold(self.ws)
         self.assertNotIn("task-old", hold["present_at_hold"])
         self.assertEqual(clh.handle_owner_actions(self.ws, later + 60, switch_cmd=str(self.switch)), [])
+
+    def test_a_task_with_no_readable_timestamp_waits(self):
+        path = gateway_task(self.ws, "task-nots", "retry now")
+        path.write_text(path.read_text().replace("timestamp: ", "timestamp: not-a-time "))
+        self.assertTrue(clh._task_predates(path, self.now - 3600))
+        path.write_text("\n".join(l for l in path.read_text().splitlines() if not l.startswith("timestamp:")))
+        self.assertTrue(clh._task_predates(path, self.now - 3600))
+
+    def test_a_server_clock_a_little_ahead_does_not_hold_back_a_fresh_command(self):
+        path = gateway_task(self.ws, "task-skew", "retry now")
+        self.assertFalse(clh._task_predates(path, self.now + 10))
+        self.assertTrue(clh._task_predates(path, self.now + 60))
 
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
