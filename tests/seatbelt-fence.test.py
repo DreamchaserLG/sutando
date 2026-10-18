@@ -75,6 +75,32 @@ class ProfileShape(unittest.TestCase):
                 self.assertNotIn("network-outbound", l)
         self.assertIn('(deny network-outbound (remote ip "localhost:*"))', text)
 
+    def test_outbound_is_tcp_443_any_host_and_dns_only(self):
+        # Seatbelt takes only "*" or "localhost" as a remote host, so 443 cannot be
+        # pinned to named hosts here; widening it to another port or host must fail.
+        for loopback in (False, True):
+            text = seatbelt.profile(cwd=self.root / "work", scratch=self.root / "scratch",
+                                    tool_binary=str(self.tool), loopback=loopback)
+            outbound = [l for l in text.splitlines() if "network-outbound" in l]
+            mdns = os.path.realpath(seatbelt.MDNS_SOCKET)
+            self.assertEqual(outbound, [
+                '(allow network-outbound (remote tcp "*:443"))',
+                '(deny network-outbound (remote ip "localhost:*"))',
+                f'(allow network-outbound (remote unix-socket (path-literal "{mdns}")))',
+            ])
+
+    def test_no_process_may_reach_the_keychain_service(self):
+        self.assertNotIn("com.apple.SecurityServer", seatbelt.MACH_ALL + seatbelt.MACH_TOOL)
+        for l in self.text.splitlines():
+            self.assertNotIn("SecurityServer", l)
+        tool_mach = [l for l in self.text.splitlines()
+                     if "mach-lookup" in l and "process-path" in l]
+        self.assertEqual(tool_mach, [
+            f'(allow mach-lookup (require-all (process-path "{self.cat}") (require-any '
+            + " ".join(f'(global-name "{m}")' for m in (
+                "com.apple.SystemConfiguration.configd", "com.apple.trustd",
+                "com.apple.trustd.agent")) + ")))"])
+
     def test_a_helper_is_readable_and_runnable_by_the_tool_only(self):
         helper = self.root / "tool" / "helper"
         text = seatbelt.profile(cwd=self.root / "work", scratch=self.root / "scratch",

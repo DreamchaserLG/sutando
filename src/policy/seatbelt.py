@@ -40,7 +40,7 @@ SYSTEM_EXEC = ("/bin", "/usr/bin", "/usr/libexec", "/usr/sbin", "/sbin")
 DEVICES_RW = ("/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx", "/dev/dtracehelper")
 DEVICES_R = ("/dev/random", "/dev/urandom")
 # Every process: name lookup, logging, notifications. Tool binary only: TLS trust
-# and network configuration.
+# and network config; never SecurityServer, which would hand it the owner's Keychain.
 MACH_ALL = (
     "com.apple.system.opendirectoryd.libinfo", "com.apple.system.logger",
     "com.apple.logd", "com.apple.system.notification_center",
@@ -48,7 +48,6 @@ MACH_ALL = (
 )
 MACH_TOOL = (
     "com.apple.SystemConfiguration.configd", "com.apple.trustd", "com.apple.trustd.agent",
-    "com.apple.SecurityServer",
 )
 MDNS_SOCKET = "/var/run/mDNSResponder"
 # The root symlinks into /private: resolving /etc/hosts or /var/folders needs them.
