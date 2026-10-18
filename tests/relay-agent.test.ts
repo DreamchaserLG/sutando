@@ -62,8 +62,8 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		const ahead = agent(pending('task-4', { queuedAhead: 2, message: 'Got it, 2 in line.' }));
 		void ahead.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
-		assert.deepEqual(ahead.notices.length, 2, 'the acknowledgement at the call, then the queue position');
-		assert.match(ahead.notices[1], /Got it, 2 in line\./);
+		assert.deepEqual(ahead.notices.length, 1, 'the queue position instead of the plain acknowledgement');
+		assert.match(ahead.notices[0], /Got it, 2 in line\./);
 		const plain = agent(pending('task-5'));
 		void plain.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
@@ -928,9 +928,7 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 describe('voice runs every work call through the relay agent', () => {
 	it('work is a NON_BLOCKING background tool mapped to the relay agent subagent; the call stays open until its result', () => {
 		assert.equal(tb.workTool.execution, 'background');
-		// No pending message: it made bodhi answer the call at once (closing its id) and inject the real
-		// result later as unrelated text. The result now returns through the open call, under its own
-		// id, with WHEN_IDLE — verified on gemini-3.8-live (Yixuan's probe, 2026-10-17).
+		// A pending message would answer the call at once and close its id; the result returns under its own id.
 		assert.equal(tb.workTool.pendingMessage, undefined, 'a pending message would close the call id before the result');
 		assert.equal(tb.workTool.behavior, 'NON_BLOCKING');
 		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');

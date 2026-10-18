@@ -119,9 +119,7 @@ describe('relay agent end to end', () => {
 		session.clientConnected = true;
 	});
 	it('the user is talking when a result lands: it goes back through its open call at once (Gemini picks the moment)', async () => {
-		// NON_BLOCKING + WHEN_IDLE: the call's own response is scheduled by Gemini, so sutando no longer holds a
-		// result until the user's turn is over (2026-10-17: paced results that arrived 20:06–20:07 reached the
-		// model at 20:10–20:11 while the turns kept being cut off).
+		// WHEN_IDLE lets Gemini schedule the call's own response: no hold until the user's turn is over.
 		const id = voiceTask('check PR 5167');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5167' });
@@ -134,6 +132,18 @@ describe('relay agent end to end', () => {
 		session.emit('speech.user_ended');
 		session.emit('turn.start'); session.emit('response.first_audio'); session.emit('turn.end', { turnId: 't5167' } as never);
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'heard once the model has spoken after the hand-off');
+	});
+
+	it('a result handed to its call but lost to a reconnect before it was spoken is handed over again', async () => {
+		const id = voiceTask('check PR 6100');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 6100' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6100 is merged.');
+		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6100 is merged/);
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
+		session.emit('session.stateChange', { toState: 'RECONNECTING' } as never);
+		assert.equal(voiceTaskStore.get(id)?.delivery, undefined, 'not heard: reconcile hands it over again');
 	});
 
 	it('a task the core ends with a skip-marked result is not pending for the user', async () => {

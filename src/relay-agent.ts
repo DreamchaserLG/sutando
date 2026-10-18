@@ -1,8 +1,7 @@
 /**
  * Sutando's relay agent: the voice side's task manager between the voice model and the core, run
- * as the bodhi subagent behind the `work` tool. The tool is NON_BLOCKING: the model keeps talking
- * while each `work` call stays open, waits for its task's result and returns it, and bodhi hands it
- * to Gemini as that call's own response (WHEN_IDLE), so it is spoken as the answer to that request. It keeps a table of every task the user asked for by
+ * as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's
+ * result returns as that call's own response (WHEN_IDLE). It keeps a table of every task the user asked for by
  * voice (what, when, cancel asked, how its result reached the user, which result answered it) and
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
@@ -85,6 +84,10 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 			update(taskId, deliver);
 			// The tasks answered in this one's result reached the user with it, whichever way it went.
 			for (const [id, row] of [...tasks.entries()]) if (row.answeredBy === taskId) update(id, deliver);
+		},
+		/** A hand-over the session lost before it was spoken: reconcile hands it over again. */
+		unsetHandedOver(taskId: string): void {
+			update(taskId, (row) => (row.delivery === 'injected' ? { ...row, delivery: undefined } : null));
 		},
 		noteReplay(taskId: string): void {
 			update(taskId, (row) => ({ ...row, replays: (row.replays ?? 0) + 1 }));
@@ -517,11 +520,8 @@ export const WORK_ACKNOWLEDGE = 'The request was sent to the core and is being w
 /** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
 export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
 
-/**
- * A task answered this recently is still compared with a new request: gemini-3.8-live was seen
- * re-issuing a call a few seconds after its result was returned (Yixuan's probe, 2026-10-17). That
- * orphan must not reach the core a second time; it is closed quietly instead.
- */
+/** A task answered this recently is still compared with a new request: the model may re-issue a
+ *  call seconds after its result, and that orphan is closed quietly instead of resent. */
 export const RECENT_ANSWER_WINDOW_MS = 60_000;
 
 interface Waiter {
@@ -569,19 +569,15 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			.map(([id, r]) => ({ id, text: r.text as string }));
 	}
 
-	/** Tasks whose result reached the user within RECENT_ANSWER_WINDOW_MS: a re-issued call for one of these is an orphan. */
+	/** Tasks answered in this session within RECENT_ANSWER_WINDOW_MS (not DM'd): a re-issued call for one is an orphan. */
 	recentlyAnswered(now = Date.now()): OpenTask[] {
 		return this.deps.store.list()
-			.filter(([, r]) => !!r.text && !!r.delivery && r.at > now - RECENT_ANSWER_WINDOW_MS)
+			.filter(([, r]) => !!r.text && (r.delivery === 'injected' || r.delivery === 'spoken') && r.at > now - RECENT_ANSWER_WINDOW_MS)
 			.map(([id, r]) => ({ id, text: r.text as string }));
 	}
 
-	/**
-	 * Every waiting call ends without its result; each result is then delivered another way. Called
-	 * when the voice session reconnects: a tool call issued on the old connection cannot be answered
-	 * on the new one (bodhi drops such a result at its dial-generation fence), so the call must not
-	 * keep waiting for a response that could never reach Gemini.
-	 */
+	/** Every waiting call ends without its result, which is then delivered another way: on a reconnect,
+	 *  a response to a call issued on the old connection is dropped. */
 	endAllCalls(why: keyof typeof ENDED): string[] {
 		const ended = [...this.waiting.keys()];
 		for (const id of ended) this.endCall(id, why);
@@ -665,12 +661,6 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.lastTakenAt = Date.now();
 		// Taken before the waits below: a room switch during them must not re-address the request.
 		let origin = this.deps.captureOrigin?.();
-		// The user hears at once that it is being done, before the waits below. gemini-3.8-live says nothing
-		// before or after a NON_BLOCKING call while it waits for the call's response, and the wait for the
-		// user's turn can be long: on 2026-10-17 a speech blip bodhi ignored never ended for the speech gate,
-		// the request was sent 14.5 s after the call, and the user heard nothing until then. A call that
-		// joins an earlier one is the same request: it was acknowledged already.
-		if (!this.holding) this.deps.notice?.(framedSystem(WORK_ACKNOWLEDGE));
 		if (this.deps.speech) {
 			// A call made while an earlier one still waits for the user's turn to end: the model has not
 			// answered in between, the user went on speaking, so the two are one request. The earlier
@@ -709,8 +699,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
 			if (verdict.action === 'duplicate') {
-				// The same request was answered moments ago: the model re-issued the call (seen on 3.8 a few
-				// seconds after the response). Closed quietly; the core never sees it twice.
+				// Answered moments ago: the model re-issued the call. Closed quietly; the core never sees it twice.
 				if (this.deps.store.get(verdict.of)?.delivery) {
 					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was returned; closed without resending`);
 					return framedSystem(ENDED.already_answered);
@@ -732,10 +721,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
 		if (replaces) this.supersede(taskId, replaces);
 
-		// The plain acknowledgement went out when the call came in (a separate notice: the old fake first
-		// response that made the model speak closed the call). A queue position or an offline core is said now.
+		// The model is silent while a NON_BLOCKING call is open, so a separate notice acknowledges it (the
+		// call stays open). Sent only once the checks let it through; a queue position or offline core instead.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
-		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
+		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
 		if (signal?.aborted) return framedSystem(ENDED.continuing);
 		return new Promise<string>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };

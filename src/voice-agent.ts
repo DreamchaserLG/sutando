@@ -1275,9 +1275,8 @@ async function main() {
 	// works again, so it clears the persisted terminal classification (R8)
 	// before the frame is built.
 	session.eventBus.subscribe('session.stateChange', (e) => {
-		// A reconnect abandons every open tool call with the old connection: a `work` result returned
-		// to one of them would be dropped at bodhi's dial-generation fence. End them now so each
-		// result goes the other way (injected, or the DM) and is reconciled.
+		// A response to a call from the old connection is dropped after a reconnect: end the open
+		// calls so each result goes the other way and is reconciled.
 		if ((e as { toState?: string })?.toState === 'RECONNECTING') {
 			const ended = relayAgent.endAllCalls('continuing');
 			if (ended.length) console.log(`${ts()} [RelayAgent] reconnecting: ${ended.length} open work call(s) ended; their results are delivered another way (${ended.join(', ')})`);

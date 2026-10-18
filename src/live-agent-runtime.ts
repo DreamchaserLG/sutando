@@ -124,12 +124,16 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	const interruptedTurns = new Set<string>();
-	// Results returned through their open work calls, waiting to be recorded heard: the first spoken model
-	// turn that starts after the hand-off is the one that says it (said once is said, as the pacer recorded).
+	// Results returned through open calls, recorded heard at the first spoken model turn after the
+	// hand-off; a reconnect before that hands them over again.
 	const returnedUnheard: Array<{ ids: string[]; at: number }> = [];
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
 	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
+	session.eventBus.subscribe('session.stateChange', (e: { toState?: string }) => {
+		if (e?.toState !== 'RECONNECTING') return;
+		for (const { ids: lost } of returnedUnheard.splice(0)) for (const id of lost) voiceTaskStore.unsetHandedOver(id);
+	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
 	session.eventBus.subscribe('turn.end', () => {
 		if (!modelSpokeInTurn) return;
@@ -239,19 +243,14 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			return;
 		}
 		if (item.taskId && opts.relay.isWaiting(item.taskId)) {
-			// Its work call is still open (NON_BLOCKING): the result goes back through it at once, not through
-			// the pacer. bodhi sends it as that call's own response with WHEN_IDLE, so Gemini picks the moment
-			// and does not cut into what it or the user is saying — the job the pacer did for injected text.
-			// Paced, a result waited for the previous one to be spoken in an uninterrupted turn: on 2026-10-17
-			// three results that had arrived 20:06–20:07 reached the model at 20:10–20:11.
-			// A meeting holds the model: the call ends and the result is held until the meeting is over.
+			// The open call takes the result at once, not through the pacer: WHEN_IDLE lets Gemini pick the
+			// moment. A meeting holds the model: the call ends and the result waits for the meeting's end.
 			if (meetingHoldsModel(session)) {
 				for (const id of ids(item)) opts.relay.endCall(id, 'delivered_separately');
 				holdForMeeting(item);
 				return;
 			}
-			// Nobody can hear it (2026-10-11 00:14): a result handed to an empty session would be recorded
-			// heard. It goes the offline way instead.
+			// A result handed to a session nobody hears would be recorded heard: it goes the offline way.
 			const now = current(item);
 			if (canSpeak() && opts.relay.offerResult(now)) {
 				returnedUnheard.push({ ids: ids(now), at: Date.now() });

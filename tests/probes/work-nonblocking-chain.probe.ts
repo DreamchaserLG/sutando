@@ -52,14 +52,13 @@ console.log = (...a: unknown[]) => {
 	origLog(...a);
 };
 
-interface Fake { id: string; text: string; delayMs: number; }
 let taskSeq = 0;
 const submitted: string[] = [];
 
 async function scenario(name: string, body: (ctx: Ctx) => Promise<string[]>): Promise<void> {
 	origLog(`\n${ts()} ════ ${name} (model=${MODEL}) ════`);
 	const ctx = await openSession(name);
-	let failures: string[] = [];
+	let failures: string[];
 	try { failures = await body(ctx); }
 	catch (err) { failures = [`threw: ${err instanceof Error ? err.message : String(err)}`]; }
 	finally {

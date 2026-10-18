@@ -1,6 +1,6 @@
 /**
  * The `work` call is NON_BLOCKING and stays open until the core's result returns through it
- * (gemini-3.8-live native tool calls; Yixuan's probe 2026-10-17). Pins the three things that make
+ * (gemini-3.8-live native tool calls). Pins the three things that make
  * that safe in sutando:
  *   1. the tool's declaration: `behavior: 'NON_BLOCKING'`, no `pendingMessage` (a pending message
  *      makes bodhi answer the call at once and inject the real result as unrelated text);
@@ -26,7 +26,9 @@ function agent(opts: { check?: WorkRequestCheck; submit?: (args: Record<string, 
 	const store = createVoiceTaskStore();
 	const submitted: string[] = [];
 	const logs: string[] = [];
+	const notices: string[] = [];
 	const relay = new RelayAgent({
+		notice: (t) => notices.push(t),
 		store,
 		submit: opts.submit ?? (async (args) => {
 			const id = `task-${submitted.length + 1}`;
@@ -37,11 +39,11 @@ function agent(opts: { check?: WorkRequestCheck; submit?: (args: Record<string, 
 		check: opts.check,
 		log: (m) => logs.push(m),
 	});
-	return { relay, store, submitted, logs };
+	return { relay, store, submitted, logs, notices };
 }
 
 test('a call re-issued after its result was returned is closed quietly and never resent', async () => {
-	const { relay, store, submitted, logs } = agent({
+	const { relay, store, submitted, logs, notices } = agent({
 		// The check compares the new request with open AND recently answered tasks.
 		check: async ({ task, openTasks }) => {
 			const same = openTasks.find((t) => t.text === task);
@@ -57,8 +59,10 @@ test('a call re-issued after its result was returned is closed quietly and never
 	assert.match(await first, /the apple is red/);
 	assert.equal(store.get('task-1')?.delivery, 'injected');
 
-	// The model re-issues the same call seconds later (seen on 3.8): closed, not resent, told to stay silent.
+	// The model re-issues the same call seconds later: closed, not resent, told to stay silent, and not acknowledged.
+	const acknowledged = notices.length;
 	const again = await relay.invoke('work', { task: 'find the apple' });
+	assert.equal(notices.length, acknowledged, 'no "on it" for something already answered');
 	assert.deepEqual(submitted, ['find the apple'], 'the core must not see the request twice');
 	assert.match(again, /answered a moment ago/);
 	assert.match(again, /Stay silent/);
@@ -109,7 +113,7 @@ test('an open call returns its result as that call\'s own response (no fake firs
 	assert.match(text, /three findings/);
 });
 
-test('a work call is acknowledged at once by a separate notice, before any wait; the call stays open', async () => {
+test('a submitted request is acknowledged by a separate notice; the call stays open', async () => {
 	const notices: string[] = [];
 	const store = createVoiceTaskStore();
 	const relay = new RelayAgent({
@@ -127,6 +131,19 @@ test('a work call is acknowledged at once by a separate notice, before any wait;
 	assert.match(await call, /the cat is drawn/);
 });
 
+test('no acknowledgement when the check asks the user or finds a duplicate', async () => {
+	for (const verdict of [{ action: 'ask', question: 'Which PR?' }, { action: 'duplicate', of: 'task-open' }] as const) {
+		const notices: string[] = [];
+		const store = createVoiceTaskStore();
+		store.add('task-open', 'check PR');
+		const relay = new RelayAgent({ store, submit: async () => ({ status: 'pending', taskId: 'task-x' }), notice: (t) => notices.push(t), check: async () => verdict });
+		void relay.invoke('work', { task: 'check the PR' });
+		await new Promise((r) => setTimeout(r, 20));
+		assert.equal(notices.length, 0, `${verdict.action}: nothing said to be "on it"`);
+		relay.endAllCalls('continuing');
+	}
+});
+
 test('a queued request is acknowledged with its queue position instead', async () => {
 	const notices: string[] = [];
 	const store = createVoiceTaskStore();
@@ -137,27 +154,7 @@ test('a queued request is acknowledged with its queue position instead', async (
 	});
 	void relay.invoke('work', { task: 'draw a dog' });
 	await new Promise((r) => setTimeout(r, 20));
-	assert.equal(notices.length, 2, 'the acknowledgement at the call, then the queue position');
-	assert.match(notices[0], /Tell the user in one short sentence that you are on it/);
-	assert.match(notices[1], /right after the one I'm on/);
-	relay.endAllCalls('continuing');
-});
-
-test('the acknowledgement goes out before the wait for the user\'s turn', async () => {
-	const notices: string[] = [];
-	const store = createVoiceTaskStore();
-	let release: () => void = () => {};
-	const relay = new RelayAgent({
-		store,
-		submit: async () => { store.add('task-w', 'x'); return { status: 'pending', taskId: 'task-w' }; },
-		notice: (t) => notices.push(t),
-		speech: { onUserSpeechStarted() {}, onUserSpeechEnded() {}, onModelSpeaking() {}, waitTurnOver: () => new Promise<void>((r) => { release = r; }) } as never,
-	});
-	void relay.invoke('work', { task: 'x' });
-	await new Promise((r) => setTimeout(r, 10));
-	assert.equal(notices.length, 1, 'acknowledged while the turn wait is still open');
-	release();
-	await new Promise((r) => setTimeout(r, 10));
-	assert.equal(notices.length, 1, 'not acknowledged twice');
+	assert.equal(notices.length, 1, 'the queue position instead of the plain acknowledgement');
+	assert.match(notices[0], /right after the one I'm on/);
 	relay.endAllCalls('continuing');
 });
