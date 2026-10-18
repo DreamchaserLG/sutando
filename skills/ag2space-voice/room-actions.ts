@@ -5,7 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import {
-	mcpPayload, ownerId, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
+	errorDetail, mcpPayload, ownerId, roomExecute, roomRead, targetRoom, OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_ERROR, ROOM_COMMONS_TIMEOUT_MS, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_NAME_ERRORS,
 	type ReadRoomDeps, type RoomRef,
 } from './room-read.js';
 
@@ -41,13 +41,16 @@ async function actionRoom(scope: Scope, room: string | undefined, deps: ReadRoom
 }
 
 /** A catalog tool (room.actions.search / describe) called directly; errors as codes, never a throw. */
-async function catalogCall(deps: ReadRoomDeps, tool: string, scope: Scope, room: RoomRef | null, args: Record<string, unknown>): Promise<{ ok: true; payload: Record<string, unknown> } | { ok: false; error: string }> {
+async function catalogCall(deps: ReadRoomDeps, tool: string, scope: Scope, room: RoomRef | null, args: Record<string, unknown>): Promise<{ ok: true; payload: Record<string, unknown> } | { ok: false; error: string; detail?: string }> {
 	const client = deps.client();
 	if (!client) return { ok: false, error: 'not_connected' };
 	try {
 		const res = await client.callTool(tool, { ...(scope === 'account' ? { target_kind: 'account' } : { room_id: room!.room_id }), ...args }, ROOM_COMMONS_TIMEOUT_MS);
 		const payload = mcpPayload(res);
-		if (res.isError || !payload) return { ok: false, error: String((payload as { code?: string } | null)?.code ?? 'unavailable') };
+		if (res.isError || !payload) {
+			const detail = errorDetail(res, payload);
+			return { ok: false, error: String((payload as { code?: string } | null)?.code ?? 'unavailable'), ...(detail ? { detail } : {}) };
+		}
 		return { ok: true, payload };
 	} catch (err) {
 		const why = err instanceof Error ? err.message : String(err);
@@ -112,7 +115,7 @@ export async function describeAction(args: { action: string; room?: string; scop
 export type RunActionResult =
 	| { ok: true; action: string; room: string | null; result: unknown; ms: number }
 	| { ok: false; error: 'needs_confirmation'; done: false; next: string; confirm_token: string; will_do: { action: string; title: string; room: string | null; arguments: Record<string, unknown> } }
-	| { ok: false; error: string; operation_id?: string; candidates?: string[]; rooms?: string[] };
+	| { ok: false; error: string; operation_id?: string; detail?: string; candidates?: string[]; rooms?: string[] };
 
 /** A result the model can read: as is when short, else its JSON cut to ACTION_RESULT_MAX_CHARS. */
 export function compactResult(result: unknown): unknown {
@@ -189,7 +192,7 @@ export async function runAction(args: { action: string; room?: string; scope?: s
 	deps.log?.(`[RoomActions] ${action}${target.room ? ` in ${target.room.name}` : ' (account)'} (${d.policy})`);
 	return { ok: true, action, room: target.room?.name ?? null, result: compactResult(done.result), ms: Date.now() - t0 };
 
-	async function confirmedExecute(): Promise<{ answer: RunActionResult } | { ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string }> {
+	async function confirmedExecute(): Promise<{ answer: RunActionResult } | { ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string; detail?: string }> {
 		const key = bindingKey(action, scope, target.ok ? target.room : null, callArgs);
 		const token = (args.confirm_token ?? '').trim();
 		const at = now();
@@ -273,7 +276,7 @@ export function createRunActionTool(deps: ReadRoomDeps): ToolDefinition {
 			'Returns {ok:true, action, room, result} — tell the user in a sentence what happened or what it found. Say it is done only after a call returned ok:true; any other answer means it was not done (or, for outcome_unknown, may not have been). ' +
 			'Arguments mean what the action\'s schema says, not a nickname: a reaction `key` is the emoji character itself (👍, ❤️, 😂), never a name like "+1", "thumbs_up" or "heart". ' +
 			'Errors: "not_by_voice" — the user must do it in the app, say so; "confirmation_mismatch" or "confirmation_expired" — the arguments changed or too much time passed: read the new version back and ask again; "confirmation_too_soon" — the user has not answered yet: say will_do and wait for their answer; never call again before they speak; "action_changed" — the action was updated since you asked: ask again; ' +
-			'"bad_arguments" — arguments_json is not a JSON object; "needs_approval" — the room requires an approval first; "TOOL_INPUT_INVALID" — the arguments do not fit, check describe_room_action; ' + ROOM_NAME_ERRORS +
+			'"bad_arguments" — arguments_json is not a JSON object; "needs_approval" — the room requires an approval first; "TOOL_INPUT_INVALID" or "INVALID_INPUT" — the arguments do not fit: read `detail` (the server\'s own words) and describe_room_action, fix exactly what it names, and only then make a new first call; never send the same arguments again. If it fails a second time, tell the user in a sentence what the server said instead of trying again. Any error may carry `detail`: use it to explain. ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not do that there; "not_connected", "timeout" or "unavailable" — say it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR + ' If the user then asks to try again, call with the same confirm_token: for an action the server deduplicates it reuses the same operation, so it cannot happen twice; otherwise the token is spent ("confirmation_expired") — tell the user to check in the app before asking again.',
 		parameters: z.object({
 			action: z.string().min(1).describe('The action, e.g. "room.commons.comments.resolve".'),

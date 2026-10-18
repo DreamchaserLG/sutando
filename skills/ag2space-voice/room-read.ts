@@ -149,6 +149,35 @@ export function createMcpStdioClient(entry: McpStdioEntry, opts: { log?: (m: str
 }
 
 /** The JSON payload of an MCP result: structuredContent, else the last text part that parses. */
+/** How much of the server's explanation of a failure the model gets. */
+export const ERROR_DETAIL_MAX_CHARS = 600;
+
+/**
+ * The server's own words for a failed action — message, details or field errors, or a prose text part
+ * when the reply carried no JSON — cut to ERROR_DETAIL_MAX_CHARS; undefined when it says nothing beyond
+ * the code. The code alone left the model guessing: asked to draw an apple in a Typst page,
+ * changes.apply answered INVALID_INPUT, and the model sent the same wrong arguments again and again
+ * (2026-10-17, each retry asking the user to confirm once more).
+ */
+export function errorDetail(r: McpToolResult, payload: Record<string, unknown> | null): string | undefined {
+	const parts: string[] = [];
+	if (payload) {
+		for (const key of ['message', 'detail', 'error', 'reason', 'hint']) {
+			const v = payload[key];
+			if (typeof v === 'string' && v.trim() && v !== payload.code) parts.push(v.trim());
+		}
+		for (const key of ['details', 'errors', 'field_errors', 'violations']) {
+			const v = payload[key];
+			if (v !== undefined && v !== null && !(Array.isArray(v) && v.length === 0)) parts.push(typeof v === 'string' ? v : JSON.stringify(v));
+		}
+	} else {
+		for (const part of r.content ?? []) if (typeof part.text === 'string' && part.text.trim()) parts.push(part.text.trim());
+	}
+	const text = parts.join(' — ').replace(/\s+/g, ' ').trim();
+	if (!text) return undefined;
+	return text.length > ERROR_DETAIL_MAX_CHARS ? `${text.slice(0, ERROR_DETAIL_MAX_CHARS)}…` : text;
+}
+
 export function mcpPayload(r: McpToolResult): Record<string, unknown> | null {
 	if (r.structuredContent && typeof r.structuredContent === 'object') return r.structuredContent as Record<string, unknown>;
 	for (const part of [...(r.content ?? [])].reverse()) {
@@ -343,11 +372,14 @@ export async function targetRoom(name: string | undefined, deps: ReadRoomDeps): 
 const actionTarget = (room: RoomRef | null) => room ? { room_id: room.room_id } : { target_kind: 'account' };
 
 /** One action that reads: a thrown error is "timeout" or "unavailable"; an error answer is its code. */
-export async function roomRead(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, timeoutMs?: number, revision?: string): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string }> {
+export async function roomRead(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, timeoutMs?: number, revision?: string): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string; detail?: string }> {
 	try {
 		const res = await client.callTool('room.action.read', { ...actionTarget(room), action, arguments: args, ...(revision ? { expected_action_revision: revision } : {}) }, timeoutMs);
 		const payload = mcpPayload(res);
-		if (res.isError || !payload) return { ok: false, error: String((payload as { code?: string } | null)?.code ?? 'read_failed') };
+		if (res.isError || !payload) {
+			const detail = errorDetail(res, payload);
+			return { ok: false, error: String((payload as { code?: string } | null)?.code ?? 'read_failed'), ...(detail ? { detail } : {}) };
+		}
 		return { ok: true, result: (payload.result ?? payload) as Record<string, unknown> };
 	} catch (err) {
 		const why = err instanceof Error ? err.message : String(err);
@@ -531,7 +563,7 @@ export const OUTCOME_UNKNOWN = 'outcome_unknown';
 
 /** One action that writes, through room.action.execute; nothing is retried. A timeout after sending, or the
  *  server's own unknown outcome, is OUTCOME_UNKNOWN with the operation_id used. */
-export async function roomExecute(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, opts: { operationId?: string; revision?: string } = {}): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string }> {
+export async function roomExecute(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, opts: { operationId?: string; revision?: string } = {}): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string; detail?: string }> {
 	const operation_id = opts.operationId ?? randomUUID();
 	try {
 		const res = await client.callTool('room.action.execute', { ...actionTarget(room), action, arguments: args, operation_id, ...(opts.revision ? { expected_action_revision: opts.revision } : {}) }, ROOM_COMMONS_TIMEOUT_MS);
@@ -540,7 +572,11 @@ export async function roomExecute(client: McpClient, room: RoomRef | null, actio
 		const status = String(payload?.status ?? '');
 		// The upstream failing while the write was in flight leaves it unknown too (seen live: UPSTREAM_UNAVAILABLE on a reaction).
 		if (code === 'ACTION_OUTCOME_UNKNOWN' || code === 'UPSTREAM_UNAVAILABLE' || /unknown/i.test(String(payload?.dispatch_state ?? '')) || /unknown/i.test(status)) return { ok: false, error: OUTCOME_UNKNOWN, operation_id };
-		if (res.isError || !payload) return { ok: false, error: code || 'write_failed' };
+		if (res.isError || !payload) {
+			const detail = errorDetail(res, payload);
+			if (detail) deps.log?.(`[RoomRead] ${action} refused: ${code || 'write_failed'}: ${detail}`);
+			return { ok: false, error: code || 'write_failed', ...(detail ? { detail } : {}) };
+		}
 		if (payload.approval_id || /approval/i.test(status)) return { ok: false, error: 'needs_approval' };
 		if (status && !/completed|succeeded|ok|done/i.test(status)) return { ok: false, error: status };
 		return { ok: true, result: (payload.result ?? payload) as Record<string, unknown> };

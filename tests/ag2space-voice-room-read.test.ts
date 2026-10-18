@@ -444,7 +444,7 @@ describe('the room\'s Commons: its documents, pages and tables', () => {
 		assert.deepEqual(f.calls, [{ name: 'room.action.read', args: { room_id: '!tdhHBCseqxerbZwbfm:ag2.space', action: 'room.commons.search', arguments: { query: 'launch video', limit: ROOM_COMMONS_DEFAULT_LIMIT } }, timeoutMs: ROOM_COMMONS_TIMEOUT_MS }]);
 		// 2026-10-13: several rooms answer INTERNAL to a Commons search; the model is told the documents cannot be searched now.
 		const broken = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"INTERNAL","message":"internal error"}' }] }));
-		assert.deepEqual(await searchCommons({ room: 'open.space launch video', query: 'x' }, { client: () => broken.client, currentRoom: () => null, index: idx(launch) }), { ok: false, error: 'INTERNAL' });
+		assert.deepEqual(await searchCommons({ room: 'open.space launch video', query: 'x' }, { client: () => broken.client, currentRoom: () => null, index: idx(launch) }), { ok: false, error: 'INTERNAL', detail: 'internal error' });
 		assert.deepEqual(await searchCommons({ query: '  ' }, { client: () => f.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'no_query' });
 		assert.deepEqual(await searchCommons({ room: 'Launch Vido', query: 'x' }, { client: () => f.client, currentRoom: () => null, index: idx(launch) }), { ok: false, error: 'not_found', rooms: ['open.space launch video'] });
 	});
@@ -464,7 +464,7 @@ describe('the room\'s Commons: its documents, pages and tables', () => {
 		assert.deepEqual(r2.ok && [r2.text, r2.more], ['all of it', false]);
 		assert.deepEqual(await readPage({ kind: 'page 7', room: '!a:x' }, { client: () => short.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'no_page' });
 		const missing = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"NOT_FOUND","message":"no such page"}' }] }));
-		assert.deepEqual(await readPage({ kind: 'markdown-nope0000', room: '!a:x' }, { client: () => missing.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'NOT_FOUND' });
+		assert.deepEqual(await readPage({ kind: 'markdown-nope0000', room: '!a:x' }, { client: () => missing.client, currentRoom: () => null, index: idx([]) }), { ok: false, error: 'NOT_FOUND', detail: 'no such page' });
 	});
 
 	it('both tools are inline; the descriptions and rules send document questions here, chat questions to search_room', async () => {
@@ -674,7 +674,7 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		assert.deepEqual(await addComment({ room: 'Launch Vido', kind: 'markdown', text: 'c' }, deps(f.client)), { ok: false, error: 'not_found', rooms: ['open.space launch video'] });
 		assert.equal(f.calls.length, 0);
 		const missing = fake(() => ({ isError: true, content: [{ type: 'text', text: '{"code":"NOT_FOUND","message":"no such passage"}' }] }));
-		assert.deepEqual(await addComment({ room: '!a:x', kind: 'markdown', text: 'c', quote: 'nope' }, deps(missing.client, [])), { ok: false, error: 'NOT_FOUND' });
+		assert.deepEqual(await addComment({ room: '!a:x', kind: 'markdown', text: 'c', quote: 'nope' }, deps(missing.client, [])), { ok: false, error: 'NOT_FOUND', detail: 'no such passage' });
 		const gated = fake(() => ({ structuredContent: { status: 'pending_approval', approval_id: 'ap' } }));
 		assert.deepEqual(await addComment({ room: '!a:x', kind: 'markdown', text: 'c' }, deps(gated.client, [])), { ok: false, error: 'needs_approval' });
 	});

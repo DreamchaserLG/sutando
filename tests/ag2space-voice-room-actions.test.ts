@@ -239,6 +239,40 @@ describe('a change runs only on a confirmation token bound to what was confirmed
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
 	});
 
+	it('a refused change hands the model the server\'s own explanation, not only the code', async () => {
+		// 2026-10-17: drawing an apple in a Typst page, changes.apply answered INVALID_INPUT; with only the code,
+		// the model resent the same wrong arguments again and again, asking the user to confirm each time.
+		const f = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT', message: 'changes[0].range.end is past the end of the document', details: { field: 'changes[0].range.end', max: 412 } } }));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r = await runAction({ ...RUN, confirm_token }, f.deps, now) as { ok: boolean; error: string; detail?: string };
+		assert.equal(r.ok, false);
+		assert.equal(r.error, 'INVALID_INPUT');
+		assert.match(r.detail ?? '', /past the end of the document/);
+		assert.match(r.detail ?? '', /"max":412/);
+	});
+
+	it('an error given as prose text still reaches the model; a bare code adds no detail', async () => {
+		const prose = change(() => ({ isError: true, content: [{ type: 'text', text: 'Typst compile failed: unknown variable `apple` at line 3' }] }));
+		const a = await first(prose);
+		t += CONFIRM_MIN_AGE_MS;
+		const r1 = await runAction({ ...RUN, confirm_token: a.confirm_token }, prose.deps, now) as { error: string; detail?: string };
+		assert.equal(r1.error, 'write_failed');
+		assert.match(r1.detail ?? '', /unknown variable `apple`/);
+		const bare = change(() => err('FORBIDDEN'));
+		const b = await first(bare);
+		t += CONFIRM_MIN_AGE_MS;
+		assert.deepEqual(await runAction({ ...RUN, confirm_token: b.confirm_token }, bare.deps, now), { ok: false, error: 'FORBIDDEN' });
+	});
+
+	it('the detail is cut so a long server message cannot flood the model', async () => {
+		const f = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT', message: 'x'.repeat(5000) } }));
+		const { confirm_token } = await first(f);
+		t += CONFIRM_MIN_AGE_MS;
+		const r = await runAction({ ...RUN, confirm_token }, f.deps, now) as { detail?: string };
+		assert.ok((r.detail ?? '').length <= 601, `detail length ${(r.detail ?? '').length}`);
+	});
+
 	it('an unknown outcome keeps the token; a retry reuses the operation_id, so it cannot run twice', async () => {
 		let n = 0;
 		const f = change(() => (++n === 1 ? { isError: true, structuredContent: { code: 'ACTION_OUTCOME_UNKNOWN' } } : ok({ status: 'completed', result: {} })));
