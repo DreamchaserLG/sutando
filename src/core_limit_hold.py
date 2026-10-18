@@ -395,6 +395,10 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     if limit is not None and (not isinstance(seen, (int, float)) or limit.at > seen):
         last_end = hold.get("until") if hold else None
         recent = isinstance(last_end, (int, float)) and now - last_end < STRIKE_MEMORY_S
+        released = hold.get("released_at") if hold and hold.get("status") != "held" else None
+        if isinstance(released, (int, float)):
+            # After a release, only a limit that ends the very next run counts as the same trouble.
+            recent = limit.at - released < BACKOFF_BASE_S
         strikes = int(hold.get("strikes") or 0) + 1 if hold and recent else 1
         new = {
             "status": "held", "kind": limit.kind, "model": limit.model, "source": limit.source,

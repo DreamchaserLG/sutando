@@ -139,6 +139,13 @@ class Decide(unittest.TestCase):
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["strikes"], 2)
         self.assertEqual(d.hold["until"], t + 30 + 2 * clh.BACKOFF_BASE_S)
+        # A limit after the released core has run a while is a new one: no inherited backoff.
+        t2 = d.hold["until"] + 1
+        self.assertTrue(clh.decide(self.ws, t2, quota=rec2).launch)
+        later = t2 + clh.BACKOFF_BASE_S + 60
+        d = clh.decide(self.ws, later, quota=limited_record(later, rejected=False, ago=1))
+        self.assertEqual(d.hold["strikes"], 1)
+        self.assertEqual(d.hold["until"], later + clh.BACKOFF_BASE_S)
 
     def test_backoff_is_bounded(self):
         lim = clh.Limit("rate-limit", 0, None, None, "provider-record")
