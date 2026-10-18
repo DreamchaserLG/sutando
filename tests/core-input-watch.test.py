@@ -87,6 +87,51 @@ _STARTUP_OK_TURN = ("❯ /startup\n"
 
 
 class TestClassify(unittest.TestCase):
+    def test_completed_recap_and_control_are_idle(self):
+        pane = ("❯ /proactive-loop\n"
+                "※ recap: if you typed X in a worker window, press Enter there to send it.\n"
+                "Nothing needs you this round.\n❯ \n⏵⏵ bypass permissions on · ← for agents")
+        for frame in (pane, pane.replace("press Enter", "submit it")):
+            with self.subTest(frame=frame):
+                result = compose_state(frame, "idle", True, styled_pane=frame)
+                self.assertEqual((result[0], result[2], result[3]), ("idle-ready", None, None))
+
+    def test_real_unknown_dialogs_near_idle_chrome(self):
+        footer = "⏵⏵ bypass permissions on · ← for agents"
+        ghost = "❯ \x1b[2mshow me how to navigate\x1b[0m"
+        for hint in ("Enter to confirm · Esc to cancel", "Keyboard: Enter to confirm",
+                     "Keyboard: Enter to confirm.", "Keyboard: Enter to confirm your choice",
+                     "Please press Enter to overwrite the file.",
+                     "※ Please press Enter to overwrite the file.",
+                     "※ recap: Please press Enter to overwrite the file."):
+            for dialog in (hint, "Overwrite the existing config file?\n" + hint):
+                for prefix, suffix in (("", ""), ("", "\n" + footer),
+                                       ("", "\n" + ghost), ("", "\n❯ \n" + footer),
+                                       (footer + "\n", "\n❯ ")):
+                    styled = prefix + dialog + suffix
+                    with self.subTest(frame=styled):
+                        result = compose_state(_mod._ANSI_SGR.sub("", styled), "idle", True,
+                                               styled_pane=styled)
+                        self.assertEqual((result[0], result[3]), ("blocked-human", "unknown"))
+                        self.assertIsNone(auto_answer(result[3]))
+
+    def test_recap_requires_completion_and_preserves_other_dialogs(self):
+        recap = "※ recap: if you typed X, press Enter there to send it."
+        self.assertEqual(classify(recap + "\n❯ ")[0], "unknown")
+        pane = recap + "\nNothing needs you this round.\nOverwrite the file?\nEnter to confirm\n❯ "
+        self.assertEqual(compose_state(pane, "idle", True)[3], "unknown")
+
+    def test_gate_composition_preserves_answer_policy(self):
+        for pane, kind, state, answer in (
+                (_PERMISSION_WITH_FOOTER, "permission", "blocked-human", None),
+                (_LOGIN_MENU, "login", "blocked-human", None),
+                (_BYPASS, "bypass-permissions", "blocked-known", None),
+                (_PRESS_ENTER, "press-enter", "blocked-known", "Enter")):
+            with self.subTest(kind=kind):
+                result = compose_state(pane, "idle", True)
+                self.assertEqual((result[0], result[3]), (state, kind))
+                self.assertEqual(auto_answer(kind), answer)
+
     def test_bypass_flags(self):
         self.assertEqual(classify(_BYPASS)[0], "bypass-permissions")
 
@@ -312,6 +357,90 @@ class TestGhostComposerComposeState(unittest.TestCase):
     def test_with_styled_pane_it_does_not_block(self):
         st, *_ = compose_state(self.PLAIN, "idle", True, styled_pane=self.STYLED)
         self.assertNotEqual(st, "blocked-human")
+
+
+
+# The core reading a test file mid-turn: its tool output quotes a boxed selection
+# dialog, caret and key hints included, above the live spinner and empty composer.
+_TOOL_OUTPUT_DIALOG = (
+    "⏺ Read(tests/core-input-watch.test.py)\n"
+    "  ⎿  ╭───────────────────────────────────────────────────╮\n"
+    "     │ Overwrite the existing config file?               │\n"
+    "     │ ❯ 1. Yes                                          │\n"
+    "     │   2. No                                           │\n"
+    "     │ Enter to select · ↑/↓ to navigate · Esc to cancel │\n"
+    "     ╰───────────────────────────────────────────────────╯\n")
+_SPINNER = "✻ Perambulating… (1m 46s · ↓ 2.1k tokens · esc to interrupt)\n"
+_LIVE_SELECTION = ("  Overwrite the existing config file?\n"
+                   "  ❯ 1. Yes\n    2. No\n"
+                   "  Enter to select · ↑/↓ to navigate · Esc to cancel")
+
+
+class TestToolOutputIsNotAGate(unittest.TestCase):
+    """A dialog quoted in tool output is transcript; only rows below the turn's
+    spinner or completion line are the live input region."""
+
+    def test_working_pane_quoting_a_dialog_is_running_not_blocked_human(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        st, _d, prompt, kind = compose_state(pane, "working", True)
+        self.assertEqual((st, kind, prompt), ("running", None, None))
+
+    def test_finished_turn_quoting_a_dialog_is_idle_ready(self):
+        pane = _TOOL_OUTPUT_DIALOG + "✻ Worked for 2m 14s · done 12:55 PM\n" + _IDLE_FOOTER
+        self.assertIsNone(classify(pane))
+        self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+
+    def test_a_real_selection_below_quoted_output_still_flags(self):
+        pane = _TOOL_OUTPUT_DIALOG + _SPINNER + _LIVE_SELECTION
+        kind, excerpt = classify(pane)
+        self.assertEqual(kind, "selection")
+        self.assertNotIn("Read(", excerpt)
+        self.assertEqual(compose_state(pane, "working", True)[0], "blocked-human")
+
+    def test_a_real_permission_prompt_mid_turn_still_flags(self):
+        pane = (_TOOL_OUTPUT_DIALOG + _SPINNER + "⏺ Bash(rm -rf build)\n"
+                "  Do you want to proceed?\n  Allow this action\n  Esc to cancel")
+        self.assertEqual(compose_state(pane, "working", True)[:4:3], ("blocked-human", "permission"))
+
+# Live Claude Code v2.1.296 shapes: the spinner row carries no "esc to interrupt";
+# the busy footer below it does.
+_LIVE_SPINNER = "✳ Moonwalking… (15s · ↓ 237 tokens)\n"
+_BUSY_FOOTER = "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+
+
+class TestTheBusyFooterIsNotTheTurnRow(unittest.TestCase):
+    """The live region is cut at the spinner, never at the footer: a dialog drawn
+    between them is live, and tool output above the spinner is transcript."""
+
+    LOGIN_PANE = (
+        "───────────────────────────────── sutando-core ─\n"
+        "Browser didn't open? Use the url below to sign in:\n"
+        "https://claude.ai/oauth/authorize?code=true&client_id=abc&scope=user%3Aprofile\n"
+        "Paste code here if prompted > \n"
+        "Esc to cancel\n"
+        "  ⏵⏵ bypass permissions on · 1 monitor · esc to interrupt · ← for agents\n"
+        "[sutando-c0:2.1.261* 2:monitor                       \"✳ sutando-core\" 00:55 06-Sep-26\n")
+    PERMISSION_UNDER_SPINNER = (
+        _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + "⏺ Bash(rm -rf build)\n"
+        "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+        "  Esc to cancel · Tab to amend\n" + _BUSY_FOOTER)
+
+    def verdicts(self, pane):
+        v = _mod._pg_classify_pane(pane, _mod.CLAUDE)
+        return (classify(pane) or (None,))[0], compose_state(pane, "working", True)[0], f"{v.state}:{v.reason}"
+
+    def test_login_dialog_above_the_busy_footer_is_login(self):
+        self.assertEqual(self.verdicts(self.LOGIN_PANE), ("login", "blocked-human", "busy:login"))
+
+    def test_permission_dialog_between_spinner_and_busy_footer_is_blocked_human(self):
+        kind, state, verdict = self.verdicts(self.PERMISSION_UNDER_SPINNER)
+        self.assertIn(kind, ("selection", "permission"))
+        self.assertEqual((state, verdict), ("blocked-human", "busy:selection"))
+
+    def test_quoted_dialog_above_the_live_spinner_is_running(self):
+        pane = _TOOL_OUTPUT_DIALOG + _LIVE_SPINNER + _BUSY_FOOTER
+        self.assertEqual(self.verdicts(pane), (None, "running", "busy:working"))
 
 
 class TestUnobservedProbeIsNotHung(unittest.TestCase):
@@ -1009,7 +1138,7 @@ class TestCodexIdleIsNotHung(unittest.TestCase):
         d = tempfile.mkdtemp()
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\n" + body + "\n")
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\n" + body + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d
 
@@ -1121,7 +1250,7 @@ class TestSendKeys(unittest.TestCase):
         log = os.path.join(d, "argv.log")
         p = os.path.join(d, "tmux")
         with open(p, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
+            f.write("#!/bin/sh\n. " + json.dumps(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "tmux-fake-unwrap.sh")) + "\nprintf '%s\\n' \"$@\" > " + json.dumps(log) + "\n"
                     + "[ \"$3\" = list-windows ] && { echo 1; " + script + "; }\n" + script + "\n")
         os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
         return d, log
@@ -1129,17 +1258,18 @@ class TestSendKeys(unittest.TestCase):
     def test_zero_exit_is_true_and_the_key_reaches_the_session_pane(self):
         from unittest.mock import patch
         d, log = self._with_fake_tmux("exit 0")
+        sock = os.path.join(d, "x.sock")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertTrue(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertTrue(_mod.send_keys(sock, "sutando-core", "Enter"))
         with open(log) as f:
             self.assertEqual(f.read().split("\n")[:6],
-                             ["-S", "/tmp/x.sock", "send-keys", "-t", "=sutando-core:1", "Enter"])
+                             ["-S", sock, "send-keys", "-t", "=sutando-core:1", "Enter"])
 
     def test_non_zero_exit_is_false(self):
         from unittest.mock import patch
         d, _ = self._with_fake_tmux("exit 1")
         with patch.dict(os.environ, {"PATH": d + os.pathsep + os.environ.get("PATH", "")}):
-            self.assertFalse(_mod.send_keys("/tmp/x.sock", "sutando-core", "Enter"))
+            self.assertFalse(_mod.send_keys(os.path.join(d, "x.sock"), "sutando-core", "Enter"))
 
     def test_an_unrunnable_tmux_is_false_not_an_exception(self):
         from unittest.mock import patch
@@ -1272,7 +1402,7 @@ class TestMainOnce(unittest.TestCase):
             self.assertTrue(_mod.send_keys("s.sock", "seat", "Enter"))
         self.assertEqual([c.args for c in target.call_args_list], [("s.sock", "seat")] * 2)
         cap.assert_called_once_with("s.sock", "=seat:1")
-        self.assertEqual(seen, [["tmux", "-S", "s.sock", "send-keys", "-t", "=seat:1", "Enter"]])
+        self.assertEqual(seen, [__import__("tmux_pane_keys").argv("s.sock", "=seat:1", "Enter")])
 
     def test_no_core_window_means_no_capture_and_no_keys(self):
         from unittest.mock import patch
