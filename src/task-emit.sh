@@ -73,19 +73,19 @@ emit_task_file() {
 # real stdout, so it must not borrow the shutdown emitter's fd 9.
 # The watcher's ordinary dispatch: QUEUED was marked once by dispatch_task; here the live core is told
 # (the printf failing means stdout is gone and the watcher exits, as before) and RUNNING follows.
-# `$2`, when set, is the absolute payload of a task whose body file is not named for it: it goes
-# out as a TASK_PAYLOAD line just before the TASK_FILE name, which stays the task's key.
+# `$2`, when set, is the task's name when `$1` (then an absolute path) is not named for it: it goes
+# out as a TASK_NAME line just before TASK_FILE, so the line itself still names a readable file.
 emit_dispatch_task_file() {
-	local filename="$1" ref="${2:-$1}"
-	{ [ -z "${2:-}" ] || printf 'TASK_PAYLOAD: %s\n' "$2"; } && printf 'TASK_FILE: %s\n' "$filename" || exit 0
-	queue_line "$ref"
-	activity_transition RUNNING "$ref"
+	local filename="$1"
+	{ [ -z "${2:-}" ] || printf 'TASK_NAME: %s\n' "$2"; } && printf 'TASK_FILE: %s\n' "$filename" || exit 0
+	queue_line "$filename"
+	activity_transition RUNNING "$filename"
 }
 
 emit_fallback_task_file() {
-	local filename="$1" ref="${2:-$1}"
-	queued_activity_row "$ref"
-	{ [ -z "${2:-}" ] || printf 'TASK_PAYLOAD: %s\n' "$2"; } && printf 'TASK_FILE: %s\n' "$filename" && { queue_line "$ref"; activity_transition RUNNING "$ref"; return 0; }
+	local filename="$1"
+	queued_activity_row "$filename"
+	{ [ -z "${2:-}" ] || printf 'TASK_NAME: %s\n' "$2"; } && printf 'TASK_FILE: %s\n' "$filename" && { queue_line "$filename"; activity_transition RUNNING "$filename"; return 0; }
 	echo "watch-tasks-stream: FAILED to emit TASK_FILE for $filename on stdout after a handler fallback (rc=$?); the fallback file is written but the live core was not told" >&2
 	return 0
 }

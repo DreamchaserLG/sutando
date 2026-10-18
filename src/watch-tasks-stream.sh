@@ -11,8 +11,8 @@
 #
 # Output format per event:
 #   TASK_FILE: <name>   a basename, or an ABSOLUTE path when a resolver is set.
-#   TASK_PAYLOAD: <abs path>   just before a TASK_FILE whose body file is not named for the
-#                       task; that TASK_FILE then carries the task's own name, its key.
+#   TASK_NAME: <name>   just before a TASK_FILE whose file is not named for the task: that
+#                       TASK_FILE is the body's ABSOLUTE path, and results key on <name>.
 #   INITIAL_SCAN block at startup for pre-existing files, same shape.
 #
 # The agent reads the named files via the Read tool when notifications
@@ -691,11 +691,11 @@ handler_result_exists() {
 SUTANDO_HANDLER_RUN_TIMEOUT="${SUTANDO_HANDLER_RUN_TIMEOUT:-10}"
 
 run_handler_now() {
-  local task_path="$1" disposition="${2:-fallback}" filename announce payload="" handler_rc verdict claim_settled
+  local task_path="$1" disposition="${2:-fallback}" filename announce name_line="" handler_rc verdict claim_settled
   local timeout_flag timed_out
   filename="${3:-$(basename "$task_path")}"
   announce="$(task_announce "$task_path")"
-  [ "$(basename "$task_path")" = "$filename" ] || { payload="$task_path"; announce="$filename"; }
+  [ "$(basename "$task_path")" = "$filename" ] || { name_line="$filename"; announce="$task_path"; }
   prepare_handler_state
   transition before-claim "$filename"
   acquire_task_claim "$filename" "$task_path" "$disposition"
@@ -770,7 +770,7 @@ run_handler_now() {
         printf '%s\n' "$task_path" > "$FALLBACKS_DIR/$filename"
         echo "watch-tasks-stream: optional task handler failed for $filename (exit $handler_rc); falling back to live core (possible at-least-once retry)" >&2
         record_worker_done "$filename" abandon "$WORKSPACE_DIR" || true  # the live core owns it now
-        emit_fallback_task_file "$announce" "$payload"
+        emit_fallback_task_file "$announce" "$name_line"
         ;;
       *)
         echo "watch-tasks-stream: claim for $filename has no recognised disposition; not publishing it to the live core" >&2
@@ -825,7 +825,7 @@ priority_sorted_tasks() {
 }
 
 dispatch_task() {
-  local task_path="$1" rc filename announce resolved attempt identity payload="" activity_ref
+  local task_path="$1" rc filename announce resolved attempt identity name_line="" activity_ref
   # Graceful-shutdown gate: every path in (sweep, replay, event, held retry)
   # holds new tasks while the sentinel is present; emitting one would orphan it.
   [ -f "$STATE_DIR/shutdown.sentinel" ] && return 0
@@ -868,8 +868,8 @@ dispatch_task() {
   task_path="$resolved"
   [ -n "$filename" ] || filename="$(basename "$task_path")"
   activity_ref="$announce"
-  # A body not named for its task is announced by the task's name, with the body beside it.
-  [ "$(basename "$task_path")" = "$filename" ] || { payload="$task_path"; announce="$filename"; }
+  # A body not named for its task is announced by its full path, with the task's name beside it.
+  [ "$(basename "$task_path")" = "$filename" ] || { name_line="$filename"; announce="$task_path"; }
   # A sentinel nothing retires is re-swept after every restart, and resolution
   # turns that from re-reading an empty file into RE-RUNNING the real task.
   if handler_result_is_answer "$filename"; then
@@ -914,7 +914,7 @@ dispatch_task() {
       echo "watch-tasks-stream: holding $filename: a handler's claim stands and no handler is available here" >&2
       return 0
     fi
-    emit_dispatch_task_file "$announce" "$payload" && record_admission
+    emit_dispatch_task_file "$announce" "$name_line" && record_admission
     return
   fi
   prepare_handler_state
@@ -928,7 +928,7 @@ dispatch_task() {
   rc=$?
   if [ "$rc" -eq 0 ]; then
     if [ -f "$FALLBACKS_DIR/$filename" ]; then
-      emit_dispatch_task_file "$announce" "$payload" && record_admission
+      emit_dispatch_task_file "$announce" "$name_line" && record_admission
       return
     fi
     run_handler_now "$task_path" "fallback" "$filename"
@@ -938,10 +938,10 @@ dispatch_task() {
     rm -f "$FALLBACKS_DIR/$filename"
     run_handler_now "$task_path" "must-handle" "$filename"
   elif [ "$rc" -eq 3 ]; then
-    emit_dispatch_task_file "$announce" "$payload" && record_admission
+    emit_dispatch_task_file "$announce" "$name_line" && record_admission
   else
     echo "watch-tasks-stream: optional task handler probe failed for $filename (exit $rc); falling back to live core" >&2
-    emit_dispatch_task_file "$announce" "$payload" && record_admission
+    emit_dispatch_task_file "$announce" "$name_line" && record_admission
   fi
 }
 

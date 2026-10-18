@@ -886,13 +886,13 @@ filename_is_claimed() {
 # announced task behind it -- the next restart's sweep re-announces it if
 # the hold ever clears, matching this design's no-durable-log recovery.
 enqueue_announced_task() {
-  local announced="$1" announced_payload="${2:-}" entry filename payload tier rc=0 resolved=()
+  local announced="$1" announced_name="${2:-}" entry filename payload tier rc=0 resolved=()
   # One reading of the announcement (task_dispatch.py): a bare name, or the absolute
   # payload path a resolver-backed watcher announces, which must sit in the workspace's
   # task store. A refusal (rc 1) types nothing quietly; any other failure is a broken
   # reader and is logged, never a silent drop.
   [ -z "${SUTANDO_INBOX_RESOLVER:-}" ] || resolved=(--resolved "$WORKSPACE_DIR/tasks")
-  [ -z "$announced_payload" ] || resolved+=(--payload "$announced_payload")
+  [ -z "$announced_name" ] || resolved+=(--name "$announced_name")
   entry="$("$NOTIFIER_PY" "$DISPATCH_PY" announced-entry "$TASKS_DIR" "$announced" ${resolved[@]+"${resolved[@]}"} 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     [ "$rc" -eq 1 ] || log_notifier "announcement not read: $announced (announced-entry rc $rc); not queuing"
@@ -976,13 +976,13 @@ while :; do
   IFS= read -r -t "$RETRY_POLL_SEC" event || rc=$?
   if [ "$rc" -eq 0 ]; then
     case "$event" in
-      # The watcher sends TASK_PAYLOAD just before the TASK_FILE it belongs to.
-      "TASK_PAYLOAD: "*)
-        announced_payload="${event#TASK_PAYLOAD: }"
+      # The watcher sends TASK_NAME just before the TASK_FILE it belongs to.
+      "TASK_NAME: "*)
+        announced_name="${event#TASK_NAME: }"
         ;;
       "TASK_FILE: "*)
-        enqueue_announced_task "${event#TASK_FILE: }" "${announced_payload:-}"
-        announced_payload=""
+        enqueue_announced_task "${event#TASK_FILE: }" "${announced_name:-}"
+        announced_name=""
         process_announced_queue
         ;;
     esac

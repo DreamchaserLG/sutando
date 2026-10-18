@@ -32,13 +32,13 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py inflight-clear <inflight_dir> <filename>
     task_dispatch.py partial-mark <partial_dir> <filename> <incarnation>   # composer text on stdin, optional
     task_dispatch.py partial-leftover <partial_dir> <filename> <incarnation>   # prints text, exit 0/1
-    task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>] [--payload <path>]  # prints key<TAB>payload, exit 0/1
+    task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>] [--name <task name>]  # prints key<TAB>payload, exit 0/1
 
 `announced-entry` is the one reading of a watcher's `TASK_FILE:` line: a bare name is a file in
 `tasks_dir`; an absolute path is what a resolver-backed watcher announces (the payload a delivery
 sentinel stands for) and is accepted only from such a watcher, and only inside the payload store the
-caller names (`--resolved <payload_dir>`). A `TASK_PAYLOAD:` line before it (`--payload`) names the
-file holding the body when that file is not named for the task; the announced name stays the key. The key is what every result, marker and queue entry is
+caller names (`--resolved <payload_dir>`). A `TASK_NAME:` line before it (`--name`) is the key when the
+announced absolute path is a body file not named for its task. The key is what every result, marker and queue entry is
 filed under; the payload is what the prompt tells the session to read.
 
 `inflight-*` is the at-most-once record a notifier keeps between a confirmed submit and a
@@ -81,7 +81,7 @@ __all__ = [
 
 def announced_entry(tasks_dir: "Path | str", announced: str, *,
                     payload_dir: "Path | str | None" = None,
-                    payload: "Path | str | None" = None) -> "tuple[str, Path] | None":
+                    name: "str | None" = None) -> "tuple[str, Path] | None":
     """(queue key, payload path) for one `TASK_FILE:` announcement, or None to refuse it.
 
     A bare name is a file in `tasks_dir`. An absolute path is accepted only when the
@@ -91,14 +91,14 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     a relative path, any absolute path when no `payload_dir` is given, a file anywhere
     else) is refused: the caller then types nothing.
 
-    `payload` is the watcher's `TASK_PAYLOAD:` line, sent when the file holding a task's
-    body is not named for the task: the bare `*.txt` name stays the key, and the payload
-    must be an absolute regular file directly in `tasks_dir` or in `payload_dir`.
+    `name` is the watcher's `TASK_NAME:` line, sent when the announced file is not named
+    for its task: the announcement is then an absolute regular file directly in
+    `tasks_dir` or `payload_dir`, and the bare `*.txt` name is the key.
     """
     if not announced or ".." in announced:
         return None
-    if payload is not None:
-        return _announced_with_payload(tasks_dir, announced, payload_dir, str(payload))
+    if name is not None:
+        return _announced_with_name(tasks_dir, announced, payload_dir, name)
     if "/" not in announced:
         return announced, Path(tasks_dir) / announced
     if payload_dir is None or not announced.startswith("/"):
@@ -109,10 +109,10 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     return payload.name, payload
 
 
-def _announced_with_payload(tasks_dir, name: str, payload_dir, payload: str) -> "tuple[str, Path] | None":
-    if "/" in name or not name.endswith(".txt") or name.startswith("."):
+def _announced_with_name(tasks_dir, payload: str, payload_dir, name: str) -> "tuple[str, Path] | None":
+    if "/" in name or ".." in name or not name.endswith(".txt") or name.startswith("."):
         return None
-    if not payload.startswith("/") or ".." in payload:
+    if not payload.startswith("/"):
         return None
     path = Path(payload)
     try:
@@ -428,7 +428,7 @@ _USAGE = (
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
-    "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>] [--payload <path>]   # prints key<TAB>payload; exit 1 refused\n"
+    "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>] [--name <task name>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
@@ -547,12 +547,12 @@ def _main(argv: list[str]) -> int:
         opts: dict = {}
         i = 0
         while i < len(rest):
-            if rest[i] not in ("--resolved", "--payload") or rest[i] in opts or i + 1 >= len(rest) or not rest[i + 1]:
+            if rest[i] not in ("--resolved", "--name") or rest[i] in opts or i + 1 >= len(rest) or not rest[i + 1]:
                 print(_USAGE, file=sys.stderr)
                 return 2
             opts[rest[i]] = rest[i + 1]
             i += 2
-        entry = announced_entry(first, second, payload_dir=opts.get("--resolved"), payload=opts.get("--payload"))
+        entry = announced_entry(first, second, payload_dir=opts.get("--resolved"), name=opts.get("--name"))
         if entry is None:
             return 1
         print(f"{entry[0]}\t{entry[1]}")

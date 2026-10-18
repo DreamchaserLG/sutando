@@ -229,6 +229,26 @@ class T(unittest.TestCase):
         rt._stage_body(src, "task-1.body", dfd)
         self.assertTrue(os.path.samefile(src, folder / "task-1.body"))
 
+    def test_a_failed_copy_leaves_no_temp_name_behind(self):
+        src = self.ws / "tasks" / "task-1.txt"
+        folder, dfd = self._stage(None)
+        for target, boom in ((rt.shutil, "copyfileobj"), (rt.os, "rename")):
+            with self.subTest(fails=boom):
+                with mock.patch.object(rt.os, "link", side_effect=OSError(18, "cross-device")), \
+                        mock.patch.object(target, boom, side_effect=OSError(28, "no space")):
+                    with self.assertRaises(OSError):
+                        rt._stage_body(src, "task-1.body", dfd)
+                self.assertEqual(list(folder.iterdir()), [], "no temp name, no body")
+
+    def test_a_planted_symlink_body_with_no_core_copy_gets_no_sentinel(self):
+        target = Path(self.td.name) / "elsewhere"
+        target.write_text(TEXT)
+        folder = self._plant(lambda b: os.symlink(target, b))
+        (self.ws / "tasks" / "task-1.txt").unlink()
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, self.task, roster({ROOM: A}))
+        self.assertFalse((folder / "task-1.txt").exists())
+
     def test_stage_copies_through_a_temp_name_when_a_link_is_refused(self):
         src = self.ws / "tasks" / "task-1.txt"
         folder, dfd = self._stage(None)
@@ -397,7 +417,7 @@ class ResolvedIdentity(unittest.TestCase):
             r = self.shim(self.inbox / "task-1.txt", fake)
             self.assertEqual(r.stdout.splitlines(), ["rc=3"], f"{bad!r}: {r.stdout} {r.stderr}")
 
-    def sweep(self):
+    def sweep(self, role="standby"):
         """One worker watcher over the inbox, with the shipped resolver, until it
         has decided about the sentinel (an announce or a refusal)."""
         out, err = Path(self.td.name) / "w.out", Path(self.td.name) / "w.err"
@@ -406,7 +426,7 @@ class ResolvedIdentity(unittest.TestCase):
                    SUTANDO_INSTANCE=A)
         with open(out, "w") as fo, open(err, "w") as fe:
             proc = subprocess.Popen(["bash", str(REPO / "src" / "watch-tasks-stream.sh"), str(self.inbox),
-                                     "--role", "standby", "--inbox", str(self.inbox)],
+                                     "--role", role, "--inbox", str(self.inbox)],
                                     stdout=fo, stderr=fe, env=env, start_new_session=True)
         try:
             deadline = time.time() + 30
@@ -423,13 +443,30 @@ class ResolvedIdentity(unittest.TestCase):
 
     def test_an_unanswered_routed_task_is_announced_by_its_name_with_its_body(self):
         out, err = self.sweep()
-        self.assertEqual(out.splitlines(), [f"TASK_PAYLOAD: {self.body}", "TASK_FILE: task-1.txt"], err[-800:])
+        self.assertEqual(out.splitlines(), ["TASK_NAME: task-1.txt", f"TASK_FILE: {self.body}"], err[-800:])
+
+    def test_a_session_role_watcher_names_a_file_that_holds_the_body(self):
+        out, err = self.sweep(role="session")
+        lines = out.splitlines()
+        files = [ln[len("TASK_FILE: "):] for ln in lines if ln.startswith("TASK_FILE: ")]
+        self.assertEqual(len(files), 1, err[-800:])
+        self.assertEqual(Path(files[0]).read_text(), TEXT, "a session reading the named file gets the task")
+        self.assertEqual(lines[lines.index(f"TASK_FILE: {files[0]}") - 1], "TASK_NAME: task-1.txt")
+
+    def test_a_notifier_that_predates_task_name_types_nothing_rather_than_the_sentinel(self):
+        events, err = self.sweep()
+        old = "".join(ln + "\n" for ln in events.splitlines() if not ln.startswith("TASK_NAME: "))
+        self.assertIn("TASK_FILE: ", old, err[-800:])
+        for runtime in ("claude", "codex"):
+            with self.subTest(runtime=runtime):
+                lines, _ = self.notify(runtime, old)
+                self.assertFalse([ln for ln in lines if ln.startswith(("KEY ", "PAYLOAD "))], lines)
 
     def test_an_answered_routed_task_is_not_dispatched_again_after_a_restart(self):
         (self.ws / "results" / "task-1.txt").write_text("answered already\n")
         out, err = self.sweep()
         self.assertNotIn("TASK_FILE:", out, err[-800:])
-        self.assertIn("already answered, not dispatching again: task-1.txt", err, err[-800:])
+        self.assertIn(f"already answered, not dispatching again: {self.body}", err, err[-800:])
 
     # Resolver -> watcher announcement -> each shipped notifier's own event loop and key derivation.
     def notify(self, runtime, events):
@@ -470,7 +507,7 @@ class ResolvedIdentity(unittest.TestCase):
 
     def test_both_notifiers_key_a_routed_task_by_its_name_and_read_its_body(self):
         events, err = self.sweep()
-        self.assertIn("TASK_FILE: task-1.txt", events, err[-800:])
+        self.assertIn("TASK_NAME: task-1.txt", events, err[-800:])
         for runtime in ("claude", "codex"):
             with self.subTest(runtime=runtime):
                 lines, stages = self.notify(runtime, events)

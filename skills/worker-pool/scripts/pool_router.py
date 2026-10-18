@@ -260,10 +260,16 @@ def _stage_body(src: Path, name: str, dfd: int) -> None:
     except OSError:
         pass
     tmp = f".{name}.{os.getpid()}"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd)
-    with open(src, "rb") as fh, os.fdopen(fd, "wb") as out:
-        shutil.copyfileobj(fh, out)
-    os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    with open(src, "rb") as fh:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644, dir_fd=dfd)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                shutil.copyfileobj(fh, out)
+            os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp, dir_fd=dfd)
+            raise
 
 
 def _require_same_body(src: Path, name: str, dfd: int, task_id: str) -> None:
