@@ -55,6 +55,26 @@ In a task result this goes in the result file; in a direct reply, in the message
 image goes where it was asked (it is your own work, not private data): the room the request came
 from, or the DM when that is where it was asked.
 
+## Put it into an AG2 Space room or project
+
+When the picture belongs in a room's media or a LaTeX/Typst project ("add figure 3, a pineapple"),
+upload it from disk with the upload script. **Never pass the image's base64 through a tool call
+yourself** (`room.media.upload` by hand): writing tens of thousands of characters takes minutes
+and corrupts the bytes.
+
+```bash
+U="<repo>/skills/ag2space-voice/scripts/upload-media.ts"
+npx tsx "$U" --room '<room id>' --file "<path from generate.py>" --name pineapple.jpg --folder <project folder id>
+```
+
+It prints one JSON line: `{"ok": true, "name", "file_id", "mxc", "sha256", ...}`. The type comes from
+the bytes, so the extension in `name` may change (a JPEG is filed as `.jpg`). With `--folder`, the
+image is filed in that project folder, where Typst's `#image("<name>")` and LaTeX's
+`\includegraphics{<name>}` find it. Then change the file with `room.commons.changes.apply` to
+reference that `name`, and compile once (`room.commons.typst.compile` or `latex.compile`, passing
+the folder's media) to check the build. `{"ok": false, "error": "needs_approval"}` means the room
+requires an approval first: say so; any other error carries `detail`, say it.
+
 ## What to say when it fails (verbatim)
 
 - `no_key`: "I can't generate images on this install yet: there is no Gemini key for image
