@@ -8,6 +8,7 @@ file tools confined to that dir. Codex is never used: its read-only sandbox stil
 reads every file the user can.
 
     review_pr_sandbox.py --pr N [--repo owner/repo] --diff-file F --out F [--max S]
+    review_pr_sandbox.py --task-mode TASK_FILE   # prints owner | non-owner
 
 Exit: the runner's code; 124 when it hits --max; 3 when no safe runner is installed.
 """
@@ -28,6 +29,8 @@ from typing import Callable, Optional
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
 
+from local_task_protocol import canonical_access_tier, parse_task_headers  # noqa: E402
+
 from policy import sandbox_runner as sr  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -46,12 +49,30 @@ PROMPT = (
     "other files.\n\nThe diff:\n\n{body}"
 )
 
+# Env that points gh at a repo or host other than this checkout's.
+GH_TARGET_ENV = ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                 "GIT_DIR", "GIT_WORK_TREE")
+
 Gh = Callable[[list], Optional[str]]
+
+
+def gh_env() -> dict:
+    return {k: v for k, v in os.environ.items() if k not in GH_TARGET_ENV}
+
+
+def task_mode(task_file: str) -> str:
+    """'owner' only for an explicit `access_tier: owner` header; else 'non-owner'."""
+    try:
+        text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "non-owner"
+    tier = canonical_access_tier(parse_task_headers(text).headers.get("access_tier"))
+    return "owner" if tier == "owner" else "non-owner"
 
 
 def _gh(args: list) -> Optional[str]:
     try:
-        p = subprocess.run(["gh", *args], capture_output=True, text=True,
+        p = subprocess.run(["gh", *args], capture_output=True, text=True, env=gh_env(),
                            stdin=subprocess.DEVNULL, timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -160,6 +181,13 @@ def run(pr: str, repo: str, diff: str, out: Path, max_s: int, gh: Gh = _gh) -> i
 
 
 def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--task-mode"]:
+        if len(argv) != 2:
+            print("usage: review_pr_sandbox.py --task-mode TASK_FILE", file=sys.stderr)
+            return 2
+        print(task_mode(argv[1]))
+        return 0
     ap = argparse.ArgumentParser()
     ap.add_argument("--pr", required=True)
     ap.add_argument("--repo", default="")
@@ -170,6 +198,9 @@ def main(argv=None) -> int:
     if a.repo:
         print(f"review-pr: --non-owner reviews only this checkout's repo; '{a.repo}' is refused",
               file=sys.stderr)
+        return 2
+    if not a.pr.isascii() or not a.pr.isdigit():
+        print(f"review-pr: '{a.pr}' is not a PR number", file=sys.stderr)
         return 2
     diff = Path(a.diff_file).read_text(encoding="utf-8")
     return run(a.pr, a.repo, diff, Path(a.out), a.max)

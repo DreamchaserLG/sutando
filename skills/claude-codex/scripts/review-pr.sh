@@ -22,6 +22,12 @@
 # read-only sandbox still reads every file the user can); review_pr_sandbox.py runs
 # the safe runner in a temp dir holding only the PR's diff and changed files.
 #
+# --task-file F: only an explicit `access_tier: owner` header gets owner mode; any
+# other tier, a missing one or an unreadable file means --non-owner.
+#
+# Non-owner mode clears gh's repo/host-selecting env (GH_REPO, GH_HOST, ...) so a
+# bare number can only resolve against this checkout's repo.
+#
 # stdout is NOT the verdict: take only what follows the LAST `VERDICT-MARKER:` line.
 # The stream, or its tail, picks up codex trace or truncates the checks. See SKILL.md.
 #
@@ -32,12 +38,13 @@
 # codex explores, not diff size.
 set -u
 
-[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number|owner/repo#N> [--repo owner/repo] [--max secs] [--stall secs] [--non-owner]" >&2; exit 2; }
+[[ $# -ge 1 && -n "${1:-}" ]] || { echo "usage: review-pr <pr-number|owner/repo#N> [--repo owner/repo] [--max secs] [--stall secs] [--non-owner] [--task-file F]" >&2; exit 2; }
 PR="$1"; shift
 MAX=240
 STALL=60
 REPO=""
 NON_OWNER=0
+TASK_FILE=""
 # `owner/repo#N` carries its own repo; a bare number does not and defers to cwd.
 if [[ "$PR" == */*#* ]]; then
     REPO="${PR%%#*}"
@@ -49,19 +56,27 @@ while [[ $# -gt 0 ]]; do
         --stall) STALL="${2:?--stall needs a value}"; shift 2;;
         --repo)  REPO="${2:?--repo needs a value}";  shift 2;;
         --non-owner) NON_OWNER=1; shift;;
+        --task-file) TASK_FILE="${2:?--task-file needs a value}"; shift 2;;
         *)       echo "review-pr: unknown arg '$1'" >&2; exit 2;;
     esac
 done
 [[ "$PR" =~ ^[0-9]+$ ]] || { echo "review-pr: '$PR' is not a PR number" >&2; exit 2; }
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "$TASK_FILE" && $NON_OWNER -eq 0 ]]; then
+    MODE="$(python3 "$HERE/review_pr_sandbox.py" --task-mode "$TASK_FILE" 2>/dev/null)"
+    [[ "$MODE" == "owner" ]] || NON_OWNER=1
+fi
 # A non-owner may only name a PR in this checkout's own repo, never another (possibly private) one.
 if [[ $NON_OWNER -eq 1 && -n "$REPO" ]]; then
     echo "review-pr: --non-owner reviews only this checkout's repo; '$REPO' (owner/repo#N or --repo) is refused" >&2
     exit 2
 fi
+if [[ $NON_OWNER -eq 1 ]]; then
+    # Keep in step with GH_TARGET_ENV in review_pr_sandbox.py.
+    unset GH_REPO GH_HOST GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GIT_DIR GIT_WORK_TREE
+fi
 GH_R=()
 [[ -n "$REPO" ]] && GH_R=(-R "$REPO")
-
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 DIFF="$(gh pr diff "${GH_R[@]+"${GH_R[@]}"}" "$PR" 2>/dev/null)" || { echo "review-pr: \`gh pr diff ${REPO:+-R $REPO }$PR\` failed (bad PR number, or no gh auth/remote)" >&2; exit 2; }
 # Identify what was actually resolved, so a wrong-repo review is visible in the verdict
