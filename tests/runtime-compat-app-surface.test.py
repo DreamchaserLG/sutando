@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import time
@@ -70,7 +71,7 @@ class RepairJson(AppBase):
         self.assertEqual(code, 0, err)
         lines = self.json_lines(out)
         phases = [ln["phase"] for ln in lines if ln["type"] == "progress"]
-        self.assertEqual(phases, ["checking-disk", "downloading", "verifying", "switching"])
+        self.assertEqual(phases, ["checking-disk", "downloading", "verifying", "switching", "done"])
         down = next(ln for ln in lines if ln.get("phase") == "downloading")
         self.assertEqual((down["attempt"], down["attempts"]), (1, 3))
         result = lines[-1]
@@ -88,6 +89,7 @@ class RepairJson(AppBase):
         self.assertEqual(code, rc.EXIT_UNUSABLE)
         lines = self.json_lines(out)
         self.assertEqual([ln["attempt"] for ln in lines if ln.get("phase") == "downloading"], [1, 2, 3])
+        self.assertEqual([ln.get("phase") for ln in lines[-2:]], ["done", None])
         self.assertEqual((lines[-1]["ok"], lines[-1]["reason"], lines[-1]["attempts"]),
                          (False, "blocked-download", 3))
 
@@ -161,7 +163,7 @@ class ConsentSurfaceApp(AppBase):
         start = time.monotonic()
         try:
             r = subprocess.run([sys.executable, "-c", code, str(REPO / "src"), str(self.ws), *argv],
-                               env=dict(self.env, **APP), capture_output=True, text=True,
+                               env=dict(self.env, SUTANDO_RUNTIME_SYSTEM_DIRS="", **APP), capture_output=True, text=True,
                                stdin=subprocess.DEVNULL, timeout=limit)
         except subprocess.TimeoutExpired:
             self.fail(f"the launch was still waiting after {limit}s")
@@ -169,11 +171,15 @@ class ConsentSurfaceApp(AppBase):
 
     def test_app_surface_never_waits_or_dms(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
+        ran = self.tmp / "npm-ran"
+        fake_npm(self.bin1 / "npm", f'touch "{ran}"; exit 1\n')
         code, err, _ = self.ensure_in_child("ensure", "--runtime", "claude", "--wait", "600",
                                             "--repair", "--notify-owner")
         self.assertEqual(code, rc.EXIT_UNUSABLE, err)
         self.assertEqual(self.notices(), [])
         self.assertNotIn("waiting up to", err)
+        self.assertFalse(ran.exists(), "no consent was given, so no installer may run")
+        self.assertFalse(os.path.lexists(self.root / "bin" / "claude"))
 
     def test_app_surface_logged_out_returns_4_at_once(self):
         fake_cli(self.bin1 / "codex", "codex-cli 0.160.1", suite.CODEX_FLAGS, login_rc=1, label="")
@@ -199,7 +205,11 @@ class DoctorJsonSchema(AppBase):
                                                "verify"])
         self.assertEqual(sorted(doc["selected"]), ["detail", "missing_flags", "path", "source",
                                                    "status", "version"])
+        for cand in doc["candidates"]:
+            self.assertEqual(sorted(cand), ["detail", "missing_flags", "path", "source", "status",
+                                            "version"])
         self.assertEqual(sorted(doc["auth"]), ["detail", "login", "remedy"])
+        self.assertEqual(doc["auth"]["login"], "unknown")
         self.assertEqual(doc["selected_reason"], f"chose {p} (PATH) 2.1.0; it passes doctor")
         self.assertRegex(doc["plan_hash"], r"^[0-9a-f]{64}$")
 
@@ -215,6 +225,22 @@ class DoctorJsonSchema(AppBase):
         _, doc = self.doctor("codex")
         self.assertEqual(doc["auth"]["login"], "logged-out")
         self.assertIn("codex", doc["auth"]["remedy"])
+        fake_cli(self.bin1 / "codex", "codex-cli 0.160.1", suite.CODEX_FLAGS, label="")
+        self.assertEqual(self.doctor("codex")[1]["auth"], {"login": "ok", "remedy": "",
+                                                          "detail": "logged in"})
+
+    def test_every_candidate_entry_has_the_same_keys(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        fake_cli(self.bin2 / "claude", "1.0.0")
+        self.managed_version("2.1.0")
+        _, doc = self.doctor()
+        self.assertEqual(len(doc["candidates"]), 3)
+        for cand in doc["candidates"]:
+            self.assertEqual(sorted(cand), ["detail", "missing_flags", "path", "source", "status",
+                                            "version"])
+        self.assertEqual([c["status"] for c in doc["candidates"]], ["broken", "too-old", "ok"])
+        self.assertIn(doc["auth"]["login"], rc.AUTH_LOGIN_VALUES)
+        self.assertEqual(rc.AUTH_LOGIN_VALUES, ("ok", "logged-out", "unknown"))
 
     def test_nothing_selected_has_no_auth(self):
         _, doc = self.doctor()
@@ -232,7 +258,7 @@ class PreferManaged(AppBase):
         self.assertEqual(r.selected.source, "managed")
         self.assertEqual(r.selected_reason,
                          f"chose {self.root / 'bin' / 'claude'} (managed) 2.1.0 because {bad} "
-                         f"(PATH) is broken: --version exited 1: no output")
+                         f"(PATH) is broken: --version exited 1: 2.1.0 (Claude Code)")
 
     def test_managed_preferred_when_path_binary_is_known_bad(self):
         spec = rc.RuntimeSpec(**dict(rc.RUNTIMES["claude"].__dict__, known_bad=((2, 1, 5),)))
@@ -241,6 +267,21 @@ class PreferManaged(AppBase):
         r = self.discover(spec=spec)
         self.assertEqual(r.selected.source, "managed")
         self.assertIn(f"because {bad} (PATH) is known-bad", r.selected_reason)
+
+    def test_managed_preferred_when_path_binary_is_too_old(self):
+        bad = fake_cli(self.bin1 / "claude", "1.0.99")
+        self.managed_version("2.1.0")
+        r = self.discover()
+        self.assertEqual(r.selected.source, "managed")
+        self.assertIn(f"because {bad} (PATH) is too-old: 1.0.99 is older than the minimum 2.0.0",
+                      r.selected_reason)
+
+    def test_managed_preferred_when_path_binary_is_incompatible(self):
+        bad = fake_cli(self.bin1 / "claude", "2.1.0", flags="--name")
+        self.managed_version("2.1.0")
+        r = self.discover()
+        self.assertEqual(r.selected.source, "managed")
+        self.assertIn(f"because {bad} (PATH) is incompatible: 2.1.0 lacks ", r.selected_reason)
 
     def test_managed_preferred_when_path_binary_is_absent(self):
         self.managed_version("2.1.0")
@@ -305,8 +346,8 @@ class NotifyOwner(AppBase):
     def test_a_new_incident_can_dm_again(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
         self.notify(**APP)
-        inc = rc.Incident(self.ws, "claude", clock=lambda: 10 ** 9)
-        inc.close()
+        rc.Incident(self.ws, "claude").close()
+        time.sleep(1.1)  # a notice is named by the second its incident opened
         self.assertTrue(self.notify(**APP)[1]["queued"])
         self.assertEqual(len(self.notices()), 2)
 
