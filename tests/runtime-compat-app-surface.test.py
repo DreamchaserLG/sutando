@@ -490,6 +490,45 @@ class AppRepairBudget(AppBase):
                          list(range(1, r.attempts + 1)))
         self.assertEqual(rc.APP_RETRY_BUDGET_S, 30)
 
+    def budget_run(self, fail_at, sleep_by, backoff_s):
+        """A fake installer that fails at clock `fail_at`; each backoff sleeps `sleep_by(s)`."""
+        fake_npm(self.bin1 / "npm", "exit 1\n")
+        clock, starts, events = [0.0], [], []
+
+        def run(argv, **_kw):
+            starts.append(clock[0])
+            clock[0] = max(clock[0], fail_at)
+            return subprocess.CompletedProcess(argv, 1, "", "npm ERR! code ENOTFOUND")
+
+        def sleep(s):
+            self.sleeps.append(s)
+            clock[0] += sleep_by(s)
+        r = rc.assisted_install("claude", env=dict(self.env, **APP), run=run, sleep=sleep,
+                                disk_usage=lambda _p: PLENTY, monotonic=lambda: clock[0],
+                                backoff_s=backoff_s,
+                                progress=lambda phase, **kw: events.append((phase, kw)))
+        return r, starts, events
+
+    def assert_nothing_started_after_the_budget(self, r, starts, events):
+        self.assertTrue(all(t < rc.APP_RETRY_BUDGET_S for t in starts), starts)
+        self.assertEqual((r.ok, r.reason, r.attempts), (False, "blocked-download", len(starts)))
+        self.assertEqual([kw["attempt"] for p, kw in events if p == "downloading"],
+                         list(range(1, len(starts) + 1)))
+
+    def test_no_attempt_starts_at_the_exact_deadline(self):
+        r, starts, events = self.budget_run(fail_at=29, sleep_by=lambda s: s, backoff_s=5)
+        self.assertEqual(self.sleeps, [1])
+        self.assertEqual(starts, [0.0])
+        self.assert_nothing_started_after_the_budget(r, starts, events)
+
+    def test_an_overslept_backoff_does_not_start_another_attempt(self):
+        for fail_at, backoff in ((29, 5), (1, 40)):
+            self.sleeps.clear()
+            r, starts, events = self.budget_run(fail_at=fail_at, sleep_by=lambda s: s + 0.01,
+                                                backoff_s=backoff)
+            self.assertEqual(starts, [0.0], (fail_at, backoff))
+            self.assert_nothing_started_after_the_budget(r, starts, events)
+
     def test_app_surface_turns_off_npm_own_fetch_retries(self):
         seen = self.tmp / "env.txt"
         fake_npm(self.bin1 / "npm", f'echo "$npm_config_fetch_retries" > "{seen}"; exit 1\n')

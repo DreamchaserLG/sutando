@@ -606,7 +606,10 @@ def _run_with_retry(ctx: _Ctx, argv: Sequence[str], env: dict, before=None):
     """(None, attempts) on success, else (failed RepairResult, attempts). With a budget,
     no attempt starts after it and no backoff outlasts it."""
     end = ctx.monotonic() + ctx.budget_s if ctx.budget_s is not None else None
+    last: Optional[Tuple[str, str]] = None
     for n in range(1, ctx.attempts + 1):
+        if last is not None and end is not None and ctx.monotonic() >= end:
+            return _failed(*last, n - 1, ctx.root, ctx.retry, ctx.installer), n - 1
         ctx.progress("downloading", attempt=n, attempts=ctx.attempts)
         if before:
             before()
@@ -620,6 +623,7 @@ def _run_with_retry(ctx: _Ctx, argv: Sequence[str], env: dict, before=None):
         if rc == 0:
             return None, n
         reason, detail = _classify_failure(text), _tail(text)
+        last = (reason, detail)
         ctx.log(f"attempt {n}/{ctx.attempts} failed ({reason}): {detail}")
         left = end - ctx.monotonic() if end is not None else None
         if reason == "disk-full" or n == ctx.attempts or (left is not None and left <= 0):
