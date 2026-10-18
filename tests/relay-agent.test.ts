@@ -924,10 +924,13 @@ describe('reconcile pass (task-bridge, temp workspace)', () => {
 });
 
 describe('voice runs every work call through the relay agent', () => {
-	it('work is a background tool mapped to the relay agent subagent; the model hears the pending message at once', () => {
+	it('work is a NON_BLOCKING background tool mapped to the relay agent subagent; the call stays open until its result', () => {
 		assert.equal(tb.workTool.execution, 'background');
-		assert.equal(tb.workTool.pendingMessage, tb.WORK_PENDING_MESSAGE, 'without it the model says nothing until the result');
-		assert.equal(tb.workTool.behavior, undefined);
+		// No pending message: it made bodhi answer the call at once (closing its id) and inject the real
+		// result later as unrelated text. The result now returns through the open call, under its own
+		// id, with WHEN_IDLE — verified on gemini-3.8-live (Yixuan's probe, 2026-10-17).
+		assert.equal(tb.workTool.pendingMessage, undefined, 'a pending message would close the call id before the result');
+		assert.equal(tb.workTool.behavior, 'NON_BLOCKING');
 		const voice = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/voice-agent.ts'), 'utf-8');
 		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
 		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);

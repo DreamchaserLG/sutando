@@ -1,8 +1,8 @@
 /**
  * Sutando's relay agent: the voice side's task manager between the voice model and the core, run
- * as the bodhi subagent behind the `work` tool. The model hears the tool's pending message at once;
- * each `work` call waits for its task's result and returns it, and bodhi hands it to the model as a
- * system notification when the model is idle. It keeps a table of every task the user asked for by
+ * as the bodhi subagent behind the `work` tool. The tool is NON_BLOCKING: the model keeps talking
+ * while each `work` call stays open, waits for its task's result and returns it, and bodhi hands it
+ * to Gemini as that call's own response (WHEN_IDLE), so it is spoken as the answer to that request. It keeps a table of every task the user asked for by
  * voice (what, when, cancel asked, how its result reached the user, which result answered it) and
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
@@ -514,14 +514,22 @@ export const ONE_ASK_WINDOW_MS = 2 * 60_000;
 /** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
 export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
 
+/**
+ * A task answered this recently is still compared with a new request: gemini-3.8-live was seen
+ * re-issuing a call a few seconds after its result was returned (Yixuan's probe, 2026-10-17). That
+ * orphan must not reach the core a second time; it is closed quietly instead.
+ */
+export const RECENT_ANSWER_WINDOW_MS = 60_000;
+
 interface Waiter {
 	resolve: (text: string) => void;
 	reject: (err: Error) => void;
 }
 
 /** How a waiting call ends without its result. bodhi reads a rejection out as a failure, so none rejects. */
-const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent', string> = {
+const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent' | 'already_answered', string> = {
 	not_sent: 'This call was cancelled before the request was sent; nothing was submitted.',
+	already_answered: 'This request was answered a moment ago; nothing new to say. Stay silent about it.',
 	continued_in_next: 'The user was not finished: this request was sent together with what they said next. Say nothing about it.',
 	cancelled: 'The user cancelled this task and was already told. Do not mention it again.',
 	continuing: 'The task is still running; its result will come in a separate message.',
@@ -556,6 +564,25 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		return this.deps.store.list()
 			.filter(([, r]) => !!r.text && !r.delivery && !r.cancelRequested && !r.retired && !r.supersededBy && !r.answeredBy && (r.submittedAt ?? r.at) > now - OPEN_TASK_WINDOW_MS)
 			.map(([id, r]) => ({ id, text: r.text as string }));
+	}
+
+	/** Tasks whose result reached the user within RECENT_ANSWER_WINDOW_MS: a re-issued call for one of these is an orphan. */
+	recentlyAnswered(now = Date.now()): OpenTask[] {
+		return this.deps.store.list()
+			.filter(([, r]) => !!r.text && !!r.delivery && r.at > now - RECENT_ANSWER_WINDOW_MS)
+			.map(([id, r]) => ({ id, text: r.text as string }));
+	}
+
+	/**
+	 * Every waiting call ends without its result; each result is then delivered another way. Called
+	 * when the voice session reconnects: a tool call issued on the old connection cannot be answered
+	 * on the new one (bodhi drops such a result at its dial-generation fence), so the call must not
+	 * keep waiting for a response that could never reach Gemini.
+	 */
+	endAllCalls(why: keyof typeof ENDED): string[] {
+		const ended = [...this.waiting.keys()];
+		for (const id of ended) this.endCall(id, why);
+		return ended;
 	}
 
 	/**
@@ -660,7 +687,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		if (signal?.aborted) return framedSystem(ENDED.not_sent);
 		if (this.deps.check) {
 			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
-			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks() }, signal)
+			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: [...this.openTasks(), ...this.recentlyAnswered()] }, signal)
 				.catch(() => ({ action: 'submit' as const }));
 			if (signal?.aborted) return framedSystem(ENDED.not_sent);
 			// One question per request: the answer is sent as it is, even if the check still finds it vague
@@ -673,6 +700,12 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
 			if (verdict.action === 'duplicate') {
+				// The same request was answered moments ago: the model re-issued the call (seen on 3.8 a few
+				// seconds after the response). Closed quietly; the core never sees it twice.
+				if (this.deps.store.get(verdict.of)?.delivery) {
+					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was returned; closed without resending`);
+					return framedSystem(ENDED.already_answered);
+				}
 				// The same request is already with the core (2026-10-12: PR 5333 was sent twice). This call
 				// waits for that task's result instead, unless another call already does.
 				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
@@ -690,7 +723,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
 		if (replaces) this.supersede(taskId, replaces);
 
-		// The ordinary "working on it" is the tool's pending message; a queue position or an offline core is said now.
+		// The ordinary case says nothing now (the open call returns the result); a queue position or an offline core is said at once.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
 		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
 		if (signal?.aborted) return framedSystem(ENDED.continuing);

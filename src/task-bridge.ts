@@ -1071,7 +1071,11 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 }
 
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
-export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+/**
+ * Said to the model only when a submission is out of the ordinary (a queue position, an offline core);
+ * the ordinary case says nothing — the `work` call simply stays open until its result returns through it.
+ */
+export const WORK_SUBMITTED_MESSAGE = 'The task is with the core; this work call returns its result when it is done. Do NOT tell the user the task is done.';
 
 /** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
 export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
@@ -1120,9 +1124,16 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	// Runs as the relay agent subagent. The call is NON_BLOCKING and stays OPEN while the core works:
+	// the model goes on talking, the relay agent returns the core's result as this call's own
+	// response, and bodhi hands it to Gemini under the same call id with WHEN_IDLE, so Gemini knows
+	// which request it answers and speaks it without cutting into whatever it is saying. No
+	// pendingMessage: that fake first response closed the id at once (the 3.1-era workaround) and
+	// left the real result to be injected as unrelated text, which is what cut other answers off.
+	// Verified on gemini-3.8-live 2026-10-17 (Yixuan's probe: no interrupted turns, no hijack, no
+	// lost results, each result spoken next to the right call id).
 	execution: 'background',
-	pendingMessage: WORK_PENDING_MESSAGE,
+	behavior: 'NON_BLOCKING',
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
@@ -1290,7 +1301,7 @@ export const workTool: ToolDefinition = {
 			taskId,
 			queuedAhead,
 			watcherOnline,
-			message: (watcherOnline ? WORK_PENDING_MESSAGE
+			message: (watcherOnline ? WORK_SUBMITTED_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};

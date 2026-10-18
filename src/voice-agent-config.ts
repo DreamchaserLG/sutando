@@ -261,7 +261,7 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'',
 		'TOOLS:',
 		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", "send to core", "ask the core", "tell the core", "delegate to core", "have the core do it" — these all mean call this tool.',
-		'  Returns status "pending" — say "Working on it" and wait for the result.',
+		'  The call stays open while the core works: say in one short sentence that you are on it, then keep talking with the user. The result comes back later as that call\'s own response — speak it then, as the answer to that request.',
 		'- get_task_status: Check if a background task is still running.',
 		'- join_zoom: Join a Zoom meeting with computer audio (no screen sharing). Use when user says "join the zoom" or gives a Zoom ID.',
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',
