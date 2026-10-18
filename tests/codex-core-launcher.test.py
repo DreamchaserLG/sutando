@@ -983,6 +983,17 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         self.assertNotIn("not installed", result.stderr)
         self.assertIn(f"{managed} -C", self._tmux_calls())
 
+    def test_two_codex_on_path_the_too_old_first_is_skipped_for_the_second(self):
+        self._write_exe("codex", CODEX_STUB.replace("0.160.1", "0.30.0"))
+        second = Path(self.tmp.name) / "bin2" / "codex"
+        second.parent.mkdir()
+        second.write_text(CODEX_STUB)
+        second.chmod(0o755)
+        result = self.run_launcher(env_extra={"PATH": f"{self.bin}:{second.parent}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"using {second} (0.160.1)", result.stderr)
+        self.assertIn(f"{second} -C", self._tmux_calls())
+
     def test_notifier_supervisor_restarts_after_child_exit(self):
         count = Path(self.tmp.name) / "notifier-count"
         self._write_exe("tmux", '''#!/bin/bash

@@ -374,7 +374,7 @@ def choose_installer(spec: RuntimeSpec, env: dict, root: Path) -> Optional[Insta
     path = env.get("PATH")
     npm = shutil.which("npm", path=path)
     if npm:
-        return Installer("npm", (npm,), f"only {root} (a Sutando-owned folder) and the npm cache",
+        return Installer("npm", (npm,), f"{root} (a Sutando-owned folder) and the npm cache",
                          str(root))
     home = Path(env.get("HOME") or str(Path.home()))
     if spec.name == "claude" and shutil.which("curl", path=path) and shutil.which("bash", path=path):

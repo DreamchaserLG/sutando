@@ -80,23 +80,23 @@ or a consent given in one of the ways above.
 | `ok` | `--version` ≥ minimum, every required flag in `--help`, same major as tested | none | none | `doctor` shows `* [ok]` | `test_discovery_reads_version_and_capabilities` |
 | `missing` | no binary on `PATH`, in the managed folder, or in a known location. The Codex launcher runs this check before any presence check of its own, so a managed or known install off `PATH` is found, and a missing one can still be installed with consent | Claude: `curl -fsSL https://claude.ai/install.sh \| bash`. Codex: `npm install -g --prefix ~/.local @openai/codex` | yes | `doctor`, then the launch continues | `test_missing_when_nothing_installed`, `test_missing_cli_stops_with_fix_and_resume_command`, `test_no_codex_anywhere_with_consent_installs_and_launches`, `test_working_managed_codex_off_path_is_found_and_launched` |
 | `missing`, no Node | as above, and no `npm` on `PATH` | Claude: the native installer. Codex: the standalone installer or Homebrew | Claude: native installer. Codex: Homebrew when present | `doctor` | `test_claude_native_install_without_node`, `test_codex_without_npm_uses_homebrew_when_present`, `test_no_installer_at_all_gives_a_manual_step` |
-| `too-old` | version below the minimum (Claude 2.0.0, Codex 0.40.0) | Claude: `<path> update`. npm install: `npm install -g --prefix <its prefix> <package>@<major>` | yes | `doctor` | `test_too_old`, `test_plan_too_old_claude_uses_its_own_updater`, `test_plan_too_old_npm_install_updates_that_prefix` |
-| `known-bad` | version is on the spec's known-bad list (empty today) | same as `too-old` | yes | `doctor` | `test_known_bad` |
+| `too-old` | version below the minimum (Claude 2.0.0, Codex 0.40.0) | Claude: `<path> update`. npm install: `npm install -g --prefix <its prefix> <package>@<major>` | yes | `doctor` | `test_too_old`, `test_claude_minimum_supported_version_is_ok_and_one_below_is_too_old`, `test_codex_minimum_supported_version_is_ok_and_one_below_is_too_old`, `test_plan_too_old_claude_uses_its_own_updater`, `test_plan_too_old_npm_install_updates_that_prefix` |
+| `known-bad` | version is on the spec's known-bad list (empty today) | same as `too-old` | yes; an install that lands on a known-bad version is refused and the old one kept | `doctor` | `test_known_bad`, `test_codex_known_bad`, `test_known_bad_first_on_path_is_skipped_for_a_working_second`, `test_known_bad_alone_blocks_and_plans_a_consented_repair`, `test_repair_that_lands_on_a_known_bad_version_is_not_success` |
 | `incompatible` | version reads, but a flag the launcher passes is not in `--help` | same as `too-old` | yes | `doctor` | `test_incompatible_when_flag_missing`, `test_help_failure_is_incompatible` |
-| `newer-untested` | major version above the tested one; flags present | none needed; to pin: `npm install -g --prefix ~/.local <package>@<tested major>` | not offered | the core starts with a warning | `test_newer_untested_is_usable_with_warning` |
+| `newer-untested` | major version above the tested one; flags present | none needed; to pin: `npm install -g --prefix ~/.local <package>@<tested major>` | not offered | the core starts with a warning | `test_newer_untested_is_usable_with_warning`, `test_codex_newer_untested_is_usable_with_warning` |
 | `broken` | not executable, a dangling link, a partial file, `--version` fails or hangs | reinstall with the `missing` command | yes | `doctor` | `test_broken_*` (7 cases) |
 | `broken` (no Node.js) | the CLI exits with `env: node: No such file` | `brew install node` (Node.js 22+), or reinstall the desktop app | not offered | `doctor` | `test_plan_broken_node_missing_points_at_node` |
-| several installs | more than one binary found | none; the first working one is used | none | `doctor` marks the chosen one with `*` | `test_multiple_path_installs_first_usable_wins`, `test_multiple_path_installs_keep_path_order_when_both_work`, `test_fallback_install_is_launched_by_path` |
+| several installs | more than one binary found | none; the first working one is used | none | `doctor` marks the chosen one with `*` | `test_multiple_path_installs_first_usable_wins`, `test_codex_multiple_path_installs_first_usable_wins`, `test_multiple_path_installs_keep_path_order_when_both_work`, `test_every_path_install_unusable_names_the_first_and_lists_all`, `test_fallback_install_is_launched_by_path`, `test_two_codex_on_path_the_too_old_first_is_skipped_for_the_second` |
 | broken on `PATH`, working elsewhere | the `PATH` binary fails, a known location works | none; the working one is used | none | `doctor` | `test_known_location_used_when_path_install_is_broken`, `test_working_path_install_is_never_overridden_by_a_known_location` |
-| logged out (Codex) | `codex login status` exits non-zero | `codex login` (with `CODEX_HOME=<home>` when set), then reply `retry now` off a terminal | not offered | the launch continues after login | `test_codex_logged_out_points_to_login`, `test_codex_logged_out_stops_then_login_lets_it_start`, `test_codex_login_dm_then_retry_now` |
+| logged out (Codex) | `codex login status` exits non-zero | `codex login` (with `CODEX_HOME=<home>` when set), then reply `retry now` off a terminal | not offered | the launch continues after login | `test_codex_logged_out_points_to_login`, `test_codex_logged_out_stops_then_login_lets_it_start`, `test_codex_login_dm_then_retry_now`, `test_codex_expired_login_stops_with_the_login_step_then_retry_continues` |
 | logged out (Claude) | `src/auth_preflight.py` finds no account or credentials. The existing startup auth preflight already stops a boot here | run `claude` in Terminal and complete `/login` | not offered | the launch continues; the boot gate re-checks | `test_claude_auth_uses_auth_preflight`, `test_logged_out_advisory_continues` |
 
 ## What can go wrong during an assisted fix
 
 | Failure | Detection | What Sutando does | What you do | Test |
 |---|---|---|---|---|
-| disk full | free space under the managed folder is below 512 MB, checked before any download; or the installer reports `ENOSPC` | stops at once, no retry, old version kept | free the space it names, then rerun the assisted fix | `test_disk_full_checked_before_download`, `test_disk_full_during_download_is_not_retried` |
-| blocked download | installer output names a network, proxy, certificate or `curl` connection error | retries 3 times with 2 s and 4 s backoff, old version kept | check network, proxy or firewall; npm must reach `registry.npmjs.org` (the native installers their vendor's site); rerun | `test_blocked_download_retries_with_backoff_then_guides`, `test_blocked_download_recovers_on_retry`, `test_native_install_blocked_download` |
+| disk full | free space under the managed folder is below 512 MB, checked before any download; or the installer reports `ENOSPC` | stops at once, no retry, old version kept | free the space it names, then rerun the assisted fix | `test_disk_full_checked_before_download`, `test_disk_full_during_download_is_not_retried`, `test_disk_full_checked_before_the_native_installer`, `test_disk_full_during_the_native_install_is_not_retried`, `test_disk_full_reply_is_answered_then_a_later_reply_installs_and_continues` |
+| blocked download | installer output names a network, proxy, certificate or `curl` connection error | retries 3 times with 2 s and 4 s backoff, old version kept | check network, proxy or firewall; npm must reach `registry.npmjs.org` (the native installers their vendor's site); rerun | `test_blocked_download_retries_with_backoff_then_guides`, `test_blocked_download_recovers_on_retry`, `test_native_install_blocked_download`, `test_codex_homebrew_blocked_download_retries_then_guides`, `test_blocked_download_reply_keeps_the_old_version_then_a_later_reply_installs` |
 | interrupted update | npm killed mid-install, or a leftover `.staging-*` folder whose process is gone | the half-written install never replaces the old one; the leftover is reported and removed by the next repair | nothing | `test_interrupted_update_keeps_old_version`, `test_leftover_staging_is_reported_then_cleaned` |
 | new binary will not run | the staged or switched binary fails the same `--version` and `--help` probe | reports failure; the link is switched back to the previous version | use the manual command | `test_unusable_download_keeps_old_version`, `test_failed_post_swap_verify_restores_the_previous_link`, `test_link_that_will_not_launch_is_not_success`, `test_native_install_that_does_not_run_is_not_success` |
 | same version reinstalled | that version's folder already exists | a working copy is reused untouched; a broken one is replaced, never the one in use | nothing | `test_reinstall_of_same_version_keeps_the_live_target`, `test_reinstall_replaces_a_broken_copy_of_the_same_version` |
@@ -123,7 +123,8 @@ The launcher does not restart onboarding after a fix:
   (`test_off_tty_broken_cli_asks_the_owner_then_their_reply_repairs_and_launches`,
   through the real Codex launcher).
 - With consent, the assisted fix runs and the same launch continues
-  (`test_consent_runs_the_repair_and_the_launch_continues`).
+  (`test_consent_runs_the_repair_and_the_launch_continues`; through the real Claude
+  launcher, `test_consent_repair_launches_the_managed_claude`).
 - Otherwise it prints the fix and the exact command to run again:
   `bash src/agent/start-cli.sh`.
 
@@ -155,8 +156,13 @@ record for the owner DM is `<workspace>/state/runtime-compat-<cli>.json`.
 ## Not covered yet
 
 - The desktop installer's own flow (slice 2, in the desktop repo).
-- `src/startup-runtime.sh` still runs its own Codex login preflight before
-  services start. Folding it into this module is a follow-up.
+- `src/startup-runtime.sh` and `src/verify-setup.sh` still run their own Codex
+  presence and login checks. Moving them onto this module is #5699.
+- A Claude token that has expired but is still on disk passes the static
+  `auth_preflight` check, so this gate does not catch it; only the live probe
+  (`auth_preflight.py --live`, one model call) does.
+- When a known-bad version is the newest of its major, the assisted fix refuses
+  it and keeps the old version, but cannot yet pin an earlier good one.
 - `src/owner_reply.py` holds the DM and reply plumbing. The provider-limit
   hold gate (#5670) has its own copy; moving it onto this module is a
   follow-up once that PR lands.

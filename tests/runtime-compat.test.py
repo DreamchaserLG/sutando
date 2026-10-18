@@ -921,6 +921,26 @@ class NoNode(Base):
         self.assertEqual((r.reason, r.attempts), ("blocked-download", 2))
         self.assertIn("vendor's download site", r.user_action)
 
+    def test_disk_full_checked_before_the_native_installer(self):
+        self.fake_native_curl()
+        r = self.install(disk_usage=lambda _p: Disk(10, 10, 5 * 1024 * 1024))
+        self.assertEqual(r.reason, "disk-full")
+        self.assertFalse((self.home / "curl.log").exists())
+        self.assertFalse(self.native.exists())
+
+    def test_disk_full_during_the_native_install_is_not_retried(self):
+        write_exe(self.bin1 / "curl", 'echo "curl: (23) Failure writing output: No space left on device" >&2; exit 23\n')
+        r = self.install()
+        self.assertEqual((r.reason, r.attempts, self.sleeps), ("disk-full", 1, []))
+        self.assertFalse(os.path.lexists(self.root / "bin" / "claude"))
+
+    def test_codex_homebrew_blocked_download_retries_then_guides(self):
+        write_exe(self.bin1 / "brew", 'echo "curl: (7) Failed to connect to github.com port 443" >&2; exit 1\n')
+        r = self.install("codex")
+        self.assertEqual((r.reason, r.attempts, self.sleeps), ("blocked-download", 3, [2.0, 4.0]))
+        self.assertIn("vendor's download site", r.user_action)
+        self.assertFalse(os.path.lexists(self.root / "bin" / "codex"))
+
     def test_codex_without_npm_uses_homebrew_when_present(self):
         write_exe(self.bin1 / "brew", f"""[ "$*" = "install --cask codex" ] || exit 2
 d="$(dirname "$0")"
@@ -956,6 +976,158 @@ class ConcurrentRepair(Base):
         self.assertTrue(all(r.ok for r in results), results)
         self.assertEqual(count.read_text().count("run"), 1)
         self.assertEqual(results[0].path, results[1].path)
+
+
+class AcceptanceMatrix(OwnerReplyBase):
+    """Rows of the owner's acceptance matrix that the other classes do not pin."""
+
+    def known_bad_spec(self, runtime, bad):
+        return rc.RuntimeSpec(**dict(rc.RUNTIMES[runtime].__dict__, known_bad=(bad,)))
+
+    def test_claude_minimum_supported_version_is_ok_and_one_below_is_too_old(self):
+        fake_cli(self.bin1 / "claude", "2.0.0")
+        self.assertEqual(self.discover().status, rc.OK)
+        fake_cli(self.bin1 / "claude", "1.99.99")
+        self.assertEqual(self.discover().status, rc.TOO_OLD)
+
+    def test_codex_minimum_supported_version_is_ok_and_one_below_is_too_old(self):
+        fake_cli(self.bin1 / "codex", "codex-cli 0.40.0", CODEX_FLAGS, label="")
+        self.assertEqual(self.discover("codex").status, rc.OK)
+        fake_cli(self.bin1 / "codex", "codex-cli 0.39.9", CODEX_FLAGS, label="")
+        r = self.discover("codex")
+        self.assertEqual(r.status, rc.TOO_OLD)
+        self.assertIn("older than the minimum 0.40.0", r.problem.detail)
+
+    def test_codex_current_version_is_ok(self):
+        p = fake_cli(self.bin1 / "codex", "codex-cli 0.160.1", CODEX_FLAGS, label="")
+        r = self.discover("codex")
+        self.assertEqual((r.status, r.selected.path, r.selected.version), (rc.OK, p, "0.160.1"))
+
+    def test_codex_newer_untested_is_usable_with_warning(self):
+        fake_cli(self.bin1 / "codex", "codex-cli 1.0.0", CODEX_FLAGS, label="")
+        r = self.discover("codex")
+        self.assertEqual(r.status, rc.NEWER_UNTESTED)
+        self.assertTrue(r.selected.usable)
+        step = rc.plan(r, root=self.root, env=self.env)
+        self.assertFalse(step.consent_required)
+        self.assertIn("@openai/codex@0", step.command)
+
+    def test_codex_known_bad(self):
+        spec = self.known_bad_spec("codex", (0, 150, 0))
+        fake_cli(self.bin1 / "codex", "codex-cli 0.150.0", CODEX_FLAGS, label="")
+        r = self.discover("codex", spec=spec)
+        self.assertEqual(r.status, rc.KNOWN_BAD)
+        self.assertIn("known to break the core", r.problem.detail)
+
+    def test_known_bad_first_on_path_is_skipped_for_a_working_second(self):
+        for runtime, bad, good, flags, label in (
+                ("claude", "2.1.5", "2.1.0", CLAUDE_FLAGS, "(Claude Code)"),
+                ("codex", "0.150.0", "0.160.1", CODEX_FLAGS, "")):
+            spec = self.known_bad_spec(runtime, rc.parse_version(bad))
+            fake_cli(self.bin1 / runtime, bad, flags, label=label)
+            second = fake_cli(self.bin2 / runtime, good, flags, label=label)
+            r = self.discover(runtime, spec=spec)
+            self.assertEqual(r.selected.path, second)
+            self.assertEqual([c.status for c in r.candidates], [rc.KNOWN_BAD, rc.OK])
+
+    def test_known_bad_alone_blocks_and_plans_a_consented_repair(self):
+        spec = self.known_bad_spec("claude", (2, 1, 5))
+        fake_npm(self.bin2 / "npm", "exit 0\n")
+        fake_cli(self.bin1 / "claude", "2.1.5")
+        r = self.discover(spec=spec)
+        self.assertIsNone(r.selected)
+        step = rc.plan(r, spec=spec, root=self.root, env=self.env)
+        self.assertEqual(step.status, rc.KNOWN_BAD)
+        self.assertTrue(step.consent_required)
+        self.assertEqual(step.assisted, "python3 src/runtime_compat.py repair --runtime claude --yes")
+
+    def test_repair_that_lands_on_a_known_bad_version_is_not_success(self):
+        spec = self.known_bad_spec("claude", (2, 3, 0))
+        old = self.managed_version("2.1.0")
+        AssistedRepair.good_npm(self, "2.3.0")
+        r = self.install(spec=spec)
+        self.assertEqual(r.reason, "verify-failed")
+        self.assertIn("known to break the core", r.detail)
+        self.assertEqual(os.readlink(self.root / "bin" / "claude"), str(old))
+        self.assertFalse((self.root / "claude" / "versions" / "2.3.0").exists())
+
+    def test_codex_multiple_path_installs_first_usable_wins(self):
+        fake_cli(self.bin1 / "codex", "codex-cli 0.30.0", CODEX_FLAGS, label="")
+        good = fake_cli(self.bin2 / "codex", "codex-cli 0.160.1", CODEX_FLAGS, label="")
+        r = self.discover("codex")
+        self.assertEqual(r.selected.path, good)
+        self.assertEqual([c.status for c in r.candidates], [rc.TOO_OLD, rc.OK])
+
+    def test_every_path_install_unusable_names_the_first_and_lists_all(self):
+        fake_cli(self.bin1 / "claude", "1.0.0")
+        fake_cli(self.bin2 / "claude", version_rc=1)
+        r = self.discover()
+        self.assertIsNone(r.selected)
+        self.assertEqual([c.status for c in r.candidates], [rc.TOO_OLD, rc.BROKEN])
+        self.assertEqual(r.problem.path, str(self.bin1 / "claude"))
+        lines = "\n".join(rc._doctor_lines(r, None, self.env))
+        self.assertIn(str(self.bin1 / "claude"), lines)
+        self.assertIn(str(self.bin2 / "claude"), lines)
+
+    def test_disk_full_reply_is_answered_then_a_later_reply_installs_and_continues(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        AssistedRepair.good_npm(self, "2.3.0")
+        self.ensure()
+        free = [Disk(10, 10, 5 * 1024 * 1024)]
+
+        def repair(*a, **k):
+            self.repairs += 1
+            return rc.assisted_install(*a, disk_usage=lambda _p: free[0], sleep=self.sleeps.append, **k)
+        first = self.reply("install compatible claude", name="task-300")
+        self.assertEqual(self.ensure(repair_fn=repair)[0], rc.EXIT_UNUSABLE)
+        answer = (self.ws / "results" / first.name).read_text()
+        self.assertIn("That did not fix it", answer)
+        self.assertIn("Free at least", answer)
+        self.assertFalse(os.path.lexists(self.root / "bin" / "claude"))
+        free[0] = PLENTY
+        second = self.reply("install compatible claude", name="task-301")
+        self.assertEqual(self.ensure(repair_fn=repair), (0, str(self.root / "bin" / "claude")))
+        self.assertEqual(self.repairs, 2)
+        self.assertIn("Installed claude 2.3.0", (self.ws / "results" / second.name).read_text())
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_blocked_download_reply_keeps_the_old_version_then_a_later_reply_installs(self):
+        old = self.managed_version("2.1.0")
+        (self.root / "claude" / "versions" / "2.1.0" / "bin" / "claude").write_text("#!/bin/sh\nexit 1\n")
+        AssistedRepair.npm(self, 'echo "npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org" >&2; exit 1\n')
+        self.ensure()
+        first = self.reply("install compatible claude", name="task-310")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], rc.EXIT_UNUSABLE)
+        answer = (self.ws / "results" / first.name).read_text()
+        self.assertIn("registry.npmjs.org", answer)
+        self.assertEqual(self.sleeps, [2.0, 4.0])
+        self.assertEqual(os.readlink(self.root / "bin" / "claude"), str(old))
+        AssistedRepair.good_npm(self, "2.3.0")
+        second = self.reply("install compatible claude", name="task-311")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], 0)
+        self.assertIn("Installed claude 2.3.0", (self.ws / "results" / second.name).read_text())
+
+    def test_dm_names_what_the_npm_install_changes_in_one_sentence(self):
+        fake_cli(self.bin1 / "codex", version_rc=1, flags=CODEX_FLAGS, label="")
+        AssistedRepair.npm(self, "exit 0\n")
+        self.ensure("codex")
+        body = self.notices()[0].read_text()
+        self.assertIn(f"It changes only {self.root} (a Sutando-owned folder) and the npm cache, "
+                      "never your settings.", body)
+
+    def test_codex_expired_login_stops_with_the_login_step_then_retry_continues(self):
+        write_exe(self.bin1 / "codex", f"""case "$1" in
+  --version) echo "codex-cli 0.160.1" ;;
+  --help) echo "{CODEX_FLAGS}" ;;
+  login) [ -f "$HOME/fresh" ] && exit 0; echo "Error: your access token has expired" >&2; exit 1 ;;
+esac
+""")
+        self.assertEqual(self.ensure("codex", enforce_auth=True)[0], rc.EXIT_LOGIN)
+        self.assertIn("codex login", self.notices()[0].read_text())
+        (self.home / "fresh").write_text("")
+        task = self.reply("retry now")
+        self.assertEqual(self.ensure("codex", enforce_auth=True), (0, str(self.bin1 / "codex")))
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
 
 
 class Crash(BaseException):
@@ -1453,8 +1625,17 @@ class HealthCheck(unittest.TestCase):
         self.assertIn("bad config", r["detail"])
 
     def test_registered_in_run_checks(self):
-        self.assertIn("checks.append(check_core_runtime_compat())",
-                      (REPO / "src" / "health-check.py").read_text())
+        from unittest import mock
+
+        def stub(name):
+            return lambda *_a, **_k: [] if name == "check_voice_stack" else {
+                "name": f"stub-{name}", "status": "ok", "detail": ""}
+        names = [n for n in dir(self.hc) if n.startswith("check_") and callable(getattr(self.hc, n))]
+        verdict = {"name": "core-cli-compat", "status": "down", "detail": "sentinel"}
+        with mock.patch.multiple(self.hc, **{n: stub(n) for n in names}), \
+                mock.patch.object(self.hc, "check_core_runtime_compat", return_value=verdict):
+            out = self.hc.run_all_checks()
+        self.assertIn(verdict, out)
 
 
 AssistedRepair.good_npm.__doc__ = "Shared with Cli: an npm stub that installs a working CLI."
