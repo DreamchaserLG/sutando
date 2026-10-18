@@ -42,6 +42,15 @@ esac
 """)
 
 
+def launcher_copy(tmp: Path) -> Path:
+    """A copy of the code the Claude launcher runs; its workspace, and any owner DM, stay in tmp."""
+    repo = tmp / "repo"
+    for rel in ("src", "scripts"):
+        shutil.copytree(REPO / rel, repo / rel, symlinks=True)
+    shutil.copy2(REPO / "sutando.config.json", repo / "sutando.config.json")
+    return repo
+
+
 class Gate(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -135,7 +144,8 @@ class ClaudeRestartKeepsRunningCore(unittest.TestCase):
                "SUTANDO_RUNTIME_WAIT_S": "0", "SUTANDO_TMUX_SOCKET": str(tmp / "sock"),
                "SUTANDO_SKIP_AUTH_PREFLIGHT": "1", "CLAUDE_CONFIG_DIR": str(tmp / "cfg"),
                "SUTANDO_RESTART_GRACE_S": "1"}
-        r = subprocess.run(["bash", str(REPO / "src/agent/claude/cli/start-cli.sh"), "--restart"],
+        repo = launcher_copy(tmp)
+        r = subprocess.run(["bash", str(repo / "src/agent/claude/cli/start-cli.sh"), "--restart"],
                            env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                            timeout=180)
         calls = log.read_text() if log.exists() else ""
@@ -143,7 +153,39 @@ class ClaudeRestartKeepsRunningCore(unittest.TestCase):
         self.assertNotIn("new-session", calls)
         self.assertEqual(r.returncode, 3, r.stderr[-2000:])
         self.assertIn("cannot start the core", r.stderr)
+        dms = list((repo / "workspace" / "results").glob("proactive-runtime-compat-claude-*.txt"))
+        self.assertEqual(len(dms), 1, "off a terminal the owner is asked once, in the test's workspace")
 
+
+
+class ClaudeConsentRepairLaunchesTheRepairedBinary(unittest.TestCase):
+    """The real Claude launcher: consent repairs a broken claude and launches the new one."""
+
+    def test_consent_repair_launches_the_managed_claude(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bin_dir = tmp / "bin"
+        log = tmp / "tmux.log"
+        write_exe(bin_dir / "tmux", f'echo "$*" >> "{log}"\nexit 0\n')
+        write_exe(bin_dir / "claude", "exit 1\n")
+        write_exe(bin_dir / "pgrep", "exit 1\n")
+        write_exe(bin_dir / "npm", f"""PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+printf '#!/bin/sh\\ncase "$1" in --version) echo 2.4.0;; --help) echo "{CLAUDE_FLAGS}";; esac\\n' > "$PREFIX/bin/claude"
+chmod +x "$PREFIX/bin/claude"
+""")
+        env = {"HOME": str(tmp / "home"), "PATH": f"{bin_dir}:/usr/bin:/bin",
+               "SUTANDO_RUNTIMES_DIR": str(tmp / "runtimes"), "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+               "SUTANDO_RUNTIME_WAIT_S": "0", "SUTANDO_TMUX_SOCKET": str(tmp / "sock"),
+               "SUTANDO_SKIP_AUTH_PREFLIGHT": "1", "CLAUDE_CONFIG_DIR": str(tmp / "cfg"),
+               "SUTANDO_RUNTIME_REPAIR_CONSENT": "1"}
+        r = subprocess.run(["bash", str(launcher_copy(tmp) / "src/agent/claude/cli/start-cli.sh")],
+                           env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                           timeout=180)
+        self.assertIn("repair succeeded: claude 2.4.0", r.stderr)
+        managed = tmp / "runtimes" / "bin" / "claude"
+        self.assertIn(f" {managed} --name sutando-core ", log.read_text(), r.stderr[-2000:])
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
