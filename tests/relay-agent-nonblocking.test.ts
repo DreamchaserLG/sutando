@@ -109,7 +109,7 @@ test('an open call returns its result as that call\'s own response (no fake firs
 	assert.match(text, /three findings/);
 });
 
-test('a submitted request is acknowledged at once by a separate notice; the call stays open', async () => {
+test('a work call is acknowledged at once by a separate notice, before any wait; the call stays open', async () => {
 	const notices: string[] = [];
 	const store = createVoiceTaskStore();
 	const relay = new RelayAgent({
@@ -137,7 +137,27 @@ test('a queued request is acknowledged with its queue position instead', async (
 	});
 	void relay.invoke('work', { task: 'draw a dog' });
 	await new Promise((r) => setTimeout(r, 20));
-	assert.equal(notices.length, 1);
-	assert.match(notices[0], /right after the one I'm on/);
+	assert.equal(notices.length, 2, 'the acknowledgement at the call, then the queue position');
+	assert.match(notices[0], /Tell the user in one short sentence that you are on it/);
+	assert.match(notices[1], /right after the one I'm on/);
+	relay.endAllCalls('continuing');
+});
+
+test('the acknowledgement goes out before the wait for the user\'s turn', async () => {
+	const notices: string[] = [];
+	const store = createVoiceTaskStore();
+	let release: () => void = () => {};
+	const relay = new RelayAgent({
+		store,
+		submit: async () => { store.add('task-w', 'x'); return { status: 'pending', taskId: 'task-w' }; },
+		notice: (t) => notices.push(t),
+		speech: { onUserSpeechStarted() {}, onUserSpeechEnded() {}, onModelSpeaking() {}, waitTurnOver: () => new Promise<void>((r) => { release = r; }) } as never,
+	});
+	void relay.invoke('work', { task: 'x' });
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(notices.length, 1, 'acknowledged while the turn wait is still open');
+	release();
+	await new Promise((r) => setTimeout(r, 10));
+	assert.equal(notices.length, 1, 'not acknowledged twice');
 	relay.endAllCalls('continuing');
 });

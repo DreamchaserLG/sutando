@@ -665,6 +665,12 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.lastTakenAt = Date.now();
 		// Taken before the waits below: a room switch during them must not re-address the request.
 		let origin = this.deps.captureOrigin?.();
+		// The user hears at once that it is being done, before the waits below. gemini-3.8-live says nothing
+		// before or after a NON_BLOCKING call while it waits for the call's response, and the wait for the
+		// user's turn can be long: on 2026-10-17 a speech blip bodhi ignored never ended for the speech gate,
+		// the request was sent 14.5 s after the call, and the user heard nothing until then. A call that
+		// joins an earlier one is the same request: it was acknowledged already.
+		if (!this.holding) this.deps.notice?.(framedSystem(WORK_ACKNOWLEDGE));
 		if (this.deps.speech) {
 			// A call made while an earlier one still waits for the user's turn to end: the model has not
 			// answered in between, the user went on speaking, so the two are one request. The earlier
@@ -726,13 +732,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
 		if (replaces) this.supersede(taskId, replaces);
 
-		// The user hears at once that it is being done. gemini-3.8-live says nothing before or after a
-		// NON_BLOCKING call while it waits for that call's response (2026-10-17 on the test Mac: the call
-		// turn ended silent; Yixuan's probe saw the same), and the old fake first response that made it
-		// speak closed the call. So the acknowledgement is a separate system notice: the call stays open.
-		// A queue position or an offline core is said instead of the plain acknowledgement.
+		// The plain acknowledgement went out when the call came in (a separate notice: the old fake first
+		// response that made the model speak closed the call). A queue position or an offline core is said now.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
-		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
+		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
 		if (signal?.aborted) return framedSystem(ENDED.continuing);
 		return new Promise<string>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };

@@ -62,8 +62,8 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		const ahead = agent(pending('task-4', { queuedAhead: 2, message: 'Got it, 2 in line.' }));
 		void ahead.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
-		assert.deepEqual(ahead.notices.length, 1);
-		assert.match(ahead.notices[0], /Got it, 2 in line\./);
+		assert.deepEqual(ahead.notices.length, 2, 'the acknowledgement at the call, then the queue position');
+		assert.match(ahead.notices[1], /Got it, 2 in line\./);
 		const plain = agent(pending('task-5'));
 		void plain.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
