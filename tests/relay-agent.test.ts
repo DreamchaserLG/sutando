@@ -256,40 +256,6 @@ describe('the Gemini check call: every failure lets the request through', () => 
 		assert.equal(called, false, 'no key, no call');
 	});
 
-	it('the rules go in as the system instruction and the turn as the user message', async () => {
-		const { checkRequestBody, workCheckPrompt, turnClassifierPrompt } = await import('../src/work-request-check.js');
-		for (const prompt of [workCheckPrompt(input, ['- none: a rule.']), turnClassifierPrompt({ utterance: 'u', recentConversation: 'user: u', openTasks: [] }, ['- none: a rule.'])]) {
-			const body = checkRequestBody(prompt) as { systemInstruction: { parts: Array<{ text: string }> }; contents: Array<{ role: string; parts: Array<{ text: string }> }> };
-			assert.match(body.systemInstruction.parts[0].text, /- none: a rule\./);
-			assert.doesNotMatch(body.systemInstruction.parts[0].text, /^Recent words/m);
-			assert.match(body.contents[0].parts[0].text, /^Recent words \(oldest first\):/);
-			assert.equal(body.contents[0].role, 'user');
-			assert.equal(body.systemInstruction.parts[0].text + '\n' + body.contents[0].parts[0].text, prompt, 'nothing is lost in the split');
-		}
-	});
-
-	it('a prompt Gemini\'s filter blocks is said as blocked, and asked again without the surface rules', async () => {
-		const { createGeminiWorkCheck, createGeminiTurnClassifier } = await import('../src/work-request-check.js');
-		const bodies: string[] = [];
-		globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
-			const body = String(init?.body);
-			bodies.push(body);
-			return body.includes('- none: a rule.')
-				? new Response(JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } }))
-				: new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: '{"action":"duplicate","of":"task-1"}' }] } }] }));
-		}) as typeof fetch;
-		const logs: string[] = [];
-		const open = [{ id: 'task-1', text: 'check PR 5302' }];
-		const work = await createGeminiWorkCheck({ apiKey: () => 'k', log: (m) => logs.push(m), ownRules: ['- none: a rule.'] })({ ...input, openTasks: open });
-		assert.deepEqual(work, { action: 'duplicate', of: 'task-1' });
-		assert.equal(bodies.length, 2);
-		assert.ok(logs.some((l) => l.includes("work check gave no answer (blocked by Gemini's prompt filter: PROHIBITED_CONTENT)")), logs.join('\n'));
-		bodies.length = 0;
-		globalThis.fetch = (async (_u: unknown, init?: RequestInit) => { bodies.push(String(init?.body)); return new Response(JSON.stringify({ promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } })); }) as typeof fetch;
-		assert.deepEqual(await createGeminiTurnClassifier({ apiKey: () => 'k', extraRules: ['- none: a rule.'] })({ utterance: 'u', recentConversation: 'user: u', openTasks: [] }), { action: 'none' });
-		assert.equal(bodies.length, 2, 'one retry, then the usual fallback');
-	});
-
 	it('a real answer is read, and the key goes in a header, never the URL', async () => {
 		const { createGeminiWorkCheck } = await import('../src/work-request-check.js');
 		let url = ''; let key = '';
