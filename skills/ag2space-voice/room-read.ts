@@ -152,13 +152,8 @@ export function createMcpStdioClient(entry: McpStdioEntry, opts: { log?: (m: str
 /** How much of the server's explanation of a failure the model gets. */
 export const ERROR_DETAIL_MAX_CHARS = 600;
 
-/**
- * The server's own words for a failed action — message, details or field errors, or a prose text part
- * when the reply carried no JSON — cut to ERROR_DETAIL_MAX_CHARS; undefined when it says nothing beyond
- * the code. The code alone left the model guessing: asked to draw an apple in a Typst page,
- * changes.apply answered INVALID_INPUT, and the model sent the same wrong arguments again and again
- * (2026-10-17, each retry asking the user to confirm once more).
- */
+/** The server's own words for a failed action (message, details, field errors, or a prose part), cut to
+ *  ERROR_DETAIL_MAX_CHARS; undefined when it says nothing beyond the code, which alone leaves the model guessing. */
 export function errorDetail(r: McpToolResult, payload: Record<string, unknown> | null): string | undefined {
 	const parts: string[] = [];
 	if (payload) {

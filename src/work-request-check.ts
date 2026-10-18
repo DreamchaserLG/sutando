@@ -10,8 +10,7 @@
  * Any failure or delay lets the request through: the check never blocks work.
  */
 
-/** `own`: the voice model does this itself with its own tools, so it is not sent (2026-10-16: "write the paper into the
- *  LaTeX project" went to the core, which was slow and wrote a plain Doc page instead). */
+/** `own`: the voice model does this itself with its own tools, so it is not sent to the core. */
 export type WorkCheck = { action: 'submit' } | { action: 'ask'; question: string } | { action: 'duplicate'; of: string } | { action: 'own' };
 
 /** A task the user asked for that has not been answered yet: the check compares a new request with these. */

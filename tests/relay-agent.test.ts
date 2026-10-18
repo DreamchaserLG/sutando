@@ -182,7 +182,7 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 	});
 
 	it('a request the voice model does with its own tools is not submitted: it is told to do it now', async () => {
-		// 2026-10-16 03:33: "write the paper into the LaTeX project" was sent to the core, which was slow and wrote a plain Doc page.
+		// Writing a LaTeX project's paper is the voice model's own, not the core's.
 		const { relay, submitted, logs } = agent(async () => ({ action: 'own' }));
 		const out = await Promise.race([relay.invoke('w', { task: "Write the content for 'The Best Paper' in susan's agents" }), tick(3_000).then(() => 'timed out')]);
 		assert.deepEqual(submitted, [], 'nothing submitted');
