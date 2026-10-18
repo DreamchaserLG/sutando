@@ -935,7 +935,7 @@ describe('voice runs every work call through the relay agent', () => {
 		assert.match(voice, /subagentConfigs: \{ work: relayAgentSubagentConfig\(relayAgent\) \},/);
 		assert.match(voice, /wireDurableChannels\(session, \{ [^}]*relay: relayAgent \}\);/);
 		const runtime = readFileSync(join(import.meta.dirname ?? '.', '..', 'src/live-agent-runtime.ts'), 'utf-8');
-		assert.match(runtime, /if \(!opts\.relay\.offerResult\(current\(item\)\)\) return false;/);
+		assert.match(runtime, /if \(canSpeak\(\) && opts\.relay\.offerResult\(now\)\) \{/, 'an open call gets its result at once, not through the pacer');
 	});
 });
 
