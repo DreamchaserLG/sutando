@@ -590,7 +590,10 @@ export async function roomExecute(client: McpClient, room: RoomRef | null, actio
 
 export type WritePageResult =
 	| { ok: true; room: string; did: 'created' | 'appended'; title: string; kind: string | null; ms: number }
-	| { ok: false; error: string; candidates?: string[]; rooms?: string[] };
+	| { ok: false; error: string; detail?: string; candidates?: string[]; rooms?: string[] };
+
+/** A LaTeX or Typst project's source file, by its title: never appended to. */
+export const PROJECT_FILE = /\.(typ|tex|bib|sty|cls)$/i;
 
 /**
  * Write a spoken note into a room's Commons: a new Doc page (title + text) or text appended to a page
@@ -610,6 +613,13 @@ export async function writePage(args: { room?: string; title?: string; kind?: st
 	if (!kind && !title) return { ok: false, error: 'no_title' };
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
+	// A project's source file (main.typ, a .tex) is edited with changes.apply: appending a revised copy
+	// duplicates the document, so its labels and bibliography appear twice and it no longer compiles.
+	if (kind) {
+		const head = await roomRead(client, target.room, 'room.commons.pages.read', { kind, max_bytes: 64 }, deps, ROOM_COMMONS_TIMEOUT_MS);
+		const pageTitle = head.ok && typeof head.result.title === 'string' ? head.result.title : '';
+		if (PROJECT_FILE.test(pageTitle)) return { ok: false, error: 'project_file', detail: `${pageTitle} is a project source file: change it with run_room_action room.commons.changes.apply (replace the part that changes), never by appending.` };
+	}
 	const action = kind ? 'room.commons.pages.append' : 'room.commons.pages.create';
 	const done = await roomExecute(client, target.room, action, kind ? { kind, text } : { title, kind: 'markdown', body: text }, deps);
 	if (!done.ok) return done;
@@ -899,7 +909,8 @@ export function createWritePageTool(deps: ReadRoomDeps): ToolDefinition {
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, did:"created"|"appended", title, kind} — then tell the user in one sentence what was written where. ' +
-			'Errors: "no_text" — nothing to write; "no_title" — a new page needs a title; "too_long" — keep a spoken note under 4000 characters; "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'Never for a LaTeX or Typst project\'s file (main.typ, a .tex): that is changed with run_room_action room.commons.changes.apply, replacing the part that changes. ' +
+			'Errors: "project_file" — the page is a project source file: use changes.apply as `detail` says, nothing was written; "no_text" — nothing to write; "no_title" — a new page needs a title; "too_long" — keep a spoken note under 4000 characters; "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not write in that room; "not_connected" or "unavailable" — say the note could not be written right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact text to write, as the user confirmed it.'),

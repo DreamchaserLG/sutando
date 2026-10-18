@@ -516,13 +516,26 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 	});
 
 	it('a kind appends to that page; "markdown" is the main Doc', async () => {
-		const f = fake(() => done({}));
+		const f = fake((name) => (name === 'room.action.read' ? { structuredContent: { result: { title: 'Meeting notes' } } } : done({})));
+		const appends = () => f.calls.filter((c) => c.name === 'room.action.execute');
 		const r = await writePage({ room: 'Sutando Triage', kind: 'markdown-ab12cd34', text: 'More.' }, deps(f.client));
 		assert.deepEqual(r.ok && [r.did, r.kind, r.title], ['appended', 'markdown-ab12cd34', '']);
-		assert.deepEqual((f.calls[0].args as { action: string; arguments: unknown }).action, 'room.commons.pages.append');
-		assert.deepEqual((f.calls[0].args as { arguments: unknown }).arguments, { kind: 'markdown-ab12cd34', text: 'More.' });
+		assert.deepEqual((appends()[0].args as { action: string; arguments: unknown }).action, 'room.commons.pages.append');
+		assert.deepEqual((appends()[0].args as { arguments: unknown }).arguments, { kind: 'markdown-ab12cd34', text: 'More.' });
 		await writePage({ room: 'Sutando Triage', kind: 'markdown', text: 'Main.' }, deps(f.client));
-		assert.deepEqual((f.calls[1].args as { arguments: unknown }).arguments, { kind: 'markdown', text: 'Main.' });
+		assert.deepEqual((appends()[1].args as { arguments: unknown }).arguments, { kind: 'markdown', text: 'Main.' });
+	});
+
+	it('a LaTeX or Typst project file is never appended to: the model is told to use changes.apply', async () => {
+		// Appending a revised main.typ duplicated the document: labels and the bibliography twice, no compile.
+		for (const title of ['main.typ', 'paper.tex', 'refs.bib']) {
+			const f = fake((name) => (name === 'room.action.read' ? { structuredContent: { result: { title } } } : done({})));
+			const r = await writePage({ room: 'Sutando Triage', kind: 'markdown-qop83g48', text: 'the whole revised file' }, deps(f.client)) as { ok: boolean; error?: string; detail?: string };
+			assert.equal(r.ok, false);
+			assert.equal(r.error, 'project_file');
+			assert.match(r.detail ?? '', /room\.commons\.changes\.apply/);
+			assert.equal(f.calls.filter((c) => c.name === 'room.action.execute').length, 0, `${title}: nothing written`);
+		}
 	});
 
 	it('nothing is written without text, without a title for a new page, with a bad kind, a too-long note, or a misheard room', async () => {
