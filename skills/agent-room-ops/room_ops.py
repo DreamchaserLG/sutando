@@ -145,6 +145,10 @@ def _dispatch_events(a):
     return _events.pull(cursor=a.cursor, wait=a.wait)  # pull
 
 
+# Writes whose room argument sits next to a free-form positional, so a swap posts nowhere.
+_ROOM_FIRST_WRITES = ("say", "mention", "send", "react", "unreact")
+
+
 def _room_arg_problem(room_id):
     """A room argument must be a room id or alias; anything else is a swapped argument."""
     if isinstance(room_id, str) and room_id[:1] in ("!", "#") and not any(c.isspace() for c in room_id):
@@ -308,6 +312,9 @@ def _main(argv):
         print(json.dumps({"ok": True, "commands": sorted(sub.choices), "say": say_flags,
                           "say_extra_content_checked": True}, indent=2))
         return 0
+    if a.cmd in _ROOM_FIRST_WRITES and (problem := _room_arg_problem(a.room_id)):
+        print(json.dumps({"ok": False, "room_id": a.room_id, "reason": problem}, indent=2))
+        return 1
     if a.cmd == "read":
         res = _read.read_room(a.room_id, a.agent_mxid, a.limit, before=a.before,
                               oldest_first=a.oldest_first)
@@ -353,9 +360,6 @@ def _main(argv):
     elif a.cmd == "resolve":
         res = _resolve.resolve_user(a.handle)
     elif a.cmd == "mention":
-        if (problem := _room_arg_problem(a.room_id)):
-            print(json.dumps({"ok": False, "room_id": a.room_id, "reason": problem}, indent=2))
-            return 1
         res = _mention.mention(a.handle, a.message, a.room_id, a.agent_mxid, reply_to=a.reply_to,
                                **({"thread_root": a.thread_root} if a.thread_root else {}))
     elif a.cmd == "history":
@@ -368,9 +372,6 @@ def _main(argv):
         except (ValueError, TypeError):
             res = {"ok": False, "complete_available_history": False, "reason": "Invalid history window or membership data"}
     elif a.cmd == "say":
-        if (problem := _room_arg_problem(a.room_id)):
-            print(json.dumps({"ok": False, "room_id": a.room_id, "reason": problem}, indent=2))
-            return 1
         if (a.message is None) == (a.body_file is None):
             print(json.dumps({"ok": False, "reason": "say requires exactly one positional message or --body-file"}))
             return 2

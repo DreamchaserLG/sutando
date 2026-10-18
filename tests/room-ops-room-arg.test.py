@@ -47,6 +47,18 @@ class RoomArgTests(unittest.TestCase):
         for room in ("!room:test.invalid", "#team:test.invalid"):
             self.assertIsNone(cli._room_arg_problem(room))
 
+    def test_send_and_react_with_a_swapped_room_never_send(self):
+        with patch.object(cli._media, "send_media") as send, patch.object(cli._react, "react") as react:
+            self.assertEqual(run(["send", "notes.txt", "!room:test.invalid"])[0], 1)
+            self.assertEqual(run(["react", "$event:test.invalid", "!room:test.invalid", "--key", "+1"])[0], 1)
+        send.assert_not_called()
+        react.assert_not_called()
+
+    def test_only_room_ids_and_aliases_pass(self):
+        for value in ("@peer:test.invalid", "ok", "$event:test.invalid", "", "room"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(cli._room_arg_problem(value))
+
 
 if __name__ == "__main__":
     unittest.main()
