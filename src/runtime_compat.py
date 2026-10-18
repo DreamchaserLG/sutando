@@ -81,6 +81,7 @@ DOCTOR_SCHEMA = 1
 APP_PROBE_TIMEOUT_S = 10
 APP_DISCOVERY_CAP_S = 60
 APP_RETRY_BUDGET_S = 30
+REPAIR_PHASES = ("checking-disk", "downloading", "verifying", "switching", "done")
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 _DISK_FULL_RE = re.compile(r"ENOSPC|no space left on device", re.I)
@@ -1195,6 +1196,8 @@ def _doctor_doc(report: Report, env: dict) -> dict:
 
 def _repair_cmd(a: argparse.Namespace, env: dict) -> int:
     def emit(kind: str, **fields) -> None:
+        if kind == "progress" and fields["phase"] not in REPAIR_PHASES:
+            raise ValueError(f"undeclared repair phase {fields['phase']!r}")
         if a.json:
             print(json.dumps(dict(type=kind, **fields)), flush=True)
 

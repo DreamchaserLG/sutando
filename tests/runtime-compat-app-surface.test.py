@@ -99,6 +99,70 @@ class RepairJson(AppBase):
         self.assertEqual((code, out), (0, ""))
 
 
+class RepairPhases(AppBase):
+    """One declared phase set: what `repair --json` emits, in order, with `done` last.
+    `done` is a stdout progress line only; no on-disk record treats it as finished."""
+
+    def phases(self, *extra):
+        code, out, _ = self.main("repair", "--runtime", "claude", "--yes", "--json", *extra)
+        lines = self.json_lines(out)
+        self.assertEqual(lines[-1]["type"], "result")
+        return code, [ln["phase"] for ln in lines[:-1]]
+
+    def assert_declared_order(self, phases):
+        self.assertTrue(set(phases) <= set(rc.REPAIR_PHASES), phases)
+        order = [rc.REPAIR_PHASES.index(p) for p in phases]
+        self.assertEqual(order, sorted(order), phases)
+        self.assertEqual((phases.count("done"), phases[-1]), (1, "done"))
+
+    def test_the_phase_set_is_declared_once(self):
+        self.assertEqual(rc.REPAIR_PHASES,
+                         ("checking-disk", "downloading", "verifying", "switching", "done"))
+
+    def test_success_and_failure_runs_emit_only_declared_phases_in_order(self):
+        self.broken_then_npm()
+        code, phases = self.phases()
+        self.assertEqual(code, 0)
+        self.assert_declared_order(phases)
+        fake_npm(self.bin1 / "npm", 'echo "npm ERR! code ENOTFOUND" >&2; exit 1\n')
+        code, phases = self.phases()
+        self.assertEqual(code, rc.EXIT_UNUSABLE)
+        self.assert_declared_order(phases)
+        self.assertNotIn("switching", phases)
+
+    def test_an_undeclared_phase_is_refused(self):
+        self.broken_then_npm()
+        real = rc.assisted_install
+
+        def rogue(*a, progress=None, **k):
+            progress("resuming")
+        rc.assisted_install = rogue
+        try:
+            with self.assertRaises(ValueError):
+                self.main("repair", "--runtime", "claude", "--yes", "--json")
+        finally:
+            rc.assisted_install = real
+
+    def test_done_is_never_written_to_a_record(self):
+        self.broken_then_npm()
+        self.main("repair", "--runtime", "claude", "--yes", "--json", "--consent-source", "app",
+                  "--consent-by", MXID)
+        records = [p for p in list(self.root.rglob("*.json")) + list(self.ws.rglob("*.json"))]
+        for path in records:
+            self.assertNotIn('"done"', path.read_text(), path)
+
+    def test_a_swap_journal_marked_done_is_rolled_back_not_finished(self):
+        old = self.managed_version("2.1.0")
+        new = suite.fake_cli(self.root / "claude" / "versions" / "2.3.0" / "bin" / "claude", "2.3.0")
+        rc._swap_link(self.root / "bin" / "claude", Path(new))
+        journal = self.root / "claude" / ".swap-999999-1.json"
+        journal.write_text(json.dumps({"phase": "done", "previous": str(old), "final": None,
+                                       "aside": None, "placed": False, "new_ino": None}))
+        rc.recover_swaps(self.root, "claude", pid_alive=lambda _p: False)
+        self.assertEqual(os.readlink(self.root / "bin" / "claude"), str(old))
+        self.assertFalse(journal.exists())
+
+
 class AppConsent(AppBase):
     """E1-b: consent given in the app is recorded before the repair acts, and closes the incident."""
 
