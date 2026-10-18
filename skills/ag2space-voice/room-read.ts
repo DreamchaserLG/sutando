@@ -925,8 +925,8 @@ export function createWritePageTool(deps: ReadRoomDeps): ToolDefinition {
 			'Errors: "project_file" — the page is a project source file: use changes.apply as `detail` says, nothing was written; "no_text" — nothing to write; "no_title" — a new page needs a title; "too_long" — keep a spoken note under 4000 characters; "no_page" — the kind is not a page kind; "NOT_FOUND" — no such page; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not write in that room; "not_connected" or "unavailable" — say the note could not be written right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
-			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact text to write, as the user confirmed it.'),
-			title: z.string().max(ROOM_WRITE_TITLE_MAX).optional().describe('For a new page: its title, as the user confirmed it.'),
+			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact text to write, as the user gave it.'),
+			title: z.string().max(ROOM_WRITE_TITLE_MAX).optional().describe('For a new page: its title, as the user gave it.'),
 			kind: z.string().optional().describe('To append instead: the page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), or "markdown" for the main Doc.'),
 			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
 		}),
@@ -956,7 +956,7 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not comment in that room; "not_connected" or "unavailable" — say the comment could not be left right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
-			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user confirmed it.'),
+			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user gave it.'),
 			kind: z.string().optional().describe('The page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), or "markdown" for the main Doc. Omit when replying in a thread.'),
 			quote: z.string().max(2000).optional().describe('A passage of the page to anchor the comment to, exactly as it reads there. Omit for the whole page.'),
 			reply_to: z.string().optional().describe('To reply in a comment thread: the comment\'s event_id.'),
@@ -988,7 +988,7 @@ export function createSendMessageTool(deps: ReadRoomDeps): ToolDefinition {
 			'Errors: "no_text" — nothing to send; "too_long" — keep it under 4000 characters; "no_message" — reply_to or thread is not a message\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not post in that room; "not_connected" or "unavailable" — say it could not be sent right now and nothing was sent; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
-			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact message, as the user confirmed it.'),
+			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact message, as the user gave it.'),
 			room: z.string().optional().describe('The room name, e.g. "Sutando Triage". Omit for the current room.'),
 			reply_to: z.string().optional().describe('The event_id of the message this replies to. Omit for a plain message.'),
 			thread: z.string().optional().describe('The thread root\'s event_id, to post inside that thread.'),
