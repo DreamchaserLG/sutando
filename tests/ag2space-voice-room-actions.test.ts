@@ -199,6 +199,16 @@ describe('a change runs at once, without a read-back or a yes', () => {
 		assert.deepEqual(await runAction(RUN, change(() => err('FORBIDDEN')).deps, now), { ok: false, error: 'FORBIDDEN', done: false, next: NOT_DONE_NEXT });
 	});
 
+	it('a refused change logs the arguments it sent, long strings cut, so the shape the server refused can be told', async () => {
+		const logs: string[] = [];
+		const f = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT', message: 'name the file by page_id or by path, one of them' } }));
+		const deps = { ...f.deps, log: (m: string) => logs.push(m) };
+		await runAction({ ...RUN, arguments_json: JSON.stringify({ project: 'p1', files: [{ page_id: 'pg1', path: 'main.typ', content: 'x'.repeat(500) }] }) }, deps, now);
+		const line = logs.find(l => l.includes('refused: INVALID_INPUT')) ?? '';
+		assert.match(line, /"page_id":"pg1","path":"main.typ"/, 'both identifiers visible');
+		assert.match(line, /x{80}…\(500\)/, 'the long text is cut, its length kept');
+	});
+
 	it('the detail is cut so a long server message cannot flood the model', async () => {
 		const f = change(() => ({ isError: true, structuredContent: { code: 'INVALID_INPUT', message: 'x'.repeat(5000) } }));
 		const r = await runAction(RUN, f.deps, now) as { detail?: string };

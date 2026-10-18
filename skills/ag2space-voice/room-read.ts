@@ -563,6 +563,17 @@ export const OUTCOME_UNKNOWN = 'outcome_unknown';
 
 /** One action that writes, through room.action.execute; nothing is retried. A timeout after sending, or the
  *  server's own unknown outcome, is OUTCOME_UNKNOWN with the operation_id used. */
+/** A refused call's arguments for the log: its shape and keys in full, each string cut to 80 characters. */
+export function argsForLog(args: Record<string, unknown>): string {
+	const cutStrings = (v: unknown): unknown =>
+		typeof v === 'string' ? (v.length > 80 ? `${v.slice(0, 80)}…(${v.length})` : v)
+			: Array.isArray(v) ? v.map(cutStrings)
+			: v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, cutStrings(x)]))
+			: v;
+	const json = JSON.stringify(cutStrings(args));
+	return json.length > 1_500 ? `${json.slice(0, 1_500)}…` : json;
+}
+
 export async function roomExecute(client: McpClient, room: RoomRef | null, action: string, args: Record<string, unknown>, deps: Pick<ReadRoomDeps, 'log'>, opts: { operationId?: string; revision?: string } = {}): Promise<{ ok: true; result: Record<string, unknown> } | { ok: false; error: string; operation_id?: string; detail?: string }> {
 	const operation_id = opts.operationId ?? randomUUID();
 	try {
@@ -574,7 +585,8 @@ export async function roomExecute(client: McpClient, room: RoomRef | null, actio
 		if (code === 'ACTION_OUTCOME_UNKNOWN' || code === 'UPSTREAM_UNAVAILABLE' || /unknown/i.test(String(payload?.dispatch_state ?? '')) || /unknown/i.test(status)) return { ok: false, error: OUTCOME_UNKNOWN, operation_id };
 		if (res.isError || !payload) {
 			const detail = errorDetail(res, payload);
-			if (detail) deps.log?.(`[RoomRead] ${action} refused: ${code || 'write_failed'}: ${detail}`);
+			// The arguments go in too (long strings cut): the refusal alone cannot say which shape the model sent.
+			deps.log?.(`[RoomRead] ${action} refused: ${code || 'write_failed'}${detail ? `: ${detail}` : ''} — arguments ${argsForLog(args)}`);
 			return { ok: false, error: code || 'write_failed', ...(detail ? { detail } : {}) };
 		}
 		if (payload.approval_id || /approval/i.test(status)) return { ok: false, error: 'needs_approval' };
