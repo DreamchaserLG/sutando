@@ -946,7 +946,7 @@ def _decision_text(task: dict) -> str:
     text = str(task.get("task") or "").strip()
     # Button replies can follow the broker's quoted context envelope; only the
     # text after it is the decision.
-    text = local_task_protocol.split_reply_context(text)[1]
+    text = local_task_protocol.reply_action_text(text)
     text = re.sub(r"^\[AG2Space\s+[^\]]+\]\s*", "", text, count=1)
     return text.strip()
 
@@ -3522,7 +3522,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     now = time.time()
     if _heartbeat_retry_at and now < _heartbeat_retry_at:
         return False
-    health = _HEALTH_COMMAND.row() if _HEALTH_COMMAND else _core_health(_health_snapshot())
+    health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
+              if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
