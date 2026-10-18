@@ -165,8 +165,8 @@ describe('the tool as the voice model sees it', () => {
 		assert.match(t.description, /do not read the change back or ask for a yes/);
 		assert.match(EDIT_FILE_PROMPT_RULE, /search_commons for the file, then edit_project_file/);
 		assert.match(EDIT_FILE_PROMPT_RULE, /never write its text out yourself/);
-		assert.match(EDIT_FILE_PROMPT_RULE, /A new or replacement picture is add_project_image, not this/);
-		assert.match(t.description, /"missing_file" — .* a picture is generated with add_project_image/);
+		assert.match(EDIT_FILE_PROMPT_RULE, /submit work once with the whole request \(generate it, put it in that room\\?'s project, change the file\), never only "generate an image"/);
+		assert.match(t.description, /"missing_file" — .* submit work with the whole request in one task/);
 	});
 });
 }

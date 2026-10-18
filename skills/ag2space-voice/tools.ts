@@ -8,7 +8,6 @@ import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateCli
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
 import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
 import { EDIT_FILE_PROMPT_RULE, createEditFileTool } from './edit-file.js';
-import { ADD_IMAGE_PROMPT_RULE, createAddImageTool } from './image-file.js';
 import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool } from './room-actions.js';
 
 export const tools: ToolDefinition[] = [];
@@ -93,12 +92,11 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 	const list = createListRoomsTool({ index, log });
 	// A project file is changed from a short instruction; the voice model never writes the file out.
 	const edit = createEditFileTool(deps);
-	const image = createAddImageTool(deps);
 	// Any other catalog action: found, described and run by name, gated by the server's own effect and risk.
 	const open = [createFindActionsTool(deps), createDescribeActionTool(deps), createRunActionTool(deps)];
 	return {
-		tools: [read, search, commons, page, write, comment, message, list, edit, image, ...open],
-		promptRules: [ROOM_READ_PROMPT_RULE, EDIT_FILE_PROMPT_RULE, ADD_IMAGE_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
+		tools: [read, search, commons, page, write, comment, message, list, edit, ...open],
+		promptRules: [ROOM_READ_PROMPT_RULE, EDIT_FILE_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
 		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
 		contextLines: () => roomIndexContextLines(index),
 	};
