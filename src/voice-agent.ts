@@ -1407,7 +1407,7 @@ async function main() {
 			} catch { /* test-only */ }
 		}, 250);
 	}
-	// Skills told when the user speaks (onUserSpoke): a change held for a spoken yes is not released by the model alone.
+	// Skills told when the user speaks (onUserSpoke).
 	(() => {
 		const transport = (session as unknown as { transport?: { onInputTranscription?: (text: string) => void } }).transport;
 		if (!transport) return;
