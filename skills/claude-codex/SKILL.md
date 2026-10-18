@@ -109,6 +109,11 @@ env, claude runs with Read/Grep/Glob confined to that dir (no command, network o
 `===SUTANDO SYSTEM INSTRUCTIONS===` block runs `review-pr.sh <N> --non-owner` to auto-review
 a non-owner PR-review request (owner-ping only on failure).
 
+Non-owner mode also clears gh's repo/host-selecting env (`GH_REPO`, `GH_HOST`, the enterprise
+tokens, `GIT_DIR`, `GIT_WORK_TREE`), so a bare number resolves only against this checkout's repo.
+Pass `--task-file <task>` to let the task decide the mode: only an explicit `access_tier: owner`
+header gets owner mode; a missing, unknown or non-owner tier is treated as `--non-owner`.
+
 ## Bounded runner — `scripts/codex-bounded.sh`
 
 Generic stall-watchdog + wall-clock cap for any (sandboxed) delegation. `--stall N` kills the

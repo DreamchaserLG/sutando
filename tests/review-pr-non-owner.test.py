@@ -202,6 +202,17 @@ class InProcess(unittest.TestCase):
                                        "--out", str(self.out)]), 0)
         run.assert_called_once_with("7", "", SPEC["diff"], self.out, 240)
 
+    def test_main_refuses_a_repo(self):
+        diff = self.tmp / "d.diff"
+        diff.write_text(SPEC["diff"])
+        with mock.patch.object(rps, "run", return_value=0) as run, \
+                mock.patch("sys.stderr") as err:
+            rc = rps.main(["--pr", "7", "--repo", "other/private", "--diff-file", str(diff),
+                           "--out", str(self.out)])
+        self.assertEqual(rc, 2)
+        run.assert_not_called()
+        self.assertIn("other/private", "".join(c.args[0] for c in err.write.call_args_list))
+
     def test_populate_stops_at_the_byte_cap(self):
         root = rps.review_dir()
         self.addCleanup(shutil.rmtree, root, True)
@@ -219,12 +230,79 @@ class InProcess(unittest.TestCase):
             self.assertIsNone(rps._gh(["pr", "diff", "7"]))
 
 
+# Synthetic values only; each names a repo or host the review must never reach.
+HOSTILE_ENV = {"GH_REPO": "o/priv", "GH_HOST": "ghe.invalid",
+               "GH_ENTERPRISE_TOKEN": "synthetic-not-a-token",
+               "GITHUB_ENTERPRISE_TOKEN": "synthetic-not-a-token",
+               "GIT_DIR": "/nonexistent/priv/.git", "GIT_WORK_TREE": "/nonexistent/priv"}
+
+
+class TaskMode(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="review-pr-task-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def mode(self, text):
+        f = self.tmp / "task.txt"
+        f.write_text(text)
+        return rps.task_mode(str(f))
+
+    def test_only_an_explicit_owner_tier_is_owner(self):
+        self.assertEqual(self.mode("id: t\naccess_tier: owner\ntask: review 7\n"), "owner")
+        self.assertEqual(self.mode("id: t\naccess_tier:  Owner \ntask: review 7\n"), "owner")
+
+    def test_absent_unknown_and_non_owner_tiers_are_non_owner(self):
+        for text in ("id: t\ntask: review 7\n",
+                     "id: t\naccess_tier: admin\ntask: review 7\n",
+                     "id: t\naccess_tier:\ntask: review 7\n",
+                     "id: t\naccess_tier: team\ntask: review 7\n",
+                     "id: t\naccess_tier: guest\ntask: review 7\n",
+                     "id: t\naccess_tier: other\ntask: review 7\n",
+                     "id: t\ntask: review 7\naccess_tier: owner\n",
+                     ""):
+            with self.subTest(text=text):
+                self.assertEqual(self.mode(text), "non-owner")
+
+    def test_an_unreadable_task_file_is_non_owner(self):
+        self.assertEqual(rps.task_mode(str(self.tmp / "missing.txt")), "non-owner")
+
+    def test_main_prints_the_mode(self):
+        f = self.tmp / "task.txt"
+        f.write_text("access_tier: owner\ntask: x\n")
+        with mock.patch("builtins.print") as out:
+            self.assertEqual(rps.main(["--task-mode", str(f)]), 0)
+        out.assert_called_once_with("owner")
+        with mock.patch("sys.stderr"):
+            self.assertEqual(rps.main(["--task-mode"]), 2)
+
+
+class GhEnv(unittest.TestCase):
+    def test_the_list_covers_every_target_var(self):
+        self.assertTrue(set(review_pr_fixture.TARGET_ENV) <= set(rps.GH_TARGET_ENV))
+
+    def test_gh_never_sees_a_repo_or_host_override(self):
+        tmp = Path(tempfile.mkdtemp(prefix="review-pr-ghenv-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        log = review_pr_fixture.install(tmp / "bin", SPEC)
+        with mock.patch.dict(os.environ, dict(HOSTILE_ENV,
+                                              PATH=f"{tmp / 'bin'}{os.pathsep}{os.environ['PATH']}")):
+            self.assertEqual(rps._gh(["pr", "diff", "7"]), SPEC["diff"])
+        self.assertEqual(Path(f"{log}.env").read_text().splitlines(), ["{}"])
+
+    def test_main_refuses_a_non_numeric_pr(self):
+        with mock.patch.object(rps, "run", return_value=0) as run, mock.patch("sys.stderr"):
+            for bad in ("-Ro/priv", "7x", "", "\u0667"):
+                with self.subTest(pr=bad):
+                    self.assertEqual(rps.main([f"--pr={bad}", "--diff-file", "d", "--out", "o"]), 2)
+        run.assert_not_called()
+
+
 class Script(unittest.TestCase):
-    def run_script(self, *args, command=None):
+    def run_script(self, *args, command=None, extra_env=None):
         tmp = Path(tempfile.mkdtemp(prefix="review-pr-test-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         bindir = tmp / "bin"
-        review_pr_fixture.install(bindir, SPEC)
+        self.gh_log = review_pr_fixture.install(bindir, SPEC)
         self.claude_log, self.codex_log = tmp / "claude.json", tmp / "codex.log"
         (bindir / "claude").write_text(FAKE_CLAUDE.format(log=str(self.claude_log)))
         (bindir / "codex").write_text(FAKE_CODEX.format(log=str(self.codex_log)))
@@ -233,8 +311,9 @@ class Script(unittest.TestCase):
         env = dict(os.environ, PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
         # Default order, but no fenced runner ready: the stub codex has no native
         # binary, and agy (possibly installed in ~/.local/bin) has no API key.
-        for k in ("SUTANDO_SANDBOX_RUNNERS", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        for k in ("SUTANDO_SANDBOX_RUNNERS", "GEMINI_API_KEY", "GOOGLE_API_KEY", *HOSTILE_ENV):
             env.pop(k, None)
+        env.update(extra_env or {})
         argv = ["bash", "-c", command] if command else ["bash", str(SCRIPT), "7", *args]
         return subprocess.run(argv, cwd=REPO, env=env,
                               capture_output=True, text=True, stdin=subprocess.DEVNULL,
@@ -254,10 +333,103 @@ class Script(unittest.TestCase):
         self.assertIn("--restricted", rec["argv"])
         self.assertFalse(cwd.exists(), "the review dir was not removed")
 
+    def test_non_owner_refuses_another_repo(self):
+        for target, extra in (("other/private#7", ()), ("7", ("--repo", "other/private"))):
+            with self.subTest(target=target):
+                argv = ["bash", str(SCRIPT), target, *extra, "--non-owner"]
+                p = self.run_script(command=" ".join(f"'{a}'" for a in argv))
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("--non-owner reviews only this checkout's repo", p.stderr)
+                self.assertIn("other/private", p.stderr)
+                self.assertNotIn("VERDICT-MARKER", p.stdout)
+                self.assertFalse(self.gh_log.exists(), "gh was called for a refused repo")
+                self.assertFalse(self.claude_log.exists())
+                self.assertFalse(self.codex_log.exists())
+
+    def test_non_owner_bare_number_uses_the_checkout_repo(self):
+        p = self.run_script("--non-owner")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        calls = self.gh_log.read_text().splitlines()
+        self.assertTrue(calls)
+        self.assertFalse(any("-R" in c.split() for c in calls), calls)
+
+    def test_owner_may_still_name_another_repo(self):
+        p = self.run_script(command=f"bash '{SCRIPT}' other/repo#7")
+        self.assertNotIn("reviews only this checkout's repo", p.stderr)
+        self.assertIn("pr diff -R other/repo 7", self.gh_log.read_text())
+        self.assertTrue(self.codex_log.exists())
+
     def test_owner_path_still_runs_codex(self):
         self.run_script()
         self.assertTrue(self.codex_log.exists(), "owner path no longer runs codex")
         self.assertFalse(self.claude_log.exists())
+
+    def gh_saw(self):
+        calls = self.gh_log.read_text().splitlines() if self.gh_log.exists() else []
+        envs = (Path(f"{self.gh_log}.env").read_text().splitlines()
+                if calls else [])
+        return calls, [json.loads(e) for e in envs]
+
+    def test_non_owner_ignores_gh_repo_and_host_env(self):
+        p = self.run_script("--non-owner", extra_env=HOSTILE_ENV)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("STUB REVIEW", p.stdout)
+        calls, envs = self.gh_saw()
+        self.assertTrue(calls)
+        self.assertEqual(envs, [{}] * len(calls), "gh saw a repo/host override")
+        self.assertFalse(any("o/priv" in c or "-R" in c.split() for c in calls), calls)
+        self.assertFalse(self.codex_log.exists())
+
+    def test_owner_mode_leaves_gh_env_alone(self):
+        self.run_script(extra_env={"GH_REPO": "o/mine"})
+        _, envs = self.gh_saw()
+        self.assertTrue(envs)
+        self.assertTrue(all(e == {"GH_REPO": "o/mine"} for e in envs), envs)
+
+    def _task(self, text):
+        d = Path(tempfile.mkdtemp(prefix="review-pr-taskf-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        (d / "task.txt").write_text(text)
+        return str(d / "task.txt")
+
+    def assert_non_owner_run(self, p):
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("STUB REVIEW", p.stdout)
+        self.assertFalse(self.codex_log.exists(), "codex ran for a non-owner task")
+        self.assertTrue(self.claude_log.exists())
+
+    def test_task_without_a_tier_defaults_to_non_owner(self):
+        t = self._task("id: t\nsource: discord\ntask: review PR 7\n")
+        p = self.run_script("--task-file", t, extra_env=HOSTILE_ENV)
+        self.assert_non_owner_run(p)
+        _, envs = self.gh_saw()
+        self.assertEqual(envs, [{}] * len(envs))
+
+    def test_task_with_an_unknown_or_non_owner_tier_is_non_owner(self):
+        for tier in ("admin", "team", "guest"):
+            with self.subTest(tier=tier):
+                t = self._task(f"id: t\naccess_tier: {tier}\ntask: review PR 7\n")
+                self.assert_non_owner_run(self.run_script("--task-file", t))
+
+    def test_missing_task_file_is_non_owner(self):
+        self.assert_non_owner_run(self.run_script("--task-file", "/nonexistent/task.txt"))
+
+    def test_owner_tier_task_gets_owner_mode(self):
+        t = self._task("id: t\naccess_tier: owner\ntask: review PR 7\n")
+        self.run_script("--task-file", t)
+        self.assertTrue(self.codex_log.exists(), "an owner task did not get owner mode")
+        self.assertFalse(self.claude_log.exists())
+
+    def test_non_owner_flag_beats_an_owner_task(self):
+        t = self._task("id: t\naccess_tier: owner\ntask: review PR 7\n")
+        self.assert_non_owner_run(self.run_script("--task-file", t, "--non-owner"))
+
+    def test_non_owner_task_refuses_another_repo_before_gh(self):
+        t = self._task("id: t\ntask: review o/priv#7\naccess_tier: owner\n")
+        p = self.run_script(command=f"bash '{SCRIPT}' o/priv#7 --task-file '{t}'")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("reviews only this checkout's repo", p.stderr)
+        self.assertFalse(self.gh_log.exists(), "gh was called for a refused repo")
 
     def test_team_rulebook_command_never_runs_codex(self):
         bridge = _load_bridge()
