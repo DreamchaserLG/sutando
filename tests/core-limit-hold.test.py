@@ -940,6 +940,16 @@ class WitnessFindings(unittest.TestCase):
         self.assertEqual(clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=str(self.switch)), [])
         self.assertIsNotNone(clh.active_hold(self.ws, self.now + 61))
 
+    def test_task_last_tiers_follow_the_shared_resolver(self):
+        from policy.egress.result import resolve_access_tier
+        for i, header in enumerate(("", "access_tier: owner\n", "access_tier: team\n",
+                                    "access_tier: other\n", "access_tier: guest\n")):
+            with self.subTest(header=header.strip() or "missing"):
+                path = self.ws / "tasks" / f"task-t{i}.txt"
+                path.write_text(f"id: task-t{i}\nsource: discord\n{header}task: retry now\n")
+                acted = clh._owner_action(path, self.ws) is not None
+                self.assertEqual(acted, resolve_access_tier(path) == "owner")
+
     def _orphan_verdicts(self, now):
         spec = importlib.util.spec_from_file_location(
             "orphan_classify_w", REPO / "skills" / "task-orphan-check" / "scripts" / "classify.py")

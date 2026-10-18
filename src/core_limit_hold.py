@@ -452,16 +452,18 @@ _RETRY = re.compile(r"^(?:please\s+)?retry(?:\s+now)?\s*[.!]?$", re.I)
 def _owner_action(path: Path, workspace: Path) -> Optional[tuple]:
     """("switch", model) or ("retry", None) for an owner's bare reply, else None."""
     from local_task_protocol import canonical_access_tier, sender_words, split_reply_context
+    from policy.egress.result import resolve_access_tier
     from task_envelope import attested_task_headers
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    if resolve_access_tier(path) != "owner":
+        return None
     parsed = attested_task_headers(text, workspace)
-    # A gateway file states its tier after `task:`; read without a verified envelope it has none.
-    mid = (parsed.headers.get("task_layout") or "").strip() == "mid"
-    tier = parsed.headers.get("access_tier") or (None if mid else "owner")
-    if tier is None or canonical_access_tier(tier) != "owner":
+    # A gateway file states its tier after `task:`, so it counts only when its envelope verifies.
+    if (parsed.headers.get("task_layout") or "").strip() == "mid" and \
+            canonical_access_tier(parsed.headers.get("access_tier") or "") != "owner":
         return None
     body = split_reply_context(sender_words(parsed))[1].strip()
     m = _SWITCH.match(body)
