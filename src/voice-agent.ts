@@ -647,8 +647,9 @@ function resolveCurrentMode(): ModeState {
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
-/** Skill tools that fetch the answer themselves: the relay agent's turn check leaves those turns alone. */
-const answeringTools = new Set(personalVoiceSurface.answeringTools);
+/** Tools that answer the turn themselves (skill fetches, and cancelling or checking tasks): the relay
+ *  agent's turn check leaves those turns alone, so "cancel that task" is never also sent to the core. */
+const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task', 'get_task_status', 'recent_context']);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the

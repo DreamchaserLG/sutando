@@ -582,6 +582,8 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
 		assert.match(agentSrc, /if \(answeringTools\.has\(e\.toolName\)\) relayAgent\.noteAnsweringTool\(e\.toolName\)/);
+		// Live 10-18: "cancel that task" was cancelled by cancel_task and also sent to the core as a new task.
+		assert.match(agentSrc, /const answeringTools = new Set\(\[\.\.\.personalVoiceSurface\.answeringTools, 'cancel_task', 'get_task_status', 'recent_context'\]\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
 		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
 	});
