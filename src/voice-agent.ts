@@ -330,6 +330,9 @@ console.log(
 	} mediaResolution=${VOICE_SESSION_TUNING.mediaResolution ?? 'unset'}`,
 );
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
+/** bodhi's echo guard drops the model's own voice picked up by the mic, so speaker playback does not
+ *  cut its own turn short. On unless VOICE_ECHO_GUARD=0 (bodhi's BODHI_ECHO_GUARD=0 also turns it off). */
+const VOICE_ECHO_GUARD = process.env.VOICE_ECHO_GUARD !== '0';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
 // Lazy-load Cartesia TTS only when a key is set. This means Gemini-only
@@ -1059,6 +1062,7 @@ async function main() {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
+		echoGuard: { enabled: VOICE_ECHO_GUARD },
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
 		orchestrationMode: 'actor',
