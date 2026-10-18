@@ -59,8 +59,8 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
   transaction: create and fsync the empty ledger, create and fsync `claims/`, write `state/format`
   (`cloud-session/1`) last by temp + fsync + rename, then fsync `state/`, `$CLOUD_WORK` and its
   parent; an interrupted init completes on the next start. With the marker, `state/` may hold only
-  `format`, `claims/`, `settled-ids`, `rate.jsonl` and `done`, and the ledger and `claims/` must
-  exist; anything else refuses naming it.
+  `format`, `claims/`, `settled-ids`, `rate.jsonl`, `done` and `collaborator-turns.json` (a plain
+  file when present), and the ledger and `claims/` must exist; anything else refuses naming it.
 - **Probe.** Rename and hard link must work in `results/` and `state/`, else exit 2.
 
 ## Setup (once)
@@ -113,9 +113,35 @@ DM."; with no `owner_dm`, such an answer becomes "I can't answer that here." in 
 else. The whole text is at most 65,536 characters; only the body is cut, ending in
 `[truncated]`. A task with no room is not queued.
 
-**Non-owner tiers are refused by default**, with the routine adapter's plain line ("This agent only
-answers its owner here."): the session holds the owner's connector and there is no narrower scope.
-`--allow-non-owner` queues them anyway, bounded only by the note and the standing instructions.
+**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
+an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) is refused with the routine adapter's plain line ("This agent
+only answers its owner here.") unless `--allow-non-owner` is passed, which queues such tasks into this
+session anyway — the owner's history and connector, bounded only by the note and the standing
+instructions. An attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed
+headers, never the message text) never enters this session: with `--allow-collaborator` it is served on
+an isolated local turn; without it, it gets the same refusal line. `--allow-non-owner` does not imply
+`--allow-collaborator`. The owner path is unchanged.
+
+**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config
+--no-session-persistence --tools Read,Grep,Glob --output-format json` with the routine adapter's payload on
+stdin (one lead line naming the situation, then the note, `collaborator=true`; not this session's reminder,
+no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed afterwards, with the same
+five-variable environment as above and this adapter's `--timeout`. What it can reach: the CLI's login and
+the three read tools over an empty directory. What it cannot: this session (no `--cloud`, no session id, no
+`--resume`, and the turn itself is never saved, so nothing can resume it), its history and connector, Bash
+or code-running tools, the web, MCP servers, CLAUDE.md, hooks, skills, settings, or the work dir. The JSON
+`result` string becomes the task's result as **inert text**: every result-delivery marker the shared parser
+knows (`[no-send]`, `[REPLIED]`, `[deduped:]`, `[channel:]`, `[thread:]`, `[thread]`, `[reply:]`,
+`[dm-only]`, `[file:]`/`[send:]`/`[attach:]`) is quoted in the parser's own form (`[ no-send]`) before
+publication and checked by the parser again, so the gateway executes nothing from it and posts it once in
+the originating room. Any failure (non-zero exit, no `result`, timeout, no temp dir, missing CLI) gets "This
+message could not be sent to the cloud agent right now." — one try, no retry. The turn runs inside the same
+claim/journal/ledger lifecycle as a queued turn, recorded as a `final` outcome, so it is never charged to
+`--max-per-hour` or `--min-gap-seconds`; its own cap is `--max-collaborator-per-hour` (1 or more, default
+10, `state/collaborator-turns.json`, part of this adapter's state contract), and its own gate: a
+collaborator waits only on that cap, never on the session's cap, hold or gap, and an owner task never waits
+on the collaborator cap. The adapter log shows `collaborator turn ->` instead of `queue ->`.
 
 ## Results
 
