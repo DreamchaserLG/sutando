@@ -13,7 +13,7 @@ const PRESENT = existsSync(join(process.cwd(), 'skills', 'ag2space-voice', 'edit
 if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 if (PRESENT) {
-const { applyEdits, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
+const { applyEdits, editsForLog, fileRefs, newFileRefs, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
 type PlanEdits = Parameters<typeof editProjectFile>[2];
 
 const FILE = '#set text(fill: black)\n= My Title\nBody text.\n';
@@ -93,6 +93,17 @@ describe('edit_project_file', () => {
 		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
 	});
 
+	it('an edit that pulls in a file nobody named is not written: the build would not find it', async () => {
+		const f = fake();
+		const orange: PlanEdits = async () => ({ ok: true, edits: [{ old_text: 'Body text.', new_text: 'Body text.\n#figure(image("orange.png"), caption: [An orange.])' }], summary: 's' });
+		const r = await editProjectFile({ ...ARGS, instruction: 'add a figure of an orange' }, f.deps, orange) as { error: string; detail?: string };
+		assert.equal(r.error, 'missing_file');
+		assert.match(r.detail ?? '', /orange\.png/);
+		assert.equal(f.calls.filter(c => c.name === 'room.action.execute').length, 0);
+		const named = fake();
+		assert.ok((await editProjectFile({ ...ARGS, instruction: 'add a figure using orange.png' }, named.deps, orange)).ok, 'the user named it');
+	});
+
 	it('a folder project is passed through when given', async () => {
 		const f = fake();
 		await editProjectFile({ ...ARGS, project: 'ab12cd34' }, f.deps, greenTitle);
@@ -120,6 +131,27 @@ describe('the edits and the editor\'s answer', () => {
 		assert.match(p, /Instruction: make the title green/);
 		assert.match(p, /<<<FILE\n#set text/);
 		assert.match(p, /could not be applied: edit 1/);
+		assert.match(p, /Never reference a file the project may not have/);
+		assert.match(p, /\{"error":"<which file is missing/);
+	});
+
+	it('file references are found in Typst and LaTeX', () => {
+		assert.deepEqual([...fileRefs('#image("a.png") #include "ch1.typ" #import "t.typ": x #bibliography("refs.bib")')], ['a.png', 'refs.bib', 'ch1.typ', 't.typ']);
+		assert.deepEqual([...fileRefs('\\includegraphics[width=3cm]{fig/b.pdf} \\input{intro} \\bibliography{a,b}')], ['fig/b.pdf', 'intro', 'a', 'b']);
+		assert.deepEqual(newFileRefs('image("apple.png")', 'image("apple.png") image("pear.png")', 'add a pear'), ['pear.png']);
+		assert.deepEqual(newFileRefs('image("apple.png")', 'image("apple.png", width: 40%)', 'shrink it'), []);
+	});
+
+	it('the log shows what each edit changed, long text cut', () => {
+		assert.equal(editsForLog([{ old_text: 'a', new_text: 'b' }]), '"a" → "b"');
+		assert.match(editsForLog([{ old_text: 'x'.repeat(300), new_text: 'y' }]), /^"x{120}…\(300\)" → "y"$/);
+	});
+
+	it('the logged line names the edits it applied', async () => {
+		const logs: string[] = [];
+		const f = fake();
+		await editProjectFile(ARGS, { ...f.deps, log: (m: string) => { logs.push(m); } }, greenTitle);
+		assert.ok(logs.some(l => l.includes('"= My Title" → "#text(fill: green)[= My Title]"')), logs.join('\n'));
 	});
 });
 

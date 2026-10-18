@@ -30,6 +30,29 @@ export type EditFileResult =
 export const EDIT_DONE_NEXT = 'Done. Tell the user in one sentence what you changed ("I have …"), in which file.';
 export const EDIT_NOT_DONE_NEXT = 'Nothing was changed. Tell the user in a sentence what went wrong; do not say it is done.';
 
+/** Files a Typst or LaTeX source pulls in: image("…"), #include/#import "…", bibliography("…"), \\includegraphics{…}, \\input{…}… */
+const FILE_REF_RES = [
+	/\b(?:image|bibliography|read|csv|json|yaml|toml|xml|cbor)\(\s*"([^"]+)"/g,
+	/#(?:include|import)\s+"([^"]+)"/g,
+	/\\(?:includegraphics|input|include|bibliography|addbibresource|lstinputlisting)\*?(?:\[[^\]]*\])?\{([^}]+)\}/g,
+];
+export function fileRefs(text: string): Set<string> {
+	const out = new Set<string>();
+	for (const re of FILE_REF_RES) for (const m of text.matchAll(re)) for (const f of m[1].split(',')) if (f.trim()) out.add(f.trim());
+	return out;
+}
+/** A file the edit references that the file did not and the user did not name: it would not be found in the build. */
+export function newFileRefs(before: string, after: string, instruction: string): string[] {
+	const had = fileRefs(before);
+	return [...fileRefs(after)].filter((f) => !had.has(f) && !instruction.includes(f));
+}
+
+/** The edits for the local log: each side cut, so a refusal or a broken build can be traced to what was sent. */
+export function editsForLog(edits: readonly Edit[]): string {
+	const cut = (t: string) => JSON.stringify(t.length > 120 ? `${t.slice(0, 120)}…(${t.length})` : t);
+	return edits.map((e) => `${cut(e.old_text)} → ${cut(e.new_text)}`).join('; ');
+}
+
 /** Each edit's old_text must occur exactly once in the text the edits before it left. */
 export function applyEdits(text: string, edits: readonly Edit[]): { ok: true; text: string } | { ok: false; problem: string } {
 	let out = text;
@@ -50,7 +73,9 @@ export function editPlanPrompt(input: Parameters<PlanEdits>[0]): string {
 		'Reply with JSON only:',
 		'{"edits":[{"old_text":"…","new_text":"…"}],"summary":"<what you changed, one short sentence in the instruction\'s language>"}',
 		'Each old_text is copied exactly from the file (whitespace included), long enough to occur exactly once, and no longer than that needs.',
-		'If the instruction cannot be done on this file: {"error":"<one sentence why>"}.',
+		'Never reference a file the project may not have (an image, a .bib, an #include or #import) unless this file already references it or the instruction gives its exact name: an invented file name breaks the build.',
+		'If the instruction needs such a file (a picture of something, a new bibliography), reply {"error":"<which file is missing, in the instruction\'s language>"}: the user uploads it first. Do not put a drawing, a shape or a placeholder in its place unless the instruction asks you to draw it.',
+		'If the instruction cannot be done on this file for another reason: {"error":"<one sentence why>"}.',
 		`File "${input.title}":`,
 		'<<<FILE',
 		input.text,
@@ -120,15 +145,23 @@ export async function editProjectFile(
 		if (read.result.next_offset != null) return { ok: false, error: 'file_too_long', done: false, next: EDIT_NOT_DONE_NEXT };
 		if (!hash) return { ok: false, error: 'no_content_hash', done: false, next: EDIT_NOT_DONE_NEXT };
 		const p = await plan({ title, text, instruction, problem });
-		if (!p.ok) return { ok: false, error: 'cannot_edit', detail: p.error, done: false, next: EDIT_NOT_DONE_NEXT };
+		if (!p.ok) {
+			deps.log?.(`[EditFile] ${title || kind}: not edited: ${p.error}`);
+			return { ok: false, error: 'cannot_edit', detail: p.error, done: false, next: EDIT_NOT_DONE_NEXT };
+		}
 		const fit = applyEdits(text, p.edits);
 		if (!fit.ok) { problem = fit.problem; continue; }
+		const missing = newFileRefs(text, fit.text, instruction);
+		if (missing.length) {
+			deps.log?.(`[EditFile] ${title || kind}: not edited: references ${missing.join(', ')}, which the project may not have`);
+			return { ok: false, error: 'missing_file', detail: `The change needs ${missing.join(', ')}, which this file does not use yet; the user uploads it to the project first, or asks for a drawing instead.`, done: false, next: EDIT_NOT_DONE_NEXT };
+		}
 		const summary = p.summary || instruction;
 		const r = await roomExecute(client, room, 'room.commons.changes.apply', {
 			project, message: summary.slice(0, 500), files: [{ page_id: kind, base_hash: hash, edits: p.edits }],
 		}, deps, { operationId });
 		if (r.ok) {
-			deps.log?.(`[EditFile] ${title || kind} in ${room.name}: ${p.edits.length} edit(s) in ${Date.now() - t0}ms`);
+			deps.log?.(`[EditFile] ${title || kind} in ${room.name}: ${p.edits.length} edit(s) in ${Date.now() - t0}ms: ${editsForLog(p.edits)}`);
 			return { ok: true, room: room.name, title, summary, edits: p.edits.length, ms: Date.now() - t0, next: EDIT_DONE_NEXT };
 		}
 		if (r.error === OUTCOME_UNKNOWN) return r;
@@ -147,7 +180,7 @@ export function createEditFileTool(deps: ReadRoomDeps, plan: PlanEdits = geminiP
 			'Never pass the file\'s text: this tool reads the file and writes the change itself. Call it at once: do not read the change back or ask for a yes. ' +
 			'Pass `project` (the folder id) only when a previous call\'s `detail` says the file belongs to a folder project. ' +
 			'Returns {ok:true, title, summary} — then tell the user in one sentence what you changed ("I have …"); never say it is done before ok:true. ' +
-			'Errors: "cannot_edit" — `detail` says why; "file_too_long" — too long to change by voice; "no_file" — the kind is not a file kind; ' + ROOM_NAME_ERRORS +
+			'Errors: "cannot_edit" — `detail` says why: say it to the user; "missing_file" — the change needs a file (a picture…) the project may not have: say which, and that they can upload it or ask you to draw it instead; "file_too_long" — too long to change by voice; "no_file" — the kind is not a file kind; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" — you may not change it there; "not_connected", "timeout" or "unavailable" — it could not be done right now; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			kind: z.string().describe('The file\'s kind from a search_commons hit, e.g. "markdown-qop83g48".'),
