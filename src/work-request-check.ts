@@ -158,8 +158,21 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	return { action: 'none' };
 }
 
-/** One generateContent call: thinking off, JSON out. Null on any failure, logged. */
-async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: number; prompt: string; signal?: AbortSignal; log?: (m: string) => void; what: string }): Promise<string | null> {
+/** Where a check prompt's instructions end and the turn being judged begins. */
+const INPUT_MARK = '\nRecent words (oldest first):';
+
+/** The instructions go in as the system instruction and the turn as the user message: sent as one block,
+ *  the rules together tripped Gemini's prompt filter (PROHIBITED_CONTENT) on harmless requests. */
+export function checkRequestBody(prompt: string): Record<string, unknown> {
+	const at = prompt.indexOf(INPUT_MARK);
+	const contents = (text: string) => [{ role: 'user', parts: [{ text }] }];
+	return at > 0
+		? { systemInstruction: { parts: [{ text: prompt.slice(0, at) }] }, contents: contents(prompt.slice(at + 1)) }
+		: { contents: contents(prompt) };
+}
+
+/** One generateContent call: thinking off, JSON out. Null text on any failure, logged; `blocked` when Gemini's filter refused the prompt. */
+async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: number; prompt: string; signal?: AbortSignal; log?: (m: string) => void; what: string }): Promise<{ text: string | null; blocked: boolean }> {
 	const ctl = new AbortController();
 	const timer = setTimeout(() => ctl.abort(), opts.timeoutMs);
 	opts.signal?.addEventListener('abort', () => ctl.abort(), { once: true });
@@ -169,23 +182,25 @@ async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: numb
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': opts.apiKey },
 			body: JSON.stringify({
-				contents: [{ parts: [{ text: opts.prompt }] }],
+				...checkRequestBody(opts.prompt),
 				// A thinking model spends the output budget on thinking and returns a cut-off "{"action":" (seen 2026-10-12):
 				// thinking off, JSON out.
 				generationConfig: { maxOutputTokens: 300, temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } },
 			}),
 			signal: ctl.signal,
 		});
-		const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
+		const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>; error?: { message?: string }; promptFeedback?: { blockReason?: string } };
 		const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
 		if (!text) {
-			opts.log?.(`[RelayAgent] ${opts.what} gave no answer (${data.error?.message ?? 'empty'})`);
-			return null;
+			const blocked = data.promptFeedback?.blockReason;
+			const why = blocked ? `blocked by Gemini's prompt filter: ${blocked}` : data.error?.message ?? `empty, finish ${data.candidates?.[0]?.finishReason ?? 'none'}`;
+			opts.log?.(`[RelayAgent] ${opts.what} gave no answer (${why})`);
+			return { text: null, blocked: !!blocked };
 		}
-		return text;
+		return { text, blocked: false };
 	} catch (err) {
 		opts.log?.(`[RelayAgent] ${opts.what} failed (${err instanceof Error ? err.message : String(err)})`);
-		return null;
+		return { text: null, blocked: false };
 	} finally {
 		clearTimeout(timer);
 	}
@@ -197,9 +212,13 @@ export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; 
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'submit' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input, opts.ownRules), signal, log: opts.log, what: 'work check' });
-		if (text === null) return { action: 'submit' };
-		const verdict = parseWorkCheck(text, input.openTasks, !!opts.ownRules?.length);
+		const ask = (rules?: readonly string[]) => geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input, rules), signal, log: opts.log, what: 'work check' });
+		let r = await ask(opts.ownRules);
+		let rules = opts.ownRules;
+		// Still filtered: once more without the surface's rules, so duplicates and asks are still caught.
+		if (r.text === null && r.blocked && opts.ownRules?.length) { rules = undefined; r = await ask(); }
+		if (r.text === null) return { action: 'submit' };
+		const verdict = parseWorkCheck(r.text, input.openTasks, !!rules?.length);
 		opts.log?.(`[RelayAgent] work check: ${verdict.action}${verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : ''} in ${Date.now() - t0}ms`);
 		return verdict;
 	};
@@ -211,9 +230,11 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'none' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, opts.extraRules), signal, log: opts.log, what: 'turn check' });
-		if (text === null) return { action: 'none' };
-		const verdict = parseTurnVerdict(text, input.openTasks);
+		const ask = (rules?: readonly string[]) => geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, rules), signal, log: opts.log, what: 'turn check' });
+		let r = await ask(opts.extraRules);
+		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
+		if (r.text === null) return { action: 'none' };
+		const verdict = parseTurnVerdict(r.text, input.openTasks);
 		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;

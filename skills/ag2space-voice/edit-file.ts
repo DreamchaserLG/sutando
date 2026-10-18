@@ -54,6 +54,27 @@ export function editsForLog(edits: readonly Edit[]): string {
 	return edits.map((e) => `${cut(e.old_text)} → ${cut(e.new_text)}`).join('; ');
 }
 
+const FIGURE_RE = /#figure\(|\\begin\{figure\*?\}/g;
+/** The user asked to take something out: only then may an edit drop a figure. */
+export const REMOVE_RE = /\b(delete|remove|replace|swap|drop|instead|get rid|change|turn)\b|删|去掉|换|替换|改成|移除|不要/i;
+
+/** The user asked for something more: an existing figure must then survive the edit unchanged. */
+export const ADD_RE = /\b(add|another|new|insert|append|more|also)\b|再|加|新|插入|另/i;
+
+/** An edit that drops a figure the instruction did not ask to remove: "add another figure" once replaced the last one. */
+export function droppedFigure(edits: readonly Edit[], instruction: string): string | null {
+	if (REMOVE_RE.test(instruction)) return null;
+	for (const [i, e] of edits.entries()) {
+		const before = (e.old_text.match(FIGURE_RE) ?? []).length;
+		const after = (e.new_text.match(FIGURE_RE) ?? []).length;
+		if (after < before) return `edit ${i + 1} removes an existing figure the instruction did not ask to remove: keep its old_text unchanged at the start of new_text and add after it`;
+		if (before > 0 && !e.new_text.includes(e.old_text) && after === before && ADD_RE.test(instruction)) {
+			return `edit ${i + 1} rewrites an existing figure the instruction did not ask to change: keep its old_text unchanged at the start of new_text and add the new figure after it`;
+		}
+	}
+	return null;
+}
+
 /** Each edit's old_text must occur exactly once in the text the edits before it left. */
 export function applyEdits(text: string, edits: readonly Edit[]): { ok: true; text: string } | { ok: false; problem: string } {
 	let out = text;
@@ -79,6 +100,7 @@ export function editPlanPrompt(input: Parameters<PlanEdits>[0]): string {
 		'Reply with JSON only:',
 		'{"edits":[{"old_text":"…","new_text":"…"}],"summary":"<what you changed, one short sentence in the instruction\'s language>"}',
 		'Each old_text is copied exactly from the file (whitespace included), long enough to occur exactly once, and no longer than that needs.',
+		'To add something (a figure, a sentence, a section) after existing text, new_text starts with that old_text unchanged: never drop or rewrite existing content the instruction did not ask to change.',
 		'Never reference a file the project may not have (an image, a .bib, an #include or #import) unless this file already references it or the instruction gives its exact name: an invented file name breaks the build.',
 		'If the instruction needs such a file (a picture of something, a new bibliography), reply {"error":"<which file is missing, in the instruction\'s language>"}: the user uploads it first. Do not put a drawing, a shape or a placeholder in its place unless the instruction asks you to draw it.',
 		'When the instruction asks you to draw something ("draw a mushroom", "画一个蘑菇"), draw it in the file with the language\'s own shapes (Typst: circle, ellipse, rect, polygon, path, curve with fill colors; LaTeX: TikZ when the file loads it), recognisable and simple, inside the figure the instruction names.',
@@ -199,6 +221,8 @@ export async function editProjectFile(
 		}
 		const fit = applyEdits(text, p.edits);
 		if (!fit.ok) { problem = fit.problem; continue; }
+		const dropped = droppedFigure(p.edits, instruction);
+		if (dropped) { deps.log?.(`[EditFile] ${title || kind}: planned again: ${dropped}`); problem = dropped; continue; }
 		const missing = newFileRefs(text, fit.text, instruction);
 		if (missing.length) {
 			deps.log?.(`[EditFile] ${title || kind}: not edited: references ${missing.join(', ')}, which the project may not have`);

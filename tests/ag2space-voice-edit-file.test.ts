@@ -13,7 +13,7 @@ const PRESENT = existsSync(join(process.cwd(), 'skills', 'ag2space-voice', 'edit
 if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 if (PRESENT) {
-const { applyEdits, editsForLog, fileRefs, newFileRefs, EDIT_REVERTED_NEXT, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
+const { applyEdits, droppedFigure, editsForLog, fileRefs, newFileRefs, EDIT_REVERTED_NEXT, parseEditPlan, editPlanPrompt, editProjectFile, createEditFileTool, EDIT_FILE_PROMPT_RULE, EDIT_DONE_NEXT, EDIT_NOT_DONE_NEXT } = await import('../skills/ag2space-voice/edit-file.ts');
 type PlanEdits = Parameters<typeof editProjectFile>[2];
 
 const FILE = '#set text(fill: black)\n= My Title\nBody text.\n';
@@ -176,6 +176,33 @@ describe('the edits and the editor\'s answer', () => {
 		assert.deepEqual(applyEdits('a b a', [{ old_text: 'b', new_text: 'c' }]), { ok: true, text: 'a c a' });
 		assert.equal(applyEdits('a b a', [{ old_text: 'a', new_text: 'x' }]).ok, false);
 		assert.deepEqual(applyEdits('ab', [{ old_text: 'a', new_text: 'z' }, { old_text: 'zb', new_text: 'y' }]), { ok: true, text: 'y' });
+	});
+
+	it('adding a figure may not drop or rewrite an existing one; removing or replacing may', () => {
+		const fig3 = '#figure(circle(radius: 20pt, fill: red), caption: [A mushroom cap.]) <fig3>';
+		const puppy = '#figure(circle(radius: 15pt, fill: gray), caption: [A puppy.]) <fig4>';
+		assert.match(droppedFigure([{ old_text: fig3, new_text: puppy }], '再画一个 figure，是一只小狗') ?? '', /rewrites an existing figure/);
+		assert.match(droppedFigure([{ old_text: `\n\n${fig3}`, new_text: '' }], 'add a figure of a tree') ?? '', /removes an existing figure/);
+		assert.equal(droppedFigure([{ old_text: fig3, new_text: `${fig3}\n\n${puppy}` }], 'draw another figure, a puppy'), null);
+		assert.equal(droppedFigure([{ old_text: `\n\n${fig3}`, new_text: '' }], 'delete figure 3'), null);
+		assert.equal(droppedFigure([{ old_text: fig3, new_text: puppy }], '把 figure 3 换成一只小狗'), null);
+		assert.equal(droppedFigure([{ old_text: fig3, new_text: fig3.replace('red', 'blue') }], 'make figure 3 blue'), null);
+	});
+
+	it('a plan that drops a figure is planned again with the reason', async () => {
+		const problems: Array<string | undefined> = [];
+		let n = 0;
+		const plan: PlanEdits = async (i) => {
+			problems.push(i.problem);
+			return n++ === 0
+				? { ok: true, edits: [{ old_text: '#figure(image("orange.png"), caption: [An orange.]) <fig3>', new_text: '#figure(circle(radius: 5pt), caption: [A dot.]) <fig4>' }], summary: 's' }
+				: { ok: true, edits: [{ old_text: '#figure(image("orange.png"), caption: [An orange.]) <fig3>', new_text: '#figure(image("orange.png"), caption: [An orange.]) <fig3>\n#figure(circle(radius: 5pt), caption: [A dot.]) <fig4>' }], summary: 's' };
+		};
+		const f = fake(undefined, [{ text: '= Results\n#figure(image("orange.png"), caption: [An orange.]) <fig3>\n', hash: 'h1' }]);
+		const r = await editProjectFile({ ...ARGS, instruction: 'draw another figure, a dot' }, f.deps, plan);
+		assert.ok(r.ok, JSON.stringify(r));
+		assert.match(problems[1] ?? '', /rewrites an existing figure/);
+		assert.match(f.calls.filter(c => c.name === 'room.action.execute').map(c => JSON.stringify(c.args)).join(''), /orange\.png[\s\S]*A dot/);
 	});
 
 	it('the answer is parsed strictly', () => {
