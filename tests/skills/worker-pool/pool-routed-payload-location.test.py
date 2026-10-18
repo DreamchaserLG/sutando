@@ -440,13 +440,16 @@ def _main_tree(dest: Path) -> "Path | None":
     """origin/main's own src/ and scripts/, unpacked: the artifacts a host runs until it
     restarts them. None when this checkout has no main ref to read them from."""
     for ref in ("origin/main", "main"):
-        if subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref + "^{commit}"],
-                          capture_output=True).returncode == 0:
+        sha = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--verify", "-q", ref + "^{commit}"],
+                             capture_output=True, text=True)
+        if sha.returncode == 0:
             arc = subprocess.run(["git", "-C", str(REPO), "archive", ref, "src", "scripts"], capture_output=True)
             if arc.returncode != 0:
                 return None
             dest.mkdir(parents=True)
             subprocess.run(["tar", "-x", "-C", str(dest)], input=arc.stdout, check=True)
+            # The CI runner shows only `Results:` lines; this one proves these suites ran.
+            print(f"\nResults: rolling-upgrade suite ran against {ref} {sha.stdout.strip()[:12]}", flush=True)
             return dest
     return None
 
@@ -584,7 +587,10 @@ class ResolvedAnnouncement(unittest.TestCase):
     def main_tree(self):
         tree = _main_tree(Path(self.td.name) / "main")
         if tree is None:
-            self.skipTest("no main ref in this checkout to unpack main's watcher and notifiers from")
+            why = "no main ref in this checkout to unpack main's watcher and notifiers from"
+            if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+                self.fail(why + " (CI must fetch it, so a skip cannot pass here)")
+            self.skipTest(why)
         return tree
 
     def test_mains_watcher_with_this_resolver_announces_the_body_by_its_task_name(self):
