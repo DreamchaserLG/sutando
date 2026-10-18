@@ -511,6 +511,9 @@ export interface RelayAgentDeps<O = unknown> {
 /** After the user was asked about a request, the next call within this window is sent as it is. */
 export const ONE_ASK_WINDOW_MS = 2 * 60_000;
 
+/** Said right after a request reaches the core: the open `work` call returns its result later. */
+export const WORK_ACKNOWLEDGE = 'The request was sent to the core and is being worked on; its result comes back later as the answer to that work call. Tell the user in one short sentence that you are on it, then carry on with the conversation. Do not call work again for it.';
+
 /** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
 export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
 
@@ -723,9 +726,13 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
 		if (replaces) this.supersede(taskId, replaces);
 
-		// The ordinary case says nothing now (the open call returns the result); a queue position or an offline core is said at once.
+		// The user hears at once that it is being done. gemini-3.8-live says nothing before or after a
+		// NON_BLOCKING call while it waits for that call's response (2026-10-17 on the test Mac: the call
+		// turn ended silent; Yixuan's probe saw the same), and the old fake first response that made it
+		// speak closed the call. So the acknowledgement is a separate system notice: the call stays open.
+		// A queue position or an offline core is said instead of the plain acknowledgement.
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
-		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
+		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
 		if (signal?.aborted) return framedSystem(ENDED.continuing);
 		return new Promise<string>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };

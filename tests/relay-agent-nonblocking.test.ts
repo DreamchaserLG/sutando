@@ -108,3 +108,36 @@ test('an open call returns its result as that call\'s own response (no fake firs
 	assert.match(text, /TASK_RESULT_START/);
 	assert.match(text, /three findings/);
 });
+
+test('a submitted request is acknowledged at once by a separate notice; the call stays open', async () => {
+	const notices: string[] = [];
+	const store = createVoiceTaskStore();
+	const relay = new RelayAgent({
+		store,
+		submit: async () => { store.add('task-ack', 'draw a cat'); return { status: 'pending', taskId: 'task-ack', queuedAhead: 0, watcherOnline: true, message: 'ignored' }; },
+		notice: (t) => notices.push(t),
+	});
+	let settled = false;
+	const call = relay.invoke('work', { task: 'draw a cat' }).then((r) => { settled = true; return r; });
+	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(notices.length, 1, 'one acknowledgement');
+	assert.match(notices[0], /Tell the user in one short sentence that you are on it/);
+	assert.equal(settled, false, 'the acknowledgement does not close the call');
+	relay.offerResult({ taskId: 'task-ack', text: 'the cat is drawn' });
+	assert.match(await call, /the cat is drawn/);
+});
+
+test('a queued request is acknowledged with its queue position instead', async () => {
+	const notices: string[] = [];
+	const store = createVoiceTaskStore();
+	const relay = new RelayAgent({
+		store,
+		submit: async () => { store.add('task-q', 'draw a dog'); return { status: 'pending', taskId: 'task-q', queuedAhead: 1, watcherOnline: true, message: 'Tell the user exactly "Got it, right after the one I\'m on."' }; },
+		notice: (t) => notices.push(t),
+	});
+	void relay.invoke('work', { task: 'draw a dog' });
+	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(notices.length, 1);
+	assert.match(notices[0], /right after the one I'm on/);
+	relay.endAllCalls('continuing');
+});

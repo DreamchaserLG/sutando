@@ -58,7 +58,7 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		assert.equal(relay.isWaiting('task-3'), false);
 	});
 
-	it('a queue position or an offline core is said at submission; the ordinary case says nothing extra', async () => {
+	it('a queue position or an offline core is said at submission; the ordinary case gets the plain acknowledgement', async () => {
 		const ahead = agent(pending('task-4', { queuedAhead: 2, message: 'Got it, 2 in line.' }));
 		void ahead.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
@@ -67,7 +67,9 @@ describe('relay agent subagent: the work call returns its task\'s result', () =>
 		const plain = agent(pending('task-5'));
 		void plain.relay.invoke('w', {}).catch(() => {});
 		await tick(0);
-		assert.equal(plain.notices.length, 0);
+		// gemini-3.8-live stays silent while a NON_BLOCKING call is open: the acknowledgement is a notice of its own.
+		assert.equal(plain.notices.length, 1);
+		assert.match(plain.notices[0], /Tell the user in one short sentence that you are on it/);
 	});
 
 	it('an aborted call ends without a failure (bodhi would read a rejection out as one); the result goes another way', async () => {
