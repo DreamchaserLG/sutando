@@ -42,7 +42,8 @@ Codex assigns new conversation IDs itself. Until its assigned ID is captured,
 the worker's `runtime_session_id` is `null`, `--resume` refuses, and recovery
 starts a fresh Codex conversation with the same worker ID and inbox. The
 notifier resolves delivery sentinels to their payloads (the `<task id>.body` the
-router wrote beside the sentinel) and keys the task by its `<task id>.txt` name, never the body's;
+router wrote beside the sentinel; the watcher announces it as `TASK_PAYLOAD: <body>` then
+`TASK_FILE: <task id>.txt`) and keys the task by its `<task id>.txt` name, never the body's;
 it writes results to shared `results/<task id>.txt`, and records
 the worker's done flag.
 If the worker dies mid-turn, recovery re-delivers the task in that fresh
@@ -158,7 +159,8 @@ sentinel as `<task id>.body` (body first, then the sentinel) and removes the `ta
 copy once every recipient holds one, so `tasks/` lists the core's own work and
 nothing routed. Never list `tasks/` to find work, and never answer a task file you
 found there: the result would be posted as a reply in a room bound to someone else.
-A finished body is archived to `tasks/archive/` by the pool's own prune; a withdrawn
+A finished body is archived to `tasks/archive/` by the pool's own prune (an archive name already
+holding anything but that same body keeps the body and its sentinel); a withdrawn
 hold (`clear_pending`) puts it back in `tasks/` for the core. The watcher's `QUEUE: n pending after this`
 counts your inbox, and that count is the only queue you have.
 

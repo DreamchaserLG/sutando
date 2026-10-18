@@ -81,6 +81,38 @@ class AnnouncedEntry(_Workspace):
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
             self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
+    def test_a_payload_beside_the_name_keys_by_the_name_and_reads_the_payload(self):
+        body = self.inbox / "task-abc.body"
+        body.write_text("id: task-abc\n")
+        self.assertEqual(td.announced_entry(self.inbox, "task-abc.txt", payload=str(body)),
+                         ("task-abc.txt", body))
+        self.assertEqual(td.announced_entry(self.inbox, "task-abc.txt", payload=str(self.payload),
+                                            payload_dir=self.ws / "tasks"), ("task-abc.txt", self.payload))
+
+    def test_a_payload_line_is_refused_unless_name_and_file_are_both_sound(self):
+        body = self.inbox / "task-abc.body"
+        body.write_text("id: task-abc\n")
+        link = self.inbox / "task-link.body"
+        link.symlink_to(body)
+        other = self.ws / "elsewhere"
+        other.mkdir()
+        (other / "task-abc.body").write_text("x\n")
+        cases = [("task-abc.body", str(body)), ("sub/task-abc.txt", str(body)), (".task-abc.txt", str(body)),
+                 ("task-abc.txt", "task-abc.body"), ("task-abc.txt", f"{self.inbox}/../w1/task-abc.body"),
+                 ("task-abc.txt", str(link)), ("task-abc.txt", str(self.inbox / "task-none.body")),
+                 ("task-abc.txt", str(self.inbox)), ("task-abc.txt", str(other / "task-abc.body")),
+                 ("task-abc.txt", str(self.payload))]  # tasks/ is accepted only with payload_dir
+        for name, payload in cases:
+            self.assertIsNone(td.announced_entry(self.inbox, name, payload=payload), (name, payload))
+
+    def test_the_cli_passes_a_payload_line_through(self):
+        body = self.inbox / "task-abc.body"
+        body.write_text("id: task-abc\n")
+        self.assertEqual(self._cli("task-abc.txt", "--payload", str(body)), (0, f"task-abc.txt\t{body}\n"))
+        self.assertEqual(self._cli("task-abc.txt", "--payload", str(self.payload), "--resolved", str(self.ws / "tasks")),
+                         (0, f"task-abc.txt\t{self.payload}\n"))
+        self.assertEqual(self._cli("task-abc.txt", "--payload", str(body), "--payload", str(body)), (2, ""))
+
     def _cli(self, *argv: str) -> tuple[int, str]:
         # In-process, so the entry point's own branch is what runs (and is measured).
         import contextlib

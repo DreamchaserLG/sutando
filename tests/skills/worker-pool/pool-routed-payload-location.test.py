@@ -267,7 +267,7 @@ class T(unittest.TestCase):
 
     def test_a_failed_archive_keeps_the_sentinel_and_the_body(self):
         self._finished()
-        with mock.patch.object(pd.os, "rename", side_effect=PermissionError(13, "denied")):
+        with mock.patch.object(pd.os, "link", side_effect=PermissionError(13, "denied")):
             acts = pd.prune_spent(self.ws, A)
         self.assertEqual(acts["retired"], [])
         self.assertIn("task-1", acts["kept"])
@@ -284,6 +284,66 @@ class T(unittest.TestCase):
         arch.write_text(TEXT)
         acts = pd.prune_spent(self.ws, A)
         self.assertEqual(acts["retired"], ["task-1"])
+        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+
+    def test_an_archive_holding_the_same_inode_lets_the_body_go(self):
+        self._finished()
+        arch = pd.archived_payload(self.ws, "task-1")
+        arch.parent.mkdir(parents=True)
+        os.link(pd.body_path(self.ws, A, "task-1"), arch)
+        self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
+        self.assertEqual(arch.read_text(), TEXT)
+
+    # Anything at the archive name that is not provably this body keeps body and sentinel.
+    def _collide(self, make):
+        self._finished()
+        arch = pd.archived_payload(self.ws, "task-1")
+        arch.parent.mkdir(parents=True)
+        make(arch)
+        acts = pd.prune_spent(self.ws, A)
+        self.assertEqual(acts["retired"], [])
+        self.assertIn("task-1", acts["kept"])
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT, "body kept")
+        self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file(), "sentinel kept")
+        return arch
+
+    def test_an_archive_with_other_bytes_keeps_the_body_and_sentinel(self):
+        arch = self._collide(lambda a: a.write_text("OTHER\n"))
+        self.assertEqual(arch.read_text(), "OTHER\n")
+
+    def test_an_archive_of_the_same_length_but_other_bytes_is_not_the_body(self):
+        self._collide(lambda a: a.write_text(TEXT[:-2] + "X\n"))
+
+    def test_an_archive_that_is_a_directory_keeps_the_body_and_sentinel(self):
+        self._collide(lambda a: a.mkdir())
+
+    def test_an_archive_that_is_a_fifo_keeps_the_body_and_sentinel(self):
+        self._collide(lambda a: os.mkfifo(a))
+
+    def test_an_archive_that_is_a_live_symlink_to_the_same_bytes_is_not_followed(self):
+        twin = Path(self.td.name) / "twin.txt"
+        twin.write_text(TEXT)
+        arch = self._collide(lambda a: os.symlink(twin, a))
+        self.assertTrue(arch.is_symlink())
+
+    def test_without_hard_links_the_body_is_moved_or_compared(self):
+        self._finished()
+        with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
+            self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
+        self.assertEqual(pd.archived_payload(self.ws, "task-1").read_text(), TEXT)
+        self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
+
+    def test_without_hard_links_a_colliding_archive_still_keeps_the_body(self):
+        self._finished()
+        arch = pd.archived_payload(self.ws, "task-1")
+        arch.parent.mkdir(parents=True)
+        arch.write_text("OTHER\n")
+        with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
+            self.assertIn("task-1", pd.prune_spent(self.ws, A)["kept"])
+        self.assertEqual(pd.body_path(self.ws, A, "task-1").read_text(), TEXT)
+        arch.write_text(TEXT)
+        with mock.patch.object(pd.os, "link", side_effect=OSError(18, "cross-device")):
+            self.assertEqual(pd.prune_spent(self.ws, A)["retired"], ["task-1"])
         self.assertFalse(pd.body_path(self.ws, A, "task-1").exists())
 
     def test_a_non_regular_body_is_not_archived_and_the_sentinel_stays(self):
@@ -361,16 +421,77 @@ class ResolvedIdentity(unittest.TestCase):
             proc.wait(timeout=30)
         return out.read_text(), err.read_text()
 
-    def test_an_unanswered_routed_task_is_announced_by_its_body(self):
+    def test_an_unanswered_routed_task_is_announced_by_its_name_with_its_body(self):
         out, err = self.sweep()
-        # The body sits in the worker's own inbox, so it is announced by its bare name.
-        self.assertEqual(out.splitlines(), ["TASK_FILE: task-1.body"], err[-800:])
+        self.assertEqual(out.splitlines(), [f"TASK_PAYLOAD: {self.body}", "TASK_FILE: task-1.txt"], err[-800:])
 
     def test_an_answered_routed_task_is_not_dispatched_again_after_a_restart(self):
         (self.ws / "results" / "task-1.txt").write_text("answered already\n")
         out, err = self.sweep()
         self.assertNotIn("TASK_FILE:", out, err[-800:])
-        self.assertIn("already answered, not dispatching again: task-1.body", err, err[-800:])
+        self.assertIn("already answered, not dispatching again: task-1.txt", err, err[-800:])
+
+    # Resolver -> watcher announcement -> each shipped notifier's own event loop and key derivation.
+    def notify(self, runtime, events):
+        import re
+        script = REPO / "src" / "agent" / runtime / "cli" / "task-notifier.sh"
+        text = script.read_text()
+        fns = [re.search(rf"^{n}\(\) \{{.*?^\}}", text, re.S | re.M).group(0)
+               for n in ("has_result", "task_payload", "enqueue_announced_task")
+               + (("task_prompt",) if runtime == "claude" else ())]
+        loop = re.search(r'^while :; do\n  event="".*?^done < "\$event_dir/events"', text, re.S | re.M).group(0)
+        tmp = Path(tempfile.mkdtemp(dir=self.td.name, prefix=runtime + "-"))
+        for d in ("queue", "payload", "inflight"):
+            (tmp / d).mkdir()
+        (tmp / "events").write_text(events)
+        harness = "\n".join([
+            "set -u",
+            'log_notifier() { printf "%s\\n" "$1" >> "$STAGE_LOG"; }',
+            'filename_is_claimed() { return 1; }',
+            'filename_is_worker_held() { return 1; }',
+            'mark_worker_stage() { printf "%s %s\\n" "$1" "$2" >> "$STAGE_LOG"; }',
+            'process_announced_queue() { :; }',
+            *fns, "watcher_pid=999999999", loop,
+            "for f in \"$queue_dir\"/*; do [ -e \"$f\" ] || continue; n=\"$(basename \"$f\")\"; printf 'KEY %s\\n' \"$n\";"
+            " printf 'PAYLOAD %s\\n' \"$(task_payload \"$n\")\"; done",
+            *(['printf "PROMPT %s\\n" "$(task_prompt task-1.txt)"'] if runtime == "claude" else []),
+        ])
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", self.td.name),
+               "TASKS_DIR": str(self.inbox), "WORKSPACE_DIR": str(self.ws), "RESULTS_DIR": str(self.ws / "results"),
+               "REPO": str(REPO), "queue_dir": str(tmp / "queue"), "PAYLOAD_DIR": str(tmp / "payload"),
+               "INFLIGHT_DIR": str(tmp / "inflight"), "STAGE_LOG": str(tmp / "stages"),
+               "event_dir": str(tmp), "RETRY_POLL_SEC": "1", "RETRY_INTERVAL": "1",
+               "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(REPO / "src" / "delivery" / "task_dispatch.py"),
+               "SUTANDO_INBOX_RESOLVER": str(SCRIPTS / "resolve-inbox-entry"), "SUTANDO_INBOX_KIND": "deliveries"}
+        r = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        stages = (tmp / "stages").read_text() if (tmp / "stages").exists() else ""
+        return r.stdout.splitlines(), stages
+
+    def test_both_notifiers_key_a_routed_task_by_its_name_and_read_its_body(self):
+        events, err = self.sweep()
+        self.assertIn("TASK_FILE: task-1.txt", events, err[-800:])
+        for runtime in ("claude", "codex"):
+            with self.subTest(runtime=runtime):
+                lines, stages = self.notify(runtime, events)
+                self.assertIn("KEY task-1.txt", lines, stages)
+                self.assertNotIn("KEY task-1.body", lines)
+                payload = [ln[len("PAYLOAD "):] for ln in lines if ln.startswith("PAYLOAD ")]
+                self.assertEqual(payload, [str(self.body)])
+                self.assertEqual(Path(payload[0]).read_text(), TEXT, "the body is what the session reads")
+                if runtime == "claude":
+                    self.assertIn(f"write the result to {self.ws / 'results'}/task-1.txt.",
+                                  next(ln for ln in lines if ln.startswith("PROMPT ")))
+
+    def test_both_notifiers_see_results_under_the_tasks_name_as_its_answer(self):
+        events, err = self.sweep()
+        (self.ws / "results" / "task-1.txt").write_text("answered\n")
+        for runtime in ("claude", "codex"):
+            with self.subTest(runtime=runtime):
+                lines, stages = self.notify(runtime, events)
+                self.assertFalse([ln for ln in lines if ln.startswith("KEY ")], "answered: nothing queued")
+                if runtime == "codex":
+                    self.assertEqual(stages, "task-1.txt done\n")
 
 
 if __name__ == "__main__":

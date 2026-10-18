@@ -132,7 +132,8 @@ def payload_location(workspace: Path, task_id: str, recipient: str | None = None
 
 def _archive_body(ws: Path, recipient: str, task_id: str) -> bool:
     """A finished body leaves the folder for tasks/archive/, the one place history readers look.
-    True once no body remains here; False (reason on stderr) when it could not be moved."""
+    True once no body remains here; False (reason on stderr) when it could not be moved, or when
+    the archive already holds something that is not provably this same body."""
     b = body_path(ws, recipient, task_id)
     state = regular_file_state(b)
     if state == "absent":
@@ -141,16 +142,67 @@ def _archive_body(ws: Path, recipient: str, task_id: str) -> bool:
         if state != "regular":
             raise OSError(errno.EINVAL, f"body is {state}", str(b))
         dst = archived_payload(ws, task_id)
-        if dst.exists():
-            with contextlib.suppress(FileNotFoundError):
-                b.unlink()
-            return True
         dst.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(b, dst)
+        try:
+            # A link never replaces what is there, so a destination that appears meanwhile is compared.
+            os.link(b, dst, follow_symlinks=False)
+        except FileExistsError:
+            if not _same_regular_body(b, dst):
+                raise OSError(errno.EEXIST, "archive holds a different file", str(dst))
+        except OSError as e:
+            if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV):
+                raise
+            if os.path.lexists(dst):
+                if not _same_regular_body(b, dst):
+                    raise OSError(errno.EEXIST, "archive holds a different file", str(dst))
+            else:
+                os.rename(b, dst)
+                return True
+        with contextlib.suppress(FileNotFoundError):
+            b.unlink()
     except OSError as e:
-        print(f"pool_delivery: cannot archive {b}: {e}; keeping its sentinel", file=sys.stderr)
+        print(f"pool_delivery: cannot archive {b}: {e}; keeping it and its sentinel", file=sys.stderr)
         return False
     return True
+
+
+def _open_regular(path: Path):
+    """An fd on a regular file at exactly that name, never followed, or None."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _same_regular_body(body: Path, dst: Path) -> bool:
+    """True only when both names are regular files (not followed) that are one inode
+    or hold the same bytes, compared in full."""
+    fds = [_open_regular(body), _open_regular(dst)]
+    try:
+        if None in fds:
+            return False
+        a, d = (os.fstat(fd) for fd in fds)
+        if (a.st_dev, a.st_ino) == (d.st_dev, d.st_ino):
+            return True
+        if a.st_size != d.st_size:
+            return False
+        with os.fdopen(os.dup(fds[0]), "rb") as fa, os.fdopen(os.dup(fds[1]), "rb") as fd_:
+            while True:
+                x, y = fa.read(65536), fd_.read(65536)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+    except OSError:
+        return False
+    finally:
+        for fd in fds:
+            if fd is not None:
+                os.close(fd)
 
 
 def results_dir(workspace) -> Path:
