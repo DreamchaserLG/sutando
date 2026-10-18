@@ -522,6 +522,8 @@ describe('the tools as the voice model sees them', () => {
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /room\.commons\.pages\.read .* room\.commons\.changes\.apply/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /write into its main file, never a new page/);
 		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /writing or changing what its files say/);
+		// Finding a room's project by name is the assistant's own too, not the core's.
+		assert.match(ROOM_ACTIONS_TURN_CHECK_RULE, /finding or reading a page, project or file that lives in an AG2 Space room by its name/);
 	});
 });
 }
