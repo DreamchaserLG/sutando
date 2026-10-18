@@ -177,7 +177,8 @@ class ProfileShape(unittest.TestCase):
                 '(subpath "/Library/Preferences/Logging") (subpath "/Library/Keychains")'),
             "/Library read": self.text.replace('(subpath "/Library/Preferences/Logging")',
                                                '(subpath "/Library")'),
-            "/Users read": self.text + '(allow file-read* (subpath "/Users"))\n',
+            "parent of home read": self.text + '(allow file-read* (subpath "%s"))\n'
+                                   % os.path.dirname(pwd.getpwuid(os.getuid()).pw_dir),
             "home read": self.text + '(allow file-read* (subpath "%s"))\n'
                          % pwd.getpwuid(os.getuid()).pw_dir,
             "/private/var/db read": self.text + '(allow file-read* (subpath "/private/var/db"))\n',
