@@ -248,7 +248,7 @@ class TestMain(Base):
         self.assertIn("retired=3", out)
         self.assertEqual(self._sentinels(d), [])
 
-    def test_a_failing_migration_never_stops_the_boot_prune(self):
+    def test_a_failing_migration_skips_this_boots_prune_and_keeps_every_sentinel(self):
         import importlib
         import unittest.mock as um
         d = self._inbox_dir()
@@ -256,8 +256,10 @@ class TestMain(Base):
         router = importlib.import_module("pool_router")
         with um.patch.object(router, "migrate_main_era", side_effect=RuntimeError("boom")):
             out = wb.prune_spent_sentinels(str(self.ws), WORKER)
-        self.assertIn("stale=1", out)
-        self.assertIn("migrate=skipped (boom)", out)
+        self.assertEqual(out, "migrate=failed (boom) prune=skipped")
+        self.assertEqual(self._sentinels(d), ["task-spent.txt"], "nothing pruned this boot")
+        # The next boot, with a working migration, prunes as usual.
+        self.assertIn("stale=1", wb.prune_spent_sentinels(str(self.ws), WORKER))
         self.assertEqual(self._sentinels(d), [])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
