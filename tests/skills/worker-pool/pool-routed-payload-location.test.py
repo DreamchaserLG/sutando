@@ -777,6 +777,110 @@ class ResolvedAnnouncement(unittest.TestCase):
                 self.assert_keyed_and_read(lines, runtime, stages)
 
 
+class MigrateAndRetireEdges(unittest.TestCase):
+    """The migration and the locked retirement, in process, on the main-era shape:
+    a sentinel whose payload is still in tasks/ and no body."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name).resolve() / "ws"
+        for d in ("tasks", "results", "state", "deliveries"):
+            (self.ws / d).mkdir(parents=True)
+        self.core = self.ws / "tasks" / "task-1.txt"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def main_era(self, *recipients):
+        self.core.write_text(TEXT)
+        for r in recipients:
+            (self.ws / "deliveries" / r).mkdir(exist_ok=True)
+            (self.ws / "deliveries" / r / "task-1.txt").touch()
+
+    def migrate(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rt.main(["migrate", "--workspace", str(self.ws)]), 0)
+        return json.loads(out.getvalue())
+
+    def test_migrate_moves_a_main_era_delivery_and_is_then_a_no_op(self):
+        self.main_era(A, B)
+        self.assertEqual(self.migrate(), {"kept": [], "migrated": ["task-1"]})
+        for r in (A, B):
+            self.assertEqual(pd.body_path(self.ws, r, "task-1").read_text(), TEXT)
+        self.assertFalse(self.core.exists())
+        self.assertEqual(self.migrate(), {"kept": [], "migrated": []})
+
+    def test_migrate_leaves_a_task_the_core_also_holds(self):
+        self.main_era(A, pr.CORE)
+        self.assertEqual(self.migrate(), {"kept": [], "migrated": []})
+        self.assertTrue(self.core.is_file())
+
+    def test_migrate_keeps_a_task_whose_body_folder_is_an_alias(self):
+        self.main_era(A)
+        real = Path(tempfile.mkdtemp(dir=self.td.name))
+        os.symlink(real, self.ws / "deliveries" / A / pd.BODY_DIR)
+        self.assertEqual(self.migrate(), {"kept": ["task-1"], "migrated": []})
+        self.assertTrue(self.core.is_file())
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_migrate_reads_nothing_through_an_aliased_recipient_folder(self):
+        self.main_era(A)
+        os.symlink(self.ws / "deliveries" / A, self.ws / "deliveries" / B)
+        self.assertEqual(self.migrate(), {"kept": [], "migrated": []})
+        self.assertTrue(self.core.is_file())
+
+    def test_retirement_keeps_the_core_copy_unless_every_holder_has_its_body(self):
+        self.main_era(A)
+        rt._retire_core_copy(self.ws, "task-1", [A])               # no body folder at all
+        (self.ws / "deliveries" / A / pd.BODY_DIR).mkdir()
+        rt._retire_core_copy(self.ws, "task-1", [A])               # a folder, no body
+        self.assertTrue(self.core.is_file())
+        os.rmdir(self.ws / "deliveries" / A / pd.BODY_DIR)
+        os.symlink(Path(tempfile.mkdtemp(dir=self.td.name)), self.ws / "deliveries" / A / pd.BODY_DIR)
+        rt._retire_core_copy(self.ws, "task-1", [A])               # an aliased body folder
+        self.assertTrue(self.core.is_file())
+
+    def test_a_route_with_a_body_folder_but_no_payload_is_no_payload(self):
+        (self.ws / "deliveries" / A / pd.BODY_DIR).mkdir(parents=True)
+        out = rt.route(self.ws, {"id": "task-1", "source": "ag2space", "channel_id": ROOM}, roster({ROOM: A}))
+        self.assertEqual(out["skipped"], [A])
+        self.assertFalse((self.ws / "deliveries" / A / "task-1.txt").exists())
+
+    def test_a_withdrawal_with_a_non_regular_body_keeps_everything(self):
+        self.core.write_text(TEXT)
+        rt.route(self.ws, {"id": "task-1", "source": "ag2space", "channel_id": ROOM}, roster({ROOM: A}))
+        pd.mark_done(self.ws, A, "task-1", published=False)
+        body = pd.body_path(self.ws, A, "task-1")
+        body.unlink()
+        body.mkdir()
+        with self.assertRaises(OSError):
+            pd.clear_pending(self.ws, A, "task-1")
+        self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file())
+        self.assertTrue(pd.pending_flag(self.ws, A, "task-1").is_file())
+
+    def test_a_comparison_that_cannot_read_is_never_a_match(self):
+        a, b = Path(self.td.name) / "a", Path(self.td.name) / "b"
+        a.write_text(TEXT)
+        b.write_text(TEXT)
+        with mock.patch.object(pd.os, "fdopen", side_effect=OSError(5, "Input/output error")):
+            self.assertFalse(pd._same_regular_body(a, b))
+        self.assertTrue(pd._same_regular_body(a, b))
+
+    def test_the_remedy_pass_still_runs_when_migration_fails(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("pool_remedy_e", SCRIPTS / "pool_remedy.py")
+        remedy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(remedy)
+        broken = mock.Mock(migrate_main_era=mock.Mock(side_effect=RuntimeError("boom")))
+        err = io.StringIO()
+        with mock.patch.object(remedy, "_sibling", return_value=broken), \
+                mock.patch.object(remedy, "_sweep", return_value=0) as sweep, contextlib.redirect_stderr(err):
+            self.assertEqual(remedy.main(["--workspace", str(self.ws), "--repo", str(REPO), "--sweep"]), 0)
+        sweep.assert_called_once()
+        self.assertIn("migrate skipped: RuntimeError: boom", err.getvalue())
+
+
 class LegacyInFlight(unittest.TestCase):
     """A task main's own router delivered (sentinel only, payload left in tasks/) gets its
     body on the next pass, and tasks/ stops listing it."""
