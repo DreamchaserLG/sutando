@@ -952,6 +952,31 @@ class LegacyInFlight(unittest.TestCase):
         self.assertEqual(pd.archived_payload(self.ws, "task-legacy").read_text(), self.text)
         self.assertEqual([p.name for p in folder.glob("task-legacy.*")], [])
 
+    def test_prune_spent_as_the_codex_notifier_calls_it_waits_for_the_migration(self):
+        folder = self.ws / "deliveries" / A
+        self.handler(self.main)
+        os.rename(folder / "task-legacy.txt", folder / "task-legacy.accepted")
+        (self.ws / "results" / "task-legacy.txt").write_text("answered\n")
+        pd.mark_done(self.ws, A, "task-legacy", published=True)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", self.td.name)}
+
+        def prune_spent():
+            r = subprocess.run([sys.executable, str(SCRIPTS / "pool_delivery.py"), "--workspace", str(self.ws),
+                                "--recipient", A, "prune-spent"], env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(r.stdout)
+
+        self.assertEqual(prune_spent(), {"retired": [], "stale": [], "kept": ["task-legacy"]})
+        self.assertEqual(pd.sweep(self.ws, A)["kept"], ["task-legacy"], "the boot sweep waits too")
+        self.assertTrue((folder / "task-legacy.accepted").is_file(), "sentinel kept for the migration")
+        self.assertTrue(self.core.is_file(), "and so is its tasks/ copy")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(rt.migrate_main_era(self.ws), {"migrated": ["task-legacy"], "kept": []})
+        self.assertEqual(prune_spent(), {"retired": ["task-legacy"], "stale": [], "kept": []})
+        self.assertEqual(pd.archived_payload(self.ws, "task-legacy").read_text(), self.text)
+        self.assertEqual(self.core_lists(), ([], []))
+        self.assertEqual([q.name for q in folder.glob("task-legacy.*")], [])
+
     def test_the_migrate_command_is_idempotent_and_keeps_what_it_cannot_read(self):
         self.handler(self.main)
         cmd = [sys.executable, str(SCRIPTS / "pool_router.py"), "migrate", "--workspace", str(self.ws)]

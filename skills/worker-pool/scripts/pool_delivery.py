@@ -576,11 +576,20 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
         if state == "stale-sentinel":
             p.unlink()
             actions["stale"].append(task_id)
-        elif state == "finished" and _nothing_can_re_queue(ws, task_id):
+        elif state == "finished" and _nothing_can_re_queue(ws, task_id) and not _awaits_migration(
+                ws, recipient, task_id):
             actions["retired" if _archive_and_retire(ws, recipient, task_id) else "kept"].append(task_id)
         else:
             actions["kept"].append(task_id)
     return actions
+
+
+def _awaits_migration(ws: Path, recipient: str, task_id: str) -> bool:
+    """A delivery made before bodies existed: its payload is only the tasks/ copy. Retiring
+    its sentinel would leave that copy with no holder, so it is kept for the migration."""
+    # The core reads tasks/ itself: its deliveries never get a body.
+    return (recipient != "core" and regular_file_state(payload_path(ws, task_id)) != "absent"
+            and regular_file_state(body_path(ws, recipient, task_id)) == "absent")
 
 
 def _nothing_can_re_queue(ws: Path, task_id: str) -> bool:
@@ -615,7 +624,10 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "finished":
             # Both result and flag exist, so the delivery is spent. Leaving the
             # sentinel would hand finished work back as ready on the next boot.
-            actions["retired" if _archive_and_retire(ws, recipient, task_id) else "kept"].append(task_id)
+            if _awaits_migration(ws, recipient, task_id):
+                actions["kept"].append(task_id)
+            else:
+                actions["retired" if _archive_and_retire(ws, recipient, task_id) else "kept"].append(task_id)
         elif state == "stale-sentinel":
             p.unlink()
             actions["stale"].append(task_id)

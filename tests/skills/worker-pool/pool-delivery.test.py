@@ -29,6 +29,11 @@ class Workspace:
         # Spelled literally, not via pd.PENDING_SUFFIX: a test that reads the
         # constant cannot catch the constant changing.
         p = d / f"{task_id}.txt"
+        # The router stages a worker's body before its sentinel; the core reads tasks/.
+        payload = self.root / "tasks" / f"{task_id}.txt"
+        if recipient != "core" and payload.is_file():
+            (d / "bodies").mkdir(exist_ok=True)
+            os.link(payload, d / "bodies" / f"{task_id}.txt")
         os.close(os.open(p, os.O_CREAT | os.O_EXCL))
         return p
 
