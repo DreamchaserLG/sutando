@@ -165,12 +165,17 @@ hard links, keeps the body and its sentinel); a withdrawn
 hold (`clear_pending`) puts it back in `tasks/` for the core. The watcher's `QUEUE: n pending after this`
 counts your inbox, and that count is the only queue you have.
 
-**Upgrading to body folders.** A notifier started before the upgrade refuses the absolute body path
-(it types nothing, never the empty sentinel), so after pulling, restart each worker's watcher and
-notifier together: end its `<worker session>-watcher` tmux session, and `worker-watcher-supervisor.sh`
-(or the remedy timer, within 5 min) starts both from the new code; the new watcher's start-up sweep
-then announces what the old pair refused. A worker's own session watcher needs nothing: an older one
-announces the same absolute path, named for its task.
+**Upgrading to body folders.** In this order, right after pulling:
+1. Migrate the deliveries made before bodies existed (a sentinel whose payload is still in `tasks/`):
+   `python3 skills/worker-pool/scripts/pool_router.py migrate --workspace <workspace>`. It stages each
+   body and retires the `tasks/` copy under the router's locks, so the core stops listing the task. The
+   remedy timer runs the same step first on every pass, so it also happens within 5 minutes unrun.
+2. Restart each worker's watcher and notifier together: a notifier started before the upgrade refuses
+   the absolute body path (it types nothing, never the empty sentinel). End its `<worker session>-watcher`
+   tmux session, and `worker-watcher-supervisor.sh` (or the remedy timer) starts both from the new code;
+   the new watcher's start-up sweep announces what the old pair refused.
+
+A worker's own session watcher needs nothing: an older one announces the same absolute path, named for its task.
 
 ```
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who

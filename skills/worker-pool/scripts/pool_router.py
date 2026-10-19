@@ -314,11 +314,62 @@ def _require_same_body(src: Path, name: str, dfd: int, task_id: str) -> None:
 
 def _retire_core_copy(workspace, task_id: str, targets: list) -> None:
     """The move completes: once every recipient holds the body, tasks/ stops
-    listing the task, so no reader of the core's inbox adopts it."""
+    listing the task, so no reader of the core's inbox adopts it. Checked and done
+    under every recipient's lock (the one a withdrawn hold takes), so a body cannot
+    leave between the check and the unlink: one payload always survives."""
     ws = Path(workspace)
-    if all(pd.is_regular_file(pd.body_path(ws, t, task_id)) for t in targets):
+    with contextlib.ExitStack() as held:
+        for t in sorted(set(targets)):
+            try:
+                dfd = held.enter_context(pd.arbitration(ws, t))
+                bfd = pd.open_body_dir(dfd)
+            except OSError:
+                return
+            if bfd is None:
+                return
+            try:
+                if pd.regular_file_state(task_id + pd.PENDING_SUFFIX, dir_fd=bfd) != "regular":
+                    return
+            finally:
+                os.close(bfd)
         with contextlib.suppress(FileNotFoundError):
             os.unlink(pd.payload_path(ws, task_id))
+
+
+def migrate_main_era(workspace) -> dict:
+    """Give every delivery made before bodies existed (a sentinel, its payload still in
+    tasks/) its body, and retire the tasks/ copy once every holder has one. Idempotent;
+    a task whose evidence cannot be read is left exactly as it was."""
+    ws = Path(workspace)
+    out = {"migrated": [], "kept": []}
+    root = pd.deliveries_dir(ws, pr.CORE).parent
+    try:
+        names = prec.iter_recipients(root) if root.is_dir() else []
+    except OSError as e:
+        print(f"pool_router: migrate: cannot list {root}: {e}", file=sys.stderr)
+        return out
+    ids = sorted({pd.parse_sentinel(p.name)[0] for n in names if n != pr.CORE
+                  for p in pd.pending(ws, n) + pd.accepted(ws, n)})
+    for task_id in ids:
+        src = pd.payload_path(ws, task_id)
+        if not src.is_file():
+            continue
+        try:
+            with task_arbitration(ws, task_id):
+                held = holders(ws, task_id)
+                if not held or pr.CORE in held:
+                    continue
+                for h in held:
+                    with pd.arbitration(ws, h) as dfd:
+                        if pd.find_in(dfd, task_id) is not None and src.is_file():
+                            _hold_body(src, h, task_id, dfd)
+                _retire_core_copy(ws, task_id, held)
+        except (RouterRefused, OSError) as e:
+            print(f"pool_router: migrate: {task_id} kept as it was: {e}", file=sys.stderr)
+            out["kept"].append(task_id)
+            continue
+        out["migrated" if not src.exists() else "kept"].append(task_id)
+    return out
 
 
 def _attribute(workspace, recipient: str, task_id: str) -> None:
@@ -384,3 +435,18 @@ def route_all(workspace, tasks, roster=None) -> list:
     if r is None:
         raise RouterRefused("roster is absent or unreadable — refusing the pass")
     return [route(workspace, t, r) for t in order_candidates(tasks)]
+
+
+def main(argv=None) -> int:
+    import argparse
+    import json
+    ap = argparse.ArgumentParser(description="worker-pool router maintenance")
+    ap.add_argument("command", choices=["migrate"])
+    ap.add_argument("--workspace", required=True)
+    a = ap.parse_args(argv)
+    print(json.dumps(migrate_main_era(a.workspace), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

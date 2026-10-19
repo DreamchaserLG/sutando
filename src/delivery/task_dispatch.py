@@ -182,8 +182,9 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     """True iff some worker's own `deliveries/<worker>/` folder holds a sentinel for this task.
 
     The pool router hands a task to a worker by writing `<id>.txt` there (the
-    worker renames it `.accepted` / `.claimed`); the task file itself stays in
-    `tasks/`, so a queue reader that never looks here re-delivers it to the core.
+    worker renames it `.accepted` / `.claimed`); until every recipient holds the
+    payload the task file can still sit in `tasks/`, so a queue reader that never
+    looks here re-delivers it to the core.
     An absent root is the no-pool case (False); a root that exists but cannot be
     listed raises WorkerHoldUnreadable — a caller must hold, never deliver, on it.
     """

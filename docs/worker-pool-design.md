@@ -498,7 +498,8 @@ Input is the roster and one admitted task; nothing else may be read.
 2. Resolve the target: `requested_worker` if present and non-null, else the binding for the task's source, else `core`. A set resolves to its member list.
 3. Any target not in the roster resolves to `core`. State is not read.
 4. For each target: if `deliveries/<target>/<task-id>.txt` **or** `<task-id>.accepted` already exists, it is delivered — do not deliver again, but stage its body when it has none, so a sentinel written before bodies existed stops pointing at `tasks/`. **Checking only the pending name would recreate a sentinel for work in flight and deliver it twice.** Otherwise stage the body in `bodies/`, then `os.open(…, O_CREAT|O_EXCL)`, treating `EEXIST` as delivered.
-5. A set is step 4 once per member. Once every member holds a body, the `tasks/` copy is removed.
+5. A set is step 4 once per member. Once every member holds a body, the `tasks/` copy is removed. That check and the removal happen under every member's folder lock, the lock a withdrawn hold takes, so the last copy is never removed while a hold is being withdrawn.
+6. Deliveries made before bodies existed are migrated by `pool_router.py migrate` (also the first step of every remedy pass): each holder gets its body, then the `tasks/` copy goes by the same locked check. A body that exists but cannot be opened is unreadable, never absent: the resolver exits retryable and no sentinel is retired on it.
 
 The name keeps `.txt` because the watcher a worker runs emits for no other extension; accepting substitutes the suffix, so a accepted file stops waking anyone.
 

@@ -47,8 +47,12 @@ def resolve(entry: str, workspace=None) -> Path:
     except pd.RecipientAliasError as e:
         raise pd.NotDelivered(f"sentinel {task_id}: {e}") from e
     body = Path(os.path.abspath(Path(entry).parent / pd.BODY_DIR / (task_id + pd.PENDING_SUFFIX)))
-    if pd.regular_file_state(body) == "regular":
+    body_state = pd.regular_file_state(body)
+    if body_state == "regular":
         return body
+    if body_state == "unknown":
+        # The body exists but this call could not open it: retry, never "no payload".
+        raise pd.NotDelivered(f"sentinel {task_id}: body at {body} could not be opened; retry")
     path = Path(os.path.abspath(pd.payload_path(ws, task_id)))
     state = pd.regular_file_state(path)
     if state == "regular":

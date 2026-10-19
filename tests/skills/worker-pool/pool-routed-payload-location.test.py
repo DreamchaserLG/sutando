@@ -9,6 +9,7 @@ where history readers look; a withdrawn hold puts the body back in tasks/.
 """
 import contextlib
 import importlib
+import io
 import json
 import os
 import signal
@@ -472,6 +473,82 @@ class T(unittest.TestCase):
         self.assertFalse(pd.pending_flag(self.ws, A, "task-1").exists())
         self.assertEqual(core.read_text(), TEXT)
 
+    def test_a_withdrawal_racing_the_routes_retirement_leaves_one_payload(self):
+        # The withdrawal starts at the router's unlink of the core copy, the window between
+        # its body check and that unlink; it must wait for the router's locks, then restore.
+        import threading
+        core = self.ws / "tasks" / "task-1.txt"
+        real_unlink = os.unlink
+        done = threading.Event()
+        errors = []
+
+        def withdraw():
+            try:
+                pd.clear_pending(self.ws, A, "task-1")
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+            done.set()
+
+        def unlink_in_the_window(path, *a, **kw):
+            if Path(str(path)) == core and not done.is_set():
+                threading.Thread(target=withdraw, daemon=True).start()
+                done.wait(1.0)
+            return real_unlink(path, *a, **kw)
+
+        with mock.patch.object(rt.os, "unlink", side_effect=unlink_in_the_window):
+            rt.route(self.ws, self.task, roster({ROOM: A}))
+        self.assertTrue(done.wait(10), "the withdrawal finished")
+        self.assertEqual(errors, [])
+        survivors = [q for q in (core, pd.body_path(self.ws, A, "task-1")) if q.exists()]
+        self.assertEqual([q.read_text() for q in survivors], [TEXT], "exactly one payload survives")
+
+    def _unreadable_body(self, how):
+        rt.route(self.ws, self.task, roster({ROOM: A}))
+        body = pd.body_path(self.ws, A, "task-1")
+        if how == "EACCES":
+            @contextlib.contextmanager
+            def denied():
+                body.chmod(0)
+                try:
+                    yield
+                finally:
+                    body.chmod(0o644)
+            return body, denied()
+        real_open = os.open
+
+        def eio(path, *a, **kw):
+            if str(path) == str(body):
+                raise OSError(5, "Input/output error", str(path))
+            return real_open(path, *a, **kw)
+
+        return body, mock.patch.object(pd.os, "open", side_effect=eio)
+
+    def test_an_unreadable_delivered_body_is_retryable_not_absent_to_the_resolver(self):
+        entry = str(self.ws / "deliveries" / A / "task-1.txt")
+        for how in ("EACCES", "EIO"):
+            with self.subTest(how=how):
+                if how == "EIO":
+                    self.tearDown(); self.setUp()
+                body, ctx = self._unreadable_body(how)
+                with ctx:
+                    with self.assertRaises(pd.NotDelivered):
+                        rie.resolve(entry)
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(rie.main([entry]), 1, "retryable, never the typed no-payload exit")
+
+    def test_an_unreadable_delivered_body_keeps_its_sentinel_through_sweep_and_prune(self):
+        for how in ("EACCES", "EIO"):
+            with self.subTest(how=how):
+                if how == "EIO":
+                    self.tearDown(); self.setUp()
+                body, ctx = self._unreadable_body(how)
+                with ctx:
+                    self.assertEqual(pd.residue(self.ws, A, "task-1"), "unreadable")
+                    self.assertEqual(pd.sweep(self.ws, A)["kept"], ["task-1"])
+                    self.assertEqual(pd.prune_spent(self.ws, A)["kept"], ["task-1"])
+                self.assertTrue((self.ws / "deliveries" / A / "task-1.txt").is_file(), "sentinel kept")
+                self.assertTrue(os.path.lexists(body), "body kept")
+
     # The archiver reads the body through the folder fd it locked, so a swap never redirects it.
     def test_a_body_folder_swapped_before_the_link_never_archives_a_decoy(self):
         self._finished()
@@ -737,6 +814,43 @@ class LegacyInFlight(unittest.TestCase):
         listed = sorted(p.name for p in (self.ws / "tasks").glob("*.txt"))
         pending = [Path(str(c)).name for c in tdm.pending_candidates(self.ws / "tasks", self.ws / "results")]
         return listed, pending
+
+    def test_the_remedy_timer_migrates_main_era_deliveries_before_anything_else_runs(self):
+        folder = self.ws / "deliveries" / A
+        self.handler(self.main)
+        os.rename(folder / "task-legacy.txt", folder / "task-legacy.accepted")
+        self.assertEqual(self.core_lists()[0], ["task-legacy.txt"], "main's route left it listed")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("pool_remedy_t", SCRIPTS / "pool_remedy.py")
+        remedy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(remedy)
+        seen = []
+        with mock.patch.object(remedy, "_sweep", side_effect=lambda a: seen.append(self.core_lists()) or 0):
+            self.assertEqual(remedy.main(["--workspace", str(self.ws), "--repo", str(REPO), "--sweep"]), 0)
+        self.assertEqual(seen, [([], [])], "tasks/ stopped listing it before supervision ran")
+        self.assertEqual(pd.body_path(self.ws, A, "task-legacy").read_text(), self.text)
+        self.assertTrue((folder / "task-legacy.accepted").is_file(), "the delivery itself is unchanged")
+
+    def test_the_migrate_command_is_idempotent_and_keeps_what_it_cannot_read(self):
+        self.handler(self.main)
+        cmd = [sys.executable, str(SCRIPTS / "pool_router.py"), "migrate", "--workspace", str(self.ws)]
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", self.td.name)}
+        first = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((first.returncode, json.loads(first.stdout)), (0, {"kept": [], "migrated": ["task-legacy"]}),
+                         first.stderr)
+        self.assertEqual(self.core_lists(), ([], []))
+        again = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(again.stdout), {"kept": [], "migrated": []})
+        # A second main-era delivery whose body folder is a symlink is left exactly as it was.
+        other = self.ws / "tasks" / "task-legacy2.txt"
+        other.write_text(self.text.replace("task-legacy", "task-legacy2"))
+        (self.ws / "deliveries" / A / "task-legacy2.txt").touch()
+        real = Path(tempfile.mkdtemp(dir=self.td.name))
+        os.rename(self.ws / "deliveries" / A / pd.BODY_DIR, real / "b")
+        os.symlink(real / "b", self.ws / "deliveries" / A / pd.BODY_DIR)
+        third = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(third.stdout), {"kept": ["task-legacy2"], "migrated": []}, third.stderr)
+        self.assertTrue(other.is_file(), "the core keeps its copy")
 
     def test_a_main_era_delivery_gets_its_body_and_leaves_tasks_under_every_sentinel_name(self):
         folder = self.ws / "deliveries" / A

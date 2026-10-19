@@ -77,6 +77,11 @@ class NotDelivered(Exception):
     """The sentinel named is absent, malformed, or not this recipient's."""
 
 
+class PayloadUnreadable(OSError):
+    """A delivered body exists but this call could not open it (EACCES, EIO): a fact
+    about the call, never that the payload is gone, so nothing may be retired on it."""
+
+
 def parse_sentinel(name: str) -> tuple[str, bool] | None:
     """(task_id, accepted) for a sentinel filename, or None if it is not one."""
     m = _SENTINEL.match(name)
@@ -148,8 +153,11 @@ def payload_location(workspace: Path, task_id: str, recipient: str | None = None
             raise RecipientAliasError(errno.ELOOP, "recipient directory is a symlink alias", str(d))
         require_body_dir(d)
         b = d / BODY_DIR / f"{task_id}{PENDING_SUFFIX}"
-        if is_regular_file(b):
+        state = regular_file_state(b)
+        if state == "regular":
             return b
+        if state == "unknown":
+            raise PayloadUnreadable(errno.EIO, "delivered body cannot be opened; retry", str(b))
     return None
 
 
@@ -519,6 +527,7 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     """What a crash left behind, read without a journal.
 
     One name per state, each mapped by `sweep` to exactly one action.
+    `unreadable`: a delivered body exists but could not be opened; everything is kept.
     """
     ws = Path(workspace)
     # The shared readiness contract, not existence: an empty or whitespace-only
@@ -528,7 +537,10 @@ def residue(workspace: Path, recipient: str, task_id: str) -> str:
     # verdict is what `sweep` deletes on, so a planted link would retire real work.
     has_flag = is_done_flag(done_flag(ws, recipient, task_id))
     sentinel = find(ws, recipient, task_id)
-    payload = payload_location(ws, task_id, recipient) is not None
+    try:
+        payload = payload_location(ws, task_id, recipient) is not None
+    except PayloadUnreadable:
+        return "unreadable"
 
     # The flag is terminal on its own: the bridge drains the result file on
     # delivery, so after a drain the flag is the only durable evidence left.
@@ -607,6 +619,8 @@ def sweep(workspace: Path, recipient: str) -> dict:
         elif state == "stale-sentinel":
             p.unlink()
             actions["stale"].append(task_id)
+        elif state == "unreadable":
+            actions["kept"].append(task_id)
         else:
             raise AssertionError(f"unmapped residue state {state!r} for {task_id}")
     return actions
