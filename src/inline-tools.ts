@@ -818,9 +818,8 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
 	} catch { return null; }
 }
 
-/** Heard means said: a result handed to the model (`injected`, returned to its call or injected as a notice) is
- *  not heard until a spoken turn carries it. 2026-10-18 04:02: PR 5696's result had returned to its call; the
- *  status tool counted it heard, said "two pending", and the user only got it a minute later from the nudge. */
+/** Heard means said: a result handed to the model (returned to its call or injected as a notice) is not heard
+ *  until a spoken turn carries it; counting it heard earlier made the status tool skip a result the user never got. */
 export const heardByUser = (r: VoiceTaskRow): boolean => r.delivery === 'spoken';
 
 /** The user's voice tasks in one sentence for the model, grouped by where each stands now. */

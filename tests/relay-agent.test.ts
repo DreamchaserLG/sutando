@@ -998,7 +998,7 @@ describe('every status answer comes from the one table', () => {
 		const retired = { id: 'r', text: 'cleared [no-send]', submittedAt: 1, state: 'done', retired: true } as never;
 		const rows = [row('merged PRs', 'done', 'spoken'), row('PR 5302', 'done', 'spoken'), row('PR 5167', 'done'), row('PR 5329', 'started'), row('non-spicy dishes', 'queued'), row('old one', 'cancelled'), retired];
 		assert.deepEqual(voiceTaskCounts(rows), { pending: 3, working: 2, doneNotHeard: 1 }, 'a task ended with nothing to say is not pending');
-		// 2026-10-18 04:02: a result returned to its work call (delivery injected) but not yet said is still pending.
+		// A result returned to its work call (delivery injected) but not yet said is still pending.
 		const returned = [row('PR 5696', 'done', 'injected'), row('Angry Birds app', 'started')];
 		assert.deepEqual(voiceTaskCounts(returned), { pending: 2, working: 1, doneNotHeard: 1 }, 'returned to the model is not heard');
 		assert.match(describeVoiceTasks(rows), /^Pending for the user: 3 \(they have not heard an answer to these yet: 2 the core is still working on, 1 finished and waiting to be read to them\)\./);

@@ -1074,13 +1074,13 @@ async function main() {
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
 		orchestrationMode: 'actor',
-		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
-		// upstreamRecovery decides when to redial, park an idle upstream and back off.
-		upstreamLossPolicy: 'hold',
 		// A reconnect ends every open work call; the silence that triggers one is tunable per install.
 		responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,
 		// Stage one of stall recovery: replay the retained utterance in place, no reconnect.
 		watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,
+		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
+		// upstreamRecovery decides when to redial, park an idle upstream and back off.
+		upstreamLossPolicy: 'hold',
 		upstreamRecovery: {
 			idleParkMs: IDLE_TEARDOWN_MS,
 			stuckConnectingMs: parseStuckConnectingMs(process.env.VOICE_STUCK_CONNECTING_MS),

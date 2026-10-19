@@ -1,7 +1,5 @@
-// A result returned through its open call counts as heard only when a spoken turn carries its content.
-// 2026-10-18 02:52: "61 PRs merged" returned to its call; the model's next words were "Yes, I can hear you",
-// the table recorded the result spoken, and the user had to ask for it. Own process (the result watcher is
-// process-wide).
+// A result returned through its open call counts as heard only when a spoken turn carries its content: an
+// unrelated sentence after the return ("Yes, I can hear you") is not it. Own process (the result watcher is process-wide).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-heard-by-content.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -123,8 +121,8 @@ describe('resultEvidence / turnSaysResult', () => {
 		assert.equal(turnSaysResult('It was merged.', n), false);
 	});
 
-	// 2026-10-19 17:29: the result said "98 PRs merged"; the model said "ninetyeight merged" and "九十八个", and was
-	// nudged, handed the result twice more and made to say it four times. 3.8-live's transcript never writes digits.
+	// The live transcript never writes digits: "98" is spoken as "ninetyeight" or "九十八", and a matcher that looks
+	// for the digits nudges and re-hands a result the user has already heard.
 	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
 		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
 		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);
