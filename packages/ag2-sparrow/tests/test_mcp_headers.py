@@ -35,12 +35,7 @@ isolate_os_environ()
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-mcp-headers-")
 _FAKE_VI = types.ModuleType("vault_intercept")
 
-
-def _no_vault(var):
-    raise KeyError(var)             # empty vault: never resolves, never touches Keychain
-
-
-_FAKE_VI.get_vault_key = _no_vault
+_FAKE_VI.get_vault_key = {}.__getitem__  # an empty vault: KeyError, never the Keychain
 sys.modules["vault_intercept"] = _FAKE_VI
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -61,7 +56,8 @@ class Stub:
         self.mint = (200, {"access_token": ACCESS, "expires_in": 900})
         stub = self
 
-        class H(http.server.BaseHTTPRequestHandler):
+        # Runs on the server's thread, which this repo's coverage config does not trace.
+        class H(http.server.BaseHTTPRequestHandler):  # pragma: no cover
             def log_message(self, *a):
                 pass
 
