@@ -1211,6 +1211,10 @@ def _repair_cmd(a: argparse.Namespace, env: dict) -> int:
     if not a.yes:
         _say("the assisted repair changes files; pass --yes to consent.")
         return done(RepairResult(False, "no-consent", "--yes was not given"), EXIT_USAGE)
+    if a.consent_source == "app" and not a.plan_hash:
+        _say("an app consent needs --plan-hash; refusing without one.")
+        return done(RepairResult(False, "plan-hash-required", "app consent requires --plan-hash",
+                                 "Resend the repair with the current plan's hash."), EXIT_USAGE)
     inc, consent_hash = None, a.plan_hash
     if a.plan_hash or a.consent_source:
         current = plan_hash(plan(discover(a.runtime, env=env), env=env))
@@ -1221,6 +1225,11 @@ def _repair_cmd(a: argparse.Namespace, env: dict) -> int:
                         EXIT_USAGE)
         consent_hash = current
     ws = _workspace() if a.consent_source else None
+    if a.consent_source and ws is None:
+        _say("the workspace isn't available to record consent; refusing without it.")
+        return done(RepairResult(False, "workspace-unavailable", "could not resolve the workspace "
+                                 "to record consent", "Retry once the workspace is reachable."),
+                    EXIT_USAGE)
     if ws is not None:
         inc = Incident(ws, a.runtime)
         inc.take_replies()
@@ -1285,7 +1294,8 @@ def main(argv: Optional[Sequence[str]] = None, *, env: Optional[dict] = None,
     r.add_argument("--consent-source", default="",
                    help="who consented, e.g. app; recorded on the incident before acting")
     r.add_argument("--consent-by", default="", help="the account that consented")
-    r.add_argument("--plan-hash", default="", help="refuse when the plan is no longer this one")
+    r.add_argument("--plan-hash", default="", help="refuse when the plan is no longer this one; "
+                   "required with --consent-source app")
     n = sub.add_parser("notify-owner", help="queue the incident's one owner DM, if still unusable")
     n.add_argument("--runtime", choices=tuple(RUNTIMES), required=True)
     n.add_argument("--json", action="store_true")

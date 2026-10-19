@@ -189,7 +189,8 @@ class AppConsent(AppBase):
         self.ensure()
         self.assertEqual(len(self.notices()), 1)
         pending = self.reply("install compatible claude", name="task-200")
-        self.assertEqual(self.app_repair()[0], 0)
+        _, plan = self.doctor()
+        self.assertEqual(self.app_repair("--plan-hash", plan["plan_hash"])[0], 0)
         inc = self.incident()
         self.assertEqual((inc["status"], inc["resolved_by"]), ("resolved", "app"))
         fixed = [p for p in self.notices() if p.name != inc["notice"]]
@@ -201,7 +202,8 @@ class AppConsent(AppBase):
     def test_dm_reply_after_app_repair_reads_as_already_fixed(self):
         self.broken_then_npm()
         self.ensure()
-        self.assertEqual(self.app_repair()[0], 0)
+        _, plan = self.doctor()
+        self.assertEqual(self.app_repair("--plan-hash", plan["plan_hash"])[0], 0)
         late = self.reply("Install compatible claude.", name="task-300")
         code, path = self.ensure(repair_fn=self.counting_repair)
         self.assertEqual((code, path, self.repairs), (0, str(self.root / "bin" / "claude"), 0))
@@ -213,6 +215,26 @@ class AppConsent(AppBase):
         code, out, err = self.app_repair("--plan-hash", "0" * 64)
         self.assertEqual(code, rc.EXIT_USAGE)
         self.assertEqual(self.json_lines(out)[-1]["reason"], "plan-changed")
+        self.assertFalse((self.root / "bin" / "claude").exists())
+
+    def test_app_consent_without_a_plan_hash_is_refused(self):
+        self.broken_then_npm()
+        code, out, err = self.app_repair()
+        self.assertEqual(code, rc.EXIT_USAGE)
+        self.assertEqual(self.json_lines(out)[-1]["reason"], "plan-hash-required")
+        self.assertFalse((self.root / "bin" / "claude").exists())
+
+    def test_missing_workspace_refuses_before_installing(self):
+        self.broken_then_npm()
+        _, plan = self.doctor()
+        real_ws = rc._workspace
+        rc._workspace = lambda: None
+        try:
+            code, out, err = self.app_repair("--plan-hash", plan["plan_hash"])
+        finally:
+            rc._workspace = real_ws
+        self.assertEqual(code, rc.EXIT_USAGE)
+        self.assertEqual(self.json_lines(out)[-1]["reason"], "workspace-unavailable")
         self.assertFalse((self.root / "bin" / "claude").exists())
 
 
@@ -401,8 +423,9 @@ class NotifyOwner(AppBase):
 
     def test_notify_owner_after_resolution_sends_nothing(self):
         self.broken_then_npm()
+        _, plan = self.doctor()
         self.main("repair", "--runtime", "claude", "--yes", "--consent-source", "app",
-                  "--consent-by", MXID)
+                  "--consent-by", MXID, "--plan-hash", plan["plan_hash"])
         before = self.notices()
         self.assertEqual(self.notify(**APP), (0, {"queued": False, "reason": "usable"}))
         self.assertEqual(self.notices(), before)
