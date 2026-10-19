@@ -237,13 +237,27 @@ class TestMain(Base):
         (tasks / "task-arch.txt").write_text("id: task-arch\nsource: test\ntask: x\n")
         arch = pd.archived_payload(Path(self.ws), "task-arch")
         arch.parent.mkdir(parents=True, exist_ok=True)
-        arch.write_text((tasks / "task-arch.txt").read_text())   # the archive IS this payload
+        # The boot migrates this payload into a body first; archiving it then needs the archive to
+        # hold the same bytes, since a different file at that name keeps the body and sentinel.
+        arch.write_text((tasks / "task-arch.txt").read_text())
         # Each one alone, so a shared fixture cannot mask a branch that never runs.
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-gone"), "payload gone")
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-result"), "ready result")
         self.assertTrue(pd._nothing_can_re_queue(Path(self.ws), "task-arch"), "archived payload")
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=3", out)
+        self.assertEqual(self._sentinels(d), [])
+
+    def test_a_failing_migration_never_stops_the_boot_prune(self):
+        import importlib
+        import unittest.mock as um
+        d = self._inbox_dir()
+        (d / "task-spent.txt").touch()                       # spent: no payload anywhere
+        router = importlib.import_module("pool_router")
+        with um.patch.object(router, "migrate_main_era", side_effect=RuntimeError("boom")):
+            out = wb.prune_spent_sentinels(str(self.ws), WORKER)
+        self.assertIn("stale=1", out)
+        self.assertIn("migrate=skipped (boom)", out)
         self.assertEqual(self._sentinels(d), [])
 
     def test_a_sentinel_named_by_both_stages_is_judged_once(self):
@@ -273,6 +287,8 @@ class TestMain(Base):
         (Path(self.ws) / "deliveries" / "core" / "task-fin.txt").touch()
         # task-done's reply is archived, so nothing can re-queue it; task-fin's is not.
         arch = pd.archived_payload(Path(self.ws), "task-done"); arch.parent.mkdir(parents=True, exist_ok=True)
+        # Same bytes as the payload: the boot migrates it into a body, and archiving that body
+        # over a different file at this name would keep it instead of retiring it.
         arch.write_text((tasks / "task-done.txt").read_text())
         out = wb.prune_spent_sentinels(str(self.ws), WORKER)
         self.assertIn("retired=1", out)

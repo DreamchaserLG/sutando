@@ -243,15 +243,20 @@ def prune_spent_sentinels(workspace: str, instance: str) -> str:
     owed, not its history. prune_spent, never sweep: the boot sweep also RELEASES
     an accepted delivery back to pending, which on a `skip` (this worker's watcher
     is live) would re-offer work the session is answering. Never changes the decision."""
+    # Migrate first: a pruned main-era sentinel would leave its tasks/ copy with no holder.
+    # Its failure is reported on its own and never stops the prune.
+    migrate = ""
+    try:
+        import pool_router as rt
+        rt.migrate_main_era(Path(workspace))
+    except Exception as e:                                   # noqa: BLE001
+        migrate = f" migrate=skipped ({e})"
     try:
         import pool_delivery as pd
-        import pool_router as rt
-        # Migrate first: a pruned main-era sentinel would leave its tasks/ copy with no holder.
-        rt.migrate_main_era(Path(workspace))
         acts = pd.prune_spent(Path(workspace), instance)
-        return " ".join(f"{k}={len(v)}" for k, v in acts.items())
+        return " ".join(f"{k}={len(v)}" for k, v in acts.items()) + migrate
     except Exception as e:                                   # noqa: BLE001
-        return f"skipped ({e})"
+        return f"skipped ({e})" + migrate
 
 
 if __name__ == "__main__":
