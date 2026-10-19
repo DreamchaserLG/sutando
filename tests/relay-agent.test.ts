@@ -325,21 +325,24 @@ describe('relay agent: review of #5348, should-fixes', () => {
 });
 
 describe('relay agent: a question for the user is said as soon as the model stops speaking', () => {
-	it('at once when the model is quiet; after its turn ends when it is speaking; only the newest waits', async () => {
-		// 2026-10-13 00:41: decided at :16, said at :35, queued behind the model's answer and a noise turn.
+	it('at once when the model is quiet; after its turn ends when it is speaking; everything held goes, in order', async () => {
+		// A question decided mid-turn is said right after the model's answer, not after a later noise turn; and a result held
+		// behind a nudge for another result is not replaced by it.
 		const { createAskDelivery } = await import('../src/relay-agent.js');
 		const said: string[] = [];
+		const delivered: string[] = [];
 		const a = createAskDelivery({ inject: (t) => said.push(t), maxWaitMs: 5_000 });
-		a.ask('q1');
-		assert.deepEqual(said, ['q1'], 'quiet model: at once');
+		assert.equal(a.ask('q1', () => delivered.push('q1')), true, 'quiet model: at once');
+		assert.deepEqual([said, delivered], [['q1'], ['q1']]);
 		a.onModelAudio();
-		a.ask('q2');
-		a.ask('q3');
+		assert.equal(a.ask('q2', () => delivered.push('q2')), false, 'held while the model speaks');
+		assert.equal(a.ask('q3', () => delivered.push('q3')), false);
 		assert.deepEqual(said, ['q1'], 'waits while the model speaks');
 		a.onTurnEnd();
-		assert.deepEqual(said, ['q1', 'q3'], 'the newest, when the turn ends');
+		assert.deepEqual(said, ['q1', 'q2', 'q3'], 'all of it, in order, when the turn ends');
+		assert.deepEqual(delivered, ['q1', 'q2', 'q3'], 'the caller learns when each went in');
 		a.onTurnEnd();
-		assert.deepEqual(said, ['q1', 'q3'], 'said once');
+		assert.deepEqual(said, ['q1', 'q2', 'q3'], 'said once');
 	});
 
 	it('a model that keeps speaking does not hold the question past the cap', async () => {

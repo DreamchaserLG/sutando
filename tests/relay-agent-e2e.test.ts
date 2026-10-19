@@ -134,7 +134,7 @@ describe('relay agent end to end', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'heard once the model has spoken after the hand-off');
 	});
 
-	it('a result handed to its call but lost to a reconnect before it was spoken is handed over again', async () => {
+	it('a result handed to its call but lost to a fresh dial before it was spoken is handed over again', async () => {
 		const id = voiceTask('check PR 6100');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 6100' });
@@ -142,8 +142,20 @@ describe('relay agent end to end', () => {
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6100 is merged.');
 		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6100 is merged/);
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
-		session.emit('session.stateChange', { toState: 'RECONNECTING' } as never);
+		session.emit('session.reconnectBoundary', {} as never);
 		assert.equal(voiceTaskStore.get(id)?.delivery, undefined, 'not heard: reconcile hands it over again');
+	});
+
+	it('a resume (RECONNECTING then ACTIVE, no boundary) keeps the open call, and the result returns through it', async () => {
+		const id = voiceTask('check PR 6200');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'check PR 6200' });
+		await tick(0);
+		session.emit('session.stateChange', { toState: 'RECONNECTING' } as never);
+		session.emit('session.stateChange', { toState: 'ACTIVE' } as never);
+		assert.equal(relay.isWaiting(id), true, 'a resumed connection still holds the call');
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'PR 6200 is merged.');
+		assert.match(await Promise.race([call, tick(5_000).then(() => 'timed out')]), /PR 6200 is merged/, 'returned through the call');
 	});
 
 	it('a task the core ends with a skip-marked result is not pending for the user', async () => {

@@ -1005,6 +1005,18 @@ async function main() {
 	// The relay agent runs every `work` call as a bodhi subagent: submit, then return the core's result.
 	// A `work` call waits until the user has finished speaking (subscribed once the session exists).
 	const speechGate = createSpeechGate();
+/** Resolves once the session is ACTIVE: now, or at the next transition to it. */
+function whenSessionActive(s: VoiceSession): Promise<void> {
+	if ((s.sessionManager as { state?: string }).state === 'ACTIVE') return Promise.resolve();
+	return new Promise<void>((resolve) => {
+		const off = s.eventBus.subscribe('session.stateChange', (e: { toState?: string }) => {
+			if (e?.toState !== 'ACTIVE') return;
+			if (typeof off === 'function') (off as () => void)();
+			resolve();
+		});
+	});
+}
+
 	const relayAsk = createAskDelivery({
 		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
 		log: (m) => console.log(`${ts()} ${m}`),
@@ -1025,7 +1037,8 @@ async function main() {
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
-		ask: (text) => relayAsk.ask(text),
+		ask: (text) => { relayAsk.ask(text); },
+		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
@@ -1288,13 +1301,13 @@ async function main() {
 	// health monitor's state reads observe. ACTIVE proves the credential
 	// works again, so it clears the persisted terminal classification (R8)
 	// before the frame is built.
+	// A fresh dial (recoverUpstream) abandons the old connection's calls: a reply to one is dropped at bodhi's
+	// fence. The open calls end at that boundary so each result goes the other way. A resume keeps them.
+	session.eventBus.subscribe('session.reconnectBoundary', () => {
+		const ended = relayAgent.noteBoundary();
+		if (ended.length) console.log(`${ts()} [RelayAgent] connection replaced: ${ended.length} open work call(s) ended; their results are delivered another way (${ended.join(', ')})`);
+	});
 	session.eventBus.subscribe('session.stateChange', (e) => {
-		// A response to a call from the old connection is dropped after a reconnect: end the open
-		// calls so each result goes the other way and is reconciled.
-		if ((e as { toState?: string })?.toState === 'RECONNECTING') {
-			const ended = relayAgent.endAllCalls('continuing');
-			if (ended.length) console.log(`${ts()} [RelayAgent] reconnecting: ${ended.length} open work call(s) ended; their results are delivered another way (${ended.join(', ')})`);
-		}
 		if ((e as { toState?: string })?.toState === 'ACTIVE') {
 			clearTerminalClassification();
 			// One recovery site, event-driven: the same seam the classification clear
@@ -1479,7 +1492,7 @@ async function main() {
 	// Durable-channel wiring (context drops, note viewing, task results →
 	// session injection) moved verbatim to live-agent-runtime.ts (step 5a-2).
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
-	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, injectLive: (text) => relayAsk.ask(text), relay: relayAgent });
+	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, injectLive: (text, onDelivered) => relayAsk.ask(text, onDelivered), relay: relayAgent });
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).

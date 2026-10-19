@@ -469,21 +469,23 @@ export const ASK_WAIT_MAX_MS = 15_000;
  */
 export function createAskDelivery(deps: { inject: (text: string) => void; maxWaitMs?: number; log?: (m: string) => void }) {
 	let speaking = false;
-	let waiting: { text: string; timer: ReturnType<typeof setTimeout> } | null = null;
+	// Held in order while the model speaks: a result and a nudge for another must both go, not the newest alone.
+	const waiting: Array<{ text: string; onDelivered?: () => void }> = [];
+	let timer: ReturnType<typeof setTimeout> | null = null;
 	const flush = () => {
-		if (!waiting) return;
-		const { text, timer } = waiting;
-		clearTimeout(timer);
-		waiting = null;
-		deps.inject(text);
+		if (timer) { clearTimeout(timer); timer = null; }
+		for (const w of waiting.splice(0)) { deps.inject(w.text); w.onDelivered?.(); }
 	};
 	return {
-		ask(text: string): void {
-			if (!speaking) { deps.inject(text); return; }
-			if (waiting) clearTimeout(waiting.timer);
-			const timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
-			timer.unref?.();
-			waiting = { text, timer };
+		/** True when the text went to the model now; false when it waits for the turn to end (then `onDelivered` runs). */
+		ask(text: string, onDelivered?: () => void): boolean {
+			if (!speaking) { deps.inject(text); onDelivered?.(); return true; }
+			waiting.push({ text, onDelivered });
+			if (!timer) {
+				timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
+				timer.unref?.();
+			}
+			return false;
 		},
 		onModelAudio(): void { speaking = true; },
 		onTurnEnd(): void { speaking = false; flush(); },
@@ -510,6 +512,9 @@ export interface RelayAgentDeps<O = unknown> {
 	classify?: TurnClassifier;
 	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
 	ask?: (text: string) => void;
+	/** Resolves when the session can take a reply: ACTIVE now, or at the next ACTIVE. A reply sent while a connection
+	 *  is being replaced is dropped by the transport, so every reply of a call waits for it. */
+	whenActive?: () => Promise<void>;
 	log?: (msg: string) => void;
 }
 
@@ -560,6 +565,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
 	/** When the user last finished a turn: a re-issued call before any user turn is an orphan, after one it is a repeat. */
 	private lastUserTurnAt = 0;
+	/** Fresh dials so far; a call compares it with the count when it began. */
+	private boundaries = 0;
 	private askedAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
 	private turns: Array<{ text: string; at: number; origin: O | undefined }> = [];
@@ -583,8 +590,15 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			.map(([id, r]) => ({ id, text: r.text as string }));
 	}
 
-	/** Every waiting call ends without its result, which is then delivered another way: on a reconnect,
-	 *  a response to a call issued on the old connection is dropped. */
+	/** A fresh dial (bodhi's `recoverUpstream`, published as `session.reconnectBoundary`) abandons the old
+	 *  connection's calls: every waiting call ends and its result goes another way. A resume keeps them. A call
+	 *  still in its checks when the boundary passed ends when it would start waiting. */
+	noteBoundary(): string[] {
+		this.boundaries++;
+		return this.endAllCalls('continuing');
+	}
+
+	/** Every waiting call ends without its result, which is then delivered another way. */
 	endAllCalls(why: keyof typeof ENDED): string[] {
 		const ended = [...this.waiting.keys()];
 		for (const id of ended) this.endCall(id, why);
@@ -665,8 +679,16 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.deps.log?.(`[RelayAgent] ${name} answers this turn; the turn check sends nothing`);
 	}
 
-	async invoke(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+	async invoke(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+		const out = await this.run(task, args, signal);
+		// A reply produced while the connection is being replaced never reaches the model: it waits for ACTIVE.
+		if (this.deps.whenActive) await this.deps.whenActive();
+		return out;
+	}
+
+	private async run(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
 		this.lastTakenAt = Date.now();
+		const boundary = this.boundaries;
 		// Taken before the waits below: a room switch during them must not re-address the request.
 		let origin = this.deps.captureOrigin?.();
 		if (this.deps.speech) {
@@ -726,6 +748,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
 				this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
 				if (this.waiting.has(verdict.of)) return framedSystem(DUPLICATE_WAITS);
+				if (this.boundaries !== boundary) return framedSystem(ENDED.continuing); // the connection was replaced meanwhile
 				return new Promise<string>((resolve, reject) => {
 					this.waiting.set(verdict.of, { resolve, reject });
 					signal?.addEventListener('abort', () => { this.endCall(verdict.of, 'continuing'); }, { once: true });
@@ -742,6 +765,11 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		// The model is silent while a NON_BLOCKING call is open, so a separate notice acknowledges it (the
 		// call stays open). Sent only once the checks let it through; a queue position or offline core instead.
 		if (signal?.aborted) return framedSystem(ENDED.continuing);
+		if (this.boundaries !== boundary) {
+			// The connection was replaced while this call was in its checks: a call id from the old one.
+			this.deps.log?.(`[RelayAgent] ${taskId}: the connection was replaced before this call could wait; its result goes another way`);
+			return framedSystem(ENDED.continuing);
+		}
 		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
 		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
 		return new Promise<string>((resolve, reject) => {

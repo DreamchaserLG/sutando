@@ -48,7 +48,7 @@ export interface DurableChannelOptions {
 	relay: RelayAgent;
 	/** Puts text to the model as live input once it is not speaking. Used for a result when system notices
 	 *  are not getting through (after a reconnect, or once a notice went unheard). */
-	injectLive?: (text: string) => void;
+	injectLive?: (text: string, onDelivered?: () => void) => boolean | void;
 }
 
 /** A returned result not said by then is nudged once, then handed over again. */
@@ -248,8 +248,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	// A result no work call can carry (its call was cancelled, its connection replaced, or the agent
 	// restarted): a system notice when the session can speak, held through a meeting; else one DM copy.
 	const heldForMeeting: ResultItem[] = [];
-	// System notices can stop reaching the model after a reconnect (bodhi 0.4.6 keeps waiting for a turn
-	// that never comes). From the first reconnect on, a result goes to the model as live input instead.
+	// System notices can stop reaching the model after a fresh dial (bodhi 0.4.6's notification actor waits for a
+	// turn that never comes). From that boundary until the model's next completed spoken turn, a result goes to
+	// the model as live input instead.
 	let noticesSuspect = false;
 	// One result at a time, each confirmed by the model's next turn (spoken) or handed over again once.
 	const pacer = createHandoffPacer({
@@ -273,16 +274,21 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
 	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
-	session.eventBus.subscribe('session.stateChange', (e: { toState?: string }) => {
-		if (e?.toState !== 'RECONNECTING') return;
-		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] reconnecting: results with no open call go as live input from here on`);
+	// A fresh dial abandons the old connection's calls and whatever the model held unsaid: a result returned to a
+	// call, or handed to the pacer, is handed over again. A resume keeps the calls and the context, so RECONNECTING
+	// alone changes nothing here.
+	session.eventBus.subscribe('session.reconnectBoundary', () => {
+		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] connection replaced: results with no open call go as live input until the model speaks`);
 		noticesSuspect = true;
 		for (const r of returnedUnheard.splice(0)) { clearTimeout(r.nudge); clearTimeout(r.release); for (const id of r.ids) voiceTaskStore.unsetHandedOver(id); }
+		for (const id of pacer.held()) voiceTaskStore.unsetHandedOver(id);
 	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
 	session.eventBus.subscribe('turn.end', () => {
 		if (!modelSpokeInTurn) return;
 		modelSpokeInTurn = false;
+		// The model completed a spoken turn on the new connection: its notifications flow again.
+		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
 		const words = turnWords();
 		for (const r of [...returnedUnheard]) {
 			if (r.at > modelTurnStartedAt) continue;
@@ -343,7 +349,11 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			if (opts.injectLive && (noticesSuspect || unheardBefore)) {
 				if (!canSpeak()) return false;
 				console.log(`${ts()} [RelayAgent] ${item.taskId ?? 'result'}: handed as live input (${noticesSuspect ? 'after a reconnect' : 'a notice went unheard'})`);
-				opts.injectLive(frameResult(now));
+				// Recorded handed over only once the text has gone in: one held behind the model's speech may be a while.
+				let recorded = false;
+				const mark = () => { if (!recorded) { recorded = true; record(now, 'injected'); } };
+				if (opts.injectLive(frameResult(now), mark) !== false) mark();
+				return true;
 			} else if (!notice(now)) return false;
 			record(now, 'injected'); return true;
 		},

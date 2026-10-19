@@ -5,8 +5,9 @@
  *   1. the tool's declaration: `behavior: 'NON_BLOCKING'`, no `pendingMessage` (a pending message
  *      makes bodhi answer the call at once and inject the real result as unrelated text);
  *   2. a call the model re-issues after its result was returned is closed quietly, never resent;
- *   3. a reconnect ends every open call, so a result is never returned to a call issued on the
- *      old connection (bodhi drops such a response at its dial-generation fence).
+ *   3. a fresh dial (bodhi's recoverUpstream, published as session.reconnectBoundary) ends every open
+ *      call, since bodhi's dial-generation fence drops a reply to a call from the abandoned connection;
+ *      a resume keeps the calls and their replies are spoken in context.
  *
  * Run: npx tsx --test tests/relay-agent-nonblocking.test.ts
  */
@@ -111,6 +112,39 @@ test('a reconnect ends every open call; the results then go another way', async 
 	assert.equal(relay.offerResult({ taskId: 'task-1', text: 'here is the picture' }), false);
 	assert.equal(relay.endAllCalls('continuing').length, 0, 'idempotent');
 	void logs;
+});
+
+test('a fresh dial while a call is still in its checks ends that call before it waits; a resume does not', async () => {
+	const { relay, submitted } = agent({ check: async () => { await new Promise((r) => setTimeout(r, 20)); return { action: 'submit' }; } });
+	const call = relay.invoke('work', { task: 'check PR 1' });
+	await new Promise((r) => setTimeout(r, 5));
+	assert.deepEqual(relay.noteBoundary(), [], 'nothing waits yet');
+	assert.match(await call, /still running; its result will come in a separate message/, 'a call id from the old connection never waits');
+	assert.deepEqual(submitted, ['check PR 1'], 'the request itself was sent');
+	assert.equal(relay.isWaiting('task-1'), false);
+	const later = relay.invoke('work', { task: 'check PR 2' });
+	await new Promise((r) => setTimeout(r, 40));
+	assert.equal(relay.isWaiting('task-2'), true, 'a call begun after the boundary waits as usual');
+	relay.endAllCalls('continuing');
+	await later;
+});
+
+test('every reply of a call waits until the session is ACTIVE', async () => {
+	let active = false;
+	const resumes: Array<() => void> = [];
+	const whenActive = () => (active ? Promise.resolve() : new Promise<void>((r) => resumes.push(r)));
+	const store = createVoiceTaskStore();
+	const relay = new RelayAgent({ store, whenActive, submit: async () => { store.add('task-1', 'x'); return { status: 'pending', taskId: 'task-1' }; } });
+	const call = relay.invoke('work', { task: 'x' });
+	await new Promise((r) => setImmediate(r));
+	assert.equal(relay.offerResult({ taskId: 'task-1', text: 'the answer' }), true);
+	let settled = false;
+	void call.then(() => { settled = true; });
+	await new Promise((r) => setTimeout(r, 20));
+	assert.equal(settled, false, 'held while the connection is being replaced');
+	active = true;
+	for (const r of resumes.splice(0)) r();
+	assert.match(await call, /the answer/, 'delivered once ACTIVE');
 });
 
 test('an open call returns its result as that call\'s own response (no fake first answer)', async () => {

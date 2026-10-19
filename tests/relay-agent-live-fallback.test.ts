@@ -61,8 +61,9 @@ describe('a result with no open call: notice before any reconnect, live input af
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
-	it('after a reconnect it goes as live input, and the model\'s next spoken turn records it heard', async () => {
+	it('after a fresh dial it goes as live input, and the model\'s next spoken turn records it heard', async () => {
 		session.emit('session.stateChange', { toState: 'RECONNECTING' });
+		session.emit('session.reconnectBoundary', {});
 		session.emit('session.stateChange', { toState: 'ACTIVE' });
 		const id = callLessTask('build the trainer app');
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Your trainer app is built and published.');
@@ -74,12 +75,14 @@ describe('a result with no open call: notice before any reconnect, live input af
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
-	it('it stays on live input for the rest of the session', async () => {
+	it('once the model has completed a spoken turn on the new connection, notices are trusted again', async () => {
+		// The spoken turn t2 above completed after ACTIVE: the notification path is back.
 		const id = callLessTask('send the file to Discord');
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Sent hello world.txt to your Discord DM.');
 		await until(() => voiceTaskStore.get(id)?.delivery === 'injected');
-		assert.equal(live.filter((n) => n.includes('hello world.txt')).length, 1);
-		assert.equal(notices.filter((n) => n.includes('hello world')).length, 0);
+		assert.equal(notices.filter((n) => n.includes('hello world')).length, 1, 'a notice again');
+		assert.equal(live.filter((n) => n.includes('hello world.txt')).length, 0, 'not live input');
 		modelSpeaks('t3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 });

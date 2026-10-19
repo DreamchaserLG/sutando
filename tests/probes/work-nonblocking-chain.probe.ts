@@ -8,9 +8,9 @@
  *   S2 out of order       — a slow call then a fast one: the fast result is spoken first; two ids.
  *   S3 re-issued call     — the same request again after its result: closed quietly, the core never
  *                           sees it twice (RelayAgent.recentlyAnswered).
- *   S4 reconnect mid-call — a forced reconnect ends the open call; its result is NOT returned to the
- *                           dead id (bodhi would drop it at the dial-generation fence) and reaches the
- *                           model the other way.
+ *   S4 reconnect mid-call — a forced reconnect here is a resume (triggerReconnect keeps the handle), so
+ *                           the open call survives it and its reply is spoken in context; only a fresh
+ *                           dial (session.reconnectBoundary) ends the call and sends the result the other way.
  *   S5 result mid-speech  — a result that lands while the model tells a story does not cut it off.
  *
  * Results are RECORDED (PASS/FAIL lines + a JSON log), judged from events and the output transcript.
