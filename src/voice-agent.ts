@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask , voiceTaskResultText } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -492,6 +492,7 @@ const getTaskStatus: ToolDefinition = {
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
 		'pendingTasks is the number to give for "how many pending": tasks whose answer the user has not heard yet, whether the core is still working on them or finished and the result is still to be read. ' +
+		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before anything else; the user asking "did you lose one?" is usually one of these. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
@@ -509,6 +510,11 @@ const getTaskStatus: ToolDefinition = {
 			stillBeingWorkedOn: counts.working,
 			doneNotYetHeard: counts.doneNotHeard,
 			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected', ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			// A finished result the user has not heard goes with its text, so "did you lose one?" is answered on the spot.
+			resultsNotYetTold: rows
+				.filter((r) => r.state === 'done' && !r.retired && r.delivery !== 'spoken')
+				.map((r) => ({ task: r.text.slice(0, 60), result: (voiceTaskResultText(r.id) ?? '').slice(0, 300) }))
+				.filter((r) => r.result),
 			description: describeVoiceTasks(rows),
 		};
 	},

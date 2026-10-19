@@ -19,7 +19,7 @@ import type { VoiceSession } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
 import { injectText } from './browser-tools.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
-import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull } from './inject-framing.js';
+import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
 import { createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
@@ -42,6 +42,9 @@ export interface DurableChannelOptions {
 	reconcileMs?: number;
 	/** How long a handed-over result waits for the model's turn before the next one goes. */
 	handoffConfirmMs?: number;
+	/** A result returned through its call and not said by then is nudged once (a notice), then handed over again. */
+	returnNudgeMs?: number;
+	returnReleaseMs?: number;
 	/** The `work` subagent, which owns the result queue. */
 	relay: RelayAgent;
 	/** Puts text to the model as live input once it is not speaking. Used for a result when system notices
@@ -55,6 +58,30 @@ export interface DurableChannelOptions {
  * text path when the session is live, with the tuned guard markers and
  * fallback semantics preserved exactly.
  */
+/** A returned result not said by then is nudged once, then handed over again. */
+export const RETURN_NUDGE_MS = 15_000;
+export const RETURN_RELEASE_MS = 60_000;
+
+const EVIDENCE_STOP = new Set(['about', 'after', 'again', 'already', 'also', 'because', 'before', 'being', 'could', 'every', 'first', 'found', 'from', 'have', 'here', 'into', 'just', 'last', 'more', 'most', 'other', 'over', 'ready', 'result', 'results', 'said', 'should', 'since', 'some', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'were', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your', 'task', 'done', 'request', 'user']);
+/** What a spoken turn must carry to count as the result: its numbers, and its distinctive words. */
+export function resultEvidence(text: string): { numbers: string[]; words: string[] } {
+	const plain = text.replace(/\[(file|send|attach|thread|channel|dm-only|no-send|REPLIED)[^\]]*\]/gi, ' ');
+	const numbers = [...new Set(plain.match(/\d+(?:[.,]\d+)?/g) ?? [])];
+	const words = [...new Set((plain.toLowerCase().match(/[a-z][a-z'-]{3,}|[\u4e00-\u9fff]{2,}/g) ?? []).map((w) => w.replace(/'s$|'$/, '')).filter((w) => w.length >= 4 && !EVIDENCE_STOP.has(w)))];
+	return { numbers, words };
+}
+/** The turn said the result: one of its numbers; else its distinctive words, two of them when the result has numbers it did
+ *  not say or has that many (a result with neither counts on its first spoken turn). */
+export function turnSaysResult(turn: string, evidence: { numbers: string[]; words: string[] }): boolean {
+	if (!evidence.numbers.length && !evidence.words.length) return true;
+	const t = turn.toLowerCase();
+	if (evidence.numbers.some((n) => t.includes(n))) return true;
+	const need = evidence.numbers.length ? 2 : Math.min(2, evidence.words.length);
+	let hits = 0;
+	for (const w of evidence.words) if (t.includes(w) && ++hits >= need) return true;
+	return false;
+}
+
 export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions): { enqueue: (item: ResultItem) => void } {
 	const { cartesiaApiKey = '', generateSpeech = null } = opts;
 
@@ -130,9 +157,19 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	const interruptedTurns = new Set<string>();
-	// Results returned through open calls, recorded heard at the first spoken model turn after the
-	// hand-off; a reconnect before that hands them over again.
-	const returnedUnheard: Array<{ ids: string[]; at: number }> = [];
+	// Results returned through open calls. Gemini may fold a WHEN_IDLE response into its context without
+	// saying it while the user keeps talking, so a spoken turn counts as the result only when its words carry
+	// the result's content (a session with no conversation items falls back to "first spoken turn").
+	// Unsaid after returnNudgeMs: one nudge; after returnReleaseMs: handed over again. A reconnect: handed over again.
+	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
+	const returnedUnheard: Returned[] = [];
+	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };
+	const turnWords = (): string | null => {
+		const items = (session as unknown as { conversationContext?: { items?: ReadonlyArray<{ role?: string; content?: string | null }> } }).conversationContext?.items;
+		if (!items) return null;
+		for (let i = items.length - 1; i >= 0; i--) if (items[i].role === 'assistant') return items[i].content ?? '';
+		return '';
+	};
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
 	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
@@ -140,16 +177,21 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		if (e?.toState !== 'RECONNECTING') return;
 		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] reconnecting: results with no open call go as live input from here on`);
 		noticesSuspect = true;
-		for (const { ids: lost } of returnedUnheard.splice(0)) for (const id of lost) voiceTaskStore.unsetHandedOver(id);
+		for (const r of returnedUnheard.splice(0)) { clearTimeout(r.nudge); clearTimeout(r.release); for (const id of r.ids) voiceTaskStore.unsetHandedOver(id); }
 	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
 	session.eventBus.subscribe('turn.end', () => {
 		if (!modelSpokeInTurn) return;
 		modelSpokeInTurn = false;
-		for (let i = returnedUnheard.length - 1; i >= 0; i--) {
-			if (returnedUnheard[i].at > modelTurnStartedAt) continue;
-			for (const id of returnedUnheard[i].ids) voiceTaskStore.set(id, 'spoken');
-			returnedUnheard.splice(i, 1);
+		const words = turnWords();
+		for (const r of [...returnedUnheard]) {
+			if (r.at > modelTurnStartedAt) continue;
+			if (words !== null && !turnSaysResult(words, r.evidence)) {
+				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
+				continue;
+			}
+			for (const id of r.ids) voiceTaskStore.set(id, 'spoken');
+			dropReturned(r);
 		}
 	});
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
@@ -269,7 +311,24 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			// A result handed to a session nobody hears would be recorded heard: it goes the offline way.
 			const now = current(item);
 			if (canSpeak() && opts.relay.offerResult(now)) {
-				returnedUnheard.push({ ids: ids(now), at: Date.now() });
+				const request = (now.requests?.[0] ?? voiceTaskStore.get(item.taskId)?.text ?? item.taskId).replace(/"/g, "'").slice(0, 120);
+				const r: Returned = {
+					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text), request,
+					nudge: setTimeout(() => {
+						if (!returnedUnheard.includes(r) || !canSpeak()) return;
+						const text = framedSystem(`The result for the request "${request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
+						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
+						if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
+					}, opts.returnNudgeMs ?? RETURN_NUDGE_MS),
+					release: setTimeout(() => {
+						if (!returnedUnheard.includes(r)) return;
+						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; handing it over again`);
+						dropReturned(r);
+						for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
+					}, opts.returnReleaseMs ?? RETURN_RELEASE_MS),
+				};
+				r.nudge.unref?.(); r.release.unref?.();
+				returnedUnheard.push(r);
 				console.log(`${ts()} [RelayAgent] ${item.taskId}: result returned to its work call`);
 				return;
 			}

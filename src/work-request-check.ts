@@ -116,6 +116,7 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		'- A fragment that is not a sentence (one letter, a sound, a lone word like "A", "in", "嗯") is none.',
 		'- "the status of 5334" / "查一下 5334 的状态" when the recent words are about PRs is a request to look up PR 5334: work. It is not a question about the assistant\'s own task list.',
 		'- A yes to the assistant\'s own offer to do something ("你是想让我查一下 5332 吗？" -> "对") is that request: work.',
+		'- A question whether an earlier request was done, lost or already answered ("did you lose that one?", "是不是丢了一个", "did you tell me the PR count?") is none: the assistant answers it from its task list, and the core is not asked again.',
 		'- none: chit-chat, thanks, any other yes/no reply, a question about the assistant\'s own task list ("how many tasks are pending", "is it done yet") with no new thing named, a public fact or general-knowledge question, or anything already being answered.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
