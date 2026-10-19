@@ -507,7 +507,7 @@ export async function searchRoom(args: { room?: string; query: string; limit?: n
 	return { ok: true, room: target.room.name, query, hits, ms: Date.now() - t0 };
 }
 
-export interface CommonsHit { title: string; where: string; text: string; kind?: string; link?: string }
+export interface CommonsHit { title: string; where: string; text: string; kind?: string; link?: string; database?: string }
 
 /** Commons hits (best first) → lines the model can retell; a page hit keeps the kind read_page needs. */
 export function toCommonsHits(hits: unknown[]): CommonsHit[] {
@@ -544,10 +544,51 @@ export async function searchCommons(args: { room?: string; query: string; limit?
 	const limit = Math.min(ROOM_COMMONS_MAX_LIMIT, Math.max(1, Math.floor(args.limit ?? ROOM_COMMONS_DEFAULT_LIMIT)));
 	const target = await targetRoom(args.room, deps);
 	if (!target.ok) return target;
-	const found = await roomRead(client, target.room, 'room.commons.search', { query, limit }, deps, ROOM_COMMONS_TIMEOUT_MS);
+	// 2026-10-19: "comment on MCP request tracker, it's a database" — room.commons.search is full text, so it answered
+	// the page whose body mentions the tracker and never the database of that name; the comment went on the page, twice.
+	// A page or database whose name is what the user said is the hit they mean: those come first, from the lists.
+	const [found, pages, dbs] = await Promise.all([
+		roomRead(client, target.room, 'room.commons.search', { query, limit }, deps, ROOM_COMMONS_TIMEOUT_MS),
+		roomRead(client, target.room, 'room.commons.pages.list', {}, deps, ROOM_COMMONS_TIMEOUT_MS),
+		roomRead(client, target.room, 'room.commons.databases.list', {}, deps, ROOM_COMMONS_TIMEOUT_MS),
+	]);
 	if (!found.ok) return found;
-	const hits = toCommonsHits(Array.isArray(found.result.hits) ? found.result.hits : []);
+	const byName = namedHits(query,
+		pages.ok ? (Array.isArray(pages.result.pages) ? pages.result.pages : []) : [],
+		dbs.ok ? (Array.isArray(dbs.result.databases) ? dbs.result.databases : []) : []);
+	const body = toCommonsHits(Array.isArray(found.result.hits) ? found.result.hits : []);
+	const hits = [...byName, ...body.filter((h) => !byName.some((n) => n.kind && n.kind === h.kind))].slice(0, Math.max(limit, byName.length));
+	deps.log?.(`[RoomRead] search_commons "${query}" in ${target.room.name}: ${byName.length} by name (${byName.map((h) => h.where + ' ' + h.title).join('; ')}), ${body.length} by text (${body.slice(0, 3).map((h) => h.where + ' ' + h.title).join('; ')})`);
 	return { ok: true, room: target.room.name, query, hits, ms: Date.now() - t0 };
+}
+
+const titleKey = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+/** Pages and databases whose name is the query, or contains it, or is contained in it (the user may add a word). Exact first. */
+export function namedHits(query: string, pages: unknown[], databases: unknown[]): CommonsHit[] {
+	const q = titleKey(query);
+	if (q.length < 3) return [];
+	const rank = (name: string): number => {
+		const n = titleKey(name);
+		if (!n) return 0;
+		if (n === q) return 3;
+		if (n.includes(q)) return 2;
+		if (q.includes(n) && n.length >= 4) return 1;
+		return 0;
+	};
+	const out: Array<{ r: number; hit: CommonsHit }> = [];
+	for (const p of pages) {
+		const page = p as { kind?: string; title?: string; surface?: string };
+		const title = typeof page.title === 'string' ? page.title.trim() : '';
+		const r = title ? rank(title) : 0;
+		if (r && typeof page.kind === 'string') out.push({ r, hit: { title, where: String(page.surface ?? 'page'), text: '', kind: page.kind } });
+	}
+	for (const d of databases) {
+		const db = d as { database?: string; name?: string; rows?: number };
+		const name = typeof db.name === 'string' ? db.name.trim() : '';
+		const r = name ? rank(name) : 0;
+		if (r && typeof db.database === 'string') out.push({ r, hit: { title: name, where: `database${typeof db.rows === 'number' ? ` (${db.rows} rows)` : ''}`, text: '', kind: 'db', database: db.database } });
+	}
+	return out.sort((a, b) => b.r - a.r).map((x) => x.hit);
 }
 
 export type ReadPageResult =
@@ -736,7 +777,7 @@ export type AddCommentResult =
  * appended to the page's text instead, and the user found no comment. `mentions` are named first and
  * notified, as on room.message.send.
  */
-export async function addComment(args: { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] }, deps: ReadRoomDeps): Promise<AddCommentResult> {
+export async function addComment(args: { room?: string; kind?: string; database?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] }, deps: ReadRoomDeps): Promise<AddCommentResult> {
 	const t0 = Date.now();
 	const client = deps.client();
 	if (!client) return { ok: false, error: 'not_connected' };
@@ -777,7 +818,11 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 		return { ok: true, room: target.room.name, kind: '', quote: null, event_id, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 	}
 	const kind = (args.kind ?? '').trim();
-	if (!/^((markdown|html|board|sheet)(-[a-z0-9]{8})?|readme)$/.test(kind)) return { ok: false, error: 'no_page' };
+	if (!/^((markdown|html|board|sheet)(-[a-z0-9]{8})?|db|readme)$/.test(kind)) return { ok: false, error: 'no_page' };
+	// A database is commented on as a whole: kind "db" plus its id from a search_commons hit (2026-10-19: without this the
+	// model answered "no_page" by commenting on the main document instead).
+	const database = (args.database ?? '').trim();
+	if (kind === 'db' && !/^d[a-z0-9]{1,24}$/.test(database)) return { ok: false, error: 'no_database' };
 	const quote = (args.quote ?? '').trim().slice(0, 2000) || null;
 	if (quote && !/^markdown/.test(kind)) return { ok: false, error: 'no_quote' };
 	const target = await targetRoom(args.room, deps);
@@ -786,13 +831,14 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 	if (!who.ok) return who;
 	const mentions = who.ids;
 	text = withoutMentionIds(text, mentions) || text;
-	const dup = alreadyLeft(target.room.room_id, kind);
+	const where = kind === 'db' ? `db:${database}` : kind;
+	const dup = alreadyLeft(target.room.room_id, where);
 	if (dup) return dup;
-	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}), ...(mentions.length ? { mentions } : {}) }, deps);
+	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, ...(kind === 'db' ? { database } : {}), text, ...(quote ? { quote } : {}), ...(mentions.length ? { mentions } : {}) }, deps);
 	if (!done.ok) return done;
 	const event_id = typeof done.result.event_id === 'string' ? done.result.event_id : null;
-	remember(target.room.room_id, kind, event_id);
-	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
+	remember(target.room.room_id, where, event_id);
+	deps.log?.(`[RoomRead] room.commons.comments.add on ${where} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
 	return { ok: true, room: target.room.name, kind, quote, event_id, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 }
 
@@ -906,7 +952,8 @@ export function createSearchCommonsTool(deps: ReadRoomDeps): ToolDefinition {
 			'Call it when the user asks about a room\'s documents, pages, notes, plans, tables or records ("is there a doc about X in <room>", "what does the design page say", "what is in the todo table") — never answer from memory; search every time. ' +
 			'For what was said in the room\'s chat, use search_room instead. ' +
 			'Pass `query` = the words to find, `room` = the room name as listed in ROOMS; leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, hits:[{title, where, text, kind, link}]} best first, each a snippet around the match — answer from them in a sentence or two; to read a whole page, call read_page with its `kind`. ' +
+			'Returns {ok:true, room, hits:[{title, where, text, kind, link, database}]} best first: a page or database whose NAME matches the words comes first (where "page"/"doc"/"database (N rows)", text empty), then snippets around text matches. ' +
+			'When the user named a document or database, the hit whose title is that name is the one they mean, never a text match on another page. To read a whole page, call read_page with its `kind`; to comment on a database hit, call add_comment with kind "db" and its `database`. ' +
 			'No hits means the room\'s Commons has nothing about it; say so. ' +
 			'Errors: ' + ROOM_NAME_ERRORS +
 			'"INTERNAL", "not_connected", "timeout" or "unavailable" — say the room\'s documents cannot be searched right now; "ROOM_ACCESS_DENIED" or "FORBIDDEN" — say you cannot read that room\'s documents.',
@@ -986,18 +1033,19 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 		description:
 			'Leave a comment on a page of an AG2 Space room\'s Commons, as the web client does — on the whole page, or on one passage of a document with `quote`. ' +
 			'Call it when the user wants to comment, remark or 留言 on a document or page ("comment on the design doc: Susan has reviewed"). To change the page\'s own text, use write_page instead. ' +
-			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
+			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; for a database pass kind "db" and `database` = its id from the search_commons hit (a database is commented on as a whole). When the user named the document or database, comment on the hit with that name, never on the main page in its place. `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
 			'To answer in an existing comment thread instead, pass `reply_to` = that comment\'s event_id and no kind. ' +
 			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, kind, quote, event_id, mentions, mentioned} — then tell the user in one sentence that the comment is on that page, naming the page by its title from the search_commons hit, and whom it @-mentioned from `mentioned`. ' +
 			'Errors: "already_left" — this exact comment is already on that page, left `ago_s` seconds ago by you: do not leave it again; if the user says it went on the wrong page, say which page it is on and ask which one they meant, then comment there. ' +
-			'"no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'"no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_database" — kind "db" needs the database id from a search_commons hit; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not comment in that room; "not_connected" or "unavailable" — say the comment could not be left right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user gave it.'),
-			kind: z.string().optional().describe('The page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), or "markdown" for the main Doc. Omit when replying in a thread.'),
+			kind: z.string().optional().describe('The page\'s kind from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, or "db" for a database. Omit when replying in a thread.'),
+			database: z.string().optional().describe('With kind "db": the database id from the search_commons hit (e.g. "dmvby04eatk7t6").'),
 			quote: z.string().max(2000).optional().describe('A passage of the page to anchor the comment to, exactly as it reads there. Omit for the whole page.'),
 			reply_to: z.string().optional().describe('To reply in a comment thread: the comment\'s event_id.'),
 			mentions: z.array(z.string()).max(10).optional().describe('Whom to @ in the comment, as the user said it: "me", a name, or a full user id. Only when the user asked to @ them.'),
@@ -1006,9 +1054,9 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 		execution: 'inline',
 		timeout: ROOM_INDEX_COLD_TIMEOUT_MS + ROOM_COMMONS_TIMEOUT_MS + 1000,
 		async execute(args) {
-			const a = (args ?? {}) as { room?: string; kind?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] };
+			const a = (args ?? {}) as { room?: string; kind?: string; database?: string; text: string; quote?: string; reply_to?: string; mentions?: string[] };
 			const r = await addComment(a, deps);
-			deps.log?.(`[RoomRead] add_comment ${a.reply_to ? 'reply in a thread' : `on ${a.kind ?? ''}`} in ${a.room ? `"${a.room}"` : '(current room)'} → ${r.ok ? `left in ${r.ms}ms` : r.error}`);
+			deps.log?.(`[RoomRead] add_comment ${a.reply_to ? 'reply in a thread' : `on ${a.kind ?? ''}${a.kind === 'db' ? `:${a.database ?? ''}` : ''}`} in ${a.room ? `"${a.room}"` : '(current room)'} → ${r.ok ? `left in ${r.ms}ms` : r.error}`);
 			return r;
 		},
 	};
