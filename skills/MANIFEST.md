@@ -192,6 +192,24 @@ Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
 `pending_questions_store`, `documented_for_core`) read `<repo>/skills` directly, past the
 installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
 
+## Orphan reaper (`orphan_reaper`)
+
+`"orphan_reaper": "scripts/<reaper>.py"` declares the script that finds, and stops, orphaned test
+processes. Core reaches it only through `src/system_load.py`, which takes the path its caller
+injects and names no skill. `src/health-check.py` resolves it with `skill_roots.declared("orphan_reaper",
+roots=[claude_home_path("skills")])`: only a skill **installed** (linked there by `skills/install.sh`)
+counts, never the shipped copy in `<repo>/skills`; containment and the one-declarer rule are as for
+`pending_questions_store`. The contract health-check relies on:
+
+- no arguments: report only, exit 0, one `would stop <kind>=<id> pids=<pid,...> ...` line per target,
+  then a summary line carrying `mode=report ... candidates=<n>`;
+- no summary line means it did nothing (another run holds its lock, or it failed);
+- exit status 2 is a usage error and is never retried.
+
+With none installed, the `system-load` warning says its cause is unclassified. A warning ends its
+detail with `cause=<leftover-test-processes|other|unclassified> action=<reap-once|none>` and carries
+the same two keys in `--json`, for the core to decide on.
+
 ## Claude plugin (`claude_plugin`)
 
 `"claude_plugin": "./plugin"` names a Claude Code plugin directory inside the skill. The Claude

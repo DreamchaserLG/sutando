@@ -165,8 +165,13 @@ into the host's skills dir (`bash scripts/sutando-config.sh claude-home-path
 skills`, where `skills/install.sh` links); a skill that is only shipped in the repo
 is skipped with one line. By default it is report-only (`--spotlight`); with
 `PROCESS_HYGIENE_WITNESS_REAP=1` it runs `--reap --spotlight` with the normal
-thresholds. It never changes the witness's exit code. A health-check load warning
-that runs it once when the cause matches comes in a follow-up.
+thresholds. It never changes the witness's exit code.
+
+The manifest declares this script as `orphan_reaper` (skills/MANIFEST.md). Once the
+skill is installed (linked into the Claude skills dir), health-check's `system-load`
+item runs the script in report mode when load stays high, and calls the cause
+leftover test processes (`cause=leftover-test-processes action=reap-once`) when the
+candidates it would stop hold at least half of the top five CPU users' share.
 
 `--reap` refuses a minimum age under 600 s (exit 2), so a typo cannot reap young
 work. A run holds an exclusive `flock` on `process-hygiene.lock` beside its log;
