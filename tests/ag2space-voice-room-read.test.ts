@@ -26,7 +26,7 @@ const {
 	listRooms, createRoomIndex, roomIndexContextLines, createListRoomsTool, ROOM_INDEX_COLD_TIMEOUT_MS, ROOM_READ_CALL_TIMEOUT_MS,
 	searchRoom, createSearchRoomTool, toHitLines, ROOM_SEARCH_DEFAULT_LIMIT, ROOM_TURN_CHECK_RULE,
 	searchCommons, readPage, toCommonsHits, createSearchCommonsTool, createReadPageTool, ROOM_COMMONS_DEFAULT_LIMIT, ROOM_COMMONS_TIMEOUT_MS, ROOM_PAGE_MAX_BYTES, ROOM_PAGE_MAX_CHARS,
-	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool, sendMessage, createSendMessageTool,
+	writePage, createWritePageTool, ROOM_WRITE_TEXT_MAX, addComment, createAddCommentTool, RECENT_COMMENT_MS, sendMessage, createSendMessageTool,
 	ROOM_READ_BODY_MAX, ROOM_READ_DEFAULT_LIMIT, ROOM_READ_PROMPT_RULE,
 } = await import(pathToFileURL(join(PLUGIN_DIR, 'room-read.ts')).href);
 
@@ -603,6 +603,29 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 	const done = (result: Record<string, unknown>) => ({ structuredContent: { status: 'completed', result } });
 	const launch = [{ room_id: '!tdhHBCseqxerbZwbfm:ag2.space', name: 'open.space launch video' }];
 	const deps = (client: { callTool: (n: string, a: Record<string, unknown>, t?: number) => Promise<unknown>; close(): void }, rooms = launch) => ({ client: () => client as never, currentRoom: () => null, index: { rooms: () => rooms, refresh: async () => rooms, fetchedAt: () => 1 } });
+
+	// 2026-10-19 17:30–17:31: "This is great!" went on markdown-liy9uut3; told it was the wrong page, the model searched
+	// seven times and left the same text on the same page again, and said nothing. The second one is refused.
+	it('the same comment on the same page within ten minutes is refused as already_left; another page, other words, or later goes through', async () => {
+		let t = 1_000_000;
+		const f = fake(() => done({ event_id: '$c1', comment: {} }));
+		const d = { ...deps(f.client), now: () => t };
+		const first = await addComment({ room: 'open.space launch video', kind: 'markdown-liy9uut3', text: 'This is great!' }, d);
+		assert.equal(first.ok, true);
+		t += 60_000;
+		const again = await addComment({ room: 'open.space launch video', kind: 'markdown-liy9uut3', text: ' This is great! ' }, d);
+		assert.deepEqual(again, { ok: false, error: 'already_left', event_id: '$c1', ago_s: 60 });
+		assert.equal(f.calls.length, 1, 'nothing was sent the second time');
+		assert.equal((await addComment({ room: 'open.space launch video', kind: 'markdown-abcd1234', text: 'This is great!' }, d)).ok, true, 'another page');
+		assert.equal((await addComment({ room: 'open.space launch video', kind: 'markdown-liy9uut3', text: 'This is wrong.' }, d)).ok, true, 'other words');
+		assert.equal((await addComment({ room: 'open.space launch video', reply_to: '$c1', text: 'This is great!' }, d)).ok, true, 'a reply in the thread is not the page comment');
+		assert.deepEqual(await addComment({ room: 'open.space launch video', reply_to: '$c1', text: 'This is great!' }, d), { ok: false, error: 'already_left', event_id: '$c1', ago_s: 0 }, 'but the same reply twice is');
+		t += RECENT_COMMENT_MS;
+		assert.equal((await addComment({ room: 'open.space launch video', kind: 'markdown-liy9uut3', text: 'This is great!' }, d)).ok, true, 'after the window it may be said again');
+		const tool = createAddCommentTool(d);
+		assert.match(tool.description, /"already_left" — this exact comment is already on that page.*do not leave it again.*ask which one they meant/);
+		assert.match(tool.description, /naming the page by its title from the search_commons hit/);
+	});
 
 	it('comments on the whole page through room.commons.comments.add, or on a passage with quote; the thread root comes back', async () => {
 		// 2026-10-13 21:16: "make a comment: Susan has reviewed" was appended to the page's text; the comments list stayed empty.

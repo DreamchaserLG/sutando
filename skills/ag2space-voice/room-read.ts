@@ -350,7 +350,15 @@ export interface ReadRoomDeps {
 	currentRoom: () => VoiceSessionRoom | null;
 	index: RoomIndex;
 	log?: (m: string) => void;
+	/** Comments this session left, by room, page and text: the same one is not left twice (filled by addComment). */
+	recentComments?: Map<string, { event_id: string | null; at: number }>;
+	/** The clock, for tests. */
+	now?: () => number;
 }
+
+/** 2026-10-19 17:31: told the comment went on the wrong page, the model searched again and left the same
+ *  text on the same page a second time, silently. Within this window the same comment is refused. */
+export const RECENT_COMMENT_MS = 10 * 60_000;
 
 export type ReadRoomResult =
 	| { ok: true; room: string; messages: RoomMessageLine[]; thread_replies?: RoomMessageLine[]; latest?: RoomMessageLine; ms: number }
@@ -720,7 +728,7 @@ const withoutMentionIds = (text: string, ids: string[]) => ids.reduce((t, id) =>
 
 export type AddCommentResult =
 	| { ok: true; room: string; kind: string; quote: string | null; event_id: string | null; mentions: number; mentioned: string[]; ms: number }
-	| { ok: false; error: string; candidates?: string[]; rooms?: string[]; name?: string };
+	| { ok: false; error: string; candidates?: string[]; rooms?: string[]; name?: string; event_id?: string | null; ago_s?: number };
 
 /**
  * A comment on a Commons page (room.commons.comments.add), as the web client leaves one: on the whole
@@ -737,6 +745,19 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 	if (text.length > ROOM_WRITE_TEXT_MAX) return { ok: false, error: 'too_long' };
 	const said = (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean);
 	const replyTo = (args.reply_to ?? '').trim();
+	const now = deps.now ?? Date.now;
+	const recent = (deps.recentComments ??= new Map());
+	// The same words on the same page (or in the same thread) within RECENT_COMMENT_MS: left once already.
+	const alreadyLeft = (roomId: string, where: string): AddCommentResult | null => {
+		const key = `${roomId}|${where}|${text}`;
+		const seen = recent.get(key);
+		if (seen && now() - seen.at < RECENT_COMMENT_MS) return { ok: false, error: 'already_left', event_id: seen.event_id, ago_s: Math.round((now() - seen.at) / 1000) };
+		return null;
+	};
+	const remember = (roomId: string, where: string, event_id: string | null) => {
+		for (const [k, v] of recent) if (now() - v.at >= RECENT_COMMENT_MS) recent.delete(k);
+		recent.set(`${roomId}|${where}|${text}`, { event_id, at: now() });
+	};
 	if (replyTo) {
 		// A reply in a comment thread: the thread's root, from a comment's event_id.
 		if (!EVENT_ID.test(replyTo)) return { ok: false, error: 'no_thread' };
@@ -746,10 +767,14 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 		if (!who.ok) return who;
 		const mentions = who.ids;
 		text = withoutMentionIds(text, mentions) || text;
+		const dup = alreadyLeft(target.room.room_id, `thread:${replyTo}`);
+		if (dup) return dup;
 		const done = await roomExecute(client, target.room, 'room.commons.comments.reply', { root_event_id: replyTo, text, ...(mentions.length ? { mentions } : {}) }, deps);
 		if (!done.ok) return done;
+		const event_id = typeof done.result.event_id === 'string' ? done.result.event_id : null;
+		remember(target.room.room_id, `thread:${replyTo}`, event_id);
 		deps.log?.(`[RoomRead] room.commons.comments.reply in ${target.room.name}: ${text.length} chars${mentions.length ? ` @${mentions.length}` : ''}`);
-		return { ok: true, room: target.room.name, kind: '', quote: null, event_id: typeof done.result.event_id === 'string' ? done.result.event_id : null, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
+		return { ok: true, room: target.room.name, kind: '', quote: null, event_id, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 	}
 	const kind = (args.kind ?? '').trim();
 	if (!/^((markdown|html|board|sheet)(-[a-z0-9]{8})?|readme)$/.test(kind)) return { ok: false, error: 'no_page' };
@@ -761,9 +786,12 @@ export async function addComment(args: { room?: string; kind?: string; text: str
 	if (!who.ok) return who;
 	const mentions = who.ids;
 	text = withoutMentionIds(text, mentions) || text;
+	const dup = alreadyLeft(target.room.room_id, kind);
+	if (dup) return dup;
 	const done = await roomExecute(client, target.room, 'room.commons.comments.add', { kind, text, ...(quote ? { quote } : {}), ...(mentions.length ? { mentions } : {}) }, deps);
 	if (!done.ok) return done;
 	const event_id = typeof done.result.event_id === 'string' ? done.result.event_id : null;
+	remember(target.room.room_id, kind, event_id);
 	deps.log?.(`[RoomRead] room.commons.comments.add on ${kind} in ${target.room.name}: ${text.length} chars${quote ? ' (on a passage)' : ''}${mentions.length ? ` @${mentions.length}` : ''}`);
 	return { ok: true, room: target.room.name, kind, quote, event_id, mentions: mentions.length, mentioned: who.names, ms: Date.now() - t0 };
 }
@@ -963,8 +991,9 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, kind, quote, event_id, mentions, mentioned} — then tell the user in one sentence that the comment is on that page, naming whom it @-mentioned from `mentioned`. ' +
-			'Errors: "no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
+			'Returns {ok:true, room, kind, quote, event_id, mentions, mentioned} — then tell the user in one sentence that the comment is on that page, naming the page by its title from the search_commons hit, and whom it @-mentioned from `mentioned`. ' +
+			'Errors: "already_left" — this exact comment is already on that page, left `ago_s` seconds ago by you: do not leave it again; if the user says it went on the wrong page, say which page it is on and ask which one they meant, then comment there. ' +
+			'"no_text" — nothing to write; "too_long" — keep it under 4000 characters; "no_page" — the kind is not a page kind; "no_quote" — a quote anchors only on a Doc page; "no_thread" — reply_to is not a comment\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "NOT_FOUND" — no such page, passage or thread; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not comment in that room; "not_connected" or "unavailable" — say the comment could not be left right now and nothing was written; ' + OUTCOME_UNKNOWN_ERROR,
 		parameters: z.object({
 			text: z.string().min(1).max(ROOM_WRITE_TEXT_MAX).describe('The exact comment, as the user gave it.'),
