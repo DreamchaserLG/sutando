@@ -54,6 +54,7 @@ class Stub:
         self.seen = []
         self.discovery = None
         self.mint = (200, {"access_token": ACCESS, "expires_in": 900})
+        self.redirect_to = None
         stub = self
 
         # Runs on the server's thread, which this repo's coverage config does not trace.
@@ -62,6 +63,12 @@ class Stub:
                 pass
 
             def _send(self, status, body):
+                if stub.redirect_to:
+                    self.send_response(302)
+                    self.send_header("location", stub.redirect_to)
+                    self.send_header("content-length", "0")
+                    self.end_headers()
+                    return
                 raw = b"<html>bad gateway</html>" if body is None else json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
@@ -185,6 +192,30 @@ class EdgeTest(unittest.TestCase):
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("/v1/mcp/discovery", err)
         self.assertNotIn(SECRET, err)
+
+
+class RedirectTest(unittest.TestCase):
+    """A 3xx would carry the bearer to its Location, past the https/loopback check."""
+
+    def setUp(self):
+        self.stub, self.elsewhere = Stub(), Stub()
+        self.addCleanup(self.stub.close)
+        self.addCleanup(self.elsewhere.close)
+        self.stub.redirect_to = f"{self.elsewhere.base}/stolen"
+
+    def test_a_redirected_discovery_is_an_error_and_is_not_followed(self):
+        rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("302", err)
+        self.assertEqual([m for m, *_ in self.stub.seen], ["GET"])
+        self.assertEqual(self.elsewhere.seen, [])
+
+    def test_a_redirected_mint_is_an_error_and_is_not_followed(self):
+        mint_url = f"{self.stub.base}/api/v1/mcp/agent-access-tokens"
+        with self.assertRaisesRegex(mcp_auth.McpAuthError, "302"):
+            mcp_auth.mint(mint_url, SECRET)
+        self.assertEqual([m for m, *_ in self.stub.seen], ["POST"])
+        self.assertEqual(self.elsewhere.seen, [])
 
 
 class SetupTest(unittest.TestCase):

@@ -55,13 +55,22 @@ def _safe_url(field: str, value: object) -> str:
     raise McpAuthError(f"{field} must be https (or http to loopback): {parsed.scheme}://{parsed.hostname}")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # urllib copies Authorization onto the redirect, which would carry the bearer past _safe_url.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _call(method: str, url: str, bearer: str) -> Tuple[int, dict]:
     req = urllib.request.Request(url, method=method, data=b"" if method == "POST" else None,
                                  headers={"Authorization": f"Bearer {bearer}",
                                           "User-Agent": USER_AGENT,
                                           "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT_S) as resp:
             status, raw = resp.status, resp.read()
     except urllib.error.HTTPError as exc:
         status, raw = exc.code, exc.read()
