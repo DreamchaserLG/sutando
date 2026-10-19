@@ -55,10 +55,22 @@ In a task result this goes in the result file; in a direct reply, in the message
 image goes where it was asked (it is your own work, not private data): the room the request came
 from, or the DM when that is where it was asked.
 
-## Put it into an AG2 Space room or project
+## Send it to an AG2 Space room or DM
 
-When the picture belongs in a room's media or a LaTeX/Typst project ("add figure 3, a pineapple"),
-upload it from disk with the upload script. **Never pass the image's base64 through a tool call
+A picture asked for in a room or DM, or to be sent to one ("send the boba tea picture to our AG2
+Space DM"), goes into that room's chat with one call: the upload script with `--post`. The DM with a
+person is the two-member room named after the two of you (`room_list`, then `room_inspect` on the
+candidates). The result's `event_id` is the chat message; a read of that event is the check.
+
+```bash
+U="<repo>/skills/ag2space-voice/scripts/upload-media.ts"
+npx tsx "$U" --room '<room id>' --file "<path>" --name boba-tea.jpg --post
+```
+
+## Put it into a project
+
+When the picture belongs in a LaTeX/Typst project ("add figure 3, a pineapple"), upload it from disk
+with the upload script, without `--post` (it is filed on the Media page, not sent into the chat). **Never pass the image's base64 through a tool call
 yourself** (`room.media.upload` by hand): writing tens of thousands of characters takes minutes
 and corrupts the bytes.
 

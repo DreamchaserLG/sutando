@@ -1,13 +1,14 @@
 /**
- * upload-media — put a local image into an AG2 Space room's media, optionally filed in a Commons folder.
+ * upload-media — put a local image into an AG2 Space room's media, optionally filed in a Commons folder, and with
+ * --post also into the room's chat (a picture sent to a room or DM; without it the picture is on the Media page only).
  *
  * room.media.upload takes the bytes as base64 inside the call. A model that writes that argument itself
  * spends minutes on it and corrupts it; this reads the file from disk, so the bytes never pass through a
  * model. It talks to the same ag2-space MCP server the agent uses, as the same agent.
  *
- *   npx tsx skills/ag2space-voice/scripts/upload-media.ts --room '!abc:ag2.space' --file pic.jpg [--name pineapple.jpg] [--folder a499a739]
+ *   npx tsx skills/ag2space-voice/scripts/upload-media.ts --room '!abc:ag2.space' --file pic.jpg [--name pineapple.jpg] [--folder a499a739] [--post]
  *
- * Prints one JSON line: {"ok":true,"mxc","file_id","name","mime","bytes","sha256","folder_id"} or {"ok":false,"error",...}.
+ * Prints one JSON line: {"ok":true,"mxc","file_id","name","mime","bytes","sha256","folder_id","posted","event_id"} or {"ok":false,"error",...}.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
@@ -35,7 +36,7 @@ export function fileName(requested: string | undefined, path: string, ext: strin
 }
 
 export type UploadResult =
-	| { ok: true; mxc: string; file_id: string | null; name: string; mime: string; bytes: number; sha256: string; folder_id: string | null }
+	| { ok: true; mxc: string; file_id: string | null; name: string; mime: string; bytes: number; sha256: string; folder_id: string | null; posted: boolean; event_id: string | null }
 	| { ok: false; error: string; detail?: string; mxc?: string };
 
 /** The server's own words for a refusal: its message, else the first line of a text reply. */
@@ -55,7 +56,7 @@ async function execute(client: McpClient, room: string, action: string, args: Re
 	return { ok: true, result: (payload.result ?? payload) as Record<string, unknown> };
 }
 
-export async function uploadMedia(opts: { room: string; file: string; name?: string; folder?: string }, client: McpClient): Promise<UploadResult> {
+export async function uploadMedia(opts: { room: string; file: string; name?: string; folder?: string; post?: boolean }, client: McpClient): Promise<UploadResult> {
 	if (!/^![^:\s]+:\S+$/.test(opts.room)) return { ok: false, error: 'bad_room', detail: 'pass the room id, e.g. !abc:ag2.space' };
 	if (opts.folder && !/^[a-z0-9]{8}$/.test(opts.folder)) return { ok: false, error: 'bad_folder', detail: 'a folder id is 8 lowercase letters or digits' };
 	let bytes: Buffer;
@@ -68,9 +69,11 @@ export async function uploadMedia(opts: { room: string; file: string; name?: str
 	const kind = sniffImage(bytes);
 	if (!kind) return { ok: false, error: 'not_an_image', detail: 'PNG, JPEG, GIF or WebP only' };
 	const name = fileName(opts.name, opts.file, kind.ext);
-	const up = await execute(client, opts.room, 'room.media.upload', { data_b64: bytes.toString('base64'), mime: kind.mime, filename: name, post: false });
+	// One upload: with post the server also puts the picture into the room's chat, so the bytes go up once.
+	const up = await execute(client, opts.room, 'room.media.upload', { data_b64: bytes.toString('base64'), mime: kind.mime, filename: name, post: opts.post === true });
 	if (!up.ok) return up;
 	const mxc = typeof up.result.mxc === 'string' ? up.result.mxc : '';
+	const eventId = typeof up.result.event_id === 'string' ? up.result.event_id : null;
 	if (!mxc) return { ok: false, error: 'no_mxc' };
 	const added = await execute(client, opts.room, 'room.media.add', { mxc, name, mime: kind.mime, folder_id: opts.folder ?? null });
 	if (!added.ok) return { ...added, mxc };
@@ -79,14 +82,16 @@ export async function uploadMedia(opts: { room: string; file: string; name?: str
 		file_id: typeof added.result.file_id === 'string' ? added.result.file_id : null,
 		sha256: createHash('sha256').update(bytes).digest('hex'),
 		folder_id: opts.folder ?? null,
+		posted: opts.post === true, event_id: eventId,
 	};
 }
 
-export function parseArgs(argv: readonly string[]): { room?: string; file?: string; name?: string; folder?: string } {
-	const out: Record<string, string> = {};
+export function parseArgs(argv: readonly string[]): { room?: string; file?: string; name?: string; folder?: string; post?: boolean } {
+	const out: { room?: string; file?: string; name?: string; folder?: string; post?: boolean } = {};
 	for (let i = 0; i < argv.length; i++) {
+		if (argv[i] === '--post') { out.post = true; continue; }
 		const m = /^--(room|file|name|folder)$/.exec(argv[i]);
-		if (m && i + 1 < argv.length) out[m[1]] = argv[++i];
+		if (m && i + 1 < argv.length) out[m[1] as 'room' | 'file' | 'name' | 'folder'] = argv[++i];
 	}
 	return out;
 }
@@ -94,12 +99,12 @@ export function parseArgs(argv: readonly string[]): { room?: string; file?: stri
 async function main(): Promise<number> {
 	const a = parseArgs(process.argv.slice(2));
 	const print = (r: UploadResult) => { console.log(JSON.stringify(r)); return r.ok ? 0 : 1; };
-	if (!a.room || !a.file) return print({ ok: false, error: 'usage', detail: 'upload-media --room <room id> --file <path> [--name <name>] [--folder <folder id>]' });
+	if (!a.room || !a.file) return print({ ok: false, error: 'usage', detail: 'upload-media --room <room id> --file <path> [--name <name>] [--folder <folder id>] [--post]' });
 	const entry = findAg2SpaceMcpEntry();
 	if (!entry) return print({ ok: false, error: 'no_mcp', detail: 'no ag2-space MCP server in this agent\'s .claude.json (CLAUDE_CONFIG_DIR)' });
 	const client = createMcpStdioClient(entry, { log: (m) => console.error(m) });
 	try {
-		return print(await uploadMedia({ room: a.room, file: a.file, name: a.name, folder: a.folder }, client));
+		return print(await uploadMedia({ room: a.room, file: a.file, name: a.name, folder: a.folder, post: a.post }, client));
 	} catch (err) {
 		return print({ ok: false, error: 'failed', detail: err instanceof Error ? err.message : String(err) });
 	} finally {
