@@ -15,7 +15,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 mkdirSync(join(TMP, 'tasks'), { recursive: true });
 mkdirSync(join(TMP, 'results'), { recursive: true });
 
-const { wireDurableChannels, resultEvidence, turnSaysResult } = await import('../src/live-agent-runtime.js');
+const { wireDurableChannels, resultEvidence, turnSaysResult, spokenNumberForms } = await import('../src/live-agent-runtime.js');
 const { RelayAgent } = await import('../src/relay-agent.js');
 const { voiceTaskStore, setVoiceTaskEndedListener, voiceTaskResultText } = await import('../src/task-bridge.js');
 
@@ -121,5 +121,26 @@ describe('resultEvidence / turnSaysResult', () => {
 		const n = resultEvidence('PR 5617 is merged.');
 		assert.equal(turnSaysResult('5617 went in on Saturday', n), true);
 		assert.equal(turnSaysResult('It was merged.', n), false);
+	});
+
+	// 2026-10-19 17:29: the result said "98 PRs merged"; the model said "ninetyeight merged" and "九十八个", and was
+	// nudged, handed the result twice more and made to say it four times. 3.8-live's transcript never writes digits.
+	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
+		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
+		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);
+		assert.equal(turnSaysResult('关于上周合并的PR数量， 一共有九十八个合并到 Sutando 仓库里。', prs), true);
+		assert.equal(turnSaysResult('Ninety-eight pull requests.', prs), true);
+		assert.equal(turnSaysResult('The newest one is fifty-seven seventeen.', prs), true);
+		assert.equal(turnSaysResult('Your disk is sixty percent free, with thirtyone gigabytes to clear.', prs), false, 'other numbers are not this result');
+		assert.equal(turnSaysResult('Yes, I can hear you.', prs), false);
+		const pct = resultEvidence('Disk is 60% free; 31 GB of caches can go.');
+		assert.equal(turnSaysResult('Your disk is sixty percent free, and about thirtyone gigabytes of caches can be cleared.', pct), true);
+		const dec = resultEvidence('It weighs 3.5 kg.');
+		assert.equal(turnSaysResult('It weighs three point five kilograms.', dec), true);
+		assert.equal(turnSaysResult('它重三点五公斤。', dec), true);
+		assert.deepEqual(spokenNumberForms('98').slice(0, 2), ['ninetyeight', '九十八']);
+		assert.ok(spokenNumberForms('5717').includes('fiftysevenseventeen'));
+		assert.ok(spokenNumberForms('2026').includes('twothousandtwentysix'));
+		assert.ok(spokenNumberForms('1105').includes('一千一百零五'));
 	});
 });

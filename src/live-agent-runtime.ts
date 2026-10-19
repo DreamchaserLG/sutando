@@ -70,12 +70,62 @@ export function resultEvidence(text: string): { numbers: string[]; words: string
 	const words = [...new Set((plain.toLowerCase().match(/[a-z][a-z'-]{3,}|[\u4e00-\u9fff]{2,}/g) ?? []).map((w) => w.replace(/'s$|'$/, '')).filter((w) => w.length >= 4 && !EVIDENCE_STOP.has(w)))];
 	return { numbers, words };
 }
-/** The turn said the result: one of its numbers; else its distinctive words, two of them when the result has numbers it did
- *  not say or has that many (a result with neither counts on its first spoken turn). */
+
+const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+const CN_DIGITS = '零一二三四五六七八九';
+function englishBelowThousand(n: number): string {
+	if (n < 20) return ONES[n];
+	if (n < 100) return n % 10 ? `${TENS[Math.floor(n / 10)]} ${ONES[n % 10]}` : TENS[Math.floor(n / 10)];
+	return `${ONES[Math.floor(n / 100)]} hundred${n % 100 ? ` ${englishBelowThousand(n % 100)}` : ''}`;
+}
+function englishCardinal(n: number): string {
+	if (n < 1000) return englishBelowThousand(n);
+	if (n < 1_000_000) return `${englishBelowThousand(Math.floor(n / 1000))} thousand${n % 1000 ? ` ${englishBelowThousand(n % 1000)}` : ''}`;
+	return '';
+}
+function chineseCardinal(n: number): string {
+	if (n < 10) return CN_DIGITS[n];
+	if (n >= 100_000) return '';
+	const units = ['', '十', '百', '千', '万'];
+	const digits = String(n).split('').map(Number);
+	let out = '';
+	digits.forEach((d, i) => {
+		const unit = units[digits.length - 1 - i];
+		if (d === 0) { if (!out.endsWith('零') && i < digits.length - 1) out += '零'; return; }
+		out += (d === 1 && unit === '十' && i === 0 ? '' : CN_DIGITS[d]) + unit;
+	});
+	return out.replace(/零+$/, '');
+}
+/** Letters, digits and CJK only: "ninety-eight", "ninety eight" and "ninetyeight" compare equal. */
+const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+/** How a transcript may spell a number the result wrote in digits: gemini-3.8-live's output transcription writes
+ *  "ninetyeight", "sixty percent", "fifty-seven fifteen" and "九十八", never "98". */
+export function spokenNumberForms(num: string): string[] {
+	const forms: string[] = [];
+	const [whole, frac] = num.replace(/,/g, '').split('.');
+	const n = Number(whole);
+	if (!Number.isFinite(n) || whole.length > 6) return forms;
+	const tail = frac ? ` point ${frac.split('').map((d) => ONES[Number(d)]).join(' ')}` : '';
+	const cnTail = frac ? `点${frac.split('').map((d) => CN_DIGITS[Number(d)]).join('')}` : '';
+	const en = englishCardinal(n);
+	if (en) forms.push(en + tail);
+	const cn = chineseCardinal(n);
+	if (cn) forms.push(cn + cnTail);
+	if (whole.length === 4 && !frac) forms.push(`${englishBelowThousand(Number(whole.slice(0, 2)))} ${englishBelowThousand(Number(whole.slice(2)))}`); // "fifty-seven seventeen"
+	if (whole.length >= 3 && !frac) {
+		forms.push(whole.split('').map((d) => ONES[Number(d)]).join(' ')); // "five seven one seven"
+		forms.push(whole.split('').map((d) => CN_DIGITS[Number(d)]).join(''));
+	}
+	return forms.map(squash).filter((f) => f.length >= 3);
+}
+/** The turn said the result: one of its numbers (as digits or as the transcript spells them); else its distinctive words,
+ *  two of them when the result has numbers it did not say or has that many (a result with neither counts on its first spoken turn). */
 export function turnSaysResult(turn: string, evidence: { numbers: string[]; words: string[] }): boolean {
 	if (!evidence.numbers.length && !evidence.words.length) return true;
 	const t = turn.toLowerCase();
-	if (evidence.numbers.some((n) => t.includes(n))) return true;
+	const squashed = squash(turn);
+	if (evidence.numbers.some((n) => t.includes(n) || spokenNumberForms(n).some((f) => squashed.includes(f)))) return true;
 	const need = evidence.numbers.length ? 2 : Math.min(2, evidence.words.length);
 	let hits = 0;
 	for (const w of evidence.words) if (t.includes(w) && ++hits >= need) return true;
