@@ -44,6 +44,9 @@ export interface DurableChannelOptions {
 	handoffConfirmMs?: number;
 	/** The `work` subagent, which owns the result queue. */
 	relay: RelayAgent;
+	/** Puts text to the model as live input once it is not speaking. Used for a result when system notices
+	 *  are not getting through (after a reconnect, or once a notice went unheard). */
+	injectLive?: (text: string) => void;
 }
 
 /**
@@ -117,6 +120,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	// A result no work call can carry (its call was cancelled, its connection replaced, or the agent
 	// restarted): a system notice when the session can speak, held through a meeting; else one DM copy.
 	const heldForMeeting: ResultItem[] = [];
+	// System notices can stop reaching the model after a reconnect (bodhi 0.4.6 keeps waiting for a turn
+	// that never comes). From the first reconnect on, a result goes to the model as live input instead.
+	let noticesSuspect = false;
 	// One result at a time, each confirmed by the model's next turn (spoken) or handed over again once.
 	const pacer = createHandoffPacer({
 		markSpoken: (spoken) => { for (const id of spoken) voiceTaskStore.set(id, 'spoken'); },
@@ -132,6 +138,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
 	session.eventBus.subscribe('session.stateChange', (e: { toState?: string }) => {
 		if (e?.toState !== 'RECONNECTING') return;
+		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] reconnecting: results with no open call go as live input from here on`);
+		noticesSuspect = true;
 		for (const { ids: lost } of returnedUnheard.splice(0)) for (const id of lost) voiceTaskStore.unsetHandedOver(id);
 	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
@@ -185,7 +193,15 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		hand: () => {
 			// A meeting that began while this waited its turn: not said into it (bodhi's notifications do not check).
 			if (meetingHoldsModel(session)) return false;
-			const now = current(item); if (!notice(now)) return false; record(now, 'injected'); return true;
+			const now = current(item);
+			// A notice already went unheard for this task, or none has been heard since the reconnect: live input.
+			const unheardBefore = ids(now).some((id) => (voiceTaskStore.get(id)?.replays ?? 0) > 0);
+			if (opts.injectLive && (noticesSuspect || unheardBefore)) {
+				if (!canSpeak()) return false;
+				console.log(`${ts()} [RelayAgent] ${item.taskId ?? 'result'}: handed as live input (${noticesSuspect ? 'after a reconnect' : 'a notice went unheard'})`);
+				opts.injectLive(frameResult(now));
+			} else if (!notice(now)) return false;
+			record(now, 'injected'); return true;
 		},
 		fallback: () => (meetingHoldsModel(session) ? holdForMeeting(item) : retryThenDm(item)),
 	});

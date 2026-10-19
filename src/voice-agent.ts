@@ -270,6 +270,8 @@ function acquirePidLock(): void {
 
 // Model configuration — override via .env for cost/quality tuning
 const VOICE_MODEL = process.env.VOICE_MODEL || 'gemini-2.5-flash';
+/** How long the model may stay silent after the user's turn before the session is reconnected (bodhi's default 5 s). */
+const VOICE_RESPONSE_WATCHDOG_MS = Math.max(2_000, Number(process.env.VOICE_RESPONSE_WATCHDOG_MS) || 5_000);
 // Per-user voice config (native-audio model + googleSearch grounding) is
 // data, not code: it lives in the workspace, NOT in the git repo.
 //   live config: $SUTANDO_WORKSPACE/config/voice-agent.json
@@ -1066,6 +1068,8 @@ async function main() {
 		// A lost upstream parks in UPSTREAM_LOST with the WS listener up; bodhi's
 		// upstreamRecovery decides when to redial, park an idle upstream and back off.
 		upstreamLossPolicy: 'hold',
+		// A reconnect ends every open work call; the silence that triggers one is tunable per install.
+		responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,
 		upstreamRecovery: {
 			idleParkMs: IDLE_TEARDOWN_MS,
 			stuckConnectingMs: parseStuckConnectingMs(process.env.VOICE_STUCK_CONNECTING_MS),
@@ -1467,7 +1471,7 @@ async function main() {
 	// Durable-channel wiring (context drops, note viewing, task results →
 	// session injection) moved verbatim to live-agent-runtime.ts (step 5a-2).
 	// The Cartesia stuck-session fallback is adapter-provided via opts.
-	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, relay: relayAgent });
+	const durable = wireDurableChannels(session, { cartesiaApiKey: CARTESIA_API_KEY, generateSpeech, injectLive: (text) => relayAsk.ask(text), relay: relayAgent });
 
 	// P7 D7.3: the transcript cursor lives in the clear helper so every clear
 	// path rebases it with the items array (G-P7-8).
