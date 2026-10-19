@@ -245,6 +245,9 @@ def prune_spent_sentinels(workspace: str, instance: str) -> str:
     is live) would re-offer work the session is answering. Never changes the decision."""
     try:
         import pool_delivery as pd
+        import pool_router as rt
+        # Migrate first: a pruned main-era sentinel would leave its tasks/ copy with no holder.
+        rt.migrate_main_era(Path(workspace))
         acts = pd.prune_spent(Path(workspace), instance)
         return " ".join(f"{k}={len(v)}" for k, v in acts.items())
     except Exception as e:                                   # noqa: BLE001

@@ -935,6 +935,23 @@ class LegacyInFlight(unittest.TestCase):
         self.assertEqual(pd.body_path(self.ws, A, "task-legacy").read_text(), self.text)
         self.assertTrue((folder / "task-legacy.accepted").is_file(), "the delivery itself is unchanged")
 
+    def test_a_worker_boot_migrates_before_it_prunes_a_finished_main_era_delivery(self):
+        folder = self.ws / "deliveries" / A
+        self.handler(self.main)
+        os.rename(folder / "task-legacy.txt", folder / "task-legacy.accepted")
+        (self.ws / "results" / "task-legacy.txt").write_text("answered\n")
+        pd.mark_done(self.ws, A, "task-legacy", published=True)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("worker_bootstrap_t", SCRIPTS / "worker_bootstrap.py")
+        wb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wb)
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = wb.prune_spent_sentinels(str(self.ws), A)
+        self.assertIn("retired=1", out)
+        self.assertEqual(self.core_lists(), ([], []), "no tasks/ copy is left behind with no holder")
+        self.assertEqual(pd.archived_payload(self.ws, "task-legacy").read_text(), self.text)
+        self.assertEqual([p.name for p in folder.glob("task-legacy.*")], [])
+
     def test_the_migrate_command_is_idempotent_and_keeps_what_it_cannot_read(self):
         self.handler(self.main)
         cmd = [sys.executable, str(SCRIPTS / "pool_router.py"), "migrate", "--workspace", str(self.ws)]
