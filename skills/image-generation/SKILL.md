@@ -58,9 +58,11 @@ from, or the DM when that is where it was asked.
 ## Send it to an AG2 Space room or DM
 
 A picture asked for in a room or DM, or to be sent to one ("send the boba tea picture to our AG2
-Space DM"), goes into that room's chat with one call: the upload script with `--post`. The DM with a
-person is the two-member room named after the two of you (`room_list`, then `room_inspect` on the
-candidates). The result's `event_id` is the chat message; a read of that event is the check.
+Space DM"), goes into that room's chat with one call: the upload script with `--post`. A voice task
+carries every room's id in its "known to the voice assistant" block: take the id from there, never
+`room_list`. The DM with a person is the two-member room named after the two of you ("Maddy-susan");
+only when the block is missing, `room_list` then `room_inspect`. The result's `event_id` is the chat
+message; a read of that event is the check.
 
 ```bash
 U="<repo>/skills/ag2space-voice/scripts/upload-media.ts"
