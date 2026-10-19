@@ -23,13 +23,25 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
 from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
 
 isolate_os_environ()
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-mcp-headers-")
+_FAKE_VI = types.ModuleType("vault_intercept")
+
+
+def _no_vault(var):
+    raise KeyError(var)             # empty vault: never resolves, never touches Keychain
+
+
+_FAKE_VI.get_vault_key = _no_vault
+sys.modules["vault_intercept"] = _FAKE_VI
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
@@ -54,7 +66,7 @@ class Stub:
                 pass
 
             def _send(self, status, body):
-                raw = json.dumps(body).encode()
+                raw = b"<html>bad gateway</html>" if body is None else json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(raw)))
@@ -148,6 +160,37 @@ class HeadersTest(unittest.TestCase):
         self.assertEqual(self.stub.seen, [])
 
 
+class EdgeTest(unittest.TestCase):
+    def setUp(self):
+        self.stub = Stub()
+        self.addCleanup(self.stub.close)
+
+    def test_discovery_without_mcp_url_is_refused(self):
+        self.stub.discovery = (200, {"mint_url": f"{self.stub.base}/mint"})
+        rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("without mcp_url", err)
+
+    def test_https_urls_pass_the_check(self):
+        url = "https://mcp.example/mcp"
+        self.assertEqual(mcp_auth._safe_url("mcp_url", url), url)
+
+    def test_a_mint_answer_that_is_not_json_names_the_status(self):
+        self.stub.mint = (502, None)
+        rc, out, err = _run_main(["headers"], (self.stub.relay, SECRET, ""))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("502", err)
+
+    def test_an_unreachable_relay_fails_cleanly(self):
+        dead = Stub()
+        dead.close()
+        dead.srv.server_close()
+        rc, out, err = _run_main(["headers"], (dead.relay, SECRET, ""))
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("/v1/mcp/discovery", err)
+        self.assertNotIn(SECRET, err)
+
+
 class SetupTest(unittest.TestCase):
     def setUp(self):
         self.stub = Stub()
@@ -173,6 +216,27 @@ class SetupTest(unittest.TestCase):
         self.assertNotIn("AG2_DEVICE_ENV=", out)
         self.assertIn("REMOTE_TASK_TOKEN", out + err)
         self.assertNotIn(SECRET, out + err)
+
+
+class HelperCommandTest(unittest.TestCase):
+    def test_from_the_zipapp_the_helper_puts_the_pyz_on_pythonpath(self):
+        pyz = os.path.join(tempfile.mkdtemp(prefix="mcp-pyz-"), "ag2-sparrow.pyz")
+        open(pyz, "w").close()
+        with mock.patch.object(mcp_auth, "__file__", os.path.join(pyz, "ag2_sparrow", "mcp_auth.py")):
+            cmd = mcp_auth._helper_command("")
+        self.assertIn(f"PYTHONPATH={os.path.realpath(pyz)} ", cmd)
+        self.assertNotIn("AG2_DEVICE_ENV", cmd)
+
+    def test_an_installed_package_needs_no_pythonpath(self):
+        self.assertNotIn("PYTHONPATH", mcp_auth._helper_command("/e/.env"))
+
+
+class ResolveTest(unittest.TestCase):
+    def test_reads_the_bridges_own_resolution(self):
+        relay = "https://gw.example/relay"
+        with mock.patch.dict(os.environ, {"REMOTE_TASK_TOKEN": f"{relay}|{SECRET}"}):
+            sys.modules.pop("ag2_sparrow.remote_gateway_bridge", None)
+            self.assertEqual(mcp_auth.resolve_gateway(), (relay, SECRET, ""))
 
 
 class EntryPointTest(unittest.TestCase):
