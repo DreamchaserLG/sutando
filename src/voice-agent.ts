@@ -494,16 +494,15 @@ const getTaskStatus: ToolDefinition = {
 	description:
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
-		'pendingTasks is the number to give for "how many pending": tasks whose answer the user has not heard yet, whether the core is still working on them or finished and the result is still to be read. ' +
-		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before anything else; the user asking "did you lose one?" is usually one of these. ' +
+		'pendingTasks is the number to give for "how many pending": tasks the core is still working on. A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
+		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before the count; the user asking "did you lose one?" is usually one of these. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
-		// Pending as the user counts it: not heard an answer yet. 2026-10-11: the core had finished a task
-		// whose result still waited to be read, the count left it out, and the user heard "2" for 3.
+		// Pending is what the core still works on; a finished result not yet told is listed apart, to be said first.
 		const counts = voiceTaskCounts(rows);
 		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
 		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);

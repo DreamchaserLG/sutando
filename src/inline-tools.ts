@@ -825,14 +825,14 @@ export const heardByUser = (r: VoiceTaskRow): boolean => r.delivery === 'spoken'
 /** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
 
 /**
- * What "pending" means to the user: tasks whose answer they have not heard yet. The core may have
- * finished one whose result still waits to be read to them; to the user it is pending until then.
+ * "Pending" is what the core is still working on. A finished result the user has not heard yet is counted
+ * apart and read to them first: a picture already in their DM half a minute ago is not a pending task.
  */
 export function voiceTaskCounts(rows: VoiceTaskRow[]): { pending: number; working: number; doneNotHeard: number } {
 	const live = rows.filter((r) => r.state !== 'cancelled' && !r.retired);
 	const working = live.filter((r) => r.state === 'queued' || r.state === 'started').length;
 	const doneNotHeard = live.filter((r) => r.state !== 'queued' && r.state !== 'started' && !heardByUser(r)).length;
-	return { pending: working + doneNotHeard, working, doneNotHeard };
+	return { pending: working, working, doneNotHeard };
 }
 
 /**
@@ -848,7 +848,7 @@ export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now()):
 	const tasks = [...rows].sort((a, b) => b.submittedAt - a.submittedAt).map((r) => {
 		const heard = heardByUser(r);
 		const live = r.state !== 'cancelled' && !r.retired;
-		return { id: r.id, text: r.text, submittedAt: r.submittedAt, state: r.state, delivery: r.delivery ?? null, heard, retired: !!r.retired, pending: live && !heard };
+		return { id: r.id, text: r.text, submittedAt: r.submittedAt, state: r.state, delivery: r.delivery ?? null, heard, retired: !!r.retired, pending: live && (r.state === 'queued' || r.state === 'started') };
 	});
 	return { at: now, ...c, tasks };
 }
@@ -861,7 +861,7 @@ export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
 	};
 	const heard = heardByUser;
 	const c = voiceTaskCounts(rows);
-	const headline = `Pending for the user: ${c.pending} (they have not heard an answer to these yet: ${c.working} the core is still working on, ${c.doneNotHeard} finished and waiting to be read to them). `;
+	const headline = `Pending: ${c.pending} the core is still working on${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}. `;
 	const parts = [
 		group('the core is working on', (r) => r.state === 'started' && !r.retired),
 		group('queued at the core', (r) => r.state === 'queued' && !r.retired),

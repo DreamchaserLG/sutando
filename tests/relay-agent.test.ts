@@ -997,11 +997,12 @@ describe('every status answer comes from the one table', () => {
 		const row = (text: string, state: string, delivery?: string) => ({ id: text, text, submittedAt: 1, state, delivery }) as never;
 		const retired = { id: 'r', text: 'cleared [no-send]', submittedAt: 1, state: 'done', retired: true } as never;
 		const rows = [row('merged PRs', 'done', 'spoken'), row('PR 5302', 'done', 'spoken'), row('PR 5167', 'done'), row('PR 5329', 'started'), row('non-spicy dishes', 'queued'), row('old one', 'cancelled'), retired];
-		assert.deepEqual(voiceTaskCounts(rows), { pending: 3, working: 2, doneNotHeard: 1 }, 'a task ended with nothing to say is not pending');
-		// A result returned to its work call (delivery injected) but not yet said is still pending.
+		assert.deepEqual(voiceTaskCounts(rows), { pending: 2, working: 2, doneNotHeard: 1 }, 'pending is what the core still works on; a finished result not yet told is counted apart; a task ended with nothing to say is neither');
+		// A result returned to its work call (delivery injected) but not yet said: not heard, and not pending either.
 		const returned = [row('PR 5696', 'done', 'injected'), row('Angry Birds app', 'started')];
-		assert.deepEqual(voiceTaskCounts(returned), { pending: 2, working: 1, doneNotHeard: 1 }, 'returned to the model is not heard');
-		assert.match(describeVoiceTasks(rows), /^Pending for the user: 3 \(they have not heard an answer to these yet: 2 the core is still working on, 1 finished and waiting to be read to them\)\./);
+		assert.deepEqual(voiceTaskCounts(returned), { pending: 1, working: 1, doneNotHeard: 1 }, 'returned to the model is not heard, and is told apart from pending');
+		assert.match(describeVoiceTasks(rows), /^Pending: 2 the core is still working on; 1 finished and not yet told to the user \(say those first, they are not pending\)\./);
+		assert.match(describeVoiceTasks([row('PR 5329', 'started')]), /^Pending: 1 the core is still working on\./);
 		assert.match(describeVoiceTasks(rows), /1 ended with nothing to say \("cleared \[no-send\]"\)/);
 		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
 		assert.ok(tool.includes('voiceTaskCounts(rows)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count');
@@ -1015,7 +1016,7 @@ describe('every status answer comes from the one table', () => {
 		assert.equal(snap.at, 99);
 		assert.deepEqual({ pending: snap.pending, working: snap.working, doneNotHeard: snap.doneNotHeard }, voiceTaskCounts(rows));
 		assert.deepEqual(snap.tasks.map((t) => t.id), ['dm one', 'cleared', 'PR 5329', 'PR 5167', 'PR 5302'], 'newest first');
-		assert.deepEqual(snap.tasks.map((t) => t.pending), [true, false, true, true, false]);
+		assert.deepEqual(snap.tasks.map((t) => t.pending), [false, false, true, false, false], 'only what the core still works on');
 		assert.deepEqual(snap.tasks.map((t) => t.heard), [false, false, false, false, true]);
 		assert.equal(snap.tasks[1].retired, true);
 		assert.equal(snap.tasks[0].delivery, 'dm');
