@@ -525,6 +525,8 @@ export function toCommonsHits(hits: unknown[]): CommonsHit[] {
 			title, where, text: text.length > ROOM_READ_BODY_MAX ? `${text.slice(0, ROOM_READ_BODY_MAX)}…` : text,
 			...(typeof hit.kind === 'string' && hit.kind ? { kind: hit.kind } : {}),
 			...(typeof hit.link === 'string' && hit.link ? { link: hit.link } : {}),
+			// The server's own database hits (kind "db", planned) carry the id add_comment needs, as the name hits do.
+			...(typeof hit.database === 'string' && /^d[a-z0-9]{1,24}$/.test(hit.database) ? { database: hit.database } : {}),
 		});
 	}
 	return out;
@@ -557,7 +559,9 @@ export async function searchCommons(args: { room?: string; query: string; limit?
 		pages.ok ? (Array.isArray(pages.result.pages) ? pages.result.pages : []) : [],
 		dbs.ok ? (Array.isArray(dbs.result.databases) ? dbs.result.databases : []) : []);
 	const body = toCommonsHits(Array.isArray(found.result.hits) ? found.result.hits : []);
-	const hits = [...byName, ...body.filter((h) => !byName.some((n) => n.kind && n.kind === h.kind))].slice(0, Math.max(limit, byName.length));
+	// The same page or database once: a server that already ranks name matches first (planned) adds nothing twice.
+	const same = (a: CommonsHit, b: CommonsHit) => !!a.kind && a.kind === b.kind && (a.database ?? '') === (b.database ?? '');
+	const hits = [...byName, ...body.filter((h) => !byName.some((n) => same(n, h)))].slice(0, Math.max(limit, byName.length));
 	deps.log?.(`[RoomRead] search_commons "${query}" in ${target.room.name}: ${byName.length} by name (${byName.map((h) => h.where + ' ' + h.title).join('; ')}), ${body.length} by text (${body.slice(0, 3).map((h) => h.where + ' ' + h.title).join('; ')})`);
 	return { ok: true, room: target.room.name, query, hits, ms: Date.now() - t0 };
 }

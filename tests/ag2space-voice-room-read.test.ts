@@ -481,6 +481,17 @@ describe('the room\'s Commons: its documents, pages and tables', () => {
 		assert.deepEqual(namedHits('xy', pages, [tracker]), [], 'two letters match nothing');
 		const r2 = await searchCommons({ room: 'Bodhi-migration', query: 'test progress' }, d);
 		assert.deepEqual(r2.ok && r2.hits.map(h => h.kind), ['markdown-liy9uut3'], 'the name hit replaces the text hit on the same page');
+		// Once the server itself ranks name matches first (planned: kind "db" hits with the id), nothing is listed twice.
+		const serverDb = { surface: 'database', kind: 'db', database: 'dmvby04eatk7t6', database_name: 'MCP request tracker', title: 'MCP request tracker', snippet: '' };
+		assert.deepEqual(toCommonsHits([serverDb]), [{ title: 'MCP request tracker', where: 'database MCP request tracker', text: '', kind: 'db', database: 'dmvby04eatk7t6' }]);
+		const g = fake((_n, a) => {
+			const action = (a as { action: string }).action;
+			if (action === 'room.commons.search') return ok({ hits: [serverDb, bodyHit] });
+			if (action === 'room.commons.pages.list') return ok({ pages });
+			return ok({ databases: [tracker] });
+		});
+		const r3 = await searchCommons({ room: 'Bodhi-migration', query: 'MCP request tracker' }, { ...d, client: () => g.client as never });
+		assert.deepEqual(r3.ok && r3.hits.map(h => [h.kind, h.database ?? '']), [['db', 'dmvby04eatk7t6'], ['markdown-liy9uut3', '']]);
 		// The comment goes on the database as a whole: kind "db" and its id.
 		const c = await addComment({ room: 'Bodhi-migration', kind: 'db', database: 'dmvby04eatk7t6', text: 'This is great!' }, d);
 		assert.equal(c.ok, true);
