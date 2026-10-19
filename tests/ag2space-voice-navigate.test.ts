@@ -32,7 +32,7 @@ const {
 const { SESSION_CONTEXT_TYPE, SESSION_CONTEXT_CAPABILITY_MAX_CHARS, SESSION_CONTEXT_MAX_CAPABILITIES, parseSessionContextCapabilities } = await plugin('session-context.ts');
 const {
 	navigateUi, navigateUiTool, navigateUiAvailable, installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, pendingNavigationCount,
-	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
+	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_TIMEOUT_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
 } = await plugin('navigate.ts');
 const pluginTools = await plugin('tools.ts');
 const { CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE, setVoiceRoomVerifier } = await plugin('room-binding.ts');
@@ -491,6 +491,20 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 		for (const text of [NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, navigateUiTool.description as string]) {
 			assert.doesNotMatch(text, /AG2/i);
 		}
+	});
+});
+
+// 2026-10-19 17:28: "navigate to the Bodhi migration room and add a comment" — navigate_ui answered unsupported (the
+// app had no ui.navigate) and the model dropped the comment with it. Every failure message and the rule now say the rest
+// of the request is still done with the room tools, by room name.
+describe('a failed move never cancels the rest of the request', () => {
+	it('unsupported, outdated and timeout all end by sending the model on to the room tools; so does the prompt rule', () => {
+		for (const m of [NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_TIMEOUT_MESSAGE]) {
+			assert.match(m, /Then still do the rest of what the user asked in that room \(a comment, a message, a search\) with the room tools, which take the room by name and need no navigation\./);
+		}
+		assert.match(navigateUiTool.description, /then still do the rest of the request \(a comment, a message, a search\) with the room tools by room name/);
+		assert.doesNotMatch(NAVIGATION_PROMPT_RULE, /and move on/);
+		assert.match(NAVIGATION_PROMPT_RULE, /a comment, message or search the user asked for in that room is still done, with the room tools by room name/);
 	});
 });
 }

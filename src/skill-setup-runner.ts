@@ -39,6 +39,9 @@ export interface VoiceSurfaceContribution {
 	answeringTools?: string[];
 	/** Rule lines for the relay agent's turn check: what the voice model answers itself and the core is never asked. */
 	turnCheckRules?: string[];
+	/** Facts for the core, re-evaluated as each voice task is written: ids the voice side already holds (a skill's
+	 *  room or channel ids), so the core uses them instead of looking them up. Body lines, never header fields. */
+	taskContextLines?: () => string[];
 }
 export type VoiceSurfaceHook = () => VoiceSurfaceContribution;
 
@@ -52,6 +55,7 @@ export function collectVoiceSurface(
 	const contextFns: Array<() => string[]> = [];
 	const answeringTools: string[] = [];
 	const turnCheckRules: string[] = [];
+	const taskContextFns: Array<() => string[]> = [];
 	for (const hook of hooks) {
 		try {
 			const c = hook();
@@ -61,23 +65,24 @@ export function collectVoiceSurface(
 			if (typeof c.contextLines === 'function') contextFns.push(c.contextLines);
 			if (Array.isArray(c.answeringTools)) answeringTools.push(...c.answeringTools.filter(n => typeof n === 'string' && n));
 			if (Array.isArray(c.turnCheckRules)) turnCheckRules.push(...c.turnCheckRules.filter(l => typeof l === 'string' && l));
+			if (typeof c.taskContextLines === 'function') taskContextFns.push(c.taskContextLines);
 		} catch (err) {
 			log('[voice-surface] hook threw:', err instanceof Error ? err.message : err);
 		}
 	}
-	const contextLines = (): string[] => {
+	const collect = (fns: Array<() => string[]>, what: string) => (): string[] => {
 		const out: string[] = [];
-		for (const fn of contextFns) {
+		for (const fn of fns) {
 			try {
 				const lines = fn();
 				if (Array.isArray(lines)) out.push(...lines.filter(l => typeof l === 'string' && l));
 			} catch (err) {
-				log('[voice-surface] contextLines threw:', err instanceof Error ? err.message : err);
+				log(`[voice-surface] ${what} threw:`, err instanceof Error ? err.message : err);
 			}
 		}
 		return out;
 	};
-	return { tools, promptRules, contextLines, answeringTools, turnCheckRules };
+	return { tools, promptRules, contextLines: collect(contextFns, 'contextLines'), answeringTools, turnCheckRules, taskContextLines: collect(taskContextFns, 'taskContextLines') };
 }
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {

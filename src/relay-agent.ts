@@ -570,6 +570,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	/** Fresh dials so far; a call compares it with the count when it began. */
 	private boundaries = 0;
 	private askedAt = 0;
+	/** When the work check last sent a request back as the voice model's own: the next call is sent as it is. */
+	private ownAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
 	private turns: Array<{ text: string; at: number; origin: O | undefined }> = [];
 	private turnsRunning = false;
@@ -732,6 +734,14 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
+			// Once per request: called again right after, the voice model's own tools did not do it, and it is sent.
+			if (verdict.action === 'own' && Date.now() - this.ownAt < ONE_ASK_WINDOW_MS) {
+				this.deps.log?.('[RelayAgent] sent back once already; sending it as it is');
+			} else if (verdict.action === 'own') {
+				this.ownAt = Date.now();
+				this.deps.log?.('[RelayAgent] not submitted: the voice model does this with its own tools');
+				return framedSystem('Nothing was submitted: this is done with your own tools, not by the core. Do it now yourself with them, and tell the user from the result. Do not say it is being worked on.');
+			}
 			if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
 				const row = this.deps.store.get(verdict.of)!;
 				// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly.
@@ -760,6 +770,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			}
 		}
 		this.askedAt = 0; // this request goes; the next vague one may be asked about again
+		this.ownAt = 0;
 		// The lane is the check's judgement alone: one the voice model wrote into its call is dropped.
 		const { lane: _fromModel, ...ownArgs } = args as Record<string, unknown> & { lane?: unknown };
 		const submitted = await this.deps.submit(lane ? { ...ownArgs, lane } : ownArgs, origin);

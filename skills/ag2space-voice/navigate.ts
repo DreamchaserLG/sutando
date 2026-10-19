@@ -19,14 +19,17 @@ import { claudeHomePath } from '../../src/util_paths.js';
 /** How long the tool waits for the client's `ui.navigated` before giving up. */
 export const NAVIGATE_UI_TIMEOUT_MS = 6000;
 
+// 2026-10-19 17:28: "navigate to the Bodhi migration room and add a comment" — navigation answered unsupported and
+// the model dropped the comment too. The rest of a request never needs the move: the room tools take a room by name.
+const THEN_DO_THE_REST = ' Then still do the rest of what the user asked in that room (a comment, a message, a search) with the room tools, which take the room by name and need no navigation.';
 export const NAVIGATE_UI_UNSUPPORTED_MESSAGE =
-	'No desktop client is connected to this session. Navigation works in the desktop app; tell the user that and move on.';
+	'No desktop client is connected to this session. Say in one short clause that navigation works in the desktop app.' + THEN_DO_THE_REST;
 export const NAVIGATE_UI_TIMEOUT_MESSAGE =
-	'The desktop did not confirm the move in time. Tell the user it did not go through and that they can ask again.';
+	'The desktop did not confirm the move in time. Tell the user it did not go through and that they can ask again.' + THEN_DO_THE_REST;
 /** An attached client that never announced `ui.navigate`: it cannot answer
  *  the frame, so nothing is sent and the owner hears this at once. */
 export const NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE =
-	"This app can't be navigated by voice yet. If it is the desktop app, tell the user to update it.";
+	"This app can't be navigated by voice yet. If it is the desktop app, tell the user to update it." + THEN_DO_THE_REST;
 /** `target:'room'` needs the spoken room words; without them there is nothing
  *  for the desktop to resolve, so no frame goes out. */
 export const NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE =
@@ -179,7 +182,7 @@ export const navigateUiTool: ToolDefinition = {
 		'Pass target "dm", "room" or "home"; for a room pass `query` = the room and space words exactly as spoken (the desktop resolves the name). ' +
 		'Returns {ok:true, room_name} when the desktop moved — say one short line ("Taking you to GTM.") and continue. ' +
 		'Returns error "ambiguous" with `candidates` — read them and ask which one; "not_found" — say you could not find that room; ' +
-		'"unsupported" or "timeout" — say navigation works in the desktop app. Never route these phrases to work.',
+		'"unsupported" or "timeout" — say navigation works in the desktop app, then still do the rest of the request (a comment, a message, a search) with the room tools by room name. Never route these phrases to work.',
 	parameters: z.object({
 		target: z.enum(UI_NAVIGATE_TARGETS as [UiNavigateTarget, ...UiNavigateTarget[]]).describe('Where to go: "dm" (the owner\'s DM with you), "room" (a room by name), or "home".'),
 		query: z.string().optional().describe('For target "room": the room and, if said, the space, as spoken — e.g. "GTM in Investors".'),
@@ -195,4 +198,4 @@ export const navigateUiTool: ToolDefinition = {
 };
 
 /** The prompt rule that goes with the tool; present only when the tool is declared. */
-export const NAVIGATION_PROMPT_RULE = '- NAVIGATION: "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", "go home" → call navigate_ui (target dm | room | home; query = the room and space words as spoken) — never work, never press_key. On ok, say ONE short line ("Taking you to GTM.") and carry on; the desktop then sends the new room context, and from there your replies and delegated work follow that room. On error "ambiguous", read the candidates and ask which one ("I found two rooms: GTM and GTM planning — which one?"), then call navigate_ui again with the name they pick. On "not_found", say you could not find a room called that. On "unsupported" or "timeout", say navigation works in the desktop app and move on.';
+export const NAVIGATION_PROMPT_RULE = '- NAVIGATION: "let\'s talk in my DM", "go to my DM", "take me to <room>", "go to / open <room> (in <space>)", "go home" → call navigate_ui (target dm | room | home; query = the room and space words as spoken) — never work, never press_key. On ok, say ONE short line ("Taking you to GTM.") and carry on; the desktop then sends the new room context, and from there your replies and delegated work follow that room. On error "ambiguous", read the candidates and ask which one ("I found two rooms: GTM and GTM planning — which one?"), then call navigate_ui again with the name they pick. On "not_found", say you could not find a room called that. On "unsupported" or "timeout", say navigation works in the desktop app. Whatever navigate_ui answered, a comment, message or search the user asked for in that room is still done, with the room tools by room name: moving there was never needed for it.';

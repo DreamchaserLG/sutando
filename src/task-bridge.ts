@@ -945,6 +945,17 @@ export async function submitVoiceSessionEndTask(summary: string, transcript: str
 	return taskId;
 }
 
+/** Facts the voice side holds for the core (ids it already knows), read as each voice task is written. */
+let _taskFacts: () => string[] = () => [];
+export function setVoiceTaskFacts(fn: () => string[]): void { _taskFacts = fn; }
+/** The facts as a task-body block: after `task:`, so nothing in it can be a header field. Empty when there are none. */
+export function voiceTaskFactsBlock(): string {
+	let lines: string[] = [];
+	try { lines = _taskFacts().filter((l) => typeof l === 'string' && l.trim()); } catch { /* best effort */ }
+	if (!lines.length) return '';
+	return `\n\n--- known to the voice assistant (ids it already holds: use them, do not look them up again) ---\n${confineUserContent(lines.join('\n'))}\n`;
+}
+
 /** Remember the origin a task was written with, so its result can follow it. */
 export function _rememberTaskOrigin(taskId: string, origin: VoiceSessionOrigin | null): void {
 	if (!origin) return;
@@ -1286,7 +1297,7 @@ export const workTool: ToolDefinition = {
 			_rememberTaskOrigin(taskId, origin);
 			const content =
 				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
-				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
+				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}${voiceTaskFactsBlock()}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
 			_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry

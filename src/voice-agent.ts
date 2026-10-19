@@ -59,7 +59,7 @@ function assertMacOS() {
 		process.exit(1);
 	}
 }
-import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText } from './task-bridge.js';
+import { voiceTaskRows, workTool, submitWorkTask, captureWorkOrigin, voiceTaskStore, resetNoteViewingDebounce, logConversationAsync, logSessionBoundaryAsync, getRecentConversation, getSecondsSinceLastTurn, setTaskStatusCallback, setVoiceSessionOrigin, endVoiceClientSession, getVoiceSessionOrigin, setVoiceTaskOriginResolver, setVoiceTurnsProvider, setVoiceTaskEndedListener, publishResultFile, submitVoiceSessionEndTask, voiceTaskResultText, setVoiceTaskFacts } from './task-bridge.js';
 import { createCallEndReporter, sessionEndTask } from './voice-session-end.js';
 import { framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
@@ -335,6 +335,9 @@ console.log(
 	} mediaResolution=${VOICE_SESSION_TUNING.mediaResolution ?? 'unset'}`,
 );
 const VOICE_NAME = process.env.VOICE_NAME || 'Puck';
+/** bodhi's echo guard drops the model's own voice picked up by the mic, so speaker playback does not
+ *  cut its own turn short. On unless VOICE_ECHO_GUARD=0 (bodhi's BODHI_ECHO_GUARD=0 also turns it off). */
+const VOICE_ECHO_GUARD = process.env.VOICE_ECHO_GUARD !== '0';
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY || '';
 
 // Lazy-load Cartesia TTS only when a key is set. This means Gemini-only
@@ -659,6 +662,8 @@ const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeToo
  *  leaves those turns alone, so "cancel that task" is never also sent to the core. A status call is not one:
  *  a request the voice model routed to get_task_status still reaches the turn check. */
 const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task']);
+// What the voice side already knows (AG2 Space room ids) rides in every voice task, so the core does not look it up.
+setVoiceTaskFacts(() => personalVoiceSurface.taskContextLines());
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1027,7 +1032,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		store: voiceTaskStore,
 		speech: speechGate,
 		// A text model, not the voice model, decides whether a request is complete enough to submit.
-		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
+		check: RELAY_CHECK ? createGeminiWorkCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), ownRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		// From the live conversation, not conversation.log: the log is written asynchronously, so a check that
 		// starts right after a turn would miss the voice model's own reply (2026-10-12 00:06: it missed "哪一个餐馆？"
 		// and sent "那个餐馆的 menu" with the blank in it).
@@ -1082,6 +1087,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		model: google(VOICE_MODEL),
 		geminiModel: VOICE_NATIVE_AUDIO_MODEL,
 		speechConfig: { voiceName: VOICE_NAME },
+		echoGuard: { enabled: VOICE_ECHO_GUARD },
 		inputAudioTranscription: true,
 		whisperProvider: meetingTranscriber,
 		orchestrationMode: 'actor',
@@ -1435,7 +1441,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 			} catch { /* test-only */ }
 		}, 250);
 	}
-	// Skills told when the user speaks (onUserSpoke): a change held for a spoken yes is not released by the model alone.
+	// Skills told when the user speaks (onUserSpoke).
 	(() => {
 		const transport = (session as unknown as { transport?: { onInputTranscription?: (text: string) => void } }).transport;
 		if (!transport) return;
