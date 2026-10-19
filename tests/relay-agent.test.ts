@@ -585,6 +585,10 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		// Live 10-18: "cancel that task" was cancelled by cancel_task and also sent to the core as a new task.
 		assert.match(agentSrc, /const answeringTools = new Set\(\[\.\.\.personalVoiceSurface\.answeringTools, 'cancel_task', 'get_task_status', 'recent_context'\]\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
+		// Live 10-18: after a barge-in Gemini stopped ending the user's turns; every watchdog fire went straight to a
+		// reconnect because the in-place replay was never enabled, and each reconnect ended the open work calls.
+		assert.match(agentSrc, /watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,/);
+		assert.match(agentSrc, /responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,/);
 		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
 	});
 });
