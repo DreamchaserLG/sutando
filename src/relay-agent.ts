@@ -1,8 +1,7 @@
 /**
  * Sutando's relay agent: the voice side's task manager between the voice model and the core, run
- * as the bodhi subagent behind the `work` tool. The model hears the tool's pending message at once;
- * each `work` call waits for its task's result and returns it, and bodhi hands it to the model as a
- * system notification when the model is idle. It keeps a table of every task the user asked for by
+ * as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's
+ * result returns as that call's own response (WHEN_IDLE). It keeps a table of every task the user asked for by
  * voice (what, when, cancel asked, how its result reached the user, which result answered it) and
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
@@ -85,6 +84,10 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 			update(taskId, deliver);
 			// The tasks answered in this one's result reached the user with it, whichever way it went.
 			for (const [id, row] of [...tasks.entries()]) if (row.answeredBy === taskId) update(id, deliver);
+		},
+		/** A hand-over the session lost before it was spoken: reconcile hands it over again. */
+		unsetHandedOver(taskId: string): void {
+			update(taskId, (row) => (row.delivery === 'injected' ? { ...row, delivery: undefined } : null));
 		},
 		noteReplay(taskId: string): void {
 			update(taskId, (row) => ({ ...row, replays: (row.replays ?? 0) + 1 }));
@@ -393,6 +396,8 @@ export function createHandoffPacer(deps: {
 		}
 	}
 	return {
+		/** Ids of the results queued or on their way: a status answer does not read them out a second time. */
+		held(): string[] { return [...(current ? [current.h] : []), ...queue].flatMap((h) => h.ids); },
 		/** Queue a result; one already queued or on its way for the same task is not queued twice. */
 		submit(h: Handoff): void {
 			if (h.ids.length && busyWith(h.ids)) return;
@@ -464,21 +469,23 @@ export const ASK_WAIT_MAX_MS = 15_000;
  */
 export function createAskDelivery(deps: { inject: (text: string) => void; maxWaitMs?: number; log?: (m: string) => void }) {
 	let speaking = false;
-	let waiting: { text: string; timer: ReturnType<typeof setTimeout> } | null = null;
+	// Held in order while the model speaks: a result and a nudge for another must both go, not the newest alone.
+	const waiting: Array<{ text: string; onDelivered?: () => void }> = [];
+	let timer: ReturnType<typeof setTimeout> | null = null;
 	const flush = () => {
-		if (!waiting) return;
-		const { text, timer } = waiting;
-		clearTimeout(timer);
-		waiting = null;
-		deps.inject(text);
+		if (timer) { clearTimeout(timer); timer = null; }
+		for (const w of waiting.splice(0)) { deps.inject(w.text); w.onDelivered?.(); }
 	};
 	return {
-		ask(text: string): void {
-			if (!speaking) { deps.inject(text); return; }
-			if (waiting) clearTimeout(waiting.timer);
-			const timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
-			timer.unref?.();
-			waiting = { text, timer };
+		/** True when the text went to the model now; false when it waits for the turn to end (then `onDelivered` runs). */
+		ask(text: string, onDelivered?: () => void): boolean {
+			if (!speaking) { deps.inject(text); onDelivered?.(); return true; }
+			waiting.push({ text, onDelivered });
+			if (!timer) {
+				timer = setTimeout(() => { deps.log?.('[RelayAgent] the model is still speaking; asking anyway'); flush(); }, deps.maxWaitMs ?? ASK_WAIT_MAX_MS);
+				timer.unref?.();
+			}
+			return false;
 		},
 		onModelAudio(): void { speaking = true; },
 		onTurnEnd(): void { speaking = false; flush(); },
@@ -505,14 +512,26 @@ export interface RelayAgentDeps<O = unknown> {
 	classify?: TurnClassifier;
 	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
 	ask?: (text: string) => void;
+	/** Resolves when the session can take a reply: ACTIVE now, or at the next ACTIVE. A reply sent while a connection
+	 *  is being replaced is dropped by the transport, so every reply of a call waits for it. */
+	whenActive?: () => Promise<void>;
 	log?: (msg: string) => void;
 }
 
 /** After the user was asked about a request, the next call within this window is sent as it is. */
 export const ONE_ASK_WINDOW_MS = 2 * 60_000;
 
+/** Said right after a request reaches the core: the open `work` call returns its result later. */
+/** A request already with the core: the new call waits for that result, and the user hears that it is on its way. */
+export const DUPLICATE_WAITS = 'This request was already sent to the core and its result will be told when it comes. Tell the user so in one short sentence.';
+export const WORK_ACKNOWLEDGE = 'The request was sent to the core and is being worked on; its result comes back later as the answer to that work call. Tell the user in one short sentence that you are on it, then carry on with the conversation. Do not call work again for it.';
+
 /** A request sent this long ago and still unanswered is compared with new ones (a repeat is not sent twice). */
 export const OPEN_TASK_WINDOW_MS = 30 * 60_000;
+
+/** A task answered this recently is still compared with a new request: the model may re-issue a
+ *  call seconds after its result, and that orphan is closed quietly instead of resent. */
+export const RECENT_ANSWER_WINDOW_MS = 60_000;
 
 interface Waiter {
 	resolve: (text: string) => void;
@@ -520,8 +539,10 @@ interface Waiter {
 }
 
 /** How a waiting call ends without its result. bodhi reads a rejection out as a failure, so none rejects. */
-const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent', string> = {
+const ENDED: Record<'cancelled' | 'continuing' | 'delivered_separately' | 'continued_in_next' | 'not_sent' | 'already_answered' | 'say_now', string> = {
 	not_sent: 'This call was cancelled before the request was sent; nothing was submitted.',
+	already_answered: 'This request was answered a moment ago; nothing new to say. Stay silent about it.',
+	say_now: 'The result for this request already came back through its earlier call. Say it to the user now, in a sentence or two; nothing was resent.',
 	continued_in_next: 'The user was not finished: this request was sent together with what they said next. Say nothing about it.',
 	cancelled: 'The user cancelled this task and was already told. Do not mention it again.',
 	continuing: 'The task is still running; its result will come in a separate message.',
@@ -542,6 +563,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	/** When the voice model last took a turn itself (`work`, or a tool that fetches the answer): the turn check does not send it again. */
 	private lastTakenAt = 0;
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
+	/** When the user last finished a turn: a re-issued call before any user turn is an orphan, after one it is a repeat. */
+	private lastUserTurnAt = 0;
+	/** Fresh dials so far; a call compares it with the count when it began. */
+	private boundaries = 0;
 	private askedAt = 0;
 	/** User turns waiting for the turn check (several when the user went on speaking). */
 	private turns: Array<{ text: string; at: number; origin: O | undefined }> = [];
@@ -558,6 +583,28 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			.map(([id, r]) => ({ id, text: r.text as string }));
 	}
 
+	/** Tasks answered in this session within RECENT_ANSWER_WINDOW_MS (not DM'd): a re-issued call for one is an orphan. */
+	recentlyAnswered(now = Date.now()): OpenTask[] {
+		return this.deps.store.list()
+			.filter(([, r]) => !!r.text && (r.delivery === 'injected' || r.delivery === 'spoken') && r.at > now - RECENT_ANSWER_WINDOW_MS)
+			.map(([id, r]) => ({ id, text: r.text as string }));
+	}
+
+	/** A fresh dial (bodhi's `recoverUpstream`, published as `session.reconnectBoundary`) abandons the old
+	 *  connection's calls: every waiting call ends and its result goes another way. A resume keeps them. A call
+	 *  still in its checks when the boundary passed ends when it would start waiting. */
+	noteBoundary(): string[] {
+		this.boundaries++;
+		return this.endAllCalls('continuing');
+	}
+
+	/** Every waiting call ends without its result, which is then delivered another way. */
+	endAllCalls(why: keyof typeof ENDED): string[] {
+		const ended = [...this.waiting.keys()];
+		for (const id of ended) this.endCall(id, why);
+		return ended;
+	}
+
 	/**
 	 * The user finished a turn. The turn check decides whether it asks the core for something, whichever
 	 * tool the voice model chose (2026-10-12: "帮我查一下 5334 的状态" went to get_task_status and was lost).
@@ -565,6 +612,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	 */
 	onUserTurn(text: string, at = Date.now()): void {
 		const t = text.trim();
+		if (t && !t.startsWith('[System:')) this.lastUserTurnAt = at;
 		if (!this.deps.classify || !t || t.startsWith('[System:')) return;
 		this.turns.push({ text: t, at, origin: this.deps.captureOrigin?.() });
 		if (!this.turnsRunning) void this.drainTurns();
@@ -631,8 +679,16 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.deps.log?.(`[RelayAgent] ${name} answers this turn; the turn check sends nothing`);
 	}
 
-	async invoke(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+	async invoke(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+		const out = await this.run(task, args, signal);
+		// A reply produced while the connection is being replaced never reaches the model: it waits for ACTIVE.
+		if (this.deps.whenActive) await this.deps.whenActive();
+		return out;
+	}
+
+	private async run(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
 		this.lastTakenAt = Date.now();
+		const boundary = this.boundaries;
 		// Taken before the waits below: a room switch during them must not re-address the request.
 		let origin = this.deps.captureOrigin?.();
 		if (this.deps.speech) {
@@ -660,7 +716,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		if (signal?.aborted) return framedSystem(ENDED.not_sent);
 		if (this.deps.check) {
 			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
-			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks() }, signal)
+			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks(), answeredTasks: this.recentlyAnswered() }, signal)
 				.catch(() => ({ action: 'submit' as const }));
 			if (signal?.aborted) return framedSystem(ENDED.not_sent);
 			// One question per request: the answer is sent as it is, even if the check still finds it vague
@@ -672,11 +728,27 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
 				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 			}
-			if (verdict.action === 'duplicate') {
-				// The same request is already with the core (2026-10-12: PR 5333 was sent twice). This call
-				// waits for that task's result instead, unless another call already does.
+			if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
+				const row = this.deps.store.get(verdict.of)!;
+				// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly.
+				if (row.delivery === 'spoken' && row.at > this.lastUserTurnAt) {
+					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was said; closed without resending`);
+					return framedSystem(ENDED.already_answered);
+				}
+				// Returned to its call but not said yet: the answer is there; the model says it instead of waiting for the nudge.
+				if (row.delivery === 'injected') {
+					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again before its result was said; the model is told to say it`);
+					return framedSystem(ENDED.say_now);
+				}
+				// Answered, and the user asked again since ("check it again"): a new request.
+				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after a user turn; sent as a new request`);
+			} else if (verdict.action === 'duplicate') {
+				// The same request is already with the core. This call waits for that task's result instead,
+				// unless another call already does; either way the user is told it is on its way.
 				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
-				if (this.waiting.has(verdict.of)) return framedSystem('This request was already sent to the core and its result will be told when it comes. Tell the user so in one short sentence.');
+				this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
+				if (this.waiting.has(verdict.of)) return framedSystem(DUPLICATE_WAITS);
+				if (this.boundaries !== boundary) return framedSystem(ENDED.continuing); // the connection was replaced meanwhile
 				return new Promise<string>((resolve, reject) => {
 					this.waiting.set(verdict.of, { resolve, reject });
 					signal?.addEventListener('abort', () => { this.endCall(verdict.of, 'continuing'); }, { once: true });
@@ -690,10 +762,16 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
 		if (replaces) this.supersede(taskId, replaces);
 
-		// The ordinary "working on it" is the tool's pending message; a queue position or an offline core is said now.
-		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
-		if (unusual && typeof submitted.message === 'string') this.deps.notice?.(framedSystem(submitted.message));
+		// The model is silent while a NON_BLOCKING call is open, so a separate notice acknowledges it (the
+		// call stays open). Sent only once the checks let it through; a queue position or offline core instead.
 		if (signal?.aborted) return framedSystem(ENDED.continuing);
+		if (this.boundaries !== boundary) {
+			// The connection was replaced while this call was in its checks: a call id from the old one.
+			this.deps.log?.(`[RelayAgent] ${taskId}: the connection was replaced before this call could wait; its result goes another way`);
+			return framedSystem(ENDED.continuing);
+		}
+		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
+		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
 		return new Promise<string>((resolve, reject) => {
 			const waiter: Waiter = { resolve, reject };
 			this.waiting.set(taskId, waiter);

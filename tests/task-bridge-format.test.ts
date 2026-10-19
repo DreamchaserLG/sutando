@@ -118,7 +118,8 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		assert.ok(second.queuedAhead >= first.queuedAhead + 1, `second saw ${second.queuedAhead}, first ${first.queuedAhead}`);
 		const expected = second.queuedAhead === 1 ? "Got it, right after the one I'm on." : `Got it, ${second.queuedAhead} in line before this one.`;
 		assert.ok(second.message.includes(expected), `message carries the spoken line: ${second.message}`);
-		assert.ok(second.message.startsWith('Task has been '), 'the original instruction is kept in front');
+		// With a task watcher the submitted instruction leads; without one (as in CI), the offline one.
+		assert.match(second.message, /^(The task is with the core; this work call returns its result|Task has been saved)/, 'the instruction is kept in front');
 	});
 });
 

@@ -606,6 +606,14 @@ export interface VoiceTaskRow {
 	retired?: boolean;
 }
 
+/** A finished voice task's result text, for a status answer that can say it at once; null when none is on disk. */
+export function voiceTaskResultText(taskId: string): string | null {
+	const row = voiceTaskStore.get(taskId);
+	const source = row?.answeredBy ?? taskId;
+	const text = _hasResult(source) ? _readResultText(source) : null;
+	return text ? stripVoiceControlLines(text).trim() : null;
+}
+
 /** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
 export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 	const rows: VoiceTaskRow[] = [];
@@ -1071,7 +1079,8 @@ export function queuedAheadInstruction(queuedAhead: number): string {
 }
 
 /** What the model is told when `work` has queued the task; the result follows when the core finishes. */
-export const WORK_PENDING_MESSAGE = 'Task has been queued and is being processed. The result will be spoken when ready. Do NOT tell the user the task is done — say you are working on it.';
+/** Said instead of the plain acknowledgement for an out-of-the-ordinary submission (a queue position). */
+export const WORK_SUBMITTED_MESSAGE = 'The task is with the core; this work call returns its result when it is done. Do NOT tell the user the task is done.';
 
 /** What a `work` call carries from the moment it was made: where it was asked, and the words around it. */
 export type WorkOrigin = { origin: VoiceSessionOrigin | null; turns: VoiceTurnsBinding; recentAtAsk: string };
@@ -1120,9 +1129,10 @@ export const workTool: ToolDefinition = {
 				'a timeout DM that shouldn\'t have gone through.'
 			),
 	}),
-	// Runs as the relay agent subagent: the model hears the pending message now, the result when the core finishes.
+	// NON_BLOCKING with no pendingMessage: the call stays open and the result returns under its own id
+	// (WHEN_IDLE). A pendingMessage would answer the call at once and close it.
 	execution: 'background',
-	pendingMessage: WORK_PENDING_MESSAGE,
+	behavior: 'NON_BLOCKING',
 	async execute(args) {
 		const { task, timeout_minutes, dm_on_timeout } = args as {
 			task: string;
@@ -1290,7 +1300,7 @@ export const workTool: ToolDefinition = {
 			taskId,
 			queuedAhead,
 			watcherOnline,
-			message: (watcherOnline ? WORK_PENDING_MESSAGE
+			message: (watcherOnline ? WORK_SUBMITTED_MESSAGE
 				: 'Task has been saved. The processing engine will pick it up on its next pass (within a few minutes). Tell the user the task is queued and will be handled shortly.')
 				+ queuedAheadInstruction(queuedAhead),
 		};

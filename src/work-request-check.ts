@@ -25,6 +25,8 @@ export interface WorkCheckInput {
 	recentConversation: string;
 	/** Tasks already sent and not yet answered: the same request again is not sent twice. */
 	openTasks?: OpenTask[];
+	/** Tasks answered in the last minute: the same request again is a duplicate of one; what to do with it is the relay's call. */
+	answeredTasks?: OpenTask[];
 }
 
 export type WorkRequestCheck = (input: WorkCheckInput, signal?: AbortSignal) => Promise<WorkCheck>;
@@ -60,6 +62,9 @@ export function workCheckPrompt(i: WorkCheckInput): string {
 		'',
 		'Open tasks (sent, not answered yet):',
 		openTasksBlock(i.openTasks),
+		'',
+		'Answered a moment ago (the same request again is a duplicate of that id too):',
+		openTasksBlock(i.answeredTasks),
 		'',
 		'Request the assistant wrote:',
 		i.task.trim(),
@@ -116,6 +121,7 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		'- A fragment that is not a sentence (one letter, a sound, a lone word like "A", "in", "嗯") is none.',
 		'- "the status of 5334" / "查一下 5334 的状态" when the recent words are about PRs is a request to look up PR 5334: work. It is not a question about the assistant\'s own task list.',
 		'- A yes to the assistant\'s own offer to do something ("你是想让我查一下 5332 吗？" -> "对") is that request: work.',
+		'- A question whether an earlier request was done, lost or already answered ("did you lose that one?", "是不是丢了一个", "did you tell me the PR count?") is none: the assistant answers it from its task list, and the core is not asked again.',
 		'- none: chit-chat, thanks, any other yes/no reply, a question about the assistant\'s own task list ("how many tasks are pending", "is it done yet") with no new thing named, a public fact or general-knowledge question, or anything already being answered.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
@@ -150,8 +156,21 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	return { action: 'none' };
 }
 
-/** One generateContent call: thinking off, JSON out. Null on any failure, logged. */
-async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: number; prompt: string; signal?: AbortSignal; log?: (m: string) => void; what: string }): Promise<string | null> {
+/** Where a check prompt's instructions end and the turn being judged begins. */
+const INPUT_MARK = '\nRecent words (oldest first):';
+
+/** The instructions go in as the system instruction and the turn as the user message: sent as one block,
+ *  the rules together tripped Gemini's prompt filter (PROHIBITED_CONTENT) on harmless requests. */
+export function checkRequestBody(prompt: string): Record<string, unknown> {
+	const at = prompt.indexOf(INPUT_MARK);
+	const contents = (text: string) => [{ role: 'user', parts: [{ text }] }];
+	return at > 0
+		? { systemInstruction: { parts: [{ text: prompt.slice(0, at) }] }, contents: contents(prompt.slice(at + 1)) }
+		: { contents: contents(prompt) };
+}
+
+/** One generateContent call: thinking off, JSON out. Null text on any failure, logged; `blocked` when Gemini's filter refused the prompt. */
+async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: number; prompt: string; signal?: AbortSignal; log?: (m: string) => void; what: string }): Promise<{ text: string | null; blocked: boolean }> {
 	const ctl = new AbortController();
 	const timer = setTimeout(() => ctl.abort(), opts.timeoutMs);
 	opts.signal?.addEventListener('abort', () => ctl.abort(), { once: true });
@@ -161,23 +180,25 @@ async function geminiJson(opts: { apiKey: string; model: string; timeoutMs: numb
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': opts.apiKey },
 			body: JSON.stringify({
-				contents: [{ parts: [{ text: opts.prompt }] }],
+				...checkRequestBody(opts.prompt),
 				// A thinking model spends the output budget on thinking and returns a cut-off "{"action":" (seen 2026-10-12):
 				// thinking off, JSON out.
 				generationConfig: { maxOutputTokens: 300, temperature: 0, responseMimeType: 'application/json', thinkingConfig: { thinkingBudget: 0 } },
 			}),
 			signal: ctl.signal,
 		});
-		const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>; error?: { message?: string } };
+		const data = await res.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> }; finishReason?: string }>; error?: { message?: string }; promptFeedback?: { blockReason?: string } };
 		const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
 		if (!text) {
-			opts.log?.(`[RelayAgent] ${opts.what} gave no answer (${data.error?.message ?? 'empty'})`);
-			return null;
+			const blocked = data.promptFeedback?.blockReason;
+			const why = blocked ? `blocked by Gemini's prompt filter: ${blocked}` : data.error?.message ?? `empty, finish ${data.candidates?.[0]?.finishReason ?? 'none'}`;
+			opts.log?.(`[RelayAgent] ${opts.what} gave no answer (${why})`);
+			return { text: null, blocked: !!blocked };
 		}
-		return text;
+		return { text, blocked: false };
 	} catch (err) {
 		opts.log?.(`[RelayAgent] ${opts.what} failed (${err instanceof Error ? err.message : String(err)})`);
-		return null;
+		return { text: null, blocked: false };
 	} finally {
 		clearTimeout(timer);
 	}
@@ -189,9 +210,9 @@ export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; 
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'submit' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input), signal, log: opts.log, what: 'work check' });
+		const { text } = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input), signal, log: opts.log, what: 'work check' });
 		if (text === null) return { action: 'submit' };
-		const verdict = parseWorkCheck(text, input.openTasks);
+		const verdict = parseWorkCheck(text, [...(input.openTasks ?? []), ...(input.answeredTasks ?? [])]);
 		opts.log?.(`[RelayAgent] work check: ${verdict.action}${verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : ''} in ${Date.now() - t0}ms`);
 		return verdict;
 	};
@@ -203,9 +224,12 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		const apiKey = opts.apiKey();
 		if (!apiKey) return { action: 'none' };
 		const t0 = Date.now();
-		const text = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, opts.extraRules), signal, log: opts.log, what: 'turn check' });
-		if (text === null) return { action: 'none' };
-		const verdict = parseTurnVerdict(text, input.openTasks);
+		const ask = (rules?: readonly string[]) => geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: turnClassifierPrompt(input, rules), signal, log: opts.log, what: 'turn check' });
+		let r = await ask(opts.extraRules);
+		// Still filtered: once more without the surface's rules, so a real request is still caught.
+		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
+		if (r.text === null) return { action: 'none' };
+		const verdict = parseTurnVerdict(r.text, input.openTasks);
 		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
