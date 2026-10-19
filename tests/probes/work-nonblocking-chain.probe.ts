@@ -1,6 +1,6 @@
 /**
  * Chain probe — sutando's real `work` tool + RelayAgent on a bodhi VoiceSession against the REAL
- * gemini-3.8-live, with the core replaced by a timer. Yixuan's probe verified Gemini's side
+ * gemini-3.8-live, with the core replaced by a timer. An earlier probe verified Gemini's side
  * (NON_BLOCKING + WHEN_IDLE); this one verifies sutando's side of the same contract:
  *
  *   S1 one call           — no response leaves until the result; one toolResponse, same id, WHEN_IDLE;

@@ -154,7 +154,7 @@ describe('relay agent: a text model checks a request before it is submitted', ()
 		assert.deepEqual(submitted, [], 'nothing submitted');
 		assert.match(out, /Nothing was submitted/);
 		assert.match(out, /Ask the user now, in their language, exactly: "你说的是哪个 PR？"/);
-		assert.deepEqual(seen, [{ task: '查一下PR的状态', recentConversation: 'user: 帮我查一下那个 PR 的状态', openTasks: [] }], 'the check reads the request, the recent words and the open tasks');
+		assert.deepEqual(seen, [{ task: '查一下PR的状态', recentConversation: 'user: 帮我查一下那个 PR 的状态', openTasks: [], answeredTasks: [] }], 'the check reads the request, the recent words, the open and the answered tasks');
 		assert.ok(logs.some((l) => l.includes('not submitted, asking the user: 你说的是哪个 PR？')));
 	});
 
@@ -582,11 +582,11 @@ describe('relay agent: every finished user turn is checked, whatever tool the vo
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
 		assert.match(agentSrc, /relayAgent\.onUserTurn\(item\.content\)/);
 		assert.match(agentSrc, /if \(answeringTools\.has\(e\.toolName\)\) relayAgent\.noteAnsweringTool\(e\.toolName\)/);
-		// Live 10-18: "cancel that task" was cancelled by cancel_task and also sent to the core as a new task.
-		assert.match(agentSrc, /const answeringTools = new Set\(\[\.\.\.personalVoiceSurface\.answeringTools, 'cancel_task', 'get_task_status', 'recent_context'\]\)/);
+		// "cancel that task" is answered by cancel_task alone; a status call is not an answering tool, so the turn check still sees the request.
+		assert.match(agentSrc, /const answeringTools = new Set\(\[\.\.\.personalVoiceSurface\.answeringTools, 'cancel_task'\]\)/);
 		assert.match(agentSrc, /classify: RELAY_CHECK \? createGeminiTurnClassifier\(/);
-		// Live 10-18: after a barge-in Gemini stopped ending the user's turns; every watchdog fire went straight to a
-		// reconnect because the in-place replay was never enabled, and each reconnect ended the open work calls.
+		// After a barge-in the model may stop ending the user's turns; the in-place replay must be on so a stall does
+		// not go straight to a reconnect, which ends the open work calls.
 		assert.match(agentSrc, /watchdogReplayRecovery: VOICE_WATCHDOG_REPLAY,/);
 		assert.match(agentSrc, /responseWatchdogMs: VOICE_RESPONSE_WATCHDOG_MS,/);
 		assert.match(agentSrc, /extraRules: personalVoiceSurface\.turnCheckRules/, 'the turn check is told what the skills answer themselves');
@@ -997,15 +997,18 @@ describe('every status answer comes from the one table', () => {
 		const row = (text: string, state: string, delivery?: string) => ({ id: text, text, submittedAt: 1, state, delivery }) as never;
 		const retired = { id: 'r', text: 'cleared [no-send]', submittedAt: 1, state: 'done', retired: true } as never;
 		const rows = [row('merged PRs', 'done', 'spoken'), row('PR 5302', 'done', 'spoken'), row('PR 5167', 'done'), row('PR 5329', 'started'), row('non-spicy dishes', 'queued'), row('old one', 'cancelled'), retired];
-		assert.deepEqual(voiceTaskCounts(rows), { pending: 2, working: 2, doneNotHeard: 1 }, 'pending is what the core still works on; a finished result not yet told is counted apart; a task ended with nothing to say is neither');
+		assert.deepEqual(voiceTaskCounts(rows), { pending: 2, working: 2, doneNotHeard: 1, unknown: 0 }, 'pending is what the core still works on; a finished result not yet told is counted apart; a task ended with nothing to say is neither');
 		// A result returned to its work call (delivery injected) but not yet said: not heard, and not pending either.
 		const returned = [row('PR 5696', 'done', 'injected'), row('Angry Birds app', 'started')];
-		assert.deepEqual(voiceTaskCounts(returned), { pending: 1, working: 1, doneNotHeard: 1 }, 'returned to the model is not heard, and is told apart from pending');
+		assert.deepEqual(voiceTaskCounts(returned), { pending: 1, working: 1, doneNotHeard: 1, unknown: 0 }, 'returned to the model is not heard, and is told apart from pending');
+		// A row the core left in an unknown state, or a done row with no readable result, is neither pending nor a result to say.
+		assert.deepEqual(voiceTaskCounts([row('PR 1', 'unknown'), row('PR 2', 'done'), row('PR 3', 'done')], (id) => (id === 'PR 3' ? 'three' : null)), { pending: 0, working: 0, doneNotHeard: 1, unknown: 1 });
+		assert.match(describeVoiceTasks([row('PR 1', 'unknown')]), /1 in an unknown state/);
 		assert.match(describeVoiceTasks(rows), /^Pending: 2 the core is still working on; 1 finished and not yet told to the user \(say those first, they are not pending\)\./);
 		assert.match(describeVoiceTasks([row('PR 5329', 'started')]), /^Pending: 1 the core is still working on\./);
 		assert.match(describeVoiceTasks(rows), /1 ended with nothing to say \("cleared \[no-send\]"\)/);
 		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
-		assert.ok(tool.includes('voiceTaskCounts(rows)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count');
+		assert.ok(tool.includes('voiceTaskCounts(rows, voiceTaskResultText)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count, finished ones only with a readable result');
 	});
 
 	it('resultsNotYetTold lists a finished, unheard result with its text; spoken, empty and retired rows are left out', async () => {
@@ -1015,7 +1018,8 @@ describe('every status answer comes from the one table', () => {
 		const rows = [row('a', 'done', 'injected'), row('b', 'done', 'spoken'), row('c', 'done'), row('d', 'done', undefined, true), row('e', 'started')];
 		assert.deepEqual(resultsNotYetTold(rows, (id) => texts[id] ?? null), [{ task: 'request a', result: 'Sixty-one PRs merged.' }]);
 		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
-		assert.ok(tool.includes('resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText)'), 'the tool reports exactly this list');
+		assert.ok(tool.includes('resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer()))'), 'the tool reports exactly this list, minus what the pacer holds');
+		assert.deepEqual(resultsNotYetTold(rows, (id) => texts[id] ?? null, new Set(['a'])), [], 'a result the pacer is about to say is not read out here');
 	});
 
 	it('the live status snapshot carries every row, newest first, with the same pending count as the tool', async () => {
@@ -1024,7 +1028,7 @@ describe('every status answer comes from the one table', () => {
 		const rows = [row('PR 5302', 1, 'done', 'spoken'), row('PR 5167', 2, 'done'), row('PR 5329', 3, 'started'), row('cleared', 4, 'done', undefined, true), row('dm one', 5, 'done', 'dm')];
 		const snap = voiceTaskStatusSnapshot(rows, 99);
 		assert.equal(snap.at, 99);
-		assert.deepEqual({ pending: snap.pending, working: snap.working, doneNotHeard: snap.doneNotHeard }, voiceTaskCounts(rows));
+		assert.deepEqual({ pending: snap.pending, working: snap.working, doneNotHeard: snap.doneNotHeard, unknown: snap.unknown }, voiceTaskCounts(rows));
 		assert.deepEqual(snap.tasks.map((t) => t.id), ['dm one', 'cleared', 'PR 5329', 'PR 5167', 'PR 5302'], 'newest first');
 		assert.deepEqual(snap.tasks.map((t) => t.pending), [false, false, true, false, false], 'only what the core still works on');
 		assert.deepEqual(snap.tasks.map((t) => t.heard), [false, false, false, false, true]);

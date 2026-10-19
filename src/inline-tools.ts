@@ -822,23 +822,26 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
  *  until a spoken turn carries it; counting it heard earlier made the status tool skip a result the user never got. */
 export const heardByUser = (r: VoiceTaskRow): boolean => r.delivery === 'spoken';
 
-/**
- * "Pending" is what the core is still working on. A finished result the user has not heard yet is counted
- * apart and read to them first: a picture already in their DM half a minute ago is not a pending task.
- */
-/** Finished results the user has not heard, each with its text, so a status answer can say them before the count. */
-export function resultsNotYetTold(rows: VoiceTaskRow[], readText: (id: string) => string | null): Array<{ task: string; result: string }> {
+/** Finished results the user has not heard, each with its text, so a status answer can say them before the count.
+ *  One the hand-off pacer still holds is left out: it is about to be said, and reading it here would say it twice. */
+export function resultsNotYetTold(rows: VoiceTaskRow[], readText: (id: string) => string | null, held: ReadonlySet<string> = new Set()): Array<{ task: string; result: string }> {
 	return rows
-		.filter((r) => r.state === 'done' && !r.retired && !heardByUser(r))
+		.filter((r) => r.state === 'done' && !r.retired && !heardByUser(r) && !held.has(r.id))
 		.map((r) => ({ task: r.text.slice(0, 60), result: (readText(r.id) ?? '').slice(0, 300) }))
 		.filter((r) => r.result);
 }
 
-export function voiceTaskCounts(rows: VoiceTaskRow[]): { pending: number; working: number; doneNotHeard: number } {
+/**
+ * "Pending" is what the core is still working on. A finished result the user has not heard yet is counted
+ * apart and read to them first: a picture already in their DM half a minute ago is not a pending task.
+ * A row the core left in an unknown state is neither, and is named as such.
+ */
+export function voiceTaskCounts(rows: VoiceTaskRow[], readText?: (id: string) => string | null): { pending: number; working: number; doneNotHeard: number; unknown: number } {
 	const live = rows.filter((r) => r.state !== 'cancelled' && !r.retired);
 	const working = live.filter((r) => r.state === 'queued' || r.state === 'started').length;
-	const doneNotHeard = live.filter((r) => r.state !== 'queued' && r.state !== 'started' && !heardByUser(r)).length;
-	return { pending: working, working, doneNotHeard };
+	const doneNotHeard = live.filter((r) => r.state === 'done' && !heardByUser(r) && (!readText || !!readText(r.id))).length;
+	const unknown = live.filter((r) => r.state !== 'queued' && r.state !== 'started' && r.state !== 'done').length;
+	return { pending: working, working, doneNotHeard, unknown };
 }
 
 /**
@@ -868,7 +871,7 @@ export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
 	};
 	const heard = heardByUser;
 	const c = voiceTaskCounts(rows);
-	const headline = `Pending: ${c.pending} the core is still working on${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}. `;
+	const headline = `Pending: ${c.pending} the core is still working on${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}${c.unknown ? `; ${c.unknown} in an unknown state` : ''}. `;
 	const parts = [
 		group('the core is working on', (r) => r.state === 'started' && !r.retired),
 		group('queued at the core', (r) => r.state === 'queued' && !r.retired),
@@ -904,7 +907,7 @@ export const getCoreStatusTool: ToolDefinition = {
 			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
 			const rows = voiceTaskRows();
 			const queueNote = ` ${describeVoiceTasks(rows)}`;
-			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: r.delivery === 'spoken' || r.delivery === 'injected' }));
+			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r) }));
 			if (!existsSync(corePath)) {
 				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
 			}

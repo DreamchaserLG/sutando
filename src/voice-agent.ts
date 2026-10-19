@@ -73,7 +73,7 @@ import { classifyFatalExitCode, isFatalExit, markFatalExit, writeCrashRecordAndE
 import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLockGuardPath } from './voice-lock.js';
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
-import { wireDurableChannels, createSessionRecorder } from './live-agent-runtime.js';
+import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
 import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
@@ -503,7 +503,7 @@ const getTaskStatus: ToolDefinition = {
 		// The relay agent's table, the same source as the in-line count and get_core_status.
 		const rows = voiceTaskRows();
 		// Pending is what the core still works on; a finished result not yet told is listed apart, to be said first.
-		const counts = voiceTaskCounts(rows);
+		const counts = voiceTaskCounts(rows, voiceTaskResultText);
 		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
 		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
@@ -511,9 +511,10 @@ const getTaskStatus: ToolDefinition = {
 			pendingTasks: counts.pending,
 			stillBeingWorkedOn: counts.working,
 			doneNotYetHeard: counts.doneNotHeard,
+			unknownState: counts.unknown,
 			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
 			// A finished result the user has not heard goes with its text, so "did you lose one?" is answered on the spot.
-			resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText),
+			resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer())),
 			description: describeVoiceTasks(rows),
 		};
 	},
@@ -654,9 +655,10 @@ function resolveCurrentMode(): ModeState {
 }
 
 const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeTool, ...inlineTools, ...personalVoiceSurface.tools];
-/** Tools that answer the turn themselves (skill fetches, and cancelling or checking tasks): the relay
- *  agent's turn check leaves those turns alone, so "cancel that task" is never also sent to the core. */
-const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task', 'get_task_status', 'recent_context']);
+/** Tools that answer the turn themselves (skill fetches, cancelling a task): the relay agent's turn check
+ *  leaves those turns alone, so "cancel that task" is never also sent to the core. A status call is not one:
+ *  a request the voice model routed to get_task_status still reaches the turn check. */
+const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task']);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the

@@ -136,9 +136,34 @@ describe('resultEvidence / turnSaysResult', () => {
 		const dec = resultEvidence('It weighs 3.5 kg.');
 		assert.equal(turnSaysResult('It weighs three point five kilograms.', dec), true);
 		assert.equal(turnSaysResult('它重三点五公斤。', dec), true);
-		assert.deepEqual(spokenNumberForms('98').slice(0, 2), ['ninetyeight', '九十八']);
-		assert.ok(spokenNumberForms('5717').includes('fiftysevenseventeen'));
-		assert.ok(spokenNumberForms('2026').includes('twothousandtwentysix'));
-		assert.ok(spokenNumberForms('1105').includes('一千一百零五'));
+		for (const [n, f] of [['98', 'ninety eight'], ['98', '九十八'], ['5717', 'fifty seven seventeen'], ['2026', 'two thousand twenty six'], ['1105', '一千一百零五'], ['120', 'one hundred and twenty'], ['100', 'a hundred'], ['2500', 'twenty five hundred'], ['205', 'two oh five'], ['250', '两百五十'], ['3.50', 'three fifty']]) {
+			assert.ok(spokenNumberForms(n).includes(f), `${n} → ${f}: ${spokenNumberForms(n).join(' | ')}`);
+		}
+		assert.ok(!spokenNumberForms('2005').includes('twenty five'), '2005 is never read as twenty-five');
+	});
+
+	// A spelled number must be whole words of the turn: "one" inside "done", "ten" inside "listening" or "attention",
+	// and a date's day are not the result. Marked heard by one of these, a result was never handed over again.
+	it('a number word inside another word, a small number, a date part, or the request\'s own number never count', () => {
+		const pr = resultEvidence('PR 5691 has 2 approvals and 1 failing check.', 'check PR 5691');
+		assert.deepEqual(pr.numbers, [], 'the request\'s number and the small counts are not evidence');
+		for (const said of ["Don't worry, I'm on it.", 'Done!', 'Sure, I\'m listening.', 'Still checking 5691']) assert.equal(turnSaysResult(said, pr), false, said);
+		assert.equal(turnSaysResult('Two approvals, one failing check.', pr), true, 'the distinctive words still count');
+		const at10 = resultEvidence('The sync is set for 2026-10-20 at 10 tomorrow.');
+		assert.deepEqual(at10.numbers, [], 'a date and a number under 13 are not evidence');
+		assert.equal(turnSaysResult('People often ask me that.', at10), false);
+		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days.');
+		assert.equal(turnSaysResult('Sure, I\'m listening.', prs), false);
+		assert.equal(turnSaysResult('Ninety-eight were merged.', prs), true);
+		assert.equal(turnSaysResult('Ninetyeight.', prs), true, 'a join inside the number is fine');
+		assert.equal(turnSaysResult('The eightyninety eight.', prs), false, 'a join with the neighbouring word is not');
+		const n100 = resultEvidence('There are 100 rows.');
+		assert.equal(turnSaysResult('一共一百行。', n100), true);
+		assert.equal(turnSaysResult('一共一百五十行。', n100), false, 'a longer numeral is a different number');
+		for (const [n, said] of [['15', '合并了十五个。'], ['60', '六十个合并了。'], ['250', '两百五十个。'], ['250', '二百五十个。']]) assert.equal(turnSaysResult(said, resultEvidence(`${n} PRs merged.`)), true, said);
+		assert.equal(turnSaysResult('Anything at all.', resultEvidence('OK', 'OK')), false, 'no evidence: never by content');
+		const cn = resultEvidence('合并了15个PR。');
+		assert.ok(cn.words.includes('合并'), 'CJK words are two-character grams');
+		assert.equal(turnSaysResult('合并了十五个。', cn), true);
 	});
 });

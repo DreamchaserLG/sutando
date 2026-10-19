@@ -52,32 +52,53 @@ export interface DurableChannelOptions {
 }
 
 /** A returned result not said by then is nudged once, then handed over again. */
+/** Results the hand-off pacer still holds for the model: a status answer must not read them out a second time. */
+let pacerHeld: () => string[] = () => [];
+export const heldByPacer = (): string[] => pacerHeld();
 export const RETURN_NUDGE_MS = 15_000;
 export const RETURN_RELEASE_MS = 60_000;
 
 const EVIDENCE_STOP = new Set(['about', 'after', 'again', 'already', 'also', 'because', 'before', 'being', 'could', 'every', 'first', 'found', 'from', 'have', 'here', 'into', 'just', 'last', 'more', 'most', 'other', 'over', 'ready', 'result', 'results', 'said', 'should', 'since', 'some', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'were', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your', 'task', 'done', 'request', 'user']);
-/** What a spoken turn must carry to count as the result: its numbers, and its distinctive words. */
-export function resultEvidence(text: string): { numbers: string[]; words: string[] } {
-	const plain = text.replace(/\[(file|send|attach|thread|channel|dm-only|no-send|REPLIED)[^\]]*\]/gi, ' ');
-	const numbers = [...new Set(plain.match(/\d+(?:[.,]\d+)?/g) ?? [])];
-	const words = [...new Set((plain.toLowerCase().match(/[a-z][a-z'-]{3,}|[\u4e00-\u9fff]{2,}/g) ?? []).map((w) => w.replace(/'s$|'$/, '')).filter((w) => w.length >= 4 && !EVIDENCE_STOP.has(w)))];
-	return { numbers, words };
+export interface ResultEvidence { numbers: string[]; words: string[] }
+const CJK = /[一-鿿]/;
+const cjkGrams = (run: string): string[] => { const out: string[] = []; for (let i = 0; i + 2 <= run.length; i++) out.push(run.slice(i, i + 2)); return out; };
+const evidenceOf = (text: string): ResultEvidence => {
+	const plain = text
+		.replace(/\[(file|send|attach|thread|channel|dm-only|no-send|REPLIED)[^\]]*\]/gi, ' ')
+		.replace(/\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?\b/g, ' ') // a date's month or day is not the result
+		.replace(/\b\d{1,2}:\d{2}\b/g, ' ');
+	// A number under 13 is too common a word ("one", "two", "ten") to prove anything on its own.
+	const numbers = [...new Set((plain.match(/\d+(?:[.,]\d+)?/g) ?? []).filter((n) => n.includes('.') || n.includes(',') || Number(n) >= 13))];
+	const words = new Set<string>();
+	for (const w of plain.toLowerCase().match(/[a-z][a-z'-]{3,}/g) ?? []) { const k = w.replace(/'s$|'$/, ''); if (k.length >= 4 && !EVIDENCE_STOP.has(k)) words.add(k); }
+	for (const run of plain.match(/[一-鿿]{2,}/g) ?? []) for (const g of cjkGrams(run)) words.add(g); // CJK words: 2-character n-grams
+	return { numbers, words: [...words] };
+};
+/** What a spoken turn must carry to count as the result: its numbers and its distinctive words, minus whatever
+ *  it shares with the request itself (the PR number, the thing asked about): restating the request is not the answer. */
+export function resultEvidence(text: string, request = ''): ResultEvidence {
+	const own = evidenceOf(text);
+	if (!request) return own;
+	const asked = evidenceOf(request);
+	return { numbers: own.numbers.filter((n) => !asked.numbers.includes(n)), words: own.words.filter((w) => !asked.words.includes(w)) };
 }
 
 const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
 const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
 const CN_DIGITS = '零一二三四五六七八九';
-function englishBelowThousand(n: number): string {
+const CN_NUMERAL = /[零一二三四五六七八九两十百千万点]/;
+function englishBelowThousand(n: number, and = false): string {
 	if (n < 20) return ONES[n];
 	if (n < 100) return n % 10 ? `${TENS[Math.floor(n / 10)]} ${ONES[n % 10]}` : TENS[Math.floor(n / 10)];
-	return `${ONES[Math.floor(n / 100)]} hundred${n % 100 ? ` ${englishBelowThousand(n % 100)}` : ''}`;
+	const rest = n % 100 ? ` ${and ? 'and ' : ''}${englishBelowThousand(n % 100)}` : '';
+	return `${ONES[Math.floor(n / 100)]} hundred${rest}`;
 }
-function englishCardinal(n: number): string {
-	if (n < 1000) return englishBelowThousand(n);
-	if (n < 1_000_000) return `${englishBelowThousand(Math.floor(n / 1000))} thousand${n % 1000 ? ` ${englishBelowThousand(n % 1000)}` : ''}`;
+function englishCardinal(n: number, and = false): string {
+	if (n < 1000) return englishBelowThousand(n, and);
+	if (n < 1_000_000) return `${englishBelowThousand(Math.floor(n / 1000), and)} thousand${n % 1000 ? ` ${n % 1000 < 100 && and ? 'and ' : ''}${englishBelowThousand(n % 1000, and)}` : ''}`;
 	return '';
 }
-function chineseCardinal(n: number): string {
+function chineseCardinal(n: number, liang = false): string {
 	if (n < 10) return CN_DIGITS[n];
 	if (n >= 100_000) return '';
 	const units = ['', '十', '百', '千', '万'];
@@ -86,42 +107,73 @@ function chineseCardinal(n: number): string {
 	digits.forEach((d, i) => {
 		const unit = units[digits.length - 1 - i];
 		if (d === 0) { if (!out.endsWith('零') && i < digits.length - 1) out += '零'; return; }
-		out += (d === 1 && unit === '十' && i === 0 ? '' : CN_DIGITS[d]) + unit;
+		const two = liang && d === 2 && (unit === '百' || unit === '千' || unit === '万');
+		out += (d === 1 && unit === '十' && i === 0 ? '' : two ? '两' : CN_DIGITS[d]) + unit;
 	});
 	return out.replace(/零+$/, '');
 }
-/** Letters, digits and CJK only: "ninety-eight", "ninety eight" and "ninetyeight" compare equal. */
-const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
-/** How a transcript may spell a number the result wrote in digits: gemini-3.8-live's output transcription writes
- *  "ninetyeight", "sixty percent", "fifty-seven fifteen" and "九十八", never "98". */
+const squash = (s: string) => s.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, '');
+/** How a transcript may spell a number the result wrote in digits: "ninety-eight", "ninetyeight", "one hundred and
+ *  twenty", "a hundred", "fifty-seven seventeen" (four digits read in pairs), "two oh five", "九十八", "两百五十". */
 export function spokenNumberForms(num: string): string[] {
 	const forms: string[] = [];
 	const [whole, frac] = num.replace(/,/g, '').split('.');
 	const n = Number(whole);
 	if (!Number.isFinite(n) || whole.length > 6) return forms;
-	const tail = frac ? ` point ${frac.split('').map((d) => ONES[Number(d)]).join(' ')}` : '';
+	const fracWords = (frac ?? '').split('').map((d) => ONES[Number(d)]);
+	const tail = frac ? ` point ${fracWords.join(' ')}` : '';
 	const cnTail = frac ? `点${frac.split('').map((d) => CN_DIGITS[Number(d)]).join('')}` : '';
-	const en = englishCardinal(n);
-	if (en) forms.push(en + tail);
-	const cn = chineseCardinal(n);
-	if (cn) forms.push(cn + cnTail);
-	if (whole.length === 4 && !frac) forms.push(`${englishBelowThousand(Number(whole.slice(0, 2)))} ${englishBelowThousand(Number(whole.slice(2)))}`); // "fifty-seven seventeen"
-	if (whole.length >= 3 && !frac) {
-		forms.push(whole.split('').map((d) => ONES[Number(d)]).join(' ')); // "five seven one seven"
+	for (const and of [false, true]) {
+		const en = englishCardinal(n, and);
+		if (en && !forms.includes(en + tail)) forms.push(en + tail);
+		if (en.startsWith('one hundred') || en.startsWith('one thousand')) forms.push(en.replace(/^one /, 'a ') + tail);
+	}
+	for (const liang of [false, true]) { const cn = chineseCardinal(n, liang); if (cn && !forms.includes(cn + cnTail)) forms.push(cn + cnTail); }
+	if (frac && frac.length === 2 && n < 1000) forms.push(`${englishBelowThousand(n)} ${englishBelowThousand(Number(frac))}`); // "three fifty"
+	if (!frac && whole.length === 4) {
+		if (whole[2] !== '0') forms.push(`${englishBelowThousand(Number(whole.slice(0, 2)))} ${englishBelowThousand(Number(whole.slice(2)))}`); // "fifty-seven seventeen", never 2005
+		if (whole.endsWith('00')) forms.push(`${englishBelowThousand(Number(whole.slice(0, 2)))} hundred`); // "twenty-five hundred"
+	}
+	if (!frac && whole.length >= 3) {
+		forms.push(whole.split('').map((d) => ONES[Number(d)]).join(' '));
+		forms.push(whole.split('').map((d) => (d === '0' ? 'oh' : ONES[Number(d)])).join(' '));
 		forms.push(whole.split('').map((d) => CN_DIGITS[Number(d)]).join(''));
 	}
-	return forms.map(squash).filter((f) => f.length >= 3);
+	return [...new Set(forms.map((f) => f.trim()).filter(Boolean))];
 }
-/** The turn said the result: one of its numbers (as digits or as the transcript spells them); else its distinctive words,
- *  two of them when the result has numbers it did not say or has that many (a result with neither counts on its first spoken turn). */
-export function turnSaysResult(turn: string, evidence: { numbers: string[]; words: string[] }): boolean {
-	if (!evidence.numbers.length && !evidence.words.length) return true;
-	const t = turn.toLowerCase();
-	const squashed = squash(turn);
-	if (evidence.numbers.some((n) => t.includes(n) || spokenNumberForms(n).some((f) => squashed.includes(f)))) return true;
+/** A spelled form is said when its words are consecutive words of the turn (a join inside the number, "ninetyeight",
+ *  is allowed; a join with a neighbouring word is not). A Chinese form must not sit inside a longer numeral. */
+function turnSaysForm(tokens: string[], cjkRuns: string[], form: string): boolean {
+	if (CJK.test(form)) {
+		return cjkRuns.some((run) => { const i = run.indexOf(form); return i >= 0 && !(i > 0 && CN_NUMERAL.test(run[i - 1])) && !(i + form.length < run.length && CN_NUMERAL.test(run[i + form.length])); });
+	}
+	const target = squash(form);
+	const parts = form.split(/\s+/).length;
+	for (let i = 0; i < tokens.length; i++) {
+		let joined = '';
+		for (let k = 0; k < parts && i + k < tokens.length; k++) {
+			joined += tokens[i + k];
+			if (joined === target) return true;
+			if (!target.startsWith(joined)) break;
+		}
+	}
+	return false;
+}
+/** The turn said the result: one of its numbers (as digits, or as the transcript spells them); else its distinctive
+ *  words, two of them when the result has numbers it did not say or has that many. No evidence at all: never by content. */
+export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean {
+	if (!evidence.numbers.length && !evidence.words.length) return false;
+	const lower = turn.toLowerCase();
+	const tokens: string[] = lower.match(/[a-z0-9]+/g) ?? [];
+	const cjkRuns: string[] = turn.match(/[一-鿿]+/g) ?? [];
+	for (const n of evidence.numbers) {
+		const digits = n.replace(/,/g, '');
+		if (tokens.includes(digits) || tokens.includes(digits.replace('.', ''))) return true;
+		if (spokenNumberForms(n).some((f) => turnSaysForm(tokens, cjkRuns, f))) return true;
+	}
 	const need = evidence.numbers.length ? 2 : Math.min(2, evidence.words.length);
 	let hits = 0;
-	for (const w of evidence.words) if (t.includes(w) && ++hits >= need) return true;
+	for (const w of evidence.words) if (lower.includes(w) && ++hits >= need) return true;
 	return false;
 }
 
@@ -205,10 +257,11 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		confirmMs: opts.handoffConfirmMs,
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	pacerHeld = () => pacer.held();
 	const interruptedTurns = new Set<string>();
 	// Results returned through open calls: a spoken turn counts as the result only when its words carry the result's
 	// content; unsaid after returnNudgeMs it is nudged, after returnReleaseMs (or a reconnect) handed over again.
-	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
+	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
 	const returnedUnheard: Returned[] = [];
 	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };
 	const turnWords = (): string | null => {
@@ -233,7 +286,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		const words = turnWords();
 		for (const r of [...returnedUnheard]) {
 			if (r.at > modelTurnStartedAt) continue;
-			if (words !== null && !turnSaysResult(words, r.evidence)) {
+			// Nothing distinctive to look for (the result only restates the request): the turn after the nudge counts.
+			const noEvidence = !r.evidence.numbers.length && !r.evidence.words.length;
+			if (words !== null && (noEvidence ? !r.nudged : !turnSaysResult(words, r.evidence))) {
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
 			}
@@ -359,9 +414,10 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			if (canSpeak() && opts.relay.offerResult(now)) {
 				const request = (now.requests?.[0] ?? voiceTaskStore.get(item.taskId)?.text ?? item.taskId).replace(/"/g, "'").slice(0, 120);
 				const r: Returned = {
-					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text), request,
+					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text, [request, ...(now.requests ?? [])].join(' ')), request, nudged: false,
 					nudge: setTimeout(() => {
 						if (!returnedUnheard.includes(r) || !canSpeak()) return;
+						r.nudged = true;
 						const text = framedSystem(`The result for the request "${request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
 						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
 						if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);

@@ -45,8 +45,8 @@ function agent(opts: { check?: WorkRequestCheck; submit?: (args: Record<string, 
 test('a call re-issued after its result was returned is closed quietly and never resent', async () => {
 	const { relay, store, submitted, logs, notices } = agent({
 		// The check compares the new request with open AND recently answered tasks.
-		check: async ({ task, openTasks }) => {
-			const same = openTasks.find((t) => t.text === task);
+		check: async ({ task, openTasks, answeredTasks }) => {
+			const same = [...openTasks, ...(answeredTasks ?? [])].find((t) => t.text === task);
 			return same ? { action: 'duplicate', of: same.id } : { action: 'submit' };
 		},
 	});
@@ -59,14 +59,27 @@ test('a call re-issued after its result was returned is closed quietly and never
 	assert.match(await first, /the apple is red/);
 	assert.equal(store.get('task-1')?.delivery, 'injected');
 
-	// The model re-issues the same call seconds later: closed, not resent, told to stay silent, and not acknowledged.
+	// The model re-issues the same call before saying the result: closed, not resent, told to say the result now.
 	const acknowledged = notices.length;
 	const again = await relay.invoke('work', { task: 'find the apple' });
 	assert.equal(notices.length, acknowledged, 'no "on it" for something already answered');
 	assert.deepEqual(submitted, ['find the apple'], 'the core must not see the request twice');
-	assert.match(again, /answered a moment ago/);
-	assert.match(again, /Stay silent/);
-	assert.ok(logs.some((l) => l.includes('asked again after its result was returned')), logs.join('\n'));
+	assert.match(again, /already came back through its earlier call/);
+	assert.match(again, /Say it to the user now/);
+	assert.ok(logs.some((l) => l.includes('asked again before its result was said')), logs.join('\n'));
+	// Said, and re-issued with no user turn since: an orphan, closed quietly.
+	store.set('task-1', 'spoken');
+	const orphan = await relay.invoke('work', { task: 'find the apple' });
+	assert.match(orphan, /Stay silent/);
+	assert.deepEqual(submitted, ['find the apple']);
+	// Said, and the user asked again afterwards ("check it again"): a new request, sent.
+	relay.onUserTurn('find the apple again', Date.now() + 1);
+	const repeat = relay.invoke('work', { task: 'find the apple' });
+	await new Promise((r) => setImmediate(r));
+	assert.deepEqual(submitted, ['find the apple', 'find the apple'], 'a deliberate repeat reaches the core');
+	assert.ok(logs.some((l) => l.includes('asked again after a user turn; sent as a new request')));
+	relay.endAllCalls('continuing');
+	await repeat;
 });
 
 test('recentlyAnswered lists delivered tasks only inside the window', () => {
@@ -131,7 +144,7 @@ test('a submitted request is acknowledged by a separate notice; the call stays o
 	assert.match(await call, /the cat is drawn/);
 });
 
-test('no acknowledgement when the check asks the user or finds a duplicate', async () => {
+test('no "on it" when the check asks the user; a duplicate of an open task is told it is on its way; nothing said when the call is aborted or the core is offline', async () => {
 	for (const verdict of [{ action: 'ask', question: 'Which PR?' }, { action: 'duplicate', of: 'task-open' }] as const) {
 		const notices: string[] = [];
 		const store = createVoiceTaskStore();
@@ -139,8 +152,26 @@ test('no acknowledgement when the check asks the user or finds a duplicate', asy
 		const relay = new RelayAgent({ store, submit: async () => ({ status: 'pending', taskId: 'task-x' }), notice: (t) => notices.push(t), check: async () => verdict });
 		void relay.invoke('work', { task: 'check the PR' });
 		await new Promise((r) => setTimeout(r, 20));
-		assert.equal(notices.length, 0, `${verdict.action}: nothing said to be "on it"`);
+		if (verdict.action === 'ask') assert.equal(notices.length, 0, 'ask: nothing said to be "on it"');
+		else { assert.equal(notices.length, 1); assert.match(notices[0], /already sent to the core and its result will be told/); }
 		relay.endAllCalls('continuing');
+	}
+	// Aborted during submit: the call ends with "continuing" and no acknowledgement follows it.
+	{
+		const notices: string[] = [];
+		const ac = new AbortController();
+		const relay = new RelayAgent({ store: createVoiceTaskStore(), notice: (t) => notices.push(t), submit: async () => { ac.abort(); return { status: 'pending', taskId: 'task-a' }; } });
+		const out = await relay.invoke('work', { task: 'x' }, ac.signal);
+		assert.match(out, /still running/);
+		assert.equal(notices.length, 0, 'an aborted call is not acknowledged');
+	}
+	// The core is offline (status not pending): the bridge's own message is the answer, no acknowledgement.
+	{
+		const notices: string[] = [];
+		const relay = new RelayAgent({ store: createVoiceTaskStore(), notice: (t) => notices.push(t), submit: async () => ({ status: 'offline', message: 'saved for later' }) });
+		const out = await relay.invoke('work', { task: 'x' });
+		assert.match(out, /offline/);
+		assert.equal(notices.length, 0);
 	}
 });
 

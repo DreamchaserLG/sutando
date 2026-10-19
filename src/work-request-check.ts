@@ -25,6 +25,8 @@ export interface WorkCheckInput {
 	recentConversation: string;
 	/** Tasks already sent and not yet answered: the same request again is not sent twice. */
 	openTasks?: OpenTask[];
+	/** Tasks answered in the last minute: the same request again is a duplicate of one; what to do with it is the relay's call. */
+	answeredTasks?: OpenTask[];
 }
 
 export type WorkRequestCheck = (input: WorkCheckInput, signal?: AbortSignal) => Promise<WorkCheck>;
@@ -60,6 +62,9 @@ export function workCheckPrompt(i: WorkCheckInput): string {
 		'',
 		'Open tasks (sent, not answered yet):',
 		openTasksBlock(i.openTasks),
+		'',
+		'Answered a moment ago (the same request again is a duplicate of that id too):',
+		openTasksBlock(i.answeredTasks),
 		'',
 		'Request the assistant wrote:',
 		i.task.trim(),
@@ -207,7 +212,7 @@ export function createGeminiWorkCheck(opts: { apiKey: () => string | undefined; 
 		const t0 = Date.now();
 		const { text } = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: workCheckPrompt(input), signal, log: opts.log, what: 'work check' });
 		if (text === null) return { action: 'submit' };
-		const verdict = parseWorkCheck(text, input.openTasks);
+		const verdict = parseWorkCheck(text, [...(input.openTasks ?? []), ...(input.answeredTasks ?? [])]);
 		opts.log?.(`[RelayAgent] work check: ${verdict.action}${verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : ''} in ${Date.now() - t0}ms`);
 		return verdict;
 	};
