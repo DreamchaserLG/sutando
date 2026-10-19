@@ -277,6 +277,17 @@ export function roomIndexContextLines(index: RoomIndex): string[] {
 	return [`ROOMS: AG2 Space rooms you can read with read_room: ${names.join(' | ')}. A name the user says that is one of these exactly (ignoring case) is that room — never swap it for a similar one ("triage system" is not "Sutando Triage"). A room name you hear is often misheard: only when it is none of these exactly, pass the one of these it clearly is, spelled exactly like this; ask which only when none clearly is. When you read back an action, say the room\'s name as listed.`];
 }
 
+/**
+ * The same index for the core, as one body line of a voice task: name = room_id. 2026-10-18 the core found
+ * the user's DM three times in one evening with room_list + room_inspect (2-18 s each time) while the voice
+ * side held every room id already.
+ */
+export function roomIndexTaskLines(index: RoomIndex): string[] {
+	const rooms = index.rooms();
+	if (!rooms.length) return [];
+	return [`AG2 Space rooms this agent is in (name = room_id; use the id, do not list rooms again): ${rooms.map(r => `${r.name.replace(/[=|\r\n]+/g, ' ')} = ${r.room_id}`).join(' | ')}`];
+}
+
 export interface RoomMessageLine { at: string; from: string; text: string; event_id?: string; reply?: boolean; thread?: boolean; in_thread_of?: string; reactions?: string[]; from_last?: number; system?: boolean }
 
 /** The server's own notice prefix ("Agent Native: @chi changed @x access …"): the client shows it as a system row, not a message. */

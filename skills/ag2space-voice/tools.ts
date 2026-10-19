@@ -6,7 +6,7 @@ import type { SkillSetupCtx, VoiceSurfaceContribution } from '../../src/skill-se
 import { SESSION_CONTEXT_TYPE, buildSessionContextAckFrame, parseSessionContextCapabilities } from './session-context.js';
 import { NAVIGATION_PROMPT_RULE, failPendingNavigations, installVoiceNavigateClient, navigateUiAvailable, navigateUiTool, resolveUiNavigated } from './navigate.js';
 import { createRoomBinding, roomContextLines, roomOriginFromTaskHeader, sessionRoomNotice, type RoomBinding } from './room-binding.js';
-import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex } from './room-read.js';
+import { ROOM_READ_PROMPT_RULE, ROOM_TURN_CHECK_RULE, createListRoomsTool, createMcpStdioClient, createReadPageTool, createReadRoomTool, createRoomIndex, createAddCommentTool, createSearchCommonsTool, createSearchRoomTool, createSendMessageTool, createWritePageTool, findAg2SpaceMcpEntry, roomIndexContextLines, type McpClient, type RoomIndex, roomIndexTaskLines } from './room-read.js';
 import { EDIT_FILE_PROMPT_RULE, createEditFileTool } from './edit-file.js';
 import { ROOM_ACTIONS_PROMPT_RULE, ROOM_ACTIONS_TURN_CHECK_RULE, createDescribeActionTool, createFindActionsTool, createRunActionTool } from './room-actions.js';
 
@@ -67,9 +67,9 @@ export function setup(ctx: SkillSetupCtx): void {
 }
 
 /** read_room is declared only where the core has the ag2-space MCP registered; the voice agent starts the same server. */
-function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; turnCheckRules: string[]; contextLines: () => string[] } {
+function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; turnCheckRules: string[]; contextLines: () => string[]; taskContextLines: () => string[] } {
 	const entry = findAg2SpaceMcpEntry();
-	if (!entry) return { tools: [], promptRules: [], turnCheckRules: [], contextLines: () => [] };
+	if (!entry) return { tools: [], promptRules: [], turnCheckRules: [], contextLines: () => [], taskContextLines: () => [] };
 	const log = (m: string) => console.log(`${ts()} ${m}`);
 	if (!_mcp) {
 		_mcp = createMcpStdioClient(entry, { log });
@@ -99,6 +99,7 @@ function roomReadSurface(): { tools: ToolDefinition[]; promptRules: string[]; tu
 		promptRules: [ROOM_READ_PROMPT_RULE, EDIT_FILE_PROMPT_RULE, ROOM_ACTIONS_PROMPT_RULE],
 		turnCheckRules: [ROOM_TURN_CHECK_RULE, ROOM_ACTIONS_TURN_CHECK_RULE],
 		contextLines: () => roomIndexContextLines(index),
+		taskContextLines: () => roomIndexTaskLines(index),
 	};
 }
 
@@ -112,5 +113,6 @@ export function voiceSurface(): VoiceSurfaceContribution {
 		contextLines: () => [...roomContextLines(_binding?.current() ?? null), ...roomRead.contextLines()],
 		answeringTools: roomRead.tools.map((t) => t.name),
 		turnCheckRules: roomRead.turnCheckRules,
+		taskContextLines: roomRead.taskContextLines,
 	};
 }

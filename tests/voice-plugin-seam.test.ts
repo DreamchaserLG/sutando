@@ -99,8 +99,10 @@ describe('collectVoiceSurface', () => {
 			() => { throw new Error('bad hook'); },
 			() => null as never,
 			() => ({ contextLines: () => { throw new Error('bad lines'); } }),
-			() => ({ promptRules: ['- FAKE: rule two'] }),
+			() => ({ promptRules: ['- FAKE: rule two'], taskContextLines: () => ['AG2 Space rooms: a = !a:x'] }),
+			() => ({ taskContextLines: () => { throw new Error('bad facts'); } }),
 		], (m, d) => logs.push(`${m} ${d ?? ''}`));
+		assert.deepEqual(merged.taskContextLines(), ['AG2 Space rooms: a = !a:x'], 'facts for the core, a broken hook dropped');
 		assert.deepEqual(merged.tools, [tool]);
 		assert.deepEqual(merged.promptRules, ['- FAKE: rule one', '- FAKE: rule two']);
 		assert.deepEqual(merged.contextLines(), ['WHERE: A']);
