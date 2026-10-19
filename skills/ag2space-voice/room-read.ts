@@ -714,6 +714,14 @@ export type MentionResolution =
 	| { ok: false; error: 'no_user' | 'ambiguous_user' | 'no_owner' | 'unavailable'; name: string; candidates?: string[] };
 
 type Person = { id: string; name: string };
+/** "<name>'s agent", "<name> 的 bot", "<name> agent"; and "the agent of <name>". */
+const AGENT_NAME_SUFFIX = /^(.+?)(?:['’]s|的)?\s*(?:agent|bot|desktop|machine)$/i;
+const AGENT_OF_NAME = /^(?:the\s+)?(?:agent|bot)\s+(?:of|for)\s+(.+)$/i;
+/** An agent account, as AG2 Space names them: an .agent id, a sutando-<name> id, or a display name that says so. */
+const isAgentAccount = (p: Person): boolean => {
+	const local = p.id.slice(1, p.id.indexOf(':'));
+	return /\.agent$/.test(local) || /^sutando-/.test(local) || /\b(agent|bot|desktop|sutando)\b/i.test(p.name);
+};
 /** A person matches a spoken name on the whole display name, one word of it, or the id's local part. */
 function matches(p: Person, said: string): boolean {
 	const key = nameKey(said);
@@ -740,6 +748,24 @@ export async function resolveMentions(client: McpClient, room: RoomRef, said: st
 	for (const raw of said) {
 		const name = String(raw).trim().replace(/^@(?![^\s:]+:)/, '');
 		if (!name) continue;
+		// "Yixuan's agent", "Qingyun 的 bot", "the agent of Chi": that person's agent account, never the person
+		// (2026-10-19: "mention Yixuan's agent" tagged Yixuan). Several agents of that name: ask which.
+		const agentOf = AGENT_OF_NAME.exec(name)?.[1] ?? AGENT_NAME_SUFFIX.exec(name)?.[1];
+		if (agentOf && nameKey(agentOf)) {
+			const base = nameKey(agentOf);
+			const fits = (p: Person) => isAgentAccount(p) && (nameKey(p.id.slice(1, p.id.indexOf(':'))).includes(base) || nameKey(p.name).includes(base));
+			let agents = (await roomMembers()).filter(fits);
+			if (!agents.length) {
+				const r = await roomRead(client, null, 'space.users.search', { query: agentOf.trim() }, deps, ROOM_READ_CALL_TIMEOUT_MS);
+				if (!r.ok) return { ok: false, error: 'unavailable', name };
+				const users = Array.isArray(r.result.users) ? r.result.users as Array<{ user_id?: unknown; display_name?: unknown }> : [];
+				agents = users.filter(u => typeof u.user_id === 'string').map(u => ({ id: u.user_id as string, name: typeof u.display_name === 'string' ? u.display_name : '' })).filter(fits);
+			}
+			if (!agents.length) return { ok: false, error: 'no_user', name };
+			if (agents.length > 1) return { ok: false, error: 'ambiguous_user', name, candidates: agents.slice(0, 5).map(p => `${p.name || p.id} (${p.id})`) };
+			add(agents[0]);
+			continue;
+		}
 		if (MENTION_ME.test(name)) {
 			const owner = await ownerId(client);
 			if (!owner) return { ok: false, error: 'no_owner', name };
@@ -869,7 +895,10 @@ export async function sendMessage(args: { room?: string; text: string; reply_to?
 	const who = await resolveMentions(client, target.room, (args.mentions ?? []).map(m => String(m).trim()).filter(Boolean), deps);
 	if (!who.ok) return who;
 	const mentions = who.ids;
+	// room.message.send only notifies the mentioned: nothing shows in the message. The ids go at its start, as every
+	// agent writes them (2026-10-19: a message "tagging Yixuan" showed no tag; the user asked three times).
 	body = withoutMentionIds(body, mentions) || body;
+	if (mentions.length) body = `${mentions.join(' ')} ${body}`.trim();
 	const done = await roomExecute(client, target.room, 'room.message.send', {
 		body,
 		...(replyTo ? { reply_to: replyTo } : {}),
@@ -1039,7 +1068,7 @@ export function createAddCommentTool(deps: ReadRoomDeps): ToolDefinition {
 			'Call it when the user wants to comment, remark or 留言 on a document or page ("comment on the design doc: Susan has reviewed"). To change the page\'s own text, use write_page instead. ' +
 			'Pass `kind` from a search_commons hit (e.g. "markdown-4m8ay3mg"), "markdown" for the main Doc, "html" for the main HTML page, or "readme"; for a database pass kind "db" and `database` = its id from the search_commons hit (a database is commented on as a whole). When the user named the document or database, comment on the hit with that name, never on the main page in its place. `quote` = the exact passage to anchor to (Doc pages only), left out for a comment on the whole page. ' +
 			'To answer in an existing comment thread instead, pass `reply_to` = that comment\'s event_id and no kind. ' +
-			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
+			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), "<name>\'s agent" or "<name>\'s bot" for that person\'s agent account (a bare name is the person), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
 			'Returns {ok:true, room, kind, quote, event_id, mentions, mentioned} — then tell the user in one sentence that the comment is on that page, naming the page by its title from the search_commons hit, and whom it @-mentioned from `mentioned`. ' +
@@ -1073,10 +1102,10 @@ export function createSendMessageTool(deps: ReadRoomDeps): ToolDefinition {
 			'Send a message in an AG2 Space room\'s chat, as this agent, where every member reads it. ' +
 			'Call it when the user wants something said or posted in a room ("tell Sutando Triage that …", "reply to Chi\'s message: …"). ' +
 			'Pass `text` = the message; `reply_to` = the event_id of the message it answers (from read_room or search_room), left out otherwise; `thread` = a thread root\'s event_id to post inside that thread. ' +
-			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
+			'`mentions` = whom the user asked to @, as they said it: "me" for the user, a name ("Chi"), "<name>\'s agent" or "<name>\'s bot" for that person\'s agent account (a bare name is the person), or a full user id; the tool looks each one up, so never make up an id. Only when the user explicitly asks to @ someone: mentioned agents act on being mentioned, so never add one on your own. Do not write the @ or their names into `text`: the mentioned are shown first. ' +
 			WRITE_CONFIRMATION +
 			'Leave `room` out for the room this session is in. ' +
-			'Returns {ok:true, room, event_id, reply, mentions, mentioned} — then tell the user in one sentence that it is posted, naming whom it @-mentioned from `mentioned`. ' +
+			'Returns {ok:true, room, event_id, reply, mentions, mentioned} — then tell the user in one sentence that it is posted, naming whom it @-mentioned from `mentioned` (the tool writes the @-mentions at the start of the message itself, so they show in the room). ' +
 			'Text only. A picture, image or file to send into a room or DM is not this tool: call work for it, and never say a picture was sent when only text was. ' +
 			'Errors: "no_text" — nothing to send; "too_long" — keep it under 4000 characters; "no_message" — reply_to or thread is not a message\'s event_id; "no_user" — nobody by that name (`name`); say so and ask who they meant; "ambiguous_user" — several people match `name`: read out `candidates` and ask which; "no_owner" — you could not tell who the user is: ask for their name; "needs_approval" — the room requires an approval first, say so; ' + ROOM_NAME_ERRORS +
 			'"FORBIDDEN" or "ROOM_ACCESS_DENIED" — say you may not post in that room; "not_connected" or "unavailable" — say it could not be sent right now and nothing was sent; ' + OUTCOME_UNKNOWN_ERROR,

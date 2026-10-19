@@ -756,9 +756,18 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		// "Yixuan" is the person, not the agent named "Yixuan’s Desktop".
 		const y = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ['Yixuan'] }, deps(f.client));
 		assert.deepEqual(y.ok && y.mentioned, ['Yixuan Zhai']);
+		// "Yixuan's agent" is the agent account, in any of the ways it is said; "Chi's agent" has two in the room.
+		for (const said of ["Yixuan's agent", 'Yixuan’s agent', 'Yixuan 的 bot', 'the agent of Yixuan', 'yixuan agent']) {
+			const a = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: [said] }, deps(f.client));
+			assert.deepEqual(a.ok && a.mentioned, ['Yixuan’s Desktop'], said);
+			assert.deepEqual(sent(f).at(-1), { kind: 'markdown', text: 'x', mentions: ['@yixuan-desktop.agent:ag2.space'] }, said);
+		}
+		const two = await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ["Chi's agent"] }, deps(f.client));
+		assert.deepEqual(two, { ok: false, error: 'ambiguous_user', name: "Chi's agent", candidates: ['Echo-Act-IV-Pro (@sutando-sonichi:ag2.space)', 'Echo-Act-IV-Blue (@chi-chi-air-blue.agent:ag2.space)'] });
+		assert.deepEqual(await addComment({ room: 'open.space launch video', kind: 'markdown', text: 'x', mentions: ["Bo's agent"] }, deps(f.client)), { ok: false, error: 'no_user', name: "Bo's agent" }, 'people are not agents');
 		const tool = createAddCommentTool({ client: () => f.client, currentRoom: () => null, index: { rooms: () => [], refresh: async () => [], fetchedAt: () => 1 } });
 		assert.doesNotMatch(tool.description, /@sutando-sonichi/);
-		assert.match(tool.description, /"me" for the user, a name \("Chi"\), or a full user id; the tool looks each one up, so never make up an id/);
+		assert.match(tool.description, /"me" for the user, a name \("Chi"\), "<name>'s agent" or "<name>'s bot" for that person's agent account \(a bare name is the person\), or a full user id; the tool looks each one up, so never make up an id/);
 		assert.match(tool.description, /Do not write the @ or their names into `text`/);
 		assert.match(tool.description, /"ambiguous_user" — several people match `name`: read out `candidates` and ask which/);
 	});
@@ -823,7 +832,11 @@ describe('send_message: a message in a room\'s chat, as the agent, after the use
 			? done({ members: [{ user_id: '@sutando-sonichi:ag2.space', display_name: 'Echo-Act-IV-Pro' }] }) : done({ event_id: '$sent' }));
 		const r2 = await sendMessage({ room: 'Sutando Triage', text: 'Yes.', reply_to: '$q', thread: '$t', mentions: ['Echo-Act-IV-Pro'] }, deps(m.client));
 		assert.deepEqual(r2.ok && [r2.reply, r2.mentions, r2.mentioned], [true, 1, ['Echo-Act-IV-Pro']]);
-		assert.deepEqual((m.calls[1].args as { arguments: unknown }).arguments, { body: 'Yes.', reply_to: '$q', thread_root: '$t', mentions: ['@sutando-sonichi:ag2.space'] });
+		// The ids go into the message itself: room.message.send only notifies, and a message "tagging Yixuan" showed no tag.
+		assert.deepEqual((m.calls[1].args as { arguments: unknown }).arguments, { body: '@sutando-sonichi:ag2.space Yes.', reply_to: '$q', thread_root: '$t', mentions: ['@sutando-sonichi:ag2.space'] });
+		const tool = createSendMessageTool(deps(m.client));
+		assert.match(tool.description, /the tool writes the @-mentions at the start of the message itself/);
+		assert.match(tool.description, /"<name>'s agent" or "<name>'s bot" for that person's agent account \(a bare name is the person\)/);
 	});
 
 	it('nothing is sent without text, with a reply or thread that is not an event id, with a mention that is not a user id, or to a misheard room; refusals are said', async () => {
