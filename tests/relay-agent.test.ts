@@ -1008,6 +1008,16 @@ describe('every status answer comes from the one table', () => {
 		assert.ok(tool.includes('voiceTaskCounts(rows)') && tool.includes('pendingTasks: counts.pending') && !tool.includes('openTasks'), 'the tool reports the table\'s count');
 	});
 
+	it('resultsNotYetTold lists a finished, unheard result with its text; spoken, empty and retired rows are left out', async () => {
+		const { resultsNotYetTold } = await import('../src/inline-tools.js');
+		const row = (id: string, state: string, delivery?: string, retired?: boolean) => ({ id, text: `request ${id}`, submittedAt: 1, state, delivery, retired }) as never;
+		const texts: Record<string, string> = { a: 'Sixty-one PRs merged.', b: 'Said already.', d: 'Cleared.' };
+		const rows = [row('a', 'done', 'injected'), row('b', 'done', 'spoken'), row('c', 'done'), row('d', 'done', undefined, true), row('e', 'started')];
+		assert.deepEqual(resultsNotYetTold(rows, (id) => texts[id] ?? null), [{ task: 'request a', result: 'Sixty-one PRs merged.' }]);
+		const tool = src('voice-agent.ts').split("name: 'get_task_status'")[1].split('};')[0];
+		assert.ok(tool.includes('resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText)'), 'the tool reports exactly this list');
+	});
+
 	it('the live status snapshot carries every row, newest first, with the same pending count as the tool', async () => {
 		const { voiceTaskStatusSnapshot, voiceTaskCounts } = await import('../src/inline-tools.js');
 		const row = (text: string, submittedAt: number, state: string, delivery?: string, retired?: boolean) => ({ id: text, text, submittedAt, state, delivery, retired }) as never;

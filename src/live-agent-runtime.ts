@@ -51,12 +51,6 @@ export interface DurableChannelOptions {
 	injectLive?: (text: string) => void;
 }
 
-/**
- * Wire the durable work channel into a live session: context drops, ambient
- * note-viewing state, and task results — each injected via the session's
- * text path when the session is live, with the tuned guard markers and
- * fallback semantics preserved exactly.
- */
 /** A returned result not said by then is nudged once, then handed over again. */
 export const RETURN_NUDGE_MS = 15_000;
 export const RETURN_RELEASE_MS = 60_000;
@@ -131,6 +125,12 @@ export function turnSaysResult(turn: string, evidence: { numbers: string[]; word
 	return false;
 }
 
+/**
+ * Wire the durable work channel into a live session: context drops, ambient
+ * note-viewing state, and task results — each injected via the session's
+ * text path when the session is live, with the tuned guard markers and
+ * fallback semantics preserved exactly.
+ */
 export function wireDurableChannels(session: VoiceSession, opts: DurableChannelOptions): { enqueue: (item: ResultItem) => void } {
 	const { cartesiaApiKey = '', generateSpeech = null } = opts;
 
@@ -206,10 +206,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	const interruptedTurns = new Set<string>();
-	// Results returned through open calls. Gemini may fold a WHEN_IDLE response into its context without
-	// saying it while the user keeps talking, so a spoken turn counts as the result only when its words carry
-	// the result's content (a session with no conversation items falls back to "first spoken turn").
-	// Unsaid after returnNudgeMs: one nudge; after returnReleaseMs: handed over again. A reconnect: handed over again.
+	// Results returned through open calls: a spoken turn counts as the result only when its words carry the result's
+	// content; unsaid after returnNudgeMs it is nudged, after returnReleaseMs (or a reconnect) handed over again.
 	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
 	const returnedUnheard: Returned[] = [];
 	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };

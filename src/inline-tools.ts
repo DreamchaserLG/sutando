@@ -822,12 +822,18 @@ export function readQueueDepth(workspaceDir: string, nowSec = Math.floor(Date.no
  *  until a spoken turn carries it; counting it heard earlier made the status tool skip a result the user never got. */
 export const heardByUser = (r: VoiceTaskRow): boolean => r.delivery === 'spoken';
 
-/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
-
 /**
  * "Pending" is what the core is still working on. A finished result the user has not heard yet is counted
  * apart and read to them first: a picture already in their DM half a minute ago is not a pending task.
  */
+/** Finished results the user has not heard, each with its text, so a status answer can say them before the count. */
+export function resultsNotYetTold(rows: VoiceTaskRow[], readText: (id: string) => string | null): Array<{ task: string; result: string }> {
+	return rows
+		.filter((r) => r.state === 'done' && !r.retired && !heardByUser(r))
+		.map((r) => ({ task: r.text.slice(0, 60), result: (readText(r.id) ?? '').slice(0, 300) }))
+		.filter((r) => r.result);
+}
+
 export function voiceTaskCounts(rows: VoiceTaskRow[]): { pending: number; working: number; doneNotHeard: number } {
 	const live = rows.filter((r) => r.state !== 'cancelled' && !r.retired);
 	const working = live.filter((r) => r.state === 'queued' || r.state === 'started').length;
@@ -853,6 +859,7 @@ export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now()):
 	return { at: now, ...c, tasks };
 }
 
+/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
 export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
 	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
 	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {

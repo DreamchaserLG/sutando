@@ -606,7 +606,6 @@ export interface VoiceTaskRow {
 	retired?: boolean;
 }
 
-/** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
 /** A finished voice task's result text, for a status answer that can say it at once; null when none is on disk. */
 export function voiceTaskResultText(taskId: string): string | null {
 	const row = voiceTaskStore.get(taskId);
@@ -615,6 +614,7 @@ export function voiceTaskResultText(taskId: string): string | null {
 	return text ? stripVoiceControlLines(text).trim() : null;
 }
 
+/** The relay agent's view for status answers: voice tasks from the last few hours, oldest first. */
 export function voiceTaskRows(now = Date.now()): VoiceTaskRow[] {
 	const rows: VoiceTaskRow[] = [];
 	for (const [id, row] of voiceTaskStore.list()) {
