@@ -78,6 +78,11 @@ __all__ = [
 ]
 
 
+# A worker's delivered bodies: `deliveries/<worker>/bodies/<id>.txt`. The pool's writer owns
+# the layout (pool_delivery.BODY_DIR); a test pins the two names together.
+DELIVERY_BODY_DIR = "bodies"
+
+
 def announced_entry(tasks_dir: "Path | str", announced: str, *,
                     payload_dir: "Path | str | None" = None) -> "tuple[str, Path] | None":
     """(queue key, payload path) for one `TASK_FILE:` announcement, or None to refuse it.
@@ -85,10 +90,10 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     A bare name is a `*.txt` file in `tasks_dir`. An absolute path is accepted only when the
     caller runs a resolver-backed watcher, only for an existing regular `*.txt` file (not a
     symlink) directly inside the payload store it names (`payload_dir`, the owning
-    workspace's task store) or inside a real directory directly under `tasks_dir`, where a
-    delivery keeps its body; its basename is the key. Anything else (empty, traversal, a
-    relative path, any absolute path when no `payload_dir` is given, a file anywhere else)
-    is refused: the caller then types nothing.
+    workspace's task store) or inside the real `bodies/` folder of a delivery inbox
+    (`deliveries/<worker>/`) that `tasks_dir` names; its basename is the key. Anything else
+    (empty, traversal, a relative path, any absolute path when no `payload_dir` is given, any
+    other folder such as an archive) is refused: the caller then types nothing.
     """
     if not announced or ".." in announced or not announced.endswith(".txt"):
         return None
@@ -105,7 +110,9 @@ def announced_entry(tasks_dir: "Path | str", announced: str, *,
     parent = payload.parent
     if parent.resolve() == Path(payload_dir).resolve():
         return payload.name, payload
-    if not parent.is_symlink() and parent.parent.resolve() == Path(tasks_dir).resolve():
+    inbox = Path(tasks_dir).resolve()
+    if (parent.name == DELIVERY_BODY_DIR and not parent.is_symlink() and inbox.parent.name == "deliveries"
+            and parent.parent.resolve() == inbox):
         return payload.name, payload
     return None
 

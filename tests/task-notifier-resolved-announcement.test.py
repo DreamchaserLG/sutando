@@ -81,13 +81,34 @@ class AnnouncedEntry(_Workspace):
                     str(self.ws / "tasks"), f"{self.ws}/tasks/../tasks/task-abc.txt"):
             self.assertIsNone(td.announced_entry(self.inbox, bad, payload_dir=self.ws / "tasks"), bad)
 
-    def test_a_body_in_a_real_folder_directly_under_the_inbox_keys_by_its_name(self):
+    def test_a_body_in_the_inbox_bodies_folder_keys_by_its_name(self):
         (self.inbox / "bodies").mkdir()
         body = self.inbox / "bodies" / "task-abc.txt"
         body.write_text("id: task-abc\n")
         self.assertEqual(td.announced_entry(self.inbox, str(body), payload_dir=self.ws / "tasks"),
                          ("task-abc.txt", body))
         self.assertIsNone(td.announced_entry(self.inbox, str(body)), "absolute needs a resolver-backed caller")
+
+    def test_the_body_folder_name_is_the_pool_writers_own(self):
+        sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
+        import pool_delivery
+        self.assertEqual(td.DELIVERY_BODY_DIR, pool_delivery.BODY_DIR)
+
+    def test_an_archived_task_or_any_other_folder_is_refused(self):
+        tasks = self.ws / "tasks"
+        (tasks / "archive").mkdir()
+        archived = tasks / "archive" / "task-abc.txt"
+        archived.write_text("id: task-abc\n")
+        # Announced on the core's own inbox, the archive is a folder directly under it: still refused.
+        self.assertIsNone(td.announced_entry(tasks, str(archived), payload_dir=tasks))
+        (tasks / "bodies").mkdir()
+        (tasks / "bodies" / "task-abc.txt").write_text("x\n")
+        self.assertIsNone(td.announced_entry(tasks, str(tasks / "bodies" / "task-abc.txt"), payload_dir=tasks),
+                          "a bodies/ folder counts only under a delivery inbox")
+        (self.inbox / "other").mkdir()
+        (self.inbox / "other" / "task-abc.txt").write_text("x\n")
+        self.assertIsNone(td.announced_entry(self.inbox, str(self.inbox / "other" / "task-abc.txt"),
+                                             payload_dir=tasks))
 
     def test_only_a_regular_txt_one_level_under_a_real_inbox_folder_is_accepted(self):
         (self.inbox / "bodies" / "deeper").mkdir(parents=True)
@@ -105,6 +126,14 @@ class AnnouncedEntry(_Workspace):
                     self.inbox / "alias" / "task-abc.txt", self.inbox / "bodies" / "task-link.txt",
                     self.inbox / "bodies" / "task-none.txt", other / "task-abc.txt", self.inbox / "bodies"):
             self.assertIsNone(td.announced_entry(self.inbox, str(bad), payload_dir=self.ws / "tasks"), bad)
+
+    def test_a_symlinked_bodies_folder_is_refused(self):
+        real = self.ws / "elsewhere-bodies"
+        real.mkdir()
+        (real / "task-abc.txt").write_text("x\n")
+        (self.inbox / "bodies").symlink_to(real)
+        self.assertIsNone(td.announced_entry(self.inbox, str(self.inbox / "bodies" / "task-abc.txt"),
+                                             payload_dir=self.ws / "tasks"))
 
     def test_a_bare_name_that_is_not_a_task_file_is_refused(self):
         for bad in ("task-abc.body", "task-abc", "bodies"):
