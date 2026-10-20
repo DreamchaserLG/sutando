@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The seed never rewrites a .claude.json it cannot read (resume plan F3, 2026-10-20).
+"""The seed never destroys a .claude.json it cannot read (resume plan F3, 2026-10-20).
 
 A Claude Code write cut off by a reboot or a power loss leaves a truncated .claude.json.
 The seed program in session-launch.sh used to treat that as an empty config and write
@@ -39,7 +39,9 @@ def _run(ccd: Path, home: Path) -> tuple[int, str]:
 
 
 class TestUnreadableClaudeJson(unittest.TestCase):
-    def test_a_truncated_file_is_kept_and_the_seed_is_skipped(self):
+    def test_a_truncated_file_is_copied_aside_and_a_fresh_config_is_seeded(self):
+        # Review on #5762: skipping every seed left the detached core at the onboarding,
+        # trust and bypass prompts. The bytes live on in the copy; the live file is seeded.
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             ccd = td / "cfg"
@@ -48,13 +50,15 @@ class TestUnreadableClaudeJson(unittest.TestCase):
             (ccd / ".claude.json").write_text(truncated)
             rc, out = _run(ccd, td)
             self.assertEqual(rc, 0, out)
-            self.assertEqual((ccd / ".claude.json").read_text(), truncated, "kept byte for byte")
             copies = list(ccd.glob(".claude.json.unreadable-*"))
             self.assertEqual(len(copies), 1, "one copy set aside")
-            self.assertEqual(copies[0].read_text(), truncated)
+            self.assertEqual(copies[0].read_text(), truncated, "the copy keeps the bytes")
+            cfg = json.loads((ccd / ".claude.json").read_text())
+            self.assertTrue(cfg["hasCompletedOnboarding"], "the live file is seeded from {}")
+            self.assertNotIn("oauthAccount", cfg)
             self.assertIn("unreadable", out)
-            self.assertNotIn("onboarding-seed: hasCompletedOnboarding", out)
-            self.assertFalse((ccd / "settings.json").exists(), "the dangerous-mode seed is skipped too")
+            self.assertIn("onboarding-seed", out)
+            self.assertTrue((ccd / "settings.json").exists(), "the dangerous-mode seed runs too")
 
     def test_only_the_newest_copies_are_kept(self):
         # Review on #5762: a launch crash loop set one copy aside per attempt with no cap.
@@ -64,17 +68,18 @@ class TestUnreadableClaudeJson(unittest.TestCase):
             ccd.mkdir()
             truncated = '{"oauthAccount": {"emailAddress": "me@example.com"}, "projects": {"/x": {'
             (ccd / ".claude.json").write_text(truncated)
+            # Named by epoch; the mtimes are deliberately the wrong way round, as copy2
+            # keeps the original's mtime: the cap must sort by the name, not the clock.
             for i in range(4):
                 old = ccd / f".claude.json.unreadable-{1000 + i}"
                 old.write_text(f"old copy {i}")
-                os.utime(old, (1000 + i, 1000 + i))
+                os.utime(old, (5000 - i, 5000 - i))
             rc, out = _run(ccd, td)
             self.assertEqual(rc, 0, out)
-            copies = sorted(ccd.glob(".claude.json.unreadable-*"), key=lambda q: q.stat().st_mtime)
+            copies = sorted(ccd.glob(".claude.json.unreadable-*"), key=lambda q: int(q.name.rsplit("-", 1)[1]))
             self.assertEqual(len(copies), 3, "the cap holds, the new copy included")
-            self.assertEqual([q.read_text() for q in copies[:2]], ["old copy 2", "old copy 3"], "the oldest went first")
+            self.assertEqual([q.read_text() for q in copies[:2]], ["old copy 2", "old copy 3"], "the oldest epochs went first")
             self.assertEqual(copies[-1].read_text(), truncated, "the newest copy is this launch's")
-            self.assertEqual((ccd / ".claude.json").read_text(), truncated, "the live file is untouched")
 
     def test_an_empty_file_is_still_seeded(self):
         with tempfile.TemporaryDirectory() as td:

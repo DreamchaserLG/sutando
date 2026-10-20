@@ -147,8 +147,11 @@ import shutil, sys, time
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
 UNREADABLE_COPIES_KEPT = 3
-# A non-empty file that does not parse is kept and copied aside, never seeded over:
-# rewriting it from {} would drop the account and projects it still holds.
+# A non-empty file that does not parse is copied aside before the seed rewrites it: the
+# copy keeps the account and projects the bytes still hold (never silently dropped), and the
+# seed still runs from {} so the detached core gets its onboarding, trust and bypass answers
+# — a skipped seed left it waiting at those prompts while the host read it as running
+# (review on #5762, the F3 symptom).
 unreadable = False
 try:
     cfg = json.load(open(target)) if os.path.exists(target) else {}
@@ -164,19 +167,23 @@ except Exception as e:
         except Exception:
             kept = "(copy failed)"
         # One copy per launch: a crash loop would add one per attempt, so only the newest
-        # UNREADABLE_COPIES_KEPT stay (review on #5762). The live file is never touched.
+        # UNREADABLE_COPIES_KEPT stay (review on #5762), newest by the epoch in the name
+        # (copy2 keeps the original's mtime, so mtime would sort them wrong).
+        def copy_epoch(q):
+            try:
+                return int(q.rsplit("-", 1)[1])
+            except Exception:
+                return 0
         try:
             copies = sorted(
                 (q for q in os.listdir(ccd) if q.startswith(".claude.json.unreadable-")),
-                key=lambda q: os.path.getmtime(os.path.join(ccd, q)),
+                key=copy_epoch,
             )
             for q in copies[:-UNREADABLE_COPIES_KEPT]:
                 os.remove(os.path.join(ccd, q))
         except Exception:
             pass
-        print("  ⚠ onboarding-seed: .claude.json is unreadable (%s); kept as-is, copy at %s; seed skipped" % (e.__class__.__name__, kept))
-if unreadable:
-    sys.exit(0)
+        print("  ⚠ onboarding-seed: .claude.json is unreadable (%s); copy kept at %s; seeding a fresh config" % (e.__class__.__name__, kept))
 glob = {}
 try:
     with open(os.path.join(os.path.expanduser("~"), ".claude.json")) as f:
