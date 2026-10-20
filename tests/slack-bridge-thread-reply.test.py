@@ -197,6 +197,7 @@ check("top-level channel message w/o mention → no task", new == [], str(new))
 
 # 9. Non-allowlisted sender in a bot thread → dropped silently (no ack spam).
 mod.app.posts.clear()
+mod._not_allowlisted_ack_at.clear()  # an earlier mention started the per-sender cooldown
 new = deliver({"user": "U_STRANGER", "text": "hi all", "thread_ts": "1000.000",
                "parent_user_id": BOT}, TIERS)
 check("non-allowlisted reply → no task", new == [], str(new))
