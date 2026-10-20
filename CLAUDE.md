@@ -241,6 +241,7 @@ Tasks arrive from multiple channels via the same file bridge:
 - This session reads and executes them, writes results to `results/task-{ts}.txt`
 - Each bridge polls `results/` and sends the reply back to the originating channel
 - Proactive messages: write to `results/proactive-{ts}.txt` to speak to the user
+- Dates in a task are the owner's: "today", "yesterday", "this week" mean calendar days in the zone of the task's `local_time:` header (e.g. `America/Los_Angeles`), never UTC. Turn them into that zone's day boundaries before a query (`gh search … --merged-at`, log greps), and say the zone-local date in the reply. A UTC day drops the owner's evening (Pacific evenings are the next UTC day).
 
 ### Where replies go
 
