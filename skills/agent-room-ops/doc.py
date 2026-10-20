@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
-# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
+# DEPRECATION NOTICE: the room vault this reads is being retired; it has no MCP fallback.
+# Use Room Commons pages and databases for durable room state (see SKILL.md).
 """room-ops · doc — read/write/delete a room's shared Room Context documents.
 
 The missing half of room participation: `read`/`send`/`react` cover the room
