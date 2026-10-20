@@ -81,6 +81,28 @@ class TestUnreadableClaudeJson(unittest.TestCase):
             self.assertEqual([q.read_text() for q in copies[:2]], ["old copy 2", "old copy 3"], "the oldest epochs went first")
             self.assertEqual(copies[-1].read_text(), truncated, "the newest copy is this launch's")
 
+    def test_no_copy_means_no_overwrite(self):
+        # Review on #5762: when the copy aside fails, the seed must not rewrite the only
+        # holder of those bytes. A read-only config dir makes the copy fail.
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory permissions")
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ccd = td / "cfg"
+            ccd.mkdir()
+            truncated = '{"oauthAccount": {"emailAddress": "me@example.com"}, "projects": {"/x": {'
+            (ccd / ".claude.json").write_text(truncated)
+            ccd.chmod(0o555)
+            try:
+                rc, out = _run(ccd, td)
+            finally:
+                ccd.chmod(0o755)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((ccd / ".claude.json").read_text(), truncated, "kept byte for byte")
+            self.assertEqual(list(ccd.glob(".claude.json.unreadable-*")), [], "no copy")
+            self.assertFalse((ccd / "settings.json").exists(), "nothing seeded")
+            self.assertIn("could not be copied aside", out)
+
     def test_an_empty_file_is_still_seeded(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

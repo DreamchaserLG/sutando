@@ -164,8 +164,12 @@ except Exception as e:
         kept = "%s.unreadable-%d" % (target, int(time.time()))
         try:
             shutil.copy2(target, kept)
-        except Exception:
-            kept = "(copy failed)"
+        except Exception as copy_err:
+            # No copy, no overwrite: the seed would be the only holder of those bytes' loss.
+            # The core may then stall at its prompts this launch (the known trade), but the
+            # account and projects the file still holds are not gone (review on #5762).
+            print("  ⚠ onboarding-seed: .claude.json is unreadable (%s) and could not be copied aside (%s); kept as-is, seed skipped" % (e.__class__.__name__, copy_err.__class__.__name__))
+            sys.exit(0)
         # One copy per launch: a crash loop would add one per attempt, so only the newest
         # UNREADABLE_COPIES_KEPT stay (review on #5762), newest by the epoch in the name
         # (copy2 keeps the original's mtime, so mtime would sort them wrong).
