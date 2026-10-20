@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral tests for #5549: a plain (no @mention) reply in a channel thread the
-bot started or posted in becomes a task, gated by the same allowlist/tier checks as
-a mention; replies in other threads, the bot's own posts and mentions are ignored.
+bot started or was @-mentioned in becomes a task, gated by the same allowlist/tier checks as
+a mention; a human-rooted thread counts only once the bot was @-mentioned in it; replies in other threads, the bot's own posts and mentions are ignored.
 
 Run: python3 tests/slack-bridge-thread-reply.test.py   (exit 0 pass / 1 fail)
 """
@@ -124,21 +124,56 @@ new = deliver({"user": "U_OWNER", "text": "chatting with a colleague",
                "thread_ts": "1500.000", "parent_user_id": "U_SOMEONE"}, TIERS)
 check("reply in thread bot never joined → no task", new == [], str(new))
 
-# 4. Thread rooted by a human where the bot posted a result → addressed.
+# 4. Human-rooted thread: a bot post alone does NOT make later unmentioned replies tasks.
 mod.app.posts.clear()
 mod._send_reply("CCHAN", "1600.000", "here is your answer", task_id="task-x")
-check("bot post into a thread is recorded",
-      mod.BOT_THREADS.contains("CCHAN", "1600.000"))
+check("bot post into a thread is not recorded", not mod.BOT_THREADS.contains("CCHAN", "1600.000"))
 new = deliver({"user": "U_OWNER", "text": "thanks, one more thing",
                "thread_ts": "1600.000", "parent_user_id": "U_OWNER"}, TIERS)
-check("reply in human-rooted thread the bot posted in → task", len(new) == 1, str(new))
-
-# 5. A top-level bot post records its own ts as a thread root, persisted to disk.
+check("human-rooted thread, bot posted but never mentioned → no task", new == [], str(new))
 mod._send_reply("CCHAN", None, "Question for the owner?", task_id="task-y")
-root = "9%d.000" % len(mod.app.posts)
-check("top-level bot post recorded as thread root", mod.BOT_THREADS.contains("CCHAN", root), root)
+check("top-level bot post is not recorded",
+      not mod.BOT_THREADS.contains("CCHAN", "9%d.000" % len(mod.app.posts)))
+
+# 5. An @mention in a human-rooted thread records it; later unmentioned replies become tasks.
+
+
+def mention(event: dict, tiers: dict = TIERS) -> list[Path]:
+    _seq[0] += 1
+    event = {"channel": "CCHAN", "channel_type": "channel", "team": "T1",
+             "ts": f"3000.{_seq[0]:03d}", **event}
+    before = set(TASKS_DIR.glob("*.txt"))
+    with patch.object(mod, "load_allowed", lambda: set(tiers)), \
+         patch.object(mod, "_ensure_tier_map_seeded", lambda: True), \
+         patch.object(mod, "load_tier_map", lambda: dict(tiers)), \
+         patch.object(mod, "write_owner_activity", lambda *a, **k: None):
+        mod.handle_mention(event, None)
+    return sorted(set(TASKS_DIR.glob("*.txt")) - before)
+
+
+new = mention({"user": "U_OWNER", "text": f"<@{BOT}> look at this", "thread_ts": "1800.000"})
+check("mention in thread → task", len(new) == 1, str(new))
+check("mention records its thread root", mod.BOT_THREADS.contains("CCHAN", "1800.000"))
+new = deliver({"user": "U_OWNER", "text": "and also this", "thread_ts": "1800.000",
+               "parent_user_id": "U_OWNER"}, TIERS)
+check("unmentioned reply in mentioned human-rooted thread → task", len(new) == 1, str(new))
 disk = json.loads((Path(_tmp) / "state" / "slack-bot-threads.json").read_text())
-check("record persisted under workspace state/", f"CCHAN:{root}" in disk, str(disk))
+check("record persisted under workspace state/", "CCHAN:1800.000" in disk, str(disk))
+new = deliver({"user": "U_OWNER", "text": "other thread", "thread_ts": "1801.000",
+               "parent_user_id": "U_OWNER"}, TIERS)
+check("different human-rooted thread, no mention → no task", new == [], str(new))
+
+# A top-level mention is the root of its own thread.
+top = f"3999.{_seq[0] + 1:03d}"
+mention({"user": "U_OWNER", "text": f"<@{BOT}> start", "ts": top})
+check("top-level mention records its own ts", mod.BOT_THREADS.contains("CCHAN", top), top)
+# A mention from a non-allowlisted sender writes no task and records nothing.
+new = mention({"user": "U_STRANGER", "text": f"<@{BOT}> hi", "thread_ts": "1900.000"})
+check("non-allowlisted mention → no task, thread not recorded",
+      new == [] and not mod.BOT_THREADS.contains("CCHAN", "1900.000"), str(new))
+# Mentions in a DM-style channel are never recorded.
+mod._note_mention_thread({"channel": "D123", "ts": "5.0"})
+check("DM channel not recorded", not mod.BOT_THREADS.contains("D123", "5.0"))
 
 # 6. The bot's own message / other bots → ignored (no feedback loop).
 new = deliver({"user": BOT, "text": "my own reply", "thread_ts": "1000.000",
@@ -205,16 +240,15 @@ with patch.object(mod.time, "monotonic", lambda: _clock[0]):
     new = deliver(dict(_ev), TIERS)
     check("auth.test recovers → reply becomes a task", len(new) == 1, str(new))
 
-# 12. Recording the thread fails → the reply is still sent.
-mod.app.posts.clear()
+# 12. Recording the thread fails → the mention still becomes a task, nothing raises.
 with patch.object(mod.BOT_THREADS, "record", side_effect=RuntimeError("disk")):
     try:
-        mod._send_reply("CCHAN", "1700.000", "result text", task_id="task-z")
+        new = mention({"user": "U_OWNER", "text": f"<@{BOT}> again", "thread_ts": "1700.000"})
         raised = False
     except Exception:
-        raised = True
-check("record failure → _send_reply does not raise", not raised)
-check("record failure → reply still posted", len(mod.app.posts) == 1, str(mod.app.posts))
+        new, raised = [], True
+check("record failure → handle_mention does not raise", not raised)
+check("record failure → task still written", len(new) == 1, str(new))
 
 if failures:
     print(f"\nFAIL — {len(failures)} check(s): {failures}")

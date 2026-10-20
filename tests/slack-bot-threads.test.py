@@ -41,10 +41,14 @@ def ev(**k):
 check("bot-root reply → addressed", is_addressed_thread_reply(ev(), BOT, False))
 check("private channel (group) → addressed", is_addressed_thread_reply(ev(channel_type="group"), BOT, False))
 check("thread_broadcast → addressed", is_addressed_thread_reply(ev(subtype="thread_broadcast"), BOT, False))
-check("bot posted in human-rooted thread → addressed",
+check("bot @-mentioned in human-rooted thread → addressed",
       is_addressed_thread_reply(ev(parent_user_id="U9"), BOT, True))
-check("human-rooted thread, bot absent → not", not is_addressed_thread_reply(ev(parent_user_id="U9"), BOT, False))
+check("human-rooted thread, no mention recorded → not", not is_addressed_thread_reply(ev(parent_user_id="U9"), BOT, False))
 check("unknown bot id → fail closed", not is_addressed_thread_reply(ev(), None, True))
+check("unknown bot id, bot-root, no record → fail closed", not is_addressed_thread_reply(ev(), None, False))
+check("bot-root reply needs no record", is_addressed_thread_reply(ev(), BOT, False))
+check("human-rooted + other user's parent id, no record → not",
+      not is_addressed_thread_reply(ev(parent_user_id="U_OWNER"), BOT, False))
 check("DM channel_type → not (DM path owns it)", not is_addressed_thread_reply(ev(channel_type="im"), BOT, True))
 check("top-level (no thread_ts) → not", not is_addressed_thread_reply(ev(thread_ts=None), BOT, True))
 check("thread root itself (ts == thread_ts) → not", not is_addressed_thread_reply(ev(ts="1.0"), BOT, True))

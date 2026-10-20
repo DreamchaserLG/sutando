@@ -1,9 +1,9 @@
-"""Slack channel thread replies the bot is party to — companion to `slack-bridge.py`.
+"""Slack channel thread replies addressed to the bot — companion to `slack-bridge.py`.
 
 A channel message reaches the bridge as an `app_mention` only when it @-mentions
-the bot, so a plain reply in a thread the bot started or answered in was never
-turned into a task. This module decides when such a reply is addressed to the
-bot, and keeps the bounded record of threads the bot has posted into.
+the bot, so a plain reply in a thread the bot started or was mentioned in was
+never turned into a task. This module decides when such a reply is addressed to
+the bot, and keeps the bounded record of threads the bot was @-mentioned in.
 
 The decision is a pure function so its truth table is unit-tested directly; the
 bridge resolves the bot's user id and the record lookup and gates on it.
@@ -36,13 +36,13 @@ def mentions_user(text: str, user_id: str) -> bool:
 
 
 def is_addressed_thread_reply(event: dict, bot_user_id: str | None,
-                              bot_posted_in_thread: bool) -> bool:
+                              bot_mentioned_in_thread: bool) -> bool:
     """Return True iff a channel `message` event is a human reply in a thread
-    the bot is party to, and is not already delivered as an `app_mention`.
+    addressed to the bot, and is not already delivered as an `app_mention`.
 
-    Party to the thread means the root is the bot's (`parent_user_id`, set by
-    Slack on every thread reply) or the bot has posted in it
-    (`bot_posted_in_thread`, from the bridge's record). Unknown bot identity
+    Addressed means the root is the bot's (`parent_user_id`, set by Slack on
+    every thread reply) or the bot was @-mentioned in the thread
+    (`bot_mentioned_in_thread`, from the bridge's record). Unknown bot identity
     fails closed: without it neither own-message nor mention filtering works.
     """
     if not bot_user_id:
@@ -61,11 +61,11 @@ def is_addressed_thread_reply(event: dict, bot_user_id: str | None,
         return False
     if mentions_user(event.get("text") or "", bot_user_id):
         return False
-    return event.get("parent_user_id") == bot_user_id or bool(bot_posted_in_thread)
+    return event.get("parent_user_id") == bot_user_id or bool(bot_mentioned_in_thread)
 
 
 class BotThreadRecord:
-    """Bounded, persisted set of (channel, thread root ts) the bot has posted into."""
+    """Bounded, persisted set of (channel, thread root ts) the bot was @-mentioned in."""
 
     def __init__(self, path: Path, *, max_entries: int = DEFAULT_MAX_ENTRIES,
                  max_age_s: int = DEFAULT_MAX_AGE_S, clock=time.time):

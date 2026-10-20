@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Slack bridge for Sutando — receives DMs, @mentions and replies in threads the
-bot started or posted in via Socket Mode, writes to
+bot started or was @-mentioned in via Socket Mode, writes to
 tasks/, sends replies from results/. Works alongside the voice / discord /
 telegram bridges. Runs as a background daemon.
 
@@ -503,7 +503,7 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 # restarted bridge still needs the original channel + thread timestamp to route
 # a late result. Discord already persists the equivalent map for this reason.
 PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
-# Channel threads the bot has posted into; a plain reply there is addressed to it.
+# Human-rooted channel threads where the bot was @-mentioned; a plain reply there is addressed to it.
 BOT_THREADS = BotThreadRecord(STATE_DIR / "slack-bot-threads.json")
 
 
@@ -1413,7 +1413,8 @@ def handle_mention(event, say):
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
     text, recovered = _resolve_mention_text(event, text)
     prefix = "Slack mention (recovered prior message)" if recovered else "Slack mention"
-    _write_task(event, prefix, text, username)
+    if _write_task(event, prefix, text, username):
+        _note_mention_thread(event)
 
 
 _bot_user_id_cache: list[str] = []
@@ -1441,20 +1442,19 @@ def _bot_user_id() -> str | None:
     return uid or None
 
 
-def _note_bot_thread(channel: str, thread_ts: str | None, resp) -> None:
-    """Record the channel thread a successful post landed in; never raises."""
+def _note_mention_thread(event: dict) -> None:
+    """Record the channel thread an accepted @mention sits in; never raises."""
     try:
-        if not channel or channel.startswith("D"):
-            return
-        root = thread_ts or (resp.get("ts") if resp is not None else None)
-        if root:
+        channel = event.get("channel") or ""
+        root = event.get("thread_ts") or event.get("ts")
+        if channel and not channel.startswith("D") and root:
             BOT_THREADS.record(channel, str(root))
     except Exception as e:
         print(f"  [bot-threads] record failed: {e}", flush=True)
 
 
 def _handle_channel_thread_reply(event: dict) -> str | None:
-    """A plain reply in a thread the bot started or posted in → task, gated like a mention."""
+    """A plain reply in a bot-rooted or bot-@-mentioned thread → task, gated like a mention."""
     thread_ts = event.get("thread_ts")
     if not thread_ts or thread_ts == event.get("ts"):
         return None
@@ -1585,7 +1585,6 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 _last_resp = app.client.chat_postMessage(**kwargs)
                 _parts_visible += 1
-                _note_bot_thread(channel, thread_ts, _last_resp)
             except Exception as e:
                 print(f"[Slack] chat_postMessage failed: {e}", flush=True)
                 _chunk_exc = e
