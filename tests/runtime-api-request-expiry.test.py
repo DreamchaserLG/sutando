@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "src" / "runtime-api"))
 from ha_adapter import DEFAULT_TTL_S, HumanActionAdapter, ha_action_id
 from hitl.projector import project
 from hitl.replies import EVENT_TYPE, REPLY_FIELD, HitlReplyHandler
-from hitl.schema import WIRE_FIELD
+from hitl.schema import HumanRequirement, WIRE_FIELD
 from request_store import RequestStore
 
 KINDS = ("approval", "elicitation", "human_action")
@@ -101,6 +101,7 @@ class ExpiryJourneyTests(unittest.TestCase):
     def start(self):
         self.boot += 1
         log = self.diagnostics / f"{self.label}-server-{self.boot}.log"
+        self.server_log = log
         argv = [sys.executable, str(ROOT / "src/runtime-api/server.py")]
         started = time.monotonic()
         with log.open("w") as output:
@@ -171,7 +172,8 @@ class ExpiryJourneyTests(unittest.TestCase):
                      "expected_revision": req.revision if revision is None else revision,
                      "guard": req.guard, "action_id": action or req.actions[0].id}}}
         self.handler.offer(event)
-        self.note("synthetic-reply", event=event, outcome=self.handler.last_outcome)
+        self.note("synthetic-reply", event=event, outcome=self.handler.last_outcome,
+                  reason=self.handler.last_reason)
         return self.handler.last_outcome
 
     def wait_expired(self, records, limit=None):
@@ -206,8 +208,13 @@ class ExpiryJourneyTests(unittest.TestCase):
             status = self.cli("task", "status", record["tid"])
             self.assertEqual(status["state"], "pending")
             self.assertNotIn("waitingOn", status)
-            self.assertEqual(self.cli("request", "get", rid)["status"], "expired")
+            response = self.cli("request", "get", rid)
+            self.assertEqual(response, {"requestId": rid, "status": "expired"})
+            self.assertEqual(self.cli("request", "wait", rid, "--timeout", "0.1"),
+                             response)
             self.assertEqual(self.reply(before), "rejected")
+            self.assertEqual(self.reply(req), "rejected")
+            self.assertIn("expired", self.handler.last_reason)
             self.assertEqual(self.raw(rid), row)
             self.assertEqual(self.manager.get(req.id), req)
         start = len(self.deliveries)
@@ -219,13 +226,43 @@ class ExpiryJourneyTests(unittest.TestCase):
             self.assertEqual(edit["op"], "edit")
             self.assertEqual(wire["status"], "expired")
             self.assertEqual(edit["event_id"], ledgers[wire["id"]]["event_id"])
+            ledger = self.manager.store.projection(wire["id"])
+            self.assertEqual(ledger, {**ledgers[wire["id"]], "revision": wire["revision"]})
         self.assertEqual(self.project(), [])
         self.assertEqual(self.project(), [])
         self.assertEqual(len(self.deliveries), start + len(records))
 
+    def snapshots(self, records):
+        return [(self.raw(r["rid"]), self.manager.get(r["req"].id),
+                 self.manager.store.projection(r["req"].id)) for r in records]
+
+    def assert_stable_after_restart(self, records):
+        before = self.snapshots(records)
+        self.stop()
+        self.start()
+        # The daemon uses its ordinary two-second resolver cadence.
+        time.sleep(4.1)
+        for record in records:
+            response = self.cli("request", "get", record["rid"])
+            self.assertEqual(self.cli("request", "wait", record["rid"], "--timeout", "0.1"),
+                             response)
+        self.assertEqual(self.snapshots(records), before)
+        delivered = len(self.deliveries)
+        self.assertEqual(self.project(), [])
+        self.assertEqual(self.project(), [])
+        self.assertEqual(len(self.deliveries), delivered)
+        self.note("stable-after-restart", requests=[r["rid"] for r in records])
+
     def test_periodic_expiry_projection_and_negative_controls(self):
         indefinite = [self.issue(kind) for kind in KINDS]
         unrelated = [self.issue(kind, 3600) for kind in KINDS]
+        choice = next(r for r in unrelated if r["row"]["request_type"] == "elicitation")
+        self.assertEqual(self.cli("request", "wait", choice["rid"], "--timeout", "0.1"),
+                         {"requestId": choice["rid"], "status": "pending", "timedOut": True})
+        self.assertEqual(self.raw(choice["rid"]), choice["row"])
+        foreign = self.manager.create(HumanRequirement(
+            kind="choice", runtime="synthetic-other", message="Unrelated local requirement",
+            guard="foreign", expires_at=time.time() - 1))
         resolved = [self.issue(kind, 30) for kind in KINDS]
         for record in resolved:
             req = record["req"]
@@ -242,8 +279,20 @@ class ExpiryJourneyTests(unittest.TestCase):
                 self.assertEqual(answer["result"], {"answer": "Beta"})
             record["terminal_row"] = self.raw(record["rid"])
             record["terminal_req"] = self.manager.get(req.id)
+        completed = self.issue("human_action", 30)
+        self.assertEqual(self.reply(completed["req"], action="done"), "applied")
+        self.assertEqual(self.cli("request", "wait", completed["rid"], "--timeout", "4")["status"],
+                         "completed")
+        cancelled = self.issue("elicitation", 30)
+        self.assertEqual(self.cli("request", "cancel", cancelled["rid"])["status"], "cancelled")
+        for record in (completed, cancelled):
+            record["terminal_row"] = self.raw(record["rid"])
+            record["terminal_req"] = self.manager.get(record["req"].id)
+        resolved += [completed, cancelled]
         expiring = [self.issue(kind, 15) for kind in KINDS]
         self.project()
+        terminal_snapshots = self.snapshots(resolved)
+        foreign_ledger = self.manager.store.projection(foreign.id)
         ledgers = {r["req"].id: self.manager.store.projection(r["req"].id)
                    for r in expiring}
         for record in expiring:
@@ -269,8 +318,7 @@ class ExpiryJourneyTests(unittest.TestCase):
         deadline = max(r["row"]["expires_at"] for r in resolved)
         while time.time() <= deadline:
             time.sleep(0.05)
-        self.stop()
-        self.start()
+        self.assert_stable_after_restart(expiring + resolved)
         for record in indefinite + unrelated:
             self.assertEqual(self.raw(record["rid"]), record["row"])
             self.assertEqual(self.manager.get(record["req"].id), record["req"])
@@ -282,8 +330,26 @@ class ExpiryJourneyTests(unittest.TestCase):
             self.assertEqual(self.raw(record["rid"]), record["terminal_row"])
             self.assertEqual(self.manager.get(record["req"].id), record["terminal_req"])
             result = self.cli("request", "get", record["rid"])
-            if record["row"]["request_type"] == "elicitation":
+            if record["terminal_row"]["status"] == "resolved":
                 self.assertEqual(result["result"], {"answer": "Beta"})
+            self.assertEqual(self.cli("task", "status", record["tid"])["state"], "pending")
+        self.assertEqual(self.snapshots(resolved), terminal_snapshots)
+        self.assertEqual(self.manager.get(foreign.id), foreign)
+        self.assertEqual(self.manager.store.projection(foreign.id), foreign_ledger)
+        self.assertIn(foreign.id, {r.id for r in self.manager.active()})
+        self.assertEqual(self.cli("task", "status", choice["tid"])["state"],
+                         "waiting_for_input")
+        self.assertLess(time.time(), choice["row"]["expires_at"])
+        self.assertEqual(self.reply(choice["req"], action="opt2"), "applied")
+        answer = self.cli("request", "wait", choice["rid"], "--timeout", "4")
+        self.assertEqual(answer["status"], "resolved")
+        self.assertEqual(answer["result"], {"answer": "Beta"})
+        self.assertEqual(self.cli("request", "get", choice["rid"]), answer)
+        self.assertEqual(self.manager.get(choice["req"].id).chosen_action, "opt2")
+        self.assertEqual(self.manager.get(choice["req"].id).status, "resolved")
+        status = self.cli("task", "status", choice["tid"])
+        self.assertEqual(status["state"], "pending")
+        self.assertNotIn("waitingOn", status)
         self.assertEqual(payloads, {p: p.read_bytes() for p in payloads})
         self.assertEqual(other_bytes, {p: p.read_bytes() for p in other.rglob("*") if p.is_file()})
 
@@ -320,13 +386,45 @@ class ExpiryJourneyTests(unittest.TestCase):
         for record in already_expired:
             self.assertEqual(self.raw(record["rid"]), record["expired_row"])
         self.assert_expired_projection(records, ledgers)
-        snapshots = [(self.raw(r["rid"]), self.manager.get(r["req"].id),
-                      self.manager.store.projection(r["req"].id)) for r in records]
-        self.stop()
-        self.start()
-        self.assertEqual(snapshots, [(self.raw(r["rid"]), self.manager.get(r["req"].id),
-                                     self.manager.store.projection(r["req"].id)) for r in records])
-        self.assertEqual(self.project(), [])
+        self.assert_stable_after_restart(records)
+
+    def test_mirror_write_failure_retries_across_restart(self):
+        record = self.issue("elicitation", 5)
+        rid, req = record["rid"], record["req"]
+        self.project()
+        ledger = self.manager.store.projection(req.id)
+        mode = self.ha_dir.stat().st_mode & 0o777
+        self.ha_dir.chmod(mode & ~0o222)
+        try:
+            bound = record["row"]["expires_at"] + 8
+            failure = f"requirement expiry error for {rid} (isolated)"
+            while failure not in self.server_log.read_text():
+                self.assertIsNone(self.proc.poll(), self.server_log.read_text())
+                self.assertLess(time.time(), bound, self.server_log.read_text())
+                time.sleep(0.05)
+            log = self.server_log.read_text()
+            self.assertIn("Permission denied", log)
+            self.assertIn(".tmp-", log)
+            expired_row = self.raw(rid)
+            self.assertEqual(expired_row["status"], "expired")
+            self.assertEqual(self.manager.get(req.id), req)
+            self.assertEqual(self.manager.store.projection(req.id), ledger)
+            self.assertIn(req.id, {r.id for r in self.manager.active()})
+            self.note("mirror-write-failure", request=expired_row, requirement=req.to_wire(),
+                      log=log)
+            self.stop()
+            self.start()
+            self.assertIn(failure, self.server_log.read_text())
+            self.assertIn("Permission denied", self.server_log.read_text())
+            self.assertEqual(self.raw(rid), expired_row)
+            self.assertEqual(self.manager.get(req.id), req)
+            self.assertEqual(self.manager.store.projection(req.id), ledger)
+        finally:
+            self.ha_dir.chmod(mode)
+        self.wait_expired([record], limit=time.time() + 6)
+        self.assertEqual(self.raw(rid), expired_row)
+        self.assert_expired_projection([record], {req.id: ledger})
+        self.assert_stable_after_restart([record])
 
 
 if __name__ == "__main__":
