@@ -143,14 +143,28 @@ resolve_claude_config_dir_and_seed() {
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
       _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
+import shutil, sys, time
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
+# A non-empty file that does not parse is kept and copied aside, never seeded over:
+# rewriting it from {} would drop the account and projects it still holds.
+unreadable = False
 try:
     cfg = json.load(open(target)) if os.path.exists(target) else {}
     if not isinstance(cfg, dict):
         cfg = {}
-except Exception:
+except Exception as e:
     cfg = {}
+    if os.path.exists(target) and os.path.getsize(target) > 0:
+        unreadable = True
+        kept = "%s.unreadable-%d" % (target, int(time.time()))
+        try:
+            shutil.copy2(target, kept)
+        except Exception:
+            kept = "(copy failed)"
+        print("  ⚠ onboarding-seed: .claude.json is unreadable (%s); kept as-is, copy at %s; seed skipped" % (e.__class__.__name__, kept))
+if unreadable:
+    sys.exit(0)
 glob = {}
 try:
     with open(os.path.join(os.path.expanduser("~"), ".claude.json")) as f:
