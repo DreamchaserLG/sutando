@@ -5,7 +5,7 @@
  * a read runs through room.action.read, a change through room.action.execute, high risk or an
  * outside effect is refused before anything runs; every failure is an answer, never a throw.
  */
-import { describe, it, test, beforeEach } from 'node:test';
+import { describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -325,10 +325,9 @@ describe('the tools as the voice model sees them', () => {
 		}
 	});
 
-	it('the run description: call before asking, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
+	it('the run description: call at once, done only on ok:true, emoji as the character (live 2026-10-15 20:07–20:09)', () => {
 		const d = createRunActionTool(fake(() => null).deps).description;
-		assert.match(d, /do not ask the user first/);
-		assert.match(d, /a yes given before the first call does not count/);
+		assert.match(d, /call at once — do not read it back or wait for a yes first/);
 		assert.match(d, /Say it is done only after a call returned ok:true/);
 		assert.match(d, /the emoji character itself \(👍/);
 		assert.match(ROOM_ACTIONS_PROMPT_RULE, /say it is done only after ok:true/);

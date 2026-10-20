@@ -567,7 +567,7 @@ describe('write_page: a spoken note into a room\'s Commons, after the user\'s ye
 		assert.match(ROOM_READ_PROMPT_RULE, /or to write a note, a comment or a message into one/);
 		assert.match(ROOM_TURN_CHECK_RULE, /A note, comment or message the user wants written into a room .* is also the assistant's own .*: none, even while the text is still missing — never ask/);
 		assert.match(ROOM_TURN_CHECK_RULE, /Only another action \(review a PR, merge, change code or settings, anything outside the room\) is work/);
-		assert.match(tool.description, /Once they have said yes, call this tool in that same turn: saying you will write it, without the call, writes nothing/);
+		assert.match(tool.description, /Call it in that same turn: saying you will write it, without the call, writes nothing/);
 		assert.match(tool.description, /A comment or remark on a page \("leave a comment", "留言"\) is add_comment, not this/);
 	});
 });
@@ -695,7 +695,7 @@ describe('add_comment: a comment on a page, as the web client leaves one', () =>
 		const out = await tool.execute({ kind: 'markdown', text: 'c' }, {} as never);
 		assert.equal(out.ok && out.room, 'C');
 		assert.match(ROOM_READ_PROMPT_RULE, /a comment or 留言 on a page → add_comment the same way, never an appended line/);
-		assert.match(ROOM_READ_PROMPT_RULE, /After the yes, the call comes in that same turn/);
+		assert.match(ROOM_READ_PROMPT_RULE, /the call comes in the same turn as the request, and the confirmation after it/);
 	});
 });
 
