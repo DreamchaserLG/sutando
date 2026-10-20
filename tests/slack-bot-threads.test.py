@@ -5,6 +5,7 @@ Run: python3 tests/slack-bot-threads.test.py   (exit 0 pass / 1 fail)
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -77,6 +78,32 @@ now[0] += 200
 check("aged-out entry not found", not rec.contains("C1", "14.0"))
 (d / "bad.json").write_text("{not json")
 check("corrupt file → empty, no raise", not BotThreadRecord(d / "bad.json").contains("C1", "1.0"))
+
+check("mentions_user: empty text or user id → False",
+      not mentions_user("", BOT) and not mentions_user("<@UBOT>", ""))
+
+# Age prune: an expired entry is dropped from the persisted file on the next record.
+pa = d / "age" / "t.json"
+clk = [1000.0]
+ra = BotThreadRecord(pa, max_entries=10, max_age_s=100, clock=lambda: clk[0])
+ra.record("C1", "1.0")
+clk[0] += 101
+ra.record("C1", "2.0")
+on_disk = json.loads(pa.read_text())
+check("age prune drops expired key from persisted JSON",
+      "C1:1.0" not in on_disk and "C1:2.0" in on_disk)
+
+# Persist failure (OSError) is swallowed; the in-memory record still works.
+blocker = d / "blocker"
+blocker.write_text("x")
+rb = BotThreadRecord(blocker / "sub" / "t.json", clock=lambda: clk[0])
+try:
+    rb.record("C1", "3.0")
+    raised = False
+except Exception:
+    raised = True
+check("OSError on persist → record does not raise", not raised)
+check("OSError on persist → entry still held in memory", rb.contains("C1", "3.0"))
 
 if failures:
     print(f"\nFAIL — {len(failures)}: {failures}")

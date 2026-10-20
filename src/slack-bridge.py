@@ -1417,15 +1417,23 @@ def handle_mention(event, say):
 
 
 _bot_user_id_cache: list[str] = []
+_BOT_ID_RETRY_S = 30.0
+_bot_id_retry_at = [0.0]
 
 
 def _bot_user_id() -> str | None:
-    """This bot's Slack user id (auth.test), cached once known; None on failure."""
+    """This bot's Slack user id (auth.test), cached once known; None on failure.
+
+    A failure is remembered for _BOT_ID_RETRY_S so an outage costs one call, not one per reply.
+    """
     if _bot_user_id_cache:
         return _bot_user_id_cache[0]
+    if time.monotonic() < _bot_id_retry_at[0]:
+        return None
     try:
         uid = app.client.auth_test().get("user_id")
     except Exception as e:
+        _bot_id_retry_at[0] = time.monotonic() + _BOT_ID_RETRY_S
         print(f"  [thread-reply] auth.test failed: {e}", flush=True)
         return None
     if uid:

@@ -172,6 +172,50 @@ check("non-allowlisted reply → no not-allowlisted ack posted",
 check("auth.test called at most once", mod.app.auth_calls == 1,
       str(mod.app.auth_calls))
 
+# 11. auth.test failure → fail closed (no task, nothing escapes), bounded, then retries.
+_clock = [5000.0]
+_boom = [0]
+
+
+def _auth_fail():
+    _boom[0] += 1
+    raise RuntimeError("slack down")
+
+
+mod._bot_user_id_cache.clear()
+_real_auth = mod.app.client.auth_test
+mod.app.client.auth_test = _auth_fail
+_ev = {"user": "U_OWNER", "text": "still there?", "thread_ts": "1000.000", "parent_user_id": BOT}
+with patch.object(mod.time, "monotonic", lambda: _clock[0]):
+    try:
+        new = deliver(dict(_ev), TIERS)
+        raised = False
+    except Exception:
+        new, raised = [], True
+    check("auth.test raising → handle_message does not raise", not raised)
+    check("auth.test raising → no task written", new == [], str(new))
+    deliver(dict(_ev), TIERS)
+    deliver(dict(_ev), TIERS)
+    check("auth.test outage → repeat replies bounded to one call", _boom[0] == 1, str(_boom[0]))
+    _clock[0] += mod._BOT_ID_RETRY_S + 1
+    deliver(dict(_ev), TIERS)
+    check("auth.test retried after the negative cache expires", _boom[0] == 2, str(_boom[0]))
+    mod.app.client.auth_test = _real_auth
+    _clock[0] += mod._BOT_ID_RETRY_S + 1
+    new = deliver(dict(_ev), TIERS)
+    check("auth.test recovers → reply becomes a task", len(new) == 1, str(new))
+
+# 12. Recording the thread fails → the reply is still sent.
+mod.app.posts.clear()
+with patch.object(mod.BOT_THREADS, "record", side_effect=RuntimeError("disk")):
+    try:
+        mod._send_reply("CCHAN", "1700.000", "result text", task_id="task-z")
+        raised = False
+    except Exception:
+        raised = True
+check("record failure → _send_reply does not raise", not raised)
+check("record failure → reply still posted", len(mod.app.posts) == 1, str(mod.app.posts))
+
 if failures:
     print(f"\nFAIL — {len(failures)} check(s): {failures}")
     sys.exit(1)
