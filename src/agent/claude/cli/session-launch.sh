@@ -149,9 +149,11 @@ target = os.path.join(ccd, ".claude.json")
 UNREADABLE_COPIES_KEPT = 3
 # A non-empty file that does not parse is copied aside before the seed rewrites it: the
 # copy keeps the account and projects the bytes still hold (never silently dropped), and the
-# seed still runs from {} so the detached core gets its onboarding, trust and bypass answers
+# seed then runs from {} so the detached core gets its onboarding, trust and bypass answers
 # — a skipped seed left it waiting at those prompts while the host read it as running
-# (review on #5762, the F3 symptom).
+# (review on #5762, the F3 symptom). The one exception: when the copy itself fails, the
+# file is left untouched and the seed is skipped for that launch, since the seed would
+# otherwise be the only holder of those bytes' loss.
 unreadable = False
 try:
     cfg = json.load(open(target)) if os.path.exists(target) else {}
@@ -168,6 +170,13 @@ except Exception as e:
             # No copy, no overwrite: the seed would be the only holder of those bytes' loss.
             # The core may then stall at its prompts this launch (the known trade), but the
             # account and projects the file still holds are not gone (review on #5762).
+            # A copy that failed part-way is removed, so the cap below never counts a stub
+            # as a kept copy and a truncated copy never passes for the real bytes.
+            try:
+                if os.path.exists(kept):
+                    os.remove(kept)
+            except Exception:
+                pass
             print("  ⚠ onboarding-seed: .claude.json is unreadable (%s) and could not be copied aside (%s); kept as-is, seed skipped" % (e.__class__.__name__, copy_err.__class__.__name__))
             sys.exit(0)
         # One copy per launch: a crash loop would add one per attempt, so only the newest

@@ -103,6 +103,28 @@ class TestUnreadableClaudeJson(unittest.TestCase):
             self.assertFalse((ccd / "settings.json").exists(), "nothing seeded")
             self.assertIn("could not be copied aside", out)
 
+    def test_a_failed_copy_leaves_older_copies_alone(self):
+        # When this launch's copy fails, the seed removes only the stub it may have left
+        # (never an older copy) and still neither prunes nor overwrites anything.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ccd = td / "cfg"
+            ccd.mkdir()
+            truncated = '{"oauthAccount": {"emailAddress": "me@example.com"}, "projects": {"/x": {'
+            (ccd / ".claude.json").write_text(truncated)
+            # An unwritable dir makes this launch's copy fail; an older stub copy is present.
+            stub = ccd / ".claude.json.unreadable-1000"
+            stub.write_text("")
+            ccd.chmod(0o555)
+            try:
+                rc, out = _run(ccd, td)
+            finally:
+                ccd.chmod(0o755)
+            self.assertEqual(rc, 0, out)
+            self.assertEqual((ccd / ".claude.json").read_text(), truncated, "kept byte for byte")
+            self.assertIn("could not be copied aside", out)
+            self.assertTrue(stub.exists(), "an older stub is not this launch's to remove")
+
     def test_an_empty_file_is_still_seeded(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
