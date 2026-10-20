@@ -56,6 +56,26 @@ class TestUnreadableClaudeJson(unittest.TestCase):
             self.assertNotIn("onboarding-seed: hasCompletedOnboarding", out)
             self.assertFalse((ccd / "settings.json").exists(), "the dangerous-mode seed is skipped too")
 
+    def test_only_the_newest_copies_are_kept(self):
+        # Review on #5762: a launch crash loop set one copy aside per attempt with no cap.
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            ccd = td / "cfg"
+            ccd.mkdir()
+            truncated = '{"oauthAccount": {"emailAddress": "me@example.com"}, "projects": {"/x": {'
+            (ccd / ".claude.json").write_text(truncated)
+            for i in range(4):
+                old = ccd / f".claude.json.unreadable-{1000 + i}"
+                old.write_text(f"old copy {i}")
+                os.utime(old, (1000 + i, 1000 + i))
+            rc, out = _run(ccd, td)
+            self.assertEqual(rc, 0, out)
+            copies = sorted(ccd.glob(".claude.json.unreadable-*"), key=lambda q: q.stat().st_mtime)
+            self.assertEqual(len(copies), 3, "the cap holds, the new copy included")
+            self.assertEqual([q.read_text() for q in copies[:2]], ["old copy 2", "old copy 3"], "the oldest went first")
+            self.assertEqual(copies[-1].read_text(), truncated, "the newest copy is this launch's")
+            self.assertEqual((ccd / ".claude.json").read_text(), truncated, "the live file is untouched")
+
     def test_an_empty_file_is_still_seeded(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

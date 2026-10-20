@@ -146,6 +146,7 @@ import json, os
 import shutil, sys, time
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
+UNREADABLE_COPIES_KEPT = 3
 # A non-empty file that does not parse is kept and copied aside, never seeded over:
 # rewriting it from {} would drop the account and projects it still holds.
 unreadable = False
@@ -162,6 +163,17 @@ except Exception as e:
             shutil.copy2(target, kept)
         except Exception:
             kept = "(copy failed)"
+        # One copy per launch: a crash loop would add one per attempt, so only the newest
+        # UNREADABLE_COPIES_KEPT stay (review on #5762). The live file is never touched.
+        try:
+            copies = sorted(
+                (q for q in os.listdir(ccd) if q.startswith(".claude.json.unreadable-")),
+                key=lambda q: os.path.getmtime(os.path.join(ccd, q)),
+            )
+            for q in copies[:-UNREADABLE_COPIES_KEPT]:
+                os.remove(os.path.join(ccd, q))
+        except Exception:
+            pass
         print("  ⚠ onboarding-seed: .claude.json is unreadable (%s); kept as-is, copy at %s; seed skipped" % (e.__class__.__name__, kept))
 if unreadable:
     sys.exit(0)
