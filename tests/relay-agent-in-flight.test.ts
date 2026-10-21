@@ -62,7 +62,7 @@ describe('the one report: rows plus requests still being sent', () => {
 });
 
 describe('the relay agent lists each accepted call until its submit returns', () => {
-	function setup(check: () => Promise<{ action: 'submit' } | { action: 'ask'; question: string }> = async () => ({ action: 'submit' })) {
+	function setup(check: () => Promise<{ action: 'submit' } | { action: 'ask'; question: string }> = async () => ({ action: 'submit' }), beforeRow: () => Promise<void> = async () => {}) {
 		const store = createVoiceTaskStore();
 		let release!: () => void;
 		const turnOver = new Promise<void>((r) => (release = r));
@@ -76,6 +76,7 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 			check: async () => { await checkGate; return check(); },
 			submit: async (args) => {
 				atSubmit.push(inFlight(relay));
+				await beforeRow(); // the submit's own waits (spoken turns, the core's queue) before the row is added
 				const id = `task-${store.list().length + 1}`;
 				store.add(id, String(args.task));
 				return { status: 'pending', taskId: id };
@@ -150,9 +151,11 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 	});
 
 	it('the /voice-tasks copy never counts a request twice while its row is being added', async () => {
-		const s = setup();
+		// The submit takes long enough that no copy is being written when the row is added (live: spoken turns, the core).
+		let w!: ReturnType<typeof createVoiceTaskStatusWriter>;
+		const s = setup(undefined, async () => { await settle(); await w.flush(); });
 		const counts: number[] = [];
-		const w = createVoiceTaskStatusWriter({
+		w = createVoiceTaskStatusWriter({
 			path: join(TMP, 'state', 'voice-task-status.json'),
 			snapshot: () => { const c = voiceTaskReport(s.rows(), inFlight(s.relay)).counts.pending; counts.push(c); return { pending: c }; },
 		});
@@ -164,11 +167,11 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 		await settle();
 		await w.flush();
 		s.release();
-		await settle();
-		await w.flush(); // in the check, nothing being written: the row's change starts a write of its own
 		s.checkRelease();
+		for (let i = 0; i < 50 && (s.store.list().length === 0 || inFlight(s.relay).length); i++) await settle();
 		await settle();
 		await w.flush();
+		assert.equal(s.store.list().length, 1);
 		assert.ok(counts.length >= 2, `snapshots: ${counts}`);
 		assert.deepEqual([...new Set(counts)], [1], `every snapshot says 1 (the call, then its row): ${counts}`);
 	});
