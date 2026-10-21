@@ -262,7 +262,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	const interruptedTurns = new Set<string>();
 	// Results returned through open calls: a spoken turn counts as the result only when its words carry the result's
 	// content; unsaid after returnNudgeMs it is nudged, after returnReleaseMs (or a reconnect) handed over again.
-	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
+	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudgeAfterTurn?: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
 	const returnedUnheard: Returned[] = [];
 	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };
 	const turnWords = (): string | null => {
@@ -273,19 +273,24 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	};
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
-	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; });
+	/** The model is in a turn: a nudge due now waits for its end (the turn may be saying that very result). */
+	let modelInTurn = false;
+	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; modelInTurn = true; });
+	session.eventBus.subscribe('turn.interrupted', () => { modelInTurn = false; });
 	// A fresh dial abandons the old connection's calls and whatever the model held unsaid: a result returned to a
 	// call, or handed to the pacer, is handed over again. A resume keeps the calls and the context, so RECONNECTING
 	// alone changes nothing here.
 	session.eventBus.subscribe('session.reconnectBoundary', () => {
 		if (!noticesSuspect && opts.injectLive) console.log(`${ts()} [RelayAgent] connection replaced: results with no open call go as live input until the model speaks`);
 		noticesSuspect = true;
+		modelInTurn = false;
 		for (const r of returnedUnheard.splice(0)) { clearTimeout(r.nudge); clearTimeout(r.release); for (const id of r.ids) voiceTaskStore.unsetHandedOver(id); }
 		for (const id of pacer.held()) voiceTaskStore.unsetHandedOver(id);
 	});
 	session.eventBus.subscribe('response.first_audio', () => { modelSpokeInTurn = true; });
 	session.eventBus.subscribe('turn.end', () => {
-		if (!modelSpokeInTurn) return;
+		modelInTurn = false;
+		if (!modelSpokeInTurn) { for (const r of returnedUnheard.filter((x) => x.nudgeAfterTurn)) sendNudge(r); return; }
 		modelSpokeInTurn = false;
 		// The model completed a spoken turn on the new connection: its notifications flow again.
 		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
@@ -301,6 +306,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			for (const id of r.ids) voiceTaskStore.set(id, 'spoken');
 			dropReturned(r);
 		}
+		// A nudge that came due during this turn, for a result the turn did not say.
+		for (const r of returnedUnheard.filter((x) => x.nudgeAfterTurn)) sendNudge(r);
 	});
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
 	session.eventBus.subscribe('response.first_audio', () => pacer.onModelAudio());
@@ -404,6 +411,16 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
 		}
 	};
+	// 2026-10-20 18:14:09: a nudge sent while the model was saying that result made it say it a second time.
+	function sendNudge(r: Returned): void {
+		if (!returnedUnheard.includes(r) || !canSpeak() || r.nudged) return;
+		if (modelInTurn) { r.nudgeAfterTurn = true; return; }
+		r.nudgeAfterTurn = false;
+		r.nudged = true;
+		const text = framedSystem(`The result for the request "${r.request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
+		console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
+		if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
+	}
 	const deliver = (item: ResultItem) => {
 		// Corrected, or already said: end its call, say nothing.
 		if (moot(item)) {
@@ -425,13 +442,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				const request = (now.requests?.[0] ?? voiceTaskStore.get(item.taskId)?.text ?? item.taskId).replace(/"/g, "'").slice(0, 120);
 				const r: Returned = {
 					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text, [request, ...(now.requests ?? [])].join(' ')), request, nudged: false,
-					nudge: setTimeout(() => {
-						if (!returnedUnheard.includes(r) || !canSpeak()) return;
-						r.nudged = true;
-						const text = framedSystem(`The result for the request "${request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
-						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
-						if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
-					}, opts.returnNudgeMs ?? RETURN_NUDGE_MS),
+					nudge: setTimeout(() => sendNudge(r), opts.returnNudgeMs ?? RETURN_NUDGE_MS),
 					release: setTimeout(() => {
 						if (!returnedUnheard.includes(r)) return;
 						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; handing it over again`);

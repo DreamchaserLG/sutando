@@ -77,6 +77,46 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
+	it('a nudge due while the model is mid-turn waits for the turn: none when that turn says the result', async () => {
+		// 2026-10-20 18:14:09: the nudge for the Use Case 03 summary went in while the model was saying it; it said it again.
+		const id = voiceTask('watch the Use Case 03 video and summarize it');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'watch the Use Case 03 video and summarize it' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The Use Case 03 video is a 38-second demo: a person and an agent edit one page; the agent formats the notes as a list and adds the missing video link.');
+		await Promise.race([call, tick(5_000)]);
+		const before = notices.length;
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600); // past the nudge time, the model still speaking
+		assert.equal(notices.length, before, 'no nudge into a turn in progress');
+		items.push({ role: 'assistant', content: 'The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link.' });
+		session.emit('turn.end', { turnId: 'tu1' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+		await tick(100);
+		assert.equal(notices.length, before, 'and none after it: the turn said it');
+	});
+
+	it('a nudge due mid-turn goes as soon as a turn ends without the result', async () => {
+		const id = voiceTask('summarize the launch plan');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'summarize the launch plan' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The launch plan has four phases; the beta opens on November 12.');
+		await Promise.race([call, tick(5_000)]);
+		const before = notices.length;
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(600);
+		assert.equal(notices.length, before);
+		items.push({ role: 'assistant', content: 'Sure, here is a joke about skeletons.' });
+		session.emit('turn.end', { turnId: 'tu2' });
+		assert.equal(notices.length, before + 1, 'nudged once the turn ended');
+		assert.match(notices[notices.length - 1], /summarize the launch plan/);
+		modelSays('The launch plan has four phases and the beta opens on November 12.', 'tu3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
 	it('a turn that carries a number from the result counts at once, with no nudge', async () => {
 		const before = notices.length;
 		const id = voiceTask('check PR 5617');
