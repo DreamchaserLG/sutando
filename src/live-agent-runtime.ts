@@ -343,7 +343,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		if (typeof said[said.length - 1]?.timestamp !== 'number') return last;
 		return said.filter((i) => typeof i.timestamp === 'number' && i.timestamp > at).map((i) => i.content!.replace(/\s+/g, ' ').trim()).join('\n') || last;
 	};
-	const markHeard = (r: Returned) => { for (const id of r.ids) voiceTaskStore.set(id, 'spoken'); dropReturned(r); };
+	// `endedAt`: when the turn that told it ended, not when its verdict came (a re-ask said in between is a new turn).
+	const markHeard = (r: Returned, endedAt: number) => { for (const id of r.ids) voiceTaskStore.set(id, 'spoken', endedAt); dropReturned(r); };
 	// The rule as it was: the fast path's evidence, two distinctive words, or the count after its noun; with no evidence
 	// at all, the turn after the nudge. The heard check's fallback, and the whole decision when there is no check.
 	const heardByRule = (r: Returned, words: string | null) => words === null || (!hasEvidence(r.evidence) ? r.nudged : turnSaysResult(words, r.evidence));
@@ -372,6 +373,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		// The model completed a spoken turn on the new connection: its notifications flow again.
 		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
 		const words = turnWords();
+		const endedAt = Date.now();
 		const toJudge: Returned[] = [];
 		for (const r of [...returnedUnheard]) {
 			if (r.at > modelTurnStartedAt) continue;
@@ -382,9 +384,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
 			}
-			markHeard(r);
+			markHeard(r, endedAt);
 		}
-		if (toJudge.length) judgeHeard(toJudge, words ?? '', turnCutOff);
+		if (toJudge.length) judgeHeard(toJudge, words ?? '', turnCutOff, endedAt);
 		// A nudge that came due during this turn, for a result the turn did not say (one being judged waits for its verdict).
 		for (const r of returnedUnheard.filter((x) => x.nudgeAfterTurn)) sendNudge(r);
 	});
@@ -392,10 +394,13 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	 * Asks the heard check whether this turn told the user these results; a nudge or release due meanwhile waits for the
 	 * verdict. No verdict (a failure, or none within heardVerdictWaitMs): the rule decides, as without a check. One
 	 * decision per turn: a verdict after that changes nothing. A "no" lets a waiting nudge or release go only once no
-	 * newer turn's verdict is still coming for that result.
+	 * newer turn's verdict is still coming for that result. The relay waits for it too: a repeat of the request asked
+	 * meanwhile is "say it now" only if the turn did not tell it.
 	 */
-	function judgeHeard(batch: Returned[], last: string, cutOff: boolean): void {
+	function judgeHeard(batch: Returned[], last: string, cutOff: boolean, endedAt: number): void {
 		for (const r of batch) r.judging++;
+		let settle!: () => void;
+		opts.relay.heardPending(batch.flatMap((r) => r.ids), new Promise<void>((resolve) => { settle = resolve; }));
 		let decided = false;
 		const decide = (told: string[] | null) => {
 			if (decided) return;
@@ -407,7 +412,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				if (!returnedUnheard.includes(r)) continue;
 				if (told ? told.includes(r.ids[0]) : heardByRule(r, last)) {
 					console.log(`${ts()} [RelayAgent] ${r.ids[0]}: ${told ? 'the heard check says the turn told it' : 'no heard verdict; by the rule the turn said it'}`);
-					markHeard(r);
+					markHeard(r, endedAt);
 					continue;
 				}
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result${told ? '' : ' (no heard verdict; by the rule)'}; still waiting for it`);
@@ -415,6 +420,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 				if (r.releaseAfterVerdict) releaseReturned(r);
 				else if (r.nudgeAfterTurn) sendNudge(r);
 			}
+			settle();
 		};
 		const timer = setTimeout(() => {
 			if (!decided) console.log(`${ts()} [RelayAgent] ${batch[0].ids[0]}: no heard verdict in time; the rule decides`);

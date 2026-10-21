@@ -31,6 +31,9 @@ export interface VoiceTaskRecord {
 	supersededBy?: string;
 	/** The core ended it with nothing for the user to hear (a skip-marked result that answers no other task). */
 	retired?: boolean;
+	/** When the turn that told the user its result ended: a user turn after it asks again. Not `at`, which the heard
+	 *  verdict moves up to seconds later (a re-check she said meanwhile read as asked before she heard it). */
+	heardAt?: number;
 	/** Last change, for the cap. */
 	at: number;
 }
@@ -80,9 +83,11 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 		markCancelRequested(taskId: string): void {
 			update(taskId, (row) => ({ ...row, cancelRequested: true }));
 		},
-		set(taskId: string, delivery: Delivery): void {
+		/** How its result reached the user; for 'spoken', `heardAt` is when the turn that said it ended (now if not given). */
+		set(taskId: string, delivery: Delivery, heardAt?: number): void {
+			const told = delivery === 'spoken' ? { heardAt: heardAt ?? now() } : {};
 			// A confirmed delivery is never downgraded by a later, weaker one.
-			const deliver = (row: VoiceTaskRecord) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery });
+			const deliver = (row: VoiceTaskRecord) => (row.delivery === 'spoken' && delivery !== 'spoken' ? null : { ...row, delivery, ...told });
 			update(taskId, deliver);
 			// One result answers this task and every task answered in it (or in the result this task was answered in):
 			// whichever of them it reached the user through, it reached the user for all of them.
@@ -104,8 +109,8 @@ export function createVoiceTaskStore(now: () => number = Date.now) {
 		setAnsweredBy(taskId: string, target: string): void {
 			if (taskId === target) return;
 			// The answering result may already have been handed over: this task went with it.
-			const reached = tasks.get(target)?.delivery;
-			update(taskId, (row) => ({ ...row, answeredBy: target, ...(reached && row.delivery !== 'spoken' ? { delivery: reached } : {}) }));
+			const { delivery: reached, heardAt } = tasks.get(target) ?? {};
+			update(taskId, (row) => ({ ...row, answeredBy: target, ...(reached && row.delivery !== 'spoken' ? { delivery: reached, ...(heardAt !== undefined ? { heardAt } : {}) } : {}) }));
 		},
 		/** The user corrected `taskId` with `by`. */
 		markRetired(taskId: string): void {
@@ -744,6 +749,8 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	private lastTurnAt = 0;
 	/** Tasks the user was told are being worked on: a correction of one is not acknowledged again. */
 	private readonly acknowledged = new Set<string>();
+	/** Returned results whose heard verdict is still coming (heardPending): settled once it is decided. */
+	private readonly heardVerdicts = new Map<string, Promise<void>>();
 
 	constructor(private readonly deps: RelayAgentDeps<O>) {}
 
@@ -1010,12 +1017,20 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 					return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 				}
 				if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
+					// Returned, and the turn that may have said it still being judged: its verdict decides which case this is
+					// (bounded by the runtime's wait). Told meanwhile, "say it now" would have it said twice.
+					const pending = this.deps.store.get(verdict.of)!.delivery === 'injected' ? this.heardVerdicts.get(verdict.of) : undefined;
+					if (pending) {
+						this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again while its heard verdict is coming; waiting for it`);
+						await pending;
+						if (signal?.aborted) return framedSystem(ENDED.not_sent);
+					}
 					const row = this.deps.store.get(verdict.of)!;
 					// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly. Her speech
 					// counts as her turn: her line is logged only when the turn answering it ends, after this call (2026-10-21
 					// 18:56:55: "I think I merged more than that" would have been closed silently).
 					const userAt = Math.max(this.lastUserTurnAt, this.deps.speech?.userEndedAt?.() ?? 0);
-					if (row.delivery === 'spoken' && row.at > userAt) {
+					if (row.delivery === 'spoken' && (row.heardAt ?? row.at) > userAt) {
 						this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was said; closed without resending`);
 						return framedSystem(ENDED.already_answered);
 					}
@@ -1177,6 +1192,12 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			this.deps.log?.(`[RelayAgent] heard check failed: ${err instanceof Error ? err.message : String(err)}`);
 			return null;
 		}
+	}
+
+	/** A heard verdict for these returned tasks is coming; `decided` settles once it is in (or the rule decided). */
+	heardPending(taskIds: string[], decided: Promise<void>): void {
+		for (const id of taskIds) this.heardVerdicts.set(id, decided);
+		void decided.finally(() => { for (const id of taskIds) if (this.heardVerdicts.get(id) === decided) this.heardVerdicts.delete(id); });
 	}
 
 	/** Whether a `work` call is waiting on `taskId`. */
