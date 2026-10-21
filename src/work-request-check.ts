@@ -106,13 +106,18 @@ export type TurnVerdict =
 	| { action: 'work'; task: string }
 	| { action: 'none' }
 	| { action: 'ask'; question: string }
-	| { action: 'duplicate'; of: string };
+	| { action: 'duplicate'; of: string }
+	/** The assistant said it already did something this turn that no tool call or delivered result backs (2026-10-21
+	 *  17:39:23 "I've replaced the V2 plan…" with no tool call). `task` when only the core can do it. */
+	| { action: 'unbacked'; claim: string; task?: string };
 
 export interface TurnInput {
 	/** What the user just said (one turn, or several when they went on speaking). */
 	utterance: string;
 	recentConversation: string;
 	openTasks?: OpenTask[];
+	/** This turn's tool calls with their status, and the results delivered to the voice model in it (thisTurnToolLines). */
+	thisTurn?: string;
 }
 
 export type TurnClassifier = (input: TurnInput, signal?: AbortSignal) => Promise<TurnVerdict>;
@@ -131,20 +136,29 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		'- A yes to the assistant\'s own offer to do something ("你是想让我查一下 5332 吗？" -> "对") is that request: work.',
 		'- A question whether an earlier request was done, lost or already answered ("did you lose that one?", "是不是丢了一个", "did you tell me the PR count?") is none: the assistant answers it from its task list, and the core is not asked again.',
 		'- none: chit-chat, thanks, any other yes/no reply, a question about the assistant\'s own task list ("how many tasks are pending", "is it done yet") with no new thing named, a public fact or general-knowledge question, or anything already being answered.',
+		// 2026-10-21 17:39:17: "Did you see it 923?" (a video at 9:23 in the room), already answered, was sent to the core.
+		'- A question about a message, video or picture at some time or place ("did you see the 9:23 one?", "did you watch it?"), or about something the assistant has just answered, is none: the assistant looks or answers itself.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
-		...extraRules,
+		// 2026-10-21 17:39:23, 17:40:00: "I've replaced the V2 plan…", "I've created a separate page … v3", no tool call in either turn.
+		'- unbacked: the assistant\'s reply to this turn (its lines after the user\'s last line in the recent words) says it already did something — did, created, wrote, updated, replaced, sent, deleted, opened — that no tool call this turn with "ok" did and no delivered result reports. claim = that sentence. Saying it is doing it or will do it, or that a task is with the core, is not a claim; nor is repeating what a delivered or earlier result said. Add task (the request for the core, as for work) only when only the core can do it and no open task is it already. When the assistant claimed it did what the user asked, decide unbacked, not work.',
+		// The skills' rules name what the assistant's own tools do: they win over "messages, notes" above (17:39:17).
+		...(extraRules.length ? ['The rules below come from the assistant\'s own tools and take precedence over the split above: what they say the assistant does itself is none, even when it is about messages or notes.', ...extraRules] : []),
 		'Reply with JSON only, one of:',
 		'{"action":"work","task":"..."}',
 		'{"action":"none"}',
 		'{"action":"duplicate","of":"<id of the open task>"}',
 		'{"action":"ask","question":"..."}',
+		'{"action":"unbacked","claim":"...","task":"..."} (task only when the core must do it)',
 		'',
 		'Recent words (oldest first):',
 		i.recentConversation.trim() || '(none)',
 		'',
 		'Open tasks (sent, not answered yet):',
 		openTasksBlock(i.openTasks),
+		'',
+		'This turn, after the user spoke — the assistant\'s tool calls (name, arguments, result) and the results delivered to it:',
+		i.thisTurn?.trim() || '(none)',
 		'',
 		'What the user just said:',
 		i.utterance.trim(),
@@ -156,7 +170,11 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	const m = /\{[\s\S]*\}/.exec(text);
 	if (!m) return { action: 'none' };
 	try {
-		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown };
+		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown; claim?: unknown };
+		if (d.action === 'unbacked' && typeof d.claim === 'string' && d.claim.trim()) {
+			const task = typeof d.task === 'string' ? d.task.trim() : '';
+			return task ? { action: 'unbacked', claim: d.claim.trim(), task } : { action: 'unbacked', claim: d.claim.trim() };
+		}
 		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) return { action: 'work', task: d.task.trim() };
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
@@ -238,7 +256,7 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
 		if (r.text === null) return { action: 'none' };
 		const verdict = parseTurnVerdict(r.text, input.openTasks);
-		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
+		const detail = verdict.action === 'work' ? ` (${verdict.task})` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task: ${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
 	};

@@ -486,13 +486,62 @@ export function createHandoffPacer(deps: {
 	};
 }
 
+/** An injected line, not speech: "[System: …]" from our framing, "[system] …" from bodhi's injectSystemMessage (stored as role assistant). */
+const isInjected = (content: string) => content.startsWith('[System:') || content.startsWith('[system] ');
+
 /** The last `n` spoken lines of the live conversation, oldest first, as "user: …" / "assistant: …". System lines are left out. */
 export function recentConversationLines(items: ReadonlyArray<{ role?: string; content?: string }>, n: number): string {
 	return items
-		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim() && !i.content.startsWith('[System:'))
+		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim() && !isInjected(i.content))
 		.slice(-n)
 		.map((i) => `${i.role}: ${i.content!.replace(/\s+/g, ' ').trim()}`)
 		.join('\n');
+}
+
+const oneLine = (s: string) => s.replace(/\s+/g, ' ').trim();
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+export const TURN_TOOL_LINE_MAX = 200;
+const TURN_TOOL_ARGS_MAX = 120;
+
+/**
+ * What backs the assistant's words this turn: each tool call after the user's entry (`userText`, else the last real
+ * user line) as "name {args} -> ok | error: … | no result yet", and each result or notice delivered to the model as
+ * "delivered: …". Each line at most TURN_TOOL_LINE_MAX chars. The turn check compares the assistant's claims with
+ * it (2026-10-21 17:39:23: "I've replaced the V2 plan…" with no tool call).
+ */
+export function thisTurnToolLines(items: ReadonlyArray<{ role?: string; content?: string }>, userText?: string): string {
+	const isUser = (i: { role?: string; content?: string }) => i.role === 'user' && !!i.content?.trim() && !isInjected(i.content);
+	let start = -1;
+	const want = userText?.trim();
+	if (want) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k]) && items[k].content!.trim() === want) start = k;
+	if (start < 0) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k])) start = k;
+	if (start < 0) return '';
+	const lines: Array<{ head: string; status: string }> = [];
+	const byId = new Map<string, { head: string; status: string }>();
+	const parse = (c: string | undefined): Record<string, unknown> | null => { try { const v = JSON.parse(c ?? ''); return v && typeof v === 'object' ? v : null; } catch { return null; } };
+	for (const item of items.slice(start + 1)) {
+		const content = item.content ?? '';
+		if (item.role === 'tool_call') {
+			const c = parse(content);
+			if (!c) continue;
+			const line = { head: `${String(c.toolName ?? '?')} ${clip(JSON.stringify(c.args ?? {}), TURN_TOOL_ARGS_MAX)}`, status: 'no result yet' };
+			lines.push(line);
+			if (typeof c.toolCallId === 'string') byId.set(c.toolCallId, line);
+		} else if (item.role === 'tool_result') {
+			const r = parse(content);
+			const line = r && typeof r.toolCallId === 'string' ? byId.get(r.toolCallId) : undefined;
+			if (!r || !line) continue;
+			const out = r.result as unknown;
+			const failed = out && typeof out === 'object' && (out as { ok?: unknown }).ok === false;
+			line.status = typeof r.error === 'string' && r.error ? `error: ${oneLine(r.error)}`
+				: failed ? `error: ${String((out as { error?: unknown }).error ?? JSON.stringify(out))}`
+				: out === null || out === undefined ? 'ok'
+				: `ok: ${oneLine(typeof out === 'string' ? out : JSON.stringify(out))}`;
+		} else if ((item.role === 'user' || item.role === 'assistant') && isInjected(content)) {
+			lines.push({ head: `delivered: ${oneLine(content)}`, status: '' });
+		}
+	}
+	return lines.map((l) => clip(l.status ? `${l.head} -> ${l.status}` : l.head, TURN_TOOL_LINE_MAX)).join('\n');
 }
 
 /** A question waiting for the model to stop speaking is put anyway after this long. */
@@ -545,6 +594,8 @@ export interface RelayAgentDeps<O = unknown> {
 	recentConversation?: () => string;
 	/** Looks at every finished user turn, whatever tool the voice model chose: is it a request for the core? */
 	classify?: TurnClassifier;
+	/** This turn's tool calls and delivered results (thisTurnToolLines), from the turn whose user line is `userText`. */
+	thisTurn?: (userText: string) => string;
 	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
 	ask?: (text: string) => void;
 	/** Resolves when the session can take a reply: ACTIVE now, or at the next ACTIVE. A reply sent while a connection
@@ -707,6 +758,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 					utterance: taken.map((x) => x.text).join(' '),
 					recentConversation: this.deps.recentConversation?.() ?? '',
 					openTasks,
+					thisTurn: this.deps.thisTurn?.(taken[0].text) ?? '',
 				}).catch(() => ({ action: 'none' as const }));
 				if (this.tookTurn(since)) continue; // the voice model's own call came in while the check ran
 				await this.actOnTurn(verdict, taken[0].origin);
@@ -732,23 +784,41 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			(this.deps.ask ?? this.deps.notice)?.(line);
 			return;
 		}
+		if (verdict.action === 'unbacked') {
+			// 2026-10-21 17:39:23 / 17:40:00: the user heard "replaced", "created" and nothing had been done.
+			const claim = verdict.claim.replace(/"/g, "'");
+			this.deps.log?.(`[RelayAgent] the voice model said "${claim}" and no tool did it; telling it`);
+			const sent = verdict.task ? await this.submitFromTurn(verdict.task, origin) : false;
+			const line = sent && verdict.task
+				? framedSystem(`You told the user "${claim}", but nothing had done it. It has now been sent to the core: "${verdict.task.replace(/"/g, "'")}". Tell the user in one short sentence that it is not done yet and is being worked on now. Do not call work for it.`)
+				// Its own tool's usual steps: a room write is still said back and confirmed (review: no write without a yes).
+				: framedSystem(`You told the user "${claim}", but no tool did that this turn. Tell the user in one short sentence that it is not done yet, then do it now: with your own tool, following its usual steps (a write to a room is said back first and done after a clear yes), or with work when only the core can do it.`);
+			(this.deps.ask ?? this.deps.notice)?.(line);
+			return;
+		}
+		if (!(await this.submitFromTurn(verdict.task, origin))) return;
+		// Its result comes like any other with no call waiting: handed to the model when it can speak.
+		this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${verdict.task.replace(/"/g, "'")}". If you have not already, tell the user in one short sentence that it is being looked into. Do not call work for it.`));
+	}
+
+	/** Submits a request the turn check wrote. True when the core took it. */
+	private async submitFromTurn(task: string, origin: O | undefined): Promise<boolean> {
 		// Pending while it is submitted, like a work call's request: the row exists only once the submit returns.
-		const flight: InFlightRequest = { task: verdict.task, stage: 'sending' };
+		const flight: InFlightRequest = { task, stage: 'sending' };
 		this.enterFlight(flight);
 		let submitted: Record<string, unknown>;
 		try {
-			submitted = await this.deps.submit({ task: verdict.task }, origin);
+			submitted = await this.deps.submit({ task }, origin);
 		} finally {
 			this.leaveFlight(flight);
 		}
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') {
 			this.deps.log?.(`[RelayAgent] turn check: the request was not taken (${String(submitted.status)})`);
-			return;
+			return false;
 		}
-		this.deps.log?.(`[RelayAgent] ${taskId}: sent by the turn check (the voice model had not called work): ${verdict.task}`);
-		// Its result comes like any other with no call waiting: handed to the model when it can speak.
-		this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${verdict.task.replace(/"/g, "'")}". If you have not already, tell the user in one short sentence that it is being looked into. Do not call work for it.`));
+		this.deps.log?.(`[RelayAgent] ${taskId}: sent by the turn check (the voice model had not called work): ${task}`);
+		return true;
 	}
 
 	/**

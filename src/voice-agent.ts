@@ -74,7 +74,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, thisTurnToolLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
@@ -1054,6 +1054,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		recentConversation: () => recentConversationLines(sessionRef?.conversationContext.items ?? [], 8) || getRecentConversation(8),
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
+		// What this turn's tools did and what was delivered: a claim with nothing behind it is caught (2026-10-21 17:39:23).
+		thisTurn: (userText) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText),
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
