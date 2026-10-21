@@ -464,7 +464,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 					nudge: setTimeout(() => sendNudge(r), opts.returnNudgeMs ?? RETURN_NUDGE_MS),
 					release: setTimeout(() => {
 						if (!returnedUnheard.includes(r)) return;
-						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; handing it over again`);
+						// Only the reconcile pass hands it over again, and logs so: one hand-over, one line (2026-10-21 17:45:48).
+						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; released to the reconcile pass`);
 						dropReturned(r);
 						for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
 					}, opts.returnReleaseMs ?? RETURN_RELEASE_MS),
