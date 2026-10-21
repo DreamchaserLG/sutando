@@ -131,6 +131,24 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(notices.length, before, 'no nudge for a result that was said');
 	});
 
+	// Live 2026-10-20 11:14 (desktop voice): the answer was "3", said as "three" inside a turn that also carried another
+	// result. The evidence was only 19/13/october/sutando, so the relay nudged and handed it over again, and the
+	// user heard it three times.
+	it('a small-number answer said before its own noun counts, even inside a combined turn', async () => {
+		const before = notices.length;
+		const request = 'Count the number of pull requests merged by myself yesterday.';
+		const id = voiceTask(request);
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: request });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Yesterday, October 19, you merged 3 pull requests in the Sutando repository, out of 13 merged in total that day. 3 of your own pull requests were also merged yesterday.');
+		await Promise.race([call, tick(5_000)]);
+		modelSays('The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link, and you merged three pull requests yesterday. I currently have one pending task, which is building the San Francisco restroom finder app.', 't88');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the answer was said');
+		await tick(600);
+		assert.equal(notices.length, before, 'no nudge and no second hand-over for a result that was said');
+	});
+
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
 		const id = voiceTask('how many tasks are open in the tracker');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
@@ -163,6 +181,16 @@ describe('resultEvidence / turnSaysResult', () => {
 
 	// The live transcript never writes digits: "98" is spoken as "ninetyeight" or "九十八", and a matcher that looks
 	// for the digits nudges and re-hands a result the user has already heard.
+	it('a small number counts only next to the result\'s own noun', () => {
+		const e = resultEvidence('Yesterday, October 19, you merged 3 pull requests in the Sutando repository, out of 13 merged in total that day.', 'Count the number of pull requests merged by myself yesterday.');
+		assert.ok(turnSaysResult('You merged three pull requests yesterday.', e), 'spelled out, before its noun');
+		assert.ok(turnSaysResult('You merged 3 pull requests.', e), 'digits, before its noun');
+		assert.equal(turnSaysResult('I currently have three pending tasks.', e), false, 'the same number before another noun is not it');
+		assert.equal(turnSaysResult('There are three of them.', e), false);
+		const asked = resultEvidence('5 tasks are open.', 'are 5 tasks open?');
+		assert.equal(turnSaysResult('Five tasks are open.', asked), false, 'a phrase the request already had is not the answer');
+	});
+
 	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
 		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
 		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);
