@@ -178,11 +178,20 @@ export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean 
 	if (!hasEvidence(evidence)) return false;
 	const lower = turn.toLowerCase();
 	const tokens: string[] = lower.match(/[a-z0-9]+/g) ?? [];
-	// A small number said right before the result's own noun: "three pull requests" for "3 pull requests".
+	// A small number said right before the result's own noun: "three pull requests" for "3 pull requests". Or said
+	// counting no other noun ("three of them", "three.") in a turn that names the result's noun elsewhere: "how many
+	// pull requests you merged ... three of them". "three pending tasks" counts something else.
 	for (const [n, w] of evidence.phrases ?? []) {
 		const stem = w.replace(/s$/, '');
+		const isNoun = (t: string | undefined) => t?.replace(/s$/, '') === stem;
+		const named = tokens.some(isNoun);
 		for (const form of [n, ONES[Number(n)]]) {
-			for (let i = 0; i + 1 < tokens.length; i++) if (tokens[i] === form && tokens[i + 1].replace(/s$/, '') === stem) return true;
+			for (let i = 0; i < tokens.length; i++) {
+				if (tokens[i] !== form) continue;
+				const next = tokens[i + 1];
+				if (isNoun(next)) return true;
+				if (named && !(next && /^[a-z]{3,}$/.test(next) && !EVIDENCE_STOP.has(next))) return true;
+			}
 		}
 	}
 	const cjkRuns: string[] = turn.match(/[一-鿿]+/g) ?? [];
