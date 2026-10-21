@@ -2,7 +2,8 @@
 # A session watcher whose owning core (nearest claude/codex ancestor) is SIGKILLed
 # exits on its own within seconds and releases its sentinel, whether the core is its
 # direct parent or sits above a Monitor-style shell wrapper that survives the kill.
-# With no runtime ancestor it never self-exits, and a standby is never checked.
+# A reused owner pid (new start time) counts as gone; the checker's sleep stops with the
+# watcher. With no runtime ancestor it never self-exits, and a standby is never checked.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -13,6 +14,14 @@ mkdir -p "$WORK/stubbin"
 cp "$REPO/tests/fixtures/fswatch-poll-stub.sh" "$WORK/stubbin/fswatch"; chmod +x "$WORK/stubbin/fswatch"
 # A stand-in core: bash under the name `claude`, which is what the ancestor walk reads.
 ln -s "$(command -v bash)" "$WORK/stubbin/claude"
+# The real ps, except the owner check's own query reports another start time once $PS_REUSE_FLAG exists.
+printf '%s\n' '#!/bin/bash' \
+  'if [ -n "${PS_REUSE_FLAG:-}" ] && [ -e "$PS_REUSE_FLAG" ] && [ "$1 $2" = "-o stat=,lstart=" ]; then' \
+  "  out=\"\$($(command -v ps) \"\$@\")\" || exit \$?" \
+  '  printf "%s\n" "$out" | sed -E "s/[0-9]+:[0-9]+:[0-9]+/00:00:00/"; exit 0' \
+  'fi' \
+  "exec $(command -v ps) \"\$@\"" > "$WORK/stubbin/ps"
+chmod +x "$WORK/stubbin/ps"
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
@@ -104,7 +113,26 @@ waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
 w="$(stamped "$WS")"; PIDS+=("$w")
 sleep 8
 alive "$w" && [ "$(cat "$WS"/state/*.pid 2>/dev/null | head -1)" = "$w" ]; check "(b) with its core alive the watcher is still up after 8s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
-kill -TERM "$w" 2>/dev/null; kill -KILL "$core" 2>/dev/null; sleep 0.3
+# The checker's own `sleep 3`, caught just after a fresh one starts so ~3s of it remain.
+nap() { local c; for c in $(pgrep -P "$w"); do pgrep -f -x -P "$c" "sleep 3"; done | head -1; }
+first="$(nap)"; n="$first"
+for i in $(seq 1 50); do n="$(nap)"; [ -n "$n" ] && [ "$n" != "$first" ] && break; sleep 0.1; done
+[ -n "$n" ] && [ "$n" != "$first" ]; check "(b) the owner checker started a fresh sleep under the watcher" $?
+kill -TERM "$w" 2>/dev/null
+gone_within "$n" 1; check "(b) ...and stopping the watcher stops that sleep too, not up to 3s later" $? "sleep $n still alive"
+kill -KILL "$core" 2>/dev/null; sleep 0.3
+
+# (f) Core alive but its pid now names another process (a different start time):
+#     the watcher treats the owner as gone. ps reports a changed lstart once $PS_REUSE_FLAG exists.
+new_ws reuse
+PS_REUSE_FLAG="$WS/reused" detach "$WS" claude -c 'echo $$ > "$WS/core.pid"; '"$WCMD"' & wait; exec sleep 60' _ session
+waitfile "$WS/core.pid"; core="$(cat "$WS/core.pid")"; PIDS+=("$core")
+w="$(stamped "$WS")"; PIDS+=("$w")
+touch "$WS/reused"
+gone_within "$w" 10; check "(f) with the core's pid reused (same pid, new start time) the watcher exits within 10s" $? "$(tail -3 "$WS/w.err" | tr '\n' '|')"
+alive "$core"; check "(f) ...while that pid itself is still alive" $?
+grep -q "the core that owns this watcher (pid $core) is gone; exiting" "$WS/logs/watch-tasks-stream.log" 2>/dev/null; check "(f) ...and logs the exit" $?
+kill -KILL "$core" 2>/dev/null; sleep 0.3
 
 # (c) No runtime ancestor, the plain-shell launcher killed: never self-exits.
 new_ws noowner

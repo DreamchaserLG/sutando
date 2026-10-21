@@ -1072,6 +1072,7 @@ cleanup() {
     kill -TERM "$WATCHER_BEAT_PID" 2>/dev/null || true
   fi
   if [ -n "${OWNER_WATCH_PID:-}" ]; then
+    pkill -TERM -P "$OWNER_WATCH_PID" 2>/dev/null || true
     kill -TERM "$OWNER_WATCH_PID" 2>/dev/null || true
   fi
   settle_own_claims_on_shutdown
