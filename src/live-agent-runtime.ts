@@ -178,19 +178,22 @@ export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean 
 	if (!hasEvidence(evidence)) return false;
 	const lower = turn.toLowerCase();
 	const tokens: string[] = lower.match(/[a-z0-9]+/g) ?? [];
-	// A small number said right before the result's own noun: "three pull requests" for "3 pull requests". Or said
-	// counting no other noun ("three of them", "three.") in a turn that names the result's noun elsewhere: "how many
-	// pull requests you merged ... three of them". "three pending tasks" counts something else.
+	// A small number said right before the result's own noun: "three pull requests" for "3 pull requests". Or, from
+	// two up, closing a sentence that named the noun before it: "how many pull requests you merged ... three of them",
+	// "pull requests: three." "three pending tasks", "at 3 pm", "three more to go" are not the count; "one" after its
+	// noun is a pronoun ("one by one", "one of them"), so one counts only before its noun.
+	const sentences = lower.split(/[.!?;。！？；]+/).map((s) => s.match(/[a-z0-9]+/g) ?? []);
 	for (const [n, w] of evidence.phrases ?? []) {
 		const stem = w.replace(/s$/, '');
 		const isNoun = (t: string | undefined) => t?.replace(/s$/, '') === stem;
-		const named = tokens.some(isNoun);
 		for (const form of [n, ONES[Number(n)]]) {
-			for (let i = 0; i < tokens.length; i++) {
-				if (tokens[i] !== form) continue;
-				const next = tokens[i + 1];
-				if (isNoun(next)) return true;
-				if (named && !(next && /^[a-z]{3,}$/.test(next) && !EVIDENCE_STOP.has(next))) return true;
+			for (const words of sentences) {
+				for (let i = 0; i < words.length; i++) {
+					if (words[i] !== form) continue;
+					if (isNoun(words[i + 1])) return true;
+					const rest = words.slice(i + 1).join(' ');
+					if (Number(n) >= 2 && words.slice(0, i).some(isNoun) && (rest === '' || rest === 'of them' || rest === 'of those')) return true;
+				}
 			}
 		}
 	}
