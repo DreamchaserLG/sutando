@@ -149,6 +149,24 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(notices.length, before, 'no nudge and no second hand-over for a result that was said');
 	});
 
+	// Replay 2026-10-21 18:39 (ws-113802): "You merged 3 pull requests yesterday: number 5641, ..." was said as
+	// "Regarding how many pull requests you merged yesterday, you merged three of them." The noun came first, the
+	// number after it, so the relay judged it unsaid, nudged, and the model said it a second time.
+	it('a small-number answer said after its noun ("three of them") counts', async () => {
+		const before = notices.length;
+		const request = 'How many pull requests did I merge yesterday?';
+		const id = voiceTask(request);
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: request });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'You merged 3 pull requests yesterday: number 5641, number 5648 and number 5650.');
+		await Promise.race([call, tick(5_000)]);
+		modelSays('Regarding how many pull requests you merged yesterday, you merged three of them.', 't89');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the answer was said');
+		await tick(600);
+		assert.equal(notices.length, before, 'no nudge for a result that was said');
+	});
+
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
 		const id = voiceTask('how many tasks are open in the tracker');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
@@ -187,6 +205,12 @@ describe('resultEvidence / turnSaysResult', () => {
 		assert.ok(turnSaysResult('You merged 3 pull requests.', e), 'digits, before its noun');
 		assert.equal(turnSaysResult('I currently have three pending tasks.', e), false, 'the same number before another noun is not it');
 		assert.equal(turnSaysResult('There are three of them.', e), false);
+		const merged = resultEvidence('You merged 3 pull requests yesterday: number 5641, number 5648 and number 5650.', 'How many pull requests did I merge yesterday?');
+		assert.ok(turnSaysResult('Regarding how many pull requests you merged yesterday, you merged three of them.', merged), 'the number after its noun, named earlier in the turn');
+		assert.ok(turnSaysResult('Pull requests you merged yesterday: three.', merged), 'the number alone, its noun named');
+		assert.equal(turnSaysResult("I'm checking how many pull requests you merged yesterday.", merged), false, 'the noun with no number is the question, not the answer');
+		assert.equal(turnSaysResult("I'm checking your pull requests; you have three pending tasks.", merged), false, 'the number counting another noun');
+		assert.equal(turnSaysResult('You merged three of them.', merged), false, 'the number with its noun never named');
 		const asked = resultEvidence('5 tasks are open.', 'are 5 tasks open?');
 		assert.equal(turnSaysResult('Five tasks are open.', asked), false, 'a phrase the request already had is not the answer');
 	});
