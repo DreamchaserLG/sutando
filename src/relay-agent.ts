@@ -525,7 +525,7 @@ function resultStatus(r: Record<string, unknown>): string {
  */
 export function thisTurnToolLines(items: ReadonlyArray<{ role?: string; content?: string; timestamp?: number }>, userText?: string, since?: number): string {
 	const isUser = (i: { role?: string; content?: string }) => i.role === 'user' && !!i.content?.trim() && !isInjected(i.content);
-	let from = -1;
+	let from: number;
 	// The session's first turn (since 0) keeps the user-line start: items loaded from an earlier session are stamped too.
 	if (since && typeof items[items.length - 1]?.timestamp === 'number') {
 		from = items.findIndex((i) => typeof i.timestamp === 'number' && i.timestamp > since);
