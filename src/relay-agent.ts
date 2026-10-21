@@ -285,6 +285,8 @@ export interface SpeechGate {
 	 * counts as the answer; audio from `answeredSince` on counts only if the user began speaking after it (cut in on it).
 	 */
 	waitTurnOver(signal?: AbortSignal, answeredSince?: number): Promise<void>;
+	/** When the client's microphone last heard the user stop speaking (0 if never). */
+	userEndedAt?(): number;
 }
 
 export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; now?: () => number } = {}): SpeechGate {
@@ -304,6 +306,7 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 		// Not an end: the quiet time runs from the last real one (2026-10-21 17:42:45: a 43 ms blip held a work call to the 30 s cap).
 		onUserSpeechAborted(e) { if (!fromClient(e)) return; speaking = false; wake(); },
 		onModelAudio() { modelAudioAt = now(); wake(); },
+		userEndedAt: () => endedAt ?? 0,
 		waitTurnOver(signal, answeredSince) {
 			const since = now();
 			return new Promise<void>((resolve) => {
@@ -1008,8 +1011,11 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				}
 				if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
 					const row = this.deps.store.get(verdict.of)!;
-					// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly.
-					if (row.delivery === 'spoken' && row.at > this.lastUserTurnAt) {
+					// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly. Her speech
+					// counts as her turn: her line is logged only when the turn answering it ends, after this call (2026-10-21
+					// 18:56:55: "I think I merged more than that" would have been closed silently).
+					const userAt = Math.max(this.lastUserTurnAt, this.deps.speech?.userEndedAt?.() ?? 0);
+					if (row.delivery === 'spoken' && row.at > userAt) {
 						this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was said; closed without resending`);
 						return framedSystem(ENDED.already_answered);
 					}
