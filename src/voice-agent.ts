@@ -74,7 +74,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
@@ -1507,8 +1507,10 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	// tells the bridge whether a transcription may still be landing (no stamp within
 	// 10 s = the model started this turn itself, so the task write does not wait).
 	let lastUserSpeechAt: number | undefined;
-	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); });
-	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); });
+	wireUserSpeech(session.eventBus, {
+		onUserSpeechStarted: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); },
+		onUserSpeechEnded: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); },
+	});
 	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
 	// The relay's question for the user waits only while the model is speaking.
 	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());

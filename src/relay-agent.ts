@@ -6,7 +6,7 @@
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
 
-import type { PersistentSubagentInstance, SubagentConfig } from 'bodhi-realtime-agent';
+import type { IEventBus, PersistentSubagentInstance, SubagentConfig } from 'bodhi-realtime-agent';
 import { frameTaskResult, framedSystem } from './inject-framing.js';
 import type { OpenTask, TurnClassifier, WorkCheck, WorkLane, WorkRequestCheck } from './work-request-check.js';
 
@@ -320,6 +320,18 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 			});
 		},
 	};
+}
+
+/** What listens to the user's speech: the speech gate, the hand-off pacer. */
+export interface UserSpeechSink {
+	onUserSpeechStarted(e?: SpeechEvent): void;
+	onUserSpeechEnded(e?: SpeechEvent): void;
+}
+
+/** Subscribes a listener to every user speech event bodhi publishes. One place, so the gate and the pacer hear the same events. */
+export function wireUserSpeech(bus: Pick<IEventBus, 'subscribe'>, sink: UserSpeechSink): void {
+	bus.subscribe('speech.user_started', (e) => sink.onUserSpeechStarted(e));
+	bus.subscribe('speech.user_ended', (e) => sink.onUserSpeechEnded(e));
 }
 
 /** The request a cut-off call sent, joined to the one the user went on to say. */

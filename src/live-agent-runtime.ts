@@ -21,7 +21,7 @@ import { meetingHoldsModel } from './meeting-input-hold.js';
 import { frameContextDrop, frameNoteViewMetadata, frameNoteViewFull, framedSystem } from './inject-framing.js';
 import { deliverWithRetry } from './inject-delivery.js';
 import { startResultWatcher, startContextDropWatcher, startNoteViewingWatcher, publishResultFile, voiceTaskStore, reconcileVoiceTasks, forwardOfflineVoiceResult, notPickedStillTrue } from './task-bridge.js';
-import { createHandoffPacer, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
+import { createHandoffPacer, wireUserSpeech, frameResult, resultIsMoot, type Handoff, type RelayAgent, type ResultItem } from './relay-agent.js';
 
 const WORKSPACE_DIR = resolveWorkspace();
 
@@ -332,8 +332,7 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
 	session.eventBus.subscribe('response.first_audio', () => pacer.onModelAudio());
 	// Only the client's microphone detection counts: Gemini marks a start on every transcription chunk and no end.
-	session.eventBus.subscribe('speech.user_started', (e: { source?: string }) => pacer.onUserSpeechStarted(e));
-	session.eventBus.subscribe('speech.user_ended', (e: { source?: string }) => pacer.onUserSpeechEnded(e));
+	wireUserSpeech(session.eventBus, pacer);
 	session.eventBus.subscribe('turn.interrupted', (e: { turnId?: string }) => { if (e?.turnId) interruptedTurns.add(String(e.turnId)); });
 	session.eventBus.subscribe('turn.end', (e: { turnId?: string }) => {
 		pacer.onTurnEnd(!!e?.turnId && interruptedTurns.delete(String(e.turnId)));
