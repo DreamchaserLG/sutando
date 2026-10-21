@@ -104,8 +104,9 @@ export function parseWorkCheck(text: string, openTasks: OpenTask[] = []): WorkCh
  */
 export type TurnVerdict =
 	/** `acknowledged`: the assistant's reply to this turn already told the user it is on this request (2026-10-21 18:38:35
-	 *  "Understood, I'll make sure to check…"), so the submit is not acknowledged a second time. */
-	| { action: 'work'; task: string; acknowledged?: true }
+	 *  "Understood, I'll make sure to check…"), so the submit is not acknowledged a second time. `corrects`: the open task
+	 *  this request corrects or spells out (a misheard name); one the user heard acknowledged is not acknowledged again. */
+	| { action: 'work'; task: string; acknowledged?: true; corrects?: string }
 	| { action: 'none' }
 	| { action: 'ask'; question: string }
 	| { action: 'duplicate'; of: string }
@@ -143,6 +144,8 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		// 2026-10-21 18:38:35: "Understood, I'll make sure to check for pull requests by Sonicchi.", then the submit's notice
 		// made it say "I'm looking into those pull requests now." as well.
 		'- With work, add "acknowledged":true when the assistant\'s reply to this turn (its lines after the user\'s last line in the recent words) already tells the user it is on this request ("let me look into", "I\'ll check that", "understood, I\'ll look for…"), even cut off. Leave it out when that reply says nothing about doing it.',
+		// 2026-10-21 18:56:16: "c h i s o n a c h i" spelled out the request sent a turn before; the reply was "Mm-hm.".
+		'- With work, add "corrects":"<id>" when the user is correcting or spelling out one of the open tasks below (a misheard name, a missing piece) rather than asking for something new.',
 		'- duplicate: the same request as one of the open tasks below (same thing, same ask, worded differently or misheard).',
 		'- ask: it is a request for the core but a specific thing is missing and the recent words do not supply it, or you cannot tell whether they want the core to act. One short question in the user\'s language.',
 		// 2026-10-21 17:39:23, 17:40:00: "I've replaced the V2 plan…", "I've created a separate page … v3", no tool call in either turn.
@@ -150,7 +153,7 @@ export function turnClassifierPrompt(i: TurnInput, extraRules: readonly string[]
 		// The skills' rules name what the assistant's own tools do: they win over "messages, notes" above (17:39:17).
 		...(extraRules.length ? ['The rules below come from the assistant\'s own tools and take precedence over the split above: what they say the assistant does itself is none, even when it is about messages or notes.', ...extraRules] : []),
 		'Reply with JSON only, one of:',
-		'{"action":"work","task":"...","acknowledged":true} (acknowledged only when the assistant already said it is on it)',
+		'{"action":"work","task":"...","acknowledged":true} (acknowledged only when the assistant already said it is on it; "corrects" as above)',
 		'{"action":"none"}',
 		'{"action":"duplicate","of":"<id of the open task>"}',
 		'{"action":"ask","question":"..."}',
@@ -175,12 +178,16 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	const m = /\{[\s\S]*\}/.exec(text);
 	if (!m) return { action: 'none' };
 	try {
-		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown; claim?: unknown; acknowledged?: unknown };
+		const d = JSON.parse(m[0]) as { action?: unknown; task?: unknown; question?: unknown; of?: unknown; claim?: unknown; acknowledged?: unknown; corrects?: unknown };
 		if (d.action === 'unbacked' && typeof d.claim === 'string' && d.claim.trim()) {
 			const task = typeof d.task === 'string' ? d.task.trim() : '';
 			return task ? { action: 'unbacked', claim: d.claim.trim(), task } : { action: 'unbacked', claim: d.claim.trim() };
 		}
-		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) return d.acknowledged === true ? { action: 'work', task: d.task.trim(), acknowledged: true } : { action: 'work', task: d.task.trim() };
+		if (d.action === 'work' && typeof d.task === 'string' && d.task.trim()) {
+			// Only an id that is really open, as for duplicate.
+			const corrects = typeof d.corrects === 'string' && openTasks.some((t) => t.id === d.corrects) ? d.corrects : undefined;
+			return { action: 'work', task: d.task.trim(), ...(d.acknowledged === true ? { acknowledged: true as const } : {}), ...(corrects ? { corrects } : {}) };
+		}
 		if (d.action === 'ask' && typeof d.question === 'string' && d.question.trim()) return { action: 'ask', question: d.question.trim() };
 		if (d.action === 'duplicate' && typeof d.of === 'string' && openTasks.some((t) => t.id === d.of)) return { action: 'duplicate', of: d.of };
 	} catch { /* not JSON */ }
@@ -261,7 +268,7 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
 		if (r.text === null) return { action: 'none' };
 		const verdict = parseTurnVerdict(r.text, input.openTasks);
-		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task: ${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
+		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}${verdict.corrects ? ` [corrects ${verdict.corrects}]` : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task: ${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
 	};

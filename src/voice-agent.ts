@@ -74,7 +74,7 @@ import { acquireVoiceLock, releaseOnExitUnlessFatal, resolveLockPython, voiceLoc
 import { recordToolCall } from './conversation-store.js';
 import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voice-agent-config.js';
 import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
-import { RelayAgent, relayAgentSubagentConfig, createSpeechGate, recentConversationLines, thisTurnToolLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
+import { RelayAgent, relayAgentSubagentConfig, createModelTurnWatch, createSpeechGate, recentConversationLines, thisTurnToolLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
 import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
@@ -1041,6 +1041,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
+	// The model's turns, for the relay: a work call the model already said it is on is not acknowledged again.
+	const modelTurns = createModelTurnWatch();
 	const relayAgent = new RelayAgent({
 		submit: submitWorkTask,
 		captureOrigin: captureWorkOrigin,
@@ -1060,6 +1062,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// Context only, no reply asked for: a request the voice model already acknowledged is not acknowledged again.
 		context: (text) => { void sessionRef?.injectText(text, { mode: 'quiet' }); },
+		modelTurns,
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => { relayAsk.ask(text); },
 		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
@@ -1533,6 +1536,9 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	// The relay's question for the user waits only while the model is speaking.
 	session.eventBus.subscribe('response.first_audio', () => relayAsk.onModelAudio());
 	session.eventBus.subscribe('turn.end', () => relayAsk.onTurnEnd());
+	session.eventBus.subscribe('turn.start', () => modelTurns.onTurnStart());
+	session.eventBus.subscribe('response.first_audio', () => modelTurns.onModelAudio());
+	session.eventBus.subscribe('turn.end', () => modelTurns.onTurnEnd());
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const speechHost = session as any;
 	setVoiceTurnsProvider(() => ({
