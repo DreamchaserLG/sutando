@@ -44,6 +44,19 @@ result to the session model when confidence is low or consequences are material;
 choose a more expensive model.
 
 
+## Mechanism per runtime
+
+- **Claude core** — the `Agent` tool with `run_in_background: true`. A foreground `Agent` call
+  blocks the thread just as inline work does.
+- **Codex core** — Codex's built-in multi-agent tools: `spawn_agent`, then `wait_agent` with a short
+  timeout at the checkpoint, and `close_agent` when done. They come from the `multi_agent` feature;
+  `codex features list` shows whether it is enabled on a host. This was observed on one host, so a
+  Codex core must check its own.
+- **Either runtime, work that outlives one turn** — a worker from the worker pool, asked through
+  `pool_ask.py`.
+
+The quota tier applies to these tools as it does to delegation generally: it gates the autonomous loop and is guidance for work the owner asked for (see above).
+
 ## When no delegation mechanism is available
 
 The rule in `CLAUDE.md` bans deferring and bans handing the work back, and the "unless you have a
@@ -56,7 +69,9 @@ operator edge case — a LIGHT-tier loop session has no delegation available at 
 owner asked for, the tier is guidance (see above), not a gate.
 
 **So: do the work inline in this session, and say plainly that it ran inline and why.**
-Inline-with-disclosure is the satisfying branch.
+Inline-with-disclosure is the satisfying branch. Say it in one line, with the constraint, e.g.
+"No subagent capacity right now (quota tier), so I'm running this inline — new messages will wait
+until it finishes." or "Two tasks are ahead of this one; I'll start it after them."
 
 **Never report work as backgrounded or delegated when nothing was spawned.** Claiming delegation you
 did not perform is indistinguishable from compliance when read from the outside, which is what makes

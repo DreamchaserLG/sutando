@@ -52,6 +52,16 @@ check(
     and "refresh-skill.sh` does not update Codex" in AGENTS,
 )
 
+DELEGATION_DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "delegation doc names each runtime's mechanism",
+    "run_in_background: true" in DELEGATION_DOC and "`spawn_agent`" in DELEGATION_DOC,
+)
+check(
+    "CLAUDE.md and AGENTS.md pointers name the delegation doc",
+    all("docs/subagent-delegation.md" in f and "per-runtime mechanism" in f for f in (CLAUDE, AGENTS)),
+)
+
 # Execute the documented import setup from a nested, repo-contained script.
 with tempfile.NamedTemporaryFile(
     mode="w",
