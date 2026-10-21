@@ -280,8 +280,11 @@ export interface SpeechGate {
 	onUserSpeechAborted(e?: SpeechEvent): void;
 	/** The model started speaking to the user. */
 	onModelAudio(): void;
-	/** Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. */
-	waitTurnOver(signal?: AbortSignal): Promise<void>;
+	/**
+	 * Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. Model audio at or after
+	 * `answeredSince` (default: the call) counts as the answer.
+	 */
+	waitTurnOver(signal?: AbortSignal, answeredSince?: number): Promise<void>;
 }
 
 export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; now?: () => number } = {}): SpeechGate {
@@ -301,7 +304,7 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 		// Not an end: the quiet time runs from the last real one (2026-10-21 17:42:45: a 43 ms blip held a work call to the 30 s cap).
 		onUserSpeechAborted(e) { if (!fromClient(e)) return; speaking = false; wake(); },
 		onModelAudio() { modelAudioAt = now(); wake(); },
-		waitTurnOver(signal) {
+		waitTurnOver(signal, answeredSince) {
 			const since = now();
 			return new Promise<void>((resolve) => {
 				let timer: ReturnType<typeof setTimeout> | null = null;
@@ -310,7 +313,7 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 					const t = now();
 					if (signal?.aborted || t - since >= maxHoldMs) return done();
 					// The model answered: the user's turn is over, whatever the microphone picks up now.
-					if (modelAudioAt !== null && modelAudioAt >= since) return done();
+					if (modelAudioAt !== null && modelAudioAt >= (answeredSince ?? since)) return done();
 					// A speech start with no end (a sound too short to be speech) does not hold the call for good.
 					const stillSpeaking = speaking && t - startedAt < maxHoldMs;
 					const quietFrom = stillSpeaking ? null : (endedAt ?? 0) + quietMs;
@@ -655,7 +658,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		try {
 			while (this.turns.length) {
 				// One request may span several turns: wait until the user is done, then take them together.
-				if (this.deps.speech) await this.deps.speech.waitTurnOver();
+				// Model audio since the previous turn completed is the answer to this one: a turn reaches the check
+				// only when it completes, after the reply began, so audio after the wait began may never come (2026-10-21
+				// 17:38:45: the user cut in on the answer and the check waited the 30 s cap for her to stop).
+				if (this.deps.speech) await this.deps.speech.waitTurnOver(undefined, this.lastTurnAt || undefined);
 				const taken = this.turns.splice(0);
 				const since = this.lastTurnAt;
 				this.lastTurnAt = taken[taken.length - 1].at;
