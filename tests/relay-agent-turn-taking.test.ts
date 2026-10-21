@@ -145,4 +145,94 @@ describe('the turn check does not wait for an answer the model already gave', ()
 		assert.equal(checked.length, 2);
 		assert.equal(checked[1].utterance, 'Check the pull requests made by');
 	});
+
+	it('a reply the model began while the user was still speaking does not end her turn', async () => {
+		// The usual shape: the model speaks to a cut-off turn before it completes, so its audio is always in the turn.
+		// Only audio the user then cut in on (17:38:45) answers it; audio over a sentence she is still saying does not.
+		const store = createVoiceTaskStore();
+		const speech = createSpeechGate({ now: clock });
+		const checked: Array<{ utterance: string; at: number }> = [];
+		const relay = new RelayAgent({
+			store,
+			speech,
+			classify: async (input) => { checked.push({ utterance: input.utterance, at: Date.now() }); return { action: 'none' }; },
+			submit: async () => ({ status: 'pending', taskId: 'task-x', queuedAhead: 0, watcherOnline: true, message: 'm' }),
+		});
+		speech.onUserSpeechStarted();
+		await at(1_000);
+		speech.onUserSpeechEnded();
+		relay.onUserTurn('Hello', 1_000);
+		await at(3_000);
+		assert.equal(checked.length, 1);
+		await at(5_000);
+		speech.onUserSpeechStarted();
+		await at(6_500);
+		speech.onModelAudio(); // the model answers the half sentence
+		await at(6_800);
+		relay.onUserTurn('Check the pull requests made by', 6_800); // she goes on speaking
+		await at(9_000);
+		speech.onUserSpeechEnded();
+		await at(9_000 + QUIET_BEFORE_SUBMIT_MS - 1);
+		assert.equal(checked.length, 1, `checked at ${checked[1]?.at}: she had not finished`);
+		await at(9_000 + QUIET_BEFORE_SUBMIT_MS);
+		assert.equal(checked.length, 2);
+	});
+});
+
+describe('a question from the turn check waits for the user to be quiet', () => {
+	// Checked at once on a turn she cut in on (17:38:45), but said to her only once she stops: said as live input at
+	// turn end it talks over her, and what she says next may answer it.
+	function barged(verdicts: Array<Record<string, unknown>>) {
+		const store = createVoiceTaskStore();
+		const speech = createSpeechGate({ now: clock });
+		const asked: Array<{ text: string; at: number }> = [];
+		const checked: number[] = [];
+		const relay = new RelayAgent({
+			store,
+			speech,
+			classify: (async () => { checked.push(Date.now()); return verdicts.shift() ?? { action: 'none' }; }) as never,
+			ask: (text: string) => { asked.push({ text, at: Date.now() }); },
+			submit: async () => ({ status: 'pending', taskId: 'task-x', queuedAhead: 0, watcherOnline: true, message: 'm' }),
+		} as never);
+		return { relay, speech, asked, checked };
+	}
+	async function cutIn(s: ReturnType<typeof barged>) {
+		s.speech.onUserSpeechStarted();
+		await at(1_000);
+		s.speech.onUserSpeechEnded();
+		s.relay.onUserTurn('Hello', 1_000);
+		await at(3_000);
+		await at(4_000);
+		s.speech.onModelAudio(); // the answer to Hello
+		await at(6_000);
+		s.speech.onUserSpeechStarted(); // she cuts in
+		await at(6_200);
+		s.relay.onUserTurn('Which one did you mean', 6_200);
+		await at(6_300);
+		assert.equal(s.checked.length, 2, 'checked at once');
+	}
+
+	it('an ask is said at her end plus the quiet time, not while she speaks', async () => {
+		const s = barged([{ action: 'none' }, { action: 'ask', question: 'Which PR?' }]);
+		await cutIn(s);
+		await at(9_000);
+		s.speech.onUserSpeechEnded();
+		await at(9_000 + QUIET_BEFORE_SUBMIT_MS - 1);
+		assert.deepEqual(s.asked, [], 'she is still speaking or just stopped');
+		await at(9_000 + QUIET_BEFORE_SUBMIT_MS);
+		assert.equal(s.asked.length, 1);
+		assert.match(s.asked[0].text, /Which PR\?/);
+	});
+
+	it('an ask is dropped when she went on to a new turn: that turn is judged with her full words', async () => {
+		const s = barged([{ action: 'none' }, { action: 'unbacked', claim: 'I have opened it' }, { action: 'none' }]);
+		await cutIn(s);
+		await at(8_000);
+		s.relay.onUserTurn('the second one', 8_000);
+		await at(8_500);
+		s.speech.onUserSpeechEnded();
+		await at(20_000);
+		assert.deepEqual(s.asked, [], 'nothing from the half sentence');
+		assert.equal(s.checked.length, 3, 'the new turn was checked');
+	});
 });

@@ -77,6 +77,40 @@ describe('this turn\'s tool lines come from the conversation items', () => {
 		assert.equal(thisTurnToolLines([{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'hello' }], 'hi'), '');
 	});
 
+	it('a result for a call made in an earlier turn is a delivered line, not dropped', () => {
+		// bodhi adds the work call's tool_call when the call starts and its tool_result when the core's answer returns,
+		// often turns later: "is it merged yet?" answered by that result was judged with "(none)" and called unbacked.
+		const thisTurnToolLines = relayMod.thisTurnToolLines as (items: unknown[], userText?: string) => string;
+		const items = [
+			call('A', 'work', { task: 'merge PR 5333' }),
+			{ role: 'user', content: 'Is it merged yet?' },
+			result('A', 'work', 'PR 5333 merged'),
+			{ role: 'assistant', content: 'It\'s merged.' },
+		];
+		assert.equal(thisTurnToolLines(items, 'Is it merged yet?'), 'delivered: work result -> ok: PR 5333 merged');
+		const failed = thisTurnToolLines([call('B', 'work', {}), { role: 'user', content: 'and?' }, result('B', 'work', null, 'core offline')], 'and?');
+		assert.equal(failed, 'delivered: work result -> error: core offline');
+		assert.ok(thisTurnToolLines([call('C', 'work', {}), { role: 'user', content: 'and?' }, result('C', 'work', 'y'.repeat(400))], 'and?').length <= 200);
+	});
+
+	it('the turn is bounded by time when the user line came after its tools', () => {
+		// bodhi writes the user transcript at flushInput; when Gemini's transcription arrives after the tool call it
+		// lands after the tool_call and tool_result, and "yes" -> write_page -> "I've added it" was judged unbacked.
+		const thisTurnToolLines = relayMod.thisTurnToolLines as (items: unknown[], userText?: string, since?: number) => string;
+		const t = (item: Record<string, unknown>, timestamp: number) => ({ ...item, timestamp });
+		const items = [
+			t({ role: 'user', content: 'Add Dot\'s plan to the v2 page.' }, 900),
+			t(call('c0', 'write_page', { kind: 'old-turn' }), 950),
+			t(result('c0', 'write_page', { ok: true }), 960),
+			t({ role: 'assistant', content: 'Shall I add it?' }, 980),
+			t(call('c1', 'write_page', { kind: 'markdown-v2' }), 1_100),
+			t(result('c1', 'write_page', { ok: true, did: 'appended' }), 1_200),
+			t({ role: 'user', content: 'Yes.' }, 1_300),
+			t({ role: 'assistant', content: 'I\'ve added it.' }, 1_400),
+		];
+		assert.equal(thisTurnToolLines(items, 'Yes.', 1_000), 'write_page {"kind":"markdown-v2"} -> ok: {"ok":true,"did":"appended"}', 'the earlier turn\'s write is left out');
+	});
+
 	it('an injected "[system] " line is not the assistant speaking', () => {
 		// bodhi's injectSystemMessage stores it as role assistant: read as speech it looks like a claim.
 		assert.equal(recentConversationLines([{ role: 'user', content: 'hi' }, { role: 'assistant', content: '[system] The room was switched.' }, { role: 'assistant', content: 'Hello.' }], 8), 'user: hi\nassistant: Hello.');
@@ -90,17 +124,18 @@ describe('relay agent: a claim no tool backs is corrected', () => {
 		const notices: string[] = [];
 		const submitted: string[] = [];
 		const inputs: Array<Record<string, unknown>> = [];
+		const sinces: number[] = [];
 		const relay = new RelayAgent({
 			store,
 			classify: (async (input: Record<string, unknown>) => { inputs.push(input); return verdict; }) as never,
 			recentConversation: () => 'user: Delete it and add a new V3.\nassistant: I\'ve replaced the V2 plan with Dot\'s designed workflow for V3.',
-			thisTurn: (u: string) => `(tools after "${u}")`,
+			thisTurn: (u: string, since: number) => { sinces.push(since); return `(tools after "${u}")`; },
 			ask: (t: string) => asked.push(t),
 			notice: (t: string) => notices.push(t),
 			log: () => {},
 			submit: async (args: Record<string, unknown>) => { submitted.push(String(args.task)); store.add('task-u1', String(args.task)); return { status: 'pending', taskId: 'task-u1', queuedAhead: 0, watcherOnline: true, message: 'm' }; },
 		} as never);
-		return { relay, asked, notices, submitted, inputs };
+		return { relay, asked, notices, submitted, inputs, sinces };
 	}
 
 	it('with no core task: the model is told it is not done, then to do it with its own tool, confirmed as usual', async () => {
@@ -112,6 +147,15 @@ describe('relay agent: a claim no tool backs is corrected', () => {
 		assert.deepEqual(notices, []);
 		assert.equal(asked.length, 1);
 		assert.match(asked[0], /^\[System: You told the user "I've created a separate page titled 'v3'", but no tool did that this turn\. Tell the user in one short sentence that it is not done yet, then do it now: with your own tool, following its usual steps \(a write to a room is said back first and done after a clear yes\), or with work when only the core can do it\.\]$/);
+	});
+
+	it('the turn\'s tools are read from the end of the turn before it', async () => {
+		const { relay, sinces } = agent({ action: 'none' });
+		relay.onUserTurn('Add Dot\'s plan to the v2 page.', 1_000);
+		await tick(10);
+		relay.onUserTurn('Yes.', 2_000);
+		await tick(10);
+		assert.deepEqual(sinces, [0, 1_000]);
 	});
 
 	it('with a core task: it is submitted the way a work verdict is, and the model says it is not done yet but under way', async () => {
@@ -126,7 +170,7 @@ describe('relay agent: a claim no tool backs is corrected', () => {
 
 	it('the voice agent passes this turn\'s tools, and the voice prompt forbids a claim before an ok', () => {
 		const agentSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent.ts'), 'utf-8');
-		assert.match(agentSrc, /thisTurn: \(userText\) => thisTurnToolLines\(sessionRef\?\.conversationContext\.items \?\? \[\], userText\)/);
+		assert.match(agentSrc, /thisTurn: \(userText, since\) => thisTurnToolLines\(sessionRef\?\.conversationContext\.items \?\? \[\], userText, since\)/);
 		const configSrc = readFileSync(join(import.meta.dirname ?? '.', '..', 'src', 'voice-agent-config.ts'), 'utf-8');
 		assert.ok(configSrc.includes('- NEVER pretend you called a tool. NEVER say you did, created, updated, wrote, replaced, deleted or sent something unless a tool call this turn did it and returned ok, or a result told you the core did it; until then say you are doing it.'));
 	});

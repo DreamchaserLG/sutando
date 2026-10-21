@@ -15,7 +15,7 @@ import { join } from 'node:path';
 const TMP = mkdtempSync(join(tmpdir(), 'sutando-in-flight-'));
 process.env.SUTANDO_WORKSPACE = TMP;
 process.env.SUTANDO_TEST_MODE = '1';
-mkdirSync(join(TMP, 'state'), { recursive: true });
+for (const d of ['state', 'tasks']) mkdirSync(join(TMP, d), { recursive: true });
 
 const { RelayAgent, createVoiceTaskStore } = await import('../src/relay-agent.js');
 const inline = await import('../src/inline-tools.js');
@@ -51,6 +51,21 @@ describe('the one report: rows plus requests still being sent', () => {
 		const r = voiceTaskReport(rows, [{ task: 'find the apple', stage: 'checking' }], () => 'a result');
 		assert.deepEqual(r.counts, { pending: 2, working: 1, sending: 1, doneNotHeard: 1, unknown: 0 });
 		assert.match(r.description, /^Pending: 2 \(1 the core is still working on, 1 being sent to the core\); 1 finished and not yet told/);
+	});
+
+	it('cancel_task\'s list gives the same number: a request being sent is pending, not "nothing_pending"', async () => {
+		inline.setVoiceTasksBeingSent(() => [video]);
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const out = await (inline.cancelTaskTool.execute as any)({ list: true }, null) as { status: string; count: number; tasks: Array<Record<string, unknown>> };
+			assert.equal(out.status, 'pending_tasks');
+			assert.equal(out.count, 1);
+			assert.deepEqual(out.tasks, [{ preview: 'Watch the use case 03 video and summarize it', state: 'being sent' }]);
+		} finally {
+			inline.setVoiceTasksBeingSent(() => []);
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		assert.equal((await (inline.cancelTaskTool.execute as any)({ list: true }, null)).status, 'nothing_pending');
 	});
 
 	it('with nothing being sent the sentence is exactly what it was', () => {
@@ -152,10 +167,9 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 
 	it('the /voice-tasks copy never counts a request twice while its row is being added', async () => {
 		// The submit takes long enough that no copy is being written when the row is added (live: spoken turns, the core).
-		let w!: ReturnType<typeof createVoiceTaskStatusWriter>;
 		const s = setup(undefined, async () => { await settle(); await w.flush(); });
 		const counts: number[] = [];
-		w = createVoiceTaskStatusWriter({
+		const w = createVoiceTaskStatusWriter({
 			path: join(TMP, 'state', 'voice-task-status.json'),
 			snapshot: () => { const c = voiceTaskReport(s.rows(), inFlight(s.relay)).counts.pending; counts.push(c); return { pending: c }; },
 		});

@@ -25,6 +25,7 @@ for (const d of [join(WS, 'data', 'apps'), join(REPO, 'docs'), HOME, BIN]) mkdir
 const APP = join(WS, 'data', 'apps', 'x.html');
 writeFileSync(APP, '<html></html>');
 writeFileSync(join(REPO, 'docs', 'notes.md'), '# notes');
+writeFileSync(join(REPO, 'README.md'), '# the repo');
 writeFileSync(join(TMP, 'secret.txt'), 'outside every root');
 for (const name of ['open', 'xdg-open']) {
 	writeFileSync(join(BIN, name), `#!/bin/sh\nprintf '%s\\n' "$@" > "${ARGV}"\n`);
@@ -62,6 +63,15 @@ describe('open_file: a path the core gave relative to the workspace opens the fi
 		const r = await execute('workspace/data/apps/x.html');
 		assert.equal(r.path, APP);
 		assert.deepEqual(openedWith(), [APP]);
+	});
+
+	it('a file in the home folder that is not there is not swapped for the repo\'s or the workspace\'s file of that name', async () => {
+		rmSync(ARGV, { force: true });
+		for (const p of ['~/README.md', '~/docs/notes.md', '~/data/apps/x.html']) {
+			const r = await execute(p);
+			assert.match(r.error ?? '', /^File not found: /, `${p} asked for the home folder: ${JSON.stringify(r)}`);
+		}
+		assert.deepEqual(openedWith(), [], 'nothing was opened');
 	});
 
 	it('a true miss, absolute or under ~, is still "File not found" and opens nothing', async () => {
