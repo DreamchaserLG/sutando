@@ -211,6 +211,18 @@ describe('resultEvidence / turnSaysResult', () => {
 		assert.equal(turnSaysResult("I'm checking how many pull requests you merged yesterday.", merged), false, 'the noun with no number is the question, not the answer');
 		assert.equal(turnSaysResult("I'm checking your pull requests; you have three pending tasks.", merged), false, 'the number counting another noun');
 		assert.equal(turnSaysResult('You merged three of them.', merged), false, 'the number with its noun never named');
+		// Holding turns that name the noun and a number that is not the count: "one of", "one more", "at 3 pm", "one by one".
+		assert.equal(turnSaysResult('I will check your pull requests at 3 pm.', merged), false, 'a number followed by another word is not the count');
+		assert.equal(turnSaysResult('Three of the pull requests are still loading.', merged), false, 'the number before its noun with words between');
+		assert.equal(turnSaysResult('I am checking pull requests now, three more to go.', merged), false, 'the number after its noun but not closing the sentence');
+		assert.equal(turnSaysResult('Three. Let me check your pull requests.', merged), false, 'the number in another sentence than its noun');
+		const one = resultEvidence('You merged 1 pull request yesterday: number 5641.', 'How many pull requests did I merge yesterday?');
+		assert.ok(turnSaysResult('You merged one pull request yesterday.', one), 'one, right before its noun');
+		assert.equal(turnSaysResult('One of the pull requests is still loading, give me a second.', one), false, '"one of" is not the count');
+		assert.equal(turnSaysResult('I am checking pull requests now, one more moment.', one), false, '"one more" is not the count');
+		assert.equal(turnSaysResult('Let me go through your pull requests one by one.', one), false, '"one by one" is not the count');
+		assert.equal(turnSaysResult('Checking your pull requests, one at a time.', one), false, '"one at a time" is not the count');
+		assert.equal(turnSaysResult('Your pull requests: one of them.', one), false, '"one" after its noun is a pronoun, not the count');
 		const asked = resultEvidence('5 tasks are open.', 'are 5 tasks open?');
 		assert.equal(turnSaysResult('Five tasks are open.', asked), false, 'a phrase the request already had is not the answer');
 	});
