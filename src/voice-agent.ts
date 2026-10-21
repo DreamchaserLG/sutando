@@ -76,7 +76,7 @@ import { buildGreeting, buildInstructions, type VoiceConfigContext } from './voi
 import { wireDurableChannels, createSessionRecorder , heldByPacer} from './live-agent-runtime.js';
 import { RelayAgent, relayAgentSubagentConfig, createModelTurnWatch, createSpeechGate, recentConversationLines, thisTurnToolLines, createAskDelivery, wireUserSpeech } from './relay-agent.js';
 import { createVoiceTaskStatusWriter } from './voice-task-status-writer.js';
-import { createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
+import { createGeminiHeardCheck, createGeminiTurnClassifier, createGeminiWorkCheck, WORK_CHECK_MODEL } from './work-request-check.js';
 import {
 	classifyTransportClose,
 	fatalCloseForRecovery,
@@ -1059,6 +1059,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		// What this turn's tools did and what was delivered: a claim with nothing behind it is caught (2026-10-21 17:39:23).
 		thisTurn: (userText, since) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText, since),
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
+		// Whether a spoken turn told the user a result waiting to be heard: a text model judges it, not a phrase pattern.
+		heard: RELAY_CHECK ? createGeminiHeardCheck({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`) }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// Context only, no reply asked for: a request the voice model already acknowledged is not acknowledged again.
 		context: (text) => { void sessionRef?.injectText(text, { mode: 'quiet' }); },

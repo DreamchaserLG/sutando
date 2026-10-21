@@ -3,6 +3,7 @@
  * - a check on a `work` request before it is submitted: can the core act on it as written, is something
  *   missing that only the user can supply (which PR, which file, who), or was it already sent?
  * - a look at every finished user turn, whichever tool the voice model chose: is it a request for the core?
+ * - a look at every spoken assistant turn while a result waits to be told: did the turn tell it?
  *
  * The voice model decides fluently and does not stop to ask (2026-10-12: four prompt revisions,
  * zero questions asked; a blank request was submitted or an answer was invented). A text model
@@ -194,13 +195,73 @@ export function parseTurnVerdict(text: string, openTasks: OpenTask[] = []): Turn
 	return { action: 'none' };
 }
 
+/** A result that came back through its work call and has not been heard yet. */
+export interface WaitingResult {
+	id: string;
+	/** What the user asked. */
+	request: string;
+	result: string;
+}
+
+export interface HeardInput {
+	results: WaitingResult[];
+	/** The assistant's spoken lines since the results came back, oldest first. */
+	assistantWords: string;
+	/** The user cut the last turn off. */
+	cutOff: boolean;
+}
+
+/** The ids of the results the assistant's words told the user; null when there is no verdict (the caller's own rule decides). */
+export type HeardCheck = (input: HeardInput, signal?: AbortSignal) => Promise<string[] | null>;
+
+/** A result is given this much: a summary's answer can sit past the first sentences. */
+export const HEARD_RESULT_MAX = 600;
+
+/**
+ * Did the assistant's words tell the user a waiting result? A phrase pattern decided it and failed on each new wording
+ * (2026-10-21 18:56:52: "you merged three yesterday" for "You merged 3 pull requests yesterday", judged unsaid, nudged
+ * and said again); looser patterns took holding lines for the answer.
+ */
+export function heardCheckPrompt(i: HeardInput): string {
+	const quote = (s: string) => `"${s.replace(/\s+/g, ' ').replace(/"/g, "'").trim()}"`;
+	const clip = (s: string) => { const t = s.replace(/\s+/g, ' ').trim(); return t.length > HEARD_RESULT_MAX ? `${t.slice(0, HEARD_RESULT_MAX - 1)}…` : t; };
+	return [
+		'A voice assistant is waiting to tell the user the results below; each answers a request the user made. Decide which of them the assistant\'s words already told the user.',
+		'Rules:',
+		'- A result is told when the words give the user its main answer, in any wording or language: "you merged three yesterday" tells "You merged 3 pull requests yesterday: number 5641, 5648 and 5650". Not every detail needs saying.',
+		'- Saying it is checking or working on it, naming the request without its answer, or a different answer does not tell it. Nor does an answer to something else that happens to share a word or number.',
+		'- An answer cut off before its main point does not tell it.',
+		'Reply with JSON only: {"told":["<id>", ...]}, an empty list when none was told.',
+		'',
+		'Results waiting to be told (id: asked -> result):',
+		...i.results.map((r) => `${r.id}: ${quote(r.request)} -> ${clip(r.result)}`),
+		'',
+		`The assistant's words since these results came back, oldest first${i.cutOff ? ' (the last turn was cut off by the user)' : ''}:`,
+		i.assistantWords.trim() || '(none)',
+	].join('\n');
+}
+
+/** The ids told, only ones that were asked about; null when the reply is not a verdict. */
+export function parseHeardVerdict(text: string, results: WaitingResult[]): string[] | null {
+	const m = /\{[\s\S]*\}/.exec(text);
+	if (!m) return null;
+	try {
+		const told = (JSON.parse(m[0]) as { told?: unknown }).told;
+		if (!Array.isArray(told)) return null;
+		return results.map((r) => r.id).filter((id) => told.includes(id));
+	} catch {
+		return null;
+	}
+}
+
 /** Where a check prompt's instructions end and the turn being judged begins. */
-const INPUT_MARK = '\nRecent words (oldest first):';
+const INPUT_MARKS = ['\nRecent words (oldest first):', '\nResults waiting to be told'];
 
 /** The instructions go in as the system instruction and the turn as the user message: sent as one block,
  *  the rules together tripped Gemini's prompt filter (PROHIBITED_CONTENT) on harmless requests. */
 export function checkRequestBody(prompt: string): Record<string, unknown> {
-	const at = prompt.indexOf(INPUT_MARK);
+	const found = INPUT_MARKS.map((m) => prompt.indexOf(m)).filter((k) => k > 0);
+	const at = found.length ? Math.min(...found) : -1;
 	const contents = (text: string) => [{ role: 'user', parts: [{ text }] }];
 	return at > 0
 		? { systemInstruction: { parts: [{ text: prompt.slice(0, at) }] }, contents: contents(prompt.slice(at + 1)) }
@@ -271,5 +332,20 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}${verdict.corrects ? ` [corrects ${verdict.corrects}]` : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task: ${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
+	};
+}
+
+/** One call, no retry: a verdict later than the relay waits for is not used (it falls back to its own rule). */
+export function createGeminiHeardCheck(opts: { apiKey: () => string | undefined; model?: string; timeoutMs?: number; log?: (m: string) => void }): HeardCheck {
+	const model = opts.model ?? WORK_CHECK_MODEL;
+	return async (input, signal) => {
+		const apiKey = opts.apiKey();
+		if (!apiKey) return null;
+		const t0 = Date.now();
+		const { text } = await geminiJson({ apiKey, model, timeoutMs: opts.timeoutMs ?? WORK_CHECK_TIMEOUT_MS, prompt: heardCheckPrompt(input), signal, log: opts.log, what: 'heard check' });
+		if (text === null) return null;
+		const told = parseHeardVerdict(text, input.results);
+		opts.log?.(`[RelayAgent] heard check: ${told === null ? 'no verdict' : `told [${told.join(', ')}] of [${input.results.map((r) => r.id).join(', ')}]`} in ${Date.now() - t0}ms`);
+		return told;
 	};
 }

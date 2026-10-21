@@ -8,7 +8,7 @@
 
 import type { IEventBus, PersistentSubagentInstance, PersistentSubagentResult, SubagentConfig } from 'bodhi-realtime-agent';
 import { frameTaskResult, framedSystem } from './inject-framing.js';
-import type { OpenTask, TurnClassifier, WorkCheck, WorkLane, WorkRequestCheck } from './work-request-check.js';
+import type { HeardCheck, HeardInput, OpenTask, TurnClassifier, WorkCheck, WorkLane, WorkRequestCheck } from './work-request-check.js';
 
 /** How a voice task's result reached the user. `injected`: handed to the model, turn never confirmed. */
 export type Delivery = 'spoken' | 'injected' | 'dm';
@@ -651,6 +651,8 @@ export interface RelayAgentDeps<O = unknown> {
 	recentConversation?: () => string;
 	/** Looks at every finished user turn, whatever tool the voice model chose: is it a request for the core? */
 	classify?: TurnClassifier;
+	/** Decides whether a spoken turn told the user a result waiting to be heard. Without it, the runtime's own rule decides. */
+	heard?: HeardCheck;
 	/** This turn's tool calls and delivered results (thisTurnToolLines): after `since`, the end of the turn before, whose user line is `userText`. */
 	thisTurn?: (userText: string, since: number) => string;
 	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
@@ -1153,6 +1155,22 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.waiting.delete(taskId);
 		waiter.resolve(framedSystem(ENDED[why]));
 		return true;
+	}
+
+	/** Whether a model decides if a turn told a waiting result (`judgeHeard`). */
+	get judgesHeard(): boolean {
+		return !!this.deps.heard;
+	}
+
+	/** The ids of the waiting results the assistant's words told the user; null on no verdict, a failure or no check. */
+	async judgeHeard(input: HeardInput): Promise<string[] | null> {
+		if (!this.deps.heard) return null;
+		try {
+			return await this.deps.heard(input);
+		} catch (err) {
+			this.deps.log?.(`[RelayAgent] heard check failed: ${err instanceof Error ? err.message : String(err)}`);
+			return null;
+		}
 	}
 
 	/** Whether a `work` call is waiting on `taskId`. */

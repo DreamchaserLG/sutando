@@ -44,6 +44,8 @@ export interface DurableChannelOptions {
 	/** A result returned through its call and not said by then is nudged once (a notice), then handed over again. */
 	returnNudgeMs?: number;
 	returnReleaseMs?: number;
+	/** How long a turn's results wait for the heard check before the rule decides (HEARD_VERDICT_WAIT_MS). */
+	heardVerdictWaitMs?: number;
 	/** The `work` subagent, which owns the result queue. */
 	relay: RelayAgent;
 	/** Puts text to the model as live input once it is not speaking. Used for a result when system notices
@@ -174,14 +176,13 @@ function turnSaysForm(tokens: string[], cjkRuns: string[], form: string): boolea
 /** The turn said the result: one of its numbers (as digits, or as the transcript spells them); else its distinctive
  *  words, two of them when the result has numbers it did not say or has that many. No evidence at all: never by content. */
 export const hasEvidence = (e: ResultEvidence): boolean => !!(e.numbers.length || e.words.length || e.phrases?.length);
-export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean {
-	if (!hasEvidence(evidence)) return false;
-	const lower = turn.toLowerCase();
-	const tokens: string[] = lower.match(/[a-z0-9]+/g) ?? [];
-	// A small number said right before the result's own noun: "three pull requests" for "3 pull requests". Or, from
-	// two up, closing a sentence that named the noun before it: "how many pull requests you merged ... three of them",
-	// "pull requests: three." "three pending tasks", "at 3 pm", "three more to go" are not the count; "one" after its
-	// noun is a pronoun ("one by one", "one of them"), so one counts only before its noun.
+/**
+ * A small number said right before the result's own noun: "three pull requests" for "3 pull requests". With `afterNoun`,
+ * also from two up closing a sentence that named the noun before it: "how many pull requests you merged ... three of
+ * them", "pull requests: three." "three pending tasks", "at 3 pm", "three more to go" are not the count; "one" after its
+ * noun is a pronoun ("one by one", "one of them"), so one counts only before its noun.
+ */
+function saysCount(lower: string, evidence: ResultEvidence, afterNoun: boolean): boolean {
 	const sentences = lower.split(/[.!?;。！？；]+/).map((s) => s.match(/[a-z0-9]+/g) ?? []);
 	for (const [n, w] of evidence.phrases ?? []) {
 		const stem = w.replace(/s$/, '');
@@ -191,23 +192,52 @@ export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean 
 				for (let i = 0; i < words.length; i++) {
 					if (words[i] !== form) continue;
 					if (isNoun(words[i + 1])) return true;
+					if (!afterNoun) continue;
 					const rest = words.slice(i + 1).join(' ');
 					if (Number(n) >= 2 && words.slice(0, i).some(isNoun) && (rest === '' || rest === 'of them' || rest === 'of those')) return true;
 				}
 			}
 		}
 	}
+	return false;
+}
+/** One of the result's numbers (13 up, or a decimal) said, as digits or as the transcript spells them. */
+function saysNumber(turn: string, evidence: ResultEvidence): boolean {
+	const tokens: string[] = turn.toLowerCase().match(/[a-z0-9]+/g) ?? [];
 	const cjkRuns: string[] = turn.match(/[一-鿿]+/g) ?? [];
 	for (const n of evidence.numbers) {
 		const digits = n.replace(/,/g, '');
 		if (tokens.includes(digits) || tokens.includes(digits.replace('.', ''))) return true;
 		if (spokenNumberForms(n).some((f) => turnSaysForm(tokens, cjkRuns, f))) return true;
 	}
+	return false;
+}
+export function turnSaysResult(turn: string, evidence: ResultEvidence): boolean {
+	if (!hasEvidence(evidence)) return false;
+	const lower = turn.toLowerCase();
+	if (saysCount(lower, evidence, true) || saysNumber(turn, evidence)) return true;
 	const need = evidence.numbers.length ? 2 : Math.min(2, evidence.words.length);
 	let hits = 0;
 	for (const w of evidence.words) if (lower.includes(w) && ++hits >= need) return true;
 	return false;
 }
+
+/** A line saying the work is under way: it can name the count it is about ("checking your three pull requests"). */
+const HOLDING_LINE = /\b(checking|looking|reviewing|searching|working on|let me|i'll|i will|going to)\b/;
+/**
+ * What proves at once, with no model asked, that the turn said the result: one of its distinctive numbers, or a small
+ * number right before its noun in a turn that is not a holding line. Only the strongest parts of the rule (2026-10-20,
+ * ebdfac30), never weaker evidence: every other turn is the heard check's call, and the full rule is its fallback.
+ */
+export function turnSaysResultExactly(turn: string, evidence: ResultEvidence): boolean {
+	if (!hasEvidence(evidence)) return false;
+	if (saysNumber(turn, evidence)) return true;
+	const lower = turn.toLowerCase();
+	return !HOLDING_LINE.test(lower) && saysCount(lower, evidence, false);
+}
+
+/** How long a turn's results wait for the heard check's verdict before the rule decides instead. */
+export const HEARD_VERDICT_WAIT_MS = 6_000;
 
 /**
  * Wire the durable work channel into a live session: context drops, ambient
@@ -292,23 +322,38 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	});
 	pacerHeld = () => pacer.held();
 	const interruptedTurns = new Set<string>();
-	// Results returned through open calls: a spoken turn counts as the result only when its words carry the result's
-	// content; unsaid after returnNudgeMs it is nudged, after returnReleaseMs (or a reconnect) handed over again.
-	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; nudged: boolean; nudgeAfterTurn?: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
+	// Results returned through open calls: a spoken turn counts as the result only when it told the user the result
+	// (the heard check decides; exact evidence at once); unsaid after returnNudgeMs it is nudged, after returnReleaseMs
+	// (or a reconnect) handed over again. `judging`: verdicts still coming for it; a nudge or release due meanwhile waits.
+	type Returned = { ids: string[]; at: number; evidence: ReturnType<typeof resultEvidence>; request: string; text: string; nudged: boolean; nudgeAfterTurn?: boolean; judging: number; releaseAfterVerdict?: boolean; nudge: ReturnType<typeof setTimeout>; release: ReturnType<typeof setTimeout> };
 	const returnedUnheard: Returned[] = [];
 	const dropReturned = (r: Returned) => { clearTimeout(r.nudge); clearTimeout(r.release); const i = returnedUnheard.indexOf(r); if (i >= 0) returnedUnheard.splice(i, 1); };
+	type Item = { role?: string; content?: string | null; timestamp?: number };
+	const sessionItems = (): ReadonlyArray<Item> | undefined => (session as unknown as { conversationContext?: { items?: ReadonlyArray<Item> } }).conversationContext?.items;
 	const turnWords = (): string | null => {
-		const items = (session as unknown as { conversationContext?: { items?: ReadonlyArray<{ role?: string; content?: string | null }> } }).conversationContext?.items;
+		const items = sessionItems();
 		if (!items) return null;
 		for (let i = items.length - 1; i >= 0; i--) if (items[i].role === 'assistant') return items[i].content ?? '';
 		return '';
 	};
+	// What the model said since `at`, for the heard check: an answer can span turns ("Regarding your PRs," cut off, then
+	// "you merged three"). Items with no stamps (a test's): the last line.
+	const wordsSince = (at: number, last: string): string => {
+		const said = (sessionItems() ?? []).filter((i) => i.role === 'assistant' && !!i.content?.trim() && !i.content.startsWith('[System:') && !i.content.startsWith('[system] '));
+		if (typeof said[said.length - 1]?.timestamp !== 'number') return last;
+		return said.filter((i) => typeof i.timestamp === 'number' && i.timestamp > at).map((i) => i.content!.replace(/\s+/g, ' ').trim()).join('\n') || last;
+	};
+	const markHeard = (r: Returned) => { for (const id of r.ids) voiceTaskStore.set(id, 'spoken'); dropReturned(r); };
+	// The rule as it was: the fast path's evidence, two distinctive words, or the count after its noun; with no evidence
+	// at all, the turn after the nudge. The heard check's fallback, and the whole decision when there is no check.
+	const heardByRule = (r: Returned, words: string | null) => words === null || (!hasEvidence(r.evidence) ? r.nudged : turnSaysResult(words, r.evidence));
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
+	let turnCutOff = false;
 	/** The model is in a turn: a nudge due now waits for its end (the turn may be saying that very result). */
 	let modelInTurn = false;
-	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; modelInTurn = true; });
-	session.eventBus.subscribe('turn.interrupted', () => { modelInTurn = false; });
+	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; modelInTurn = true; turnCutOff = false; });
+	session.eventBus.subscribe('turn.interrupted', () => { modelInTurn = false; turnCutOff = true; });
 	// A fresh dial abandons the old connection's calls and whatever the model held unsaid: a result returned to a
 	// call, or handed to the pacer, is handed over again. A resume keeps the calls and the context, so RECONNECTING
 	// alone changes nothing here.
@@ -327,20 +372,59 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		// The model completed a spoken turn on the new connection: its notifications flow again.
 		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
 		const words = turnWords();
+		const toJudge: Returned[] = [];
 		for (const r of [...returnedUnheard]) {
 			if (r.at > modelTurnStartedAt) continue;
-			// Nothing distinctive to look for (the result only restates the request): the turn after the nudge counts.
-			const noEvidence = !hasEvidence(r.evidence);
-			if (words !== null && (noEvidence ? !r.nudged : !turnSaysResult(words, r.evidence))) {
+			// Exact evidence decides at once; anything less is the heard check's call (2026-10-21 18:56:52: "you merged three
+			// yesterday" was judged unsaid by the pattern, nudged, and said twice more).
+			if (words !== null && opts.relay.judgesHeard && !turnSaysResultExactly(words, r.evidence)) { toJudge.push(r); continue; }
+			if (!heardByRule(r, words)) {
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
 			}
-			for (const id of r.ids) voiceTaskStore.set(id, 'spoken');
-			dropReturned(r);
+			markHeard(r);
 		}
-		// A nudge that came due during this turn, for a result the turn did not say.
+		if (toJudge.length) judgeHeard(toJudge, words ?? '', turnCutOff);
+		// A nudge that came due during this turn, for a result the turn did not say (one being judged waits for its verdict).
 		for (const r of returnedUnheard.filter((x) => x.nudgeAfterTurn)) sendNudge(r);
 	});
+	/**
+	 * Asks the heard check whether this turn told the user these results; a nudge or release due meanwhile waits for the
+	 * verdict. No verdict (a failure, or none within heardVerdictWaitMs): the rule decides, as without a check. One
+	 * decision per turn: a verdict after that changes nothing. A "no" lets a waiting nudge or release go only once no
+	 * newer turn's verdict is still coming for that result.
+	 */
+	function judgeHeard(batch: Returned[], last: string, cutOff: boolean): void {
+		for (const r of batch) r.judging++;
+		let decided = false;
+		const decide = (told: string[] | null) => {
+			if (decided) return;
+			decided = true;
+			clearTimeout(timer);
+			for (const r of batch) {
+				r.judging--;
+				// Heard through another turn, released, or a reconnect handed it over again.
+				if (!returnedUnheard.includes(r)) continue;
+				if (told ? told.includes(r.ids[0]) : heardByRule(r, last)) {
+					console.log(`${ts()} [RelayAgent] ${r.ids[0]}: ${told ? 'the heard check says the turn told it' : 'no heard verdict; by the rule the turn said it'}`);
+					markHeard(r);
+					continue;
+				}
+				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result${told ? '' : ' (no heard verdict; by the rule)'}; still waiting for it`);
+				if (r.judging) continue;
+				if (r.releaseAfterVerdict) releaseReturned(r);
+				else if (r.nudgeAfterTurn) sendNudge(r);
+			}
+		};
+		const timer = setTimeout(() => {
+			if (!decided) console.log(`${ts()} [RelayAgent] ${batch[0].ids[0]}: no heard verdict in time; the rule decides`);
+			decide(null);
+		}, opts.heardVerdictWaitMs ?? HEARD_VERDICT_WAIT_MS);
+		timer.unref?.();
+		const at = Math.min(...batch.map((r) => r.at));
+		void opts.relay.judgeHeard({ results: batch.map((r) => ({ id: r.ids[0], request: r.request, result: r.text })), assistantWords: wordsSince(at, last), cutOff })
+			.then(decide, () => decide(null));
+	}
 	session.eventBus.subscribe('turn.start', () => pacer.onTurnStart());
 	session.eventBus.subscribe('response.first_audio', () => pacer.onModelAudio());
 	// Only the client's microphone detection counts: Gemini marks a start on every transcription chunk and no end.
@@ -445,12 +529,21 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	// 2026-10-20 18:14:09: a nudge sent while the model was saying that result made it say it a second time.
 	function sendNudge(r: Returned): void {
 		if (!returnedUnheard.includes(r) || !canSpeak() || r.nudged) return;
-		if (modelInTurn) { r.nudgeAfterTurn = true; return; }
+		// Mid-turn, or a turn's verdict still coming: that turn may have said it.
+		if (modelInTurn || r.judging) { r.nudgeAfterTurn = true; return; }
 		r.nudgeAfterTurn = false;
 		r.nudged = true;
 		const text = framedSystem(`The result for the request "${r.request}" came back through its work call but you have not told the user yet. Tell them now, in one or two sentences.`);
 		console.log(`${ts()} [RelayAgent] ${r.ids[0]}: returned ${Math.round((Date.now() - r.at) / 1000)} s ago and not said; nudging`);
 		if (noticesSuspect && opts.injectLive) opts.injectLive(text); else session.tryPublishSystemNotification(text);
+	}
+	function releaseReturned(r: Returned): void {
+		if (!returnedUnheard.includes(r)) return;
+		if (r.judging) { r.releaseAfterVerdict = true; return; }
+		// Only the reconcile pass hands it over again, and logs so: one hand-over, one line (2026-10-21 17:45:48).
+		console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; released to the reconcile pass`);
+		dropReturned(r);
+		for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
 	}
 	const deliver = (item: ResultItem) => {
 		// Corrected, or already said: end its call, say nothing.
@@ -472,15 +565,9 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			if (canSpeak() && opts.relay.offerResult(now)) {
 				const request = (now.requests?.[0] ?? voiceTaskStore.get(item.taskId)?.text ?? item.taskId).replace(/"/g, "'").slice(0, 120);
 				const r: Returned = {
-					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text, [request, ...(now.requests ?? [])].join(' ')), request, nudged: false,
+					ids: ids(now), at: Date.now(), evidence: resultEvidence(now.text, [request, ...(now.requests ?? [])].join(' ')), request, text: now.text, nudged: false, judging: 0,
 					nudge: setTimeout(() => sendNudge(r), opts.returnNudgeMs ?? RETURN_NUDGE_MS),
-					release: setTimeout(() => {
-						if (!returnedUnheard.includes(r)) return;
-						// Only the reconcile pass hands it over again, and logs so: one hand-over, one line (2026-10-21 17:45:48).
-						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: still not said after the nudge; released to the reconcile pass`);
-						dropReturned(r);
-						for (const id of r.ids) voiceTaskStore.unsetHandedOver(id);
-					}, opts.returnReleaseMs ?? RETURN_RELEASE_MS),
+					release: setTimeout(() => releaseReturned(r), opts.returnReleaseMs ?? RETURN_RELEASE_MS),
 				};
 				r.nudge.unref?.(); r.release.unref?.();
 				returnedUnheard.push(r);
