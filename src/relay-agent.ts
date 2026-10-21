@@ -605,6 +605,8 @@ export interface RelayAgentDeps<O = unknown> {
 	store: VoiceTaskStore;
 	/** Says a line to the model now (the queue position at submission). */
 	notice?: (text: string) => void;
+	/** Adds a line to the model's context without asking for a reply (bodhi injectText 'quiet'). */
+	context?: (text: string) => void;
 	/** Holds each call until the user has finished speaking. Without it, calls are submitted at once. */
 	speech?: SpeechGate;
 	/** Decides, before a request is submitted, whether the user must first be asked for a missing piece. */
@@ -827,7 +829,11 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		}
 		if (!(await this.submitFromTurn(verdict.task, origin))) return;
 		// Its result comes like any other with no call waiting: handed to the model when it can speak.
-		this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${verdict.task.replace(/"/g, "'")}". If you have not already, tell the user in one short sentence that it is being looked into. Do not call work for it.`));
+		const task = verdict.task.replace(/"/g, "'");
+		// One acknowledgement (as for a work call): the model already said it is on it, so it is told as context only
+		// (2026-10-21 18:38:35 "Understood, I'll make sure to check…", then 18:38:41 "I'm looking into those pull requests now.").
+		if (verdict.acknowledged && this.deps.context) this.deps.context(framedSystem(`This request was sent to the core for the user: "${task}". You already told the user you are on it; say nothing more about it until its result comes. Do not call work for it.`));
+		else this.deps.notice?.(framedSystem(`This request was sent to the core for the user: "${task}". Tell the user in one short sentence that it is being looked into. Do not call work for it.`));
 	}
 
 	/** Submits a request the turn check wrote. True when the core took it. */

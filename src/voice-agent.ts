@@ -1058,6 +1058,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		thisTurn: (userText, since) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText, since),
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
+		// Context only, no reply asked for: a request the voice model already acknowledged is not acknowledged again.
+		context: (text) => { void sessionRef?.injectText(text, { mode: 'quiet' }); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => { relayAsk.ask(text); },
 		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
