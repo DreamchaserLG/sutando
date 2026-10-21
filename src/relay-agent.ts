@@ -6,7 +6,7 @@
  * answers from it; a result whose call is gone is delivered another way and reconciled.
  */
 
-import type { IEventBus, PersistentSubagentInstance, SubagentConfig } from 'bodhi-realtime-agent';
+import type { IEventBus, PersistentSubagentInstance, PersistentSubagentResult, SubagentConfig } from 'bodhi-realtime-agent';
 import { frameTaskResult, framedSystem } from './inject-framing.js';
 import type { OpenTask, TurnClassifier, WorkCheck, WorkLane, WorkRequestCheck } from './work-request-check.js';
 
@@ -717,14 +717,19 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.deps.log?.(`[RelayAgent] ${name} answers this turn; the turn check sends nothing`);
 	}
 
-	async invoke(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+	/** What bodhi calls for the `work` tool: the answer and how it is delivered (a plain answer goes when_idle). */
+	async invokeWithScheduling(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<PersistentSubagentResult> {
 		const out = await this.run(task, args, signal);
 		// A reply produced while the connection is being replaced never reaches the model: it waits for ACTIVE.
 		if (this.deps.whenActive) await this.deps.whenActive();
-		return out;
+		return typeof out === 'string' ? { text: out } : out;
 	}
 
-	private async run(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+	async invoke(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string> {
+		return (await this.invokeWithScheduling(task, args, signal)).text;
+	}
+
+	private async run(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string | PersistentSubagentResult> {
 		this.lastTakenAt = Date.now();
 		const boundary = this.boundaries;
 		// Taken before the waits below: a room switch during them must not re-address the request.
@@ -747,7 +752,9 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			const mine = { args, origin, joined: false };
 			this.holding = mine;
 			await this.deps.speech.waitTurnOver(signal);
-			if (mine.joined) return framedSystem(ENDED.continued_in_next);
+			// Closed without a turn: the later call's acknowledgement is the one (2026-10-21 17:12:25 nbe2e: this answer,
+			// sent when_idle, was answered "I'm looking into those" before the later call was even submitted).
+			if (mine.joined) return { text: framedSystem(ENDED.continued_in_next), scheduling: 'silent' };
 			if (this.holding === mine) this.holding = null;
 		}
 		// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
