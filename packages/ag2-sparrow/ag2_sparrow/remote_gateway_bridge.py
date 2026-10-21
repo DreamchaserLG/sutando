@@ -2706,8 +2706,35 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
-def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S):
-    """One authenticated HTTP request. Returns parsed JSON (or {} for empty)."""
+# The last response's status and edge headers, per thread, for the poll's anomaly line.
+_RESP_META = threading.local()
+
+
+def _read_by(resp, deadline: float) -> bytes:
+    """The body, read in chunks against a wall-clock deadline: urllib's timeout bounds each
+    socket operation, so a body that drips in could otherwise run on past it."""
+    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
+    chunks = []
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("response body still arriving at its deadline")
+        if sock is not None:
+            sock.settimeout(left)
+        chunk = resp.read(4096)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _req(method: str, path: str, payload: dict | None = None, timeout: int = _REQ_TIMEOUT_S,
+         deadline: "float | None" = None):
+    """One authenticated HTTP request. Returns parsed JSON (or {} for empty). With
+    `deadline` (time.monotonic()), the whole request must finish by then."""
+    if deadline is not None:
+        timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("request deadline already passed")
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
     req.add_header("Authorization", f"Bearer {TOKEN}")
@@ -2718,7 +2745,11 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
     if data is not None:
         req.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode().strip()
+        headers = getattr(resp, "headers", None) or {}
+        _RESP_META.last = {"status": getattr(resp, "status", None),
+                           "content_length": headers.get("Content-Length"),
+                           "cf_ray": headers.get("CF-Ray")}
+        raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
         return json.loads(raw) if raw else {}
 
 
@@ -2977,12 +3008,28 @@ def _retry_pending_acks(inflight: "set[str]") -> None:
         _post_task_ack(tid, durable, leases.get(tid))
 
 
-def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None) -> bool:
+ACK_DROP_RETRY_S = 0.5
+# Dropped acks are retried only while this long since the poll answered remains: well
+# inside the broker's 15 s delivery lease. Past it they are left to the pending-ack retry.
+ACK_RETRY_BUDGET_S = 10.0
+
+
+def _connection_dropped(e: BaseException) -> bool:
+    """The peer closed or reset the connection: the request may never have been read."""
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    return isinstance(reason, (ConnectionResetError, http.client.IncompleteRead))
+
+
+def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = None,
+                   dropped: "list | None" = None, deadline: "float | None" = None,
+                   retry_inline: bool = True) -> bool:
     """Tell the gateway a task made it safely into the local queue. `durable`
     says the task file, its media sidecar and the in-flight set are all fsync'd,
     which is the only thing that lets the relay call the task accepted.
     `lease_id` echoes the generation the task was served under; absent for a
-    broker that served none."""
+    broker that served none. With `dropped`, an ack lost to a dropped connection is
+    appended there for the caller to retry; without it, it is retried once inline unless
+    `retry_inline` is False. `deadline` (time.monotonic()) bounds the whole request."""
     global _ack_disabled_until
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
@@ -2998,7 +3045,19 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             body["lease_id"] = lease_id
         if durable:
             body["durable"] = True
-        _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10)
+        bound = {} if deadline is None else {"deadline": deadline}   # a healthy ack's call is unchanged
+        try:
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
+        except _NETWORK_ERRORS as e:
+            if not _connection_dropped(e) or (dropped is None and not retry_inline):
+                raise
+            if dropped is not None:
+                dropped.append((tid, durable, lease_id))
+                _log(f"task ack for {tid} lost to a dropped connection ({e}) — set aside for retry")
+                return False
+            # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
+            time.sleep(ACK_DROP_RETRY_S)
+            _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=10, **bound)
         _ack_disabled_until = 0.0  # success (or re-enablement) → clear any backoff
         _forget_pending_ack(tid, lease_id)
         return True
@@ -5026,24 +5085,152 @@ def _relay_failed_sent(broker_id: str) -> bool:
     return False
 
 
-def _take_ack_first(task: dict, inflight: "set[str]") -> bool:
+_POLL_ANOMALIES = 0
+
+
+class _PollAnomaly(Exception):
+    """A 200 poll answer that carries no task list; the loop backs off as for any bad answer."""
+
+
+def _served_key(task: dict) -> str:
+    return _one_line(task.get("id"))[:128]
+
+
+def _poll_task_list(resp) -> list:
+    """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
+    counted and raised: it can stand for a batch the broker served and the client never saw."""
+    global _POLL_ANOMALIES
+    tasks = resp.get("tasks") if isinstance(resp, dict) else None
+    if isinstance(tasks, list):
+        return tasks
+    _POLL_ANOMALIES += 1
+    meta = getattr(_RESP_META, "last", None) or {}
+    shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
+    raise _PollAnomaly(
+        f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
+        f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
+        "— any task served in it is lost to this client until its lease expires")
+
+
+def _receive_round(tasks: list) -> "tuple[list, dict]":
+    """Log each served task at receipt, before any branching; returns the tasks to take and
+    their fates (None until the round settles one)."""
+    taken, fates = [], {}
+    for task in tasks:
+        if not isinstance(task, dict):
+            _log(f"served entry is a {type(task).__name__}, not a task — dropped")
+            continue
+        key = _served_key(task)
+        _log(f"served {key} lease={_one_line(_lease_id_of(task) or 'none')}"
+             + (" ack_first" if task.get("ack_first") is True else ""))
+        taken.append(task)
+        fates[key] = None
+    return taken, fates
+
+
+def _retry_dropped_acks(dropped: list, received_at: float, fates: dict) -> None:
+    """One more try for each ack lost to a dropped connection, inside ACK_RETRY_BUDGET_S of
+    the poll's answer; whatever the budget cannot cover stays with the pending-ack retry."""
+    for n, (tid, durable, lease) in enumerate(dropped):
+        left = received_at + ACK_RETRY_BUDGET_S - time.monotonic() - ACK_DROP_RETRY_S
+        if left < 1:
+            _log(f"{len(dropped) - n} dropped ack(s) left to the pending-ack retry: the "
+                 f"{ACK_RETRY_BUDGET_S:g}s retry budget is spent")
+            return
+        time.sleep(ACK_DROP_RETRY_S)
+        if _post_task_ack(tid, durable, lease, retry_inline=False,
+                          deadline=received_at + ACK_RETRY_BUDGET_S):
+            fates[_broker_tid(tid)] = "acked"
+
+
+def _settle_round(fates: dict) -> None:
+    """Every served task ends the round acked, staged, consumed or dropped with a reason."""
+    for key, fate in fates.items():
+        if fate is None:
+            _log(f"served {key} was not acked, staged, consumed or dropped this round "
+                 "— the broker re-serves it when its lease expires")
+
+
+def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
+    """`take(*args)`, where a raise costs only this task: it is logged and left unacked for
+    the broker to re-serve, and the rest of its batch is still taken and acked."""
+    try:
+        return bool(take(*args))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise                     # the loop's auth recovery owns a rejected bearer
+        why = f"HTTPError: {e}"
+    except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
+        why = f"{type(e).__name__}: {e}"
+    if fates is not None:
+        fates[_served_key(task)] = "dropped"
+    _log(f"task {_served_key(task)} not taken ({why}) — not acked; the broker re-serves it")
+    return False
+
+
+def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
+                      fates: "dict | None" = None) -> bool:
+    """One served task that is not `ack_first`: consumed as a control, or queued and its
+    ack added to `pending_ack`. True when it newly entered the in-flight set."""
+    hitl_out = _handle_hitl_action(task)
+    if hitl_out:
+        body = _hitl_control_body(hitl_out)
+        _queue_review_control_result(task, body=body)
+        _retry_review_control_results()
+        _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
+        _set_fate(fates, task, "consumed")
+        return False
+    if _handle_review_decision(task):
+        _queue_review_control_result(task)
+        _retry_review_control_results()
+        _log(f"consumed private review decision {task.get('id')}")
+        _set_fate(fates, task, "consumed")
+        return False
+    written = _write_task(task)
+    if not written:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
+        return False
+    tid, durable = written
+    pending_ack.append((tid, durable, _lease_id_of(task)))
+    fresh = tid not in inflight
+    inflight.add(tid)
+    return fresh
+
+
+def _set_fate(fates: "dict | None", task: dict, fate: str) -> None:
+    if fates is not None:
+        fates[_served_key(task)] = fate
+
+
+def _take_ack_first(task: dict, inflight: "set[str]", fates: "dict | None" = None,
+                    dropped: "list | None" = None) -> bool:
     """A task served with `ack_first`: staged, acked on its own and published only once
     the ack is accepted, so a withdrawn ask never reaches the core. True once published."""
     written = _write_task(task, hold=True)
     if written is None:
+        _set_fate(fates, task, "dropped")       # _write_task logged why
         return False
     tid, durable = written
     held = _load_held()
     if held is None:
+        _set_fate(fates, task, "dropped")       # _load_held logged why
         return False                            # nothing is acked while it cannot be read
     entry = held.get(tid)
     if not _held_entry_ok(tid, entry):
         # Already queued or handled here: acked as any redelivery is.
         lease = _lease_id_of(task)
-        if _track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)]):
-            _post_task_ack(tid, durable, lease)
+        if (_track_durably(tid, inflight) and _record_pending_acks([(tid, durable, lease)])
+                and _post_task_ack(tid, durable, lease, dropped=dropped)):
+            _set_fate(fates, task, "acked")
         return False
-    return _advance_held(tid, entry, inflight)
+    published = _advance_held(tid, entry, inflight)
+    if published:
+        _set_fate(fates, task, "acked")
+    elif tid in (_load_held() or {}):
+        _set_fate(fates, task, "staged")
+    else:
+        _set_fate(fates, task, "dropped")       # _advance_held logged the refusal
+    return published
 
 
 def _fold_target(tid: str, wire: str, holder: "str | None") -> "str | None":
@@ -7493,6 +7680,7 @@ def main() -> None:
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
             prev_ok = poll_grace_since
+            _RESP_META.last = None
             try:
                 resp = _req("GET", f"/v1/tasks?wait={POLL_WAIT}{_POLL_PROOF}", timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
@@ -7503,46 +7691,40 @@ def main() -> None:
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
                 if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
+                _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
+                     f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
+            received_at = time.monotonic()           # the dropped-ack retry budget runs from here
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
                 _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
                 poll_failures = 0
             added = False
             pending_ack = []
-            tasks = resp.get("tasks", [])
+            tasks, fates = _receive_round(_poll_task_list(resp))
+            # Every task's first ack goes before any retry, so one bad link delays no sibling.
+            dropped: list = []
             # First and on its own, so a slow task ahead cannot hold it past its delivery lease.
             for task in tasks:
                 if task.get("ack_first") is True:
-                    added |= _take_ack_first(task, inflight)
+                    added |= _isolated(task, _take_ack_first, task, inflight, fates, dropped,
+                                       fates=fates)
             for task in tasks:
-                if task.get("ack_first") is True:
-                    continue
-                hitl_out = _handle_hitl_action(task)
-                if hitl_out:
-                    body = _hitl_control_body(hitl_out)
-                    _queue_review_control_result(task, body=body)
-                    _retry_review_control_results()
-                    _log(f"hitl: consumed card click {task.get('id')} from the task relay ({hitl_out})")
-                    continue
-                if _handle_review_decision(task):
-                    _queue_review_control_result(task)
-                    _retry_review_control_results()
-                    _log(f"consumed private review decision {task.get('id')}")
-                    continue
-                written = _write_task(task)
-                if written:
-                    tid, durable = written
-                    if tid not in inflight:
-                        inflight.add(tid)
-                        added = True
-                    pending_ack.append((tid, durable, _lease_id_of(task)))
+                if task.get("ack_first") is not True:
+                    added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
+                                       fates, fates=fates)
             # Ack only after task file, in-flight set and ack ledger are durable;
             # any failure withholds every ack this round, redeliveries included.
             committed = _save_inflight(inflight) if pending_ack else True
             if pending_ack and committed:
                 committed = _record_pending_acks(pending_ack)
+            if pending_ack and not committed:
+                _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
+                     "ack ledger did not commit")
             for tid, durable, lease in pending_ack if committed else ():
-                _post_task_ack(tid, durable, lease)
+                if _post_task_ack(tid, durable, lease, dropped=dropped):
+                    fates[_broker_tid(tid)] = "acked"
+            _retry_dropped_acks(dropped, received_at, fates)
+            _settle_round(fates)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
@@ -7564,6 +7746,12 @@ def main() -> None:
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+        except _PollAnomaly as e:
+            # Every anomaly is counted in its line; the log itself thins out a run of them.
+            _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
+            _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
