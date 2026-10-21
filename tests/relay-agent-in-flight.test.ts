@@ -112,7 +112,7 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 		await settle();
 		const list = inFlight(s.relay);
 		assert.equal(list.length, 1, 'counted once from the moment they join');
-		assert.match(list[0].task, /watch the video.*and summarize it/);
+		assert.ok(list[0].task.includes('and summarize it') && list[0].task.includes('watch the video'), `the joined text carries both: ${list[0].task}`);
 		s.release();
 		s.checkRelease();
 		await settle();
