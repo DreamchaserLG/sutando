@@ -32,7 +32,7 @@ import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { existsSync, readFileSync, unlinkSync, mkdirSync, copyFileSync, appendFileSync, writeFileSync, realpathSync } from 'node:fs';
 import { notify as platformNotify } from './platform.js';
-import { inlineTools, personalSkillSetups, personalVoiceSurface, describeVoiceTasks, voiceTaskCounts, voiceTaskStatusSnapshot, heardByUser, resultsNotYetTold } from './inline-tools.js';
+import { inlineTools, personalSkillSetups, personalVoiceSurface, voiceTaskReport, voiceTaskStatusSnapshot, voiceTasksBeingSent, setVoiceTasksBeingSent, heardByUser, resultsNotYetTold } from './inline-tools.js';
 import { createClientFrameHub } from './client-frame-hub.js';
 import { runSkillSetups } from './skill-setup-runner.js';
 import { setVisionSession, startVisionControlServer, stopVisionControlServer, setSessionToolUpdater, setVisionSpeechEvidence, getVisionEgressStats, isStreaming, stopStreaming as stopVisionStreaming } from './vision-tools.js';
@@ -494,28 +494,35 @@ const getTaskStatus: ToolDefinition = {
 	description:
 		'Check the tasks the user asked for by voice and where each stands now (queued, in progress, cancel requested, done, and whether the user heard the result). ' +
 		'Use for status/progress questions like "any pending tasks?", "how many tasks are there?", "are you working on something?". ' +
-		'pendingTasks is the number to give for "how many pending": tasks the core is still working on. A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
+		'pendingTasks is the number to give for "how many pending": tasks the core is still working on plus requests still being sent to it (beingSentToCore: accepted, and waiting for the user to finish, being checked or being submitted). A finished result the user has not heard is not pending: it is in resultsNotYetTold. ' +
 		'resultsNotYetTold lists finished results the user has not heard, with the result text: say each of them now, in a sentence, before the count; the user asking "did you lose one?" is usually one of these. ' +
 		'Always call it for these: never answer from memory, the state changes. Do NOT call work just to check progress.',
 	parameters: z.object({}),
 	execution: 'inline',
 	execute: async () => {
-		// The relay agent's table, the same source as the in-line count and get_core_status.
+		// The relay agent's table and its requests not yet sent, the same source as get_core_status and /voice-tasks.
 		const rows = voiceTaskRows();
-		// Pending is what the core still works on; a finished result not yet told is listed apart, to be said first.
-		const counts = voiceTaskCounts(rows, voiceTaskResultText);
+		const sending = voiceTasksBeingSent();
+		// Pending is what the core still works on and what is still being sent to it (nbe2e 17:13:24: "pending 0" while
+		// the request was in its check); a finished result not yet told is listed apart, to be said first.
+		const report = voiceTaskReport(rows, sending, voiceTaskResultText);
+		const counts = report.counts;
 		// What the tool said, so a wrong number out loud can be laid against it (2026-10-12: "one" for 4).
-		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, done not heard ${counts.doneNotHeard})`);
+		console.log(`${ts()} [RelayAgent] get_task_status: pending ${counts.pending} (the core is working on ${counts.working}, being sent ${counts.sending}, done not heard ${counts.doneNotHeard})`);
 		// Counts and states only: a yes/no "in progress" flag was read as "all of them are being worked on".
 		return {
 			pendingTasks: counts.pending,
 			stillBeingWorkedOn: counts.working,
+			beingSentToCore: counts.sending,
 			doneNotYetHeard: counts.doneNotHeard,
 			unknownState: counts.unknown,
-			tasks: rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			tasks: [
+				...sending.map((e) => ({ task: e.task.slice(0, 60), state: 'being sent', heard: false })),
+				...rows.map((r) => ({ task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r), ...(r.retired ? { endedWithNothingToSay: true } : {}) })),
+			],
 			// A finished result the user has not heard goes with its text, so "did you lose one?" is answered on the spot.
 			resultsNotYetTold: resultsNotYetTold(rows, voiceTaskResultText, new Set(heldByPacer())),
-			description: describeVoiceTasks(rows),
+			description: report.description,
 		};
 	},
 };
@@ -1017,6 +1024,17 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	});
 }
 
+	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
+	// written asynchronously after each change, as bodhi's history stores write the conversation.
+	// Requests the relay agent has not sent yet are in it too, and rewrite it as they come and go.
+	const voiceTaskStatus = createVoiceTaskStatusWriter({
+		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
+		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows(), Date.now(), voiceTasksBeingSent()),
+		log: (m) => console.error(`${ts()} ${m}`),
+	});
+	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
+	voiceTaskStatus.changed();
+
 	const relayAsk = createAskDelivery({
 		inject: (text) => { void sessionRef?.injectText(text, { mode: 'live' }); },
 		log: (m) => console.log(`${ts()} ${m}`),
@@ -1039,8 +1057,10 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.
 		ask: (text) => { relayAsk.ask(text); },
 		whenActive: () => (sessionRef ? whenSessionActive(sessionRef) : Promise.resolve()),
+		onInFlightChange: () => voiceTaskStatus.changed(),
 		log: (msg) => console.log(`${ts()} ${msg}`),
 	});
+	setVoiceTasksBeingSent(() => relayAgent.inFlightRequests());
 	setVoiceTaskEndedListener((taskId, why) => { relayAgent.endCall(taskId, why); });
 
 	// When the user hangs up, the core gets a task about that call.
@@ -1054,16 +1074,6 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		log: (m) => console.log(`${ts()} ${m}`),
 	});
 	beforeConversationClear = () => callEnd.collect();
-
-	// The task table lives in memory; the status page (/voice-tasks on the web client) reads a copy,
-	// written asynchronously after each change, as bodhi's history stores write the conversation.
-	const voiceTaskStatus = createVoiceTaskStatusWriter({
-		path: statusPath('voice-task-status.json', WORKSPACE_DIR),
-		snapshot: () => voiceTaskStatusSnapshot(voiceTaskRows()),
-		log: (m) => console.error(`${ts()} ${m}`),
-	});
-	voiceTaskStore.onChange(() => voiceTaskStatus.changed());
-	voiceTaskStatus.changed();
 
 	const session = new VoiceSession({
 		sessionId: SESSION_ID,

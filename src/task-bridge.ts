@@ -1299,6 +1299,8 @@ export const workTool: ToolDefinition = {
 		// default was producing unwanted DMs). Caller must explicitly pass
 		// dm_on_timeout: true on critical tasks where they want the fallback.
 		_pendingTasks.set(taskId, pendingEntry());
+		// No await from here to the return: the relay agent lists this request as being sent until the submit
+		// returns, so a status answer in between would count it twice (its row and its call).
 		voiceTaskStore.add(taskId, task, undefined, lane);
 		// Record owner activity for status-aware-pivot in proactive loop
 		writeOwnerActivity('voice', task);

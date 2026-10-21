@@ -550,8 +550,14 @@ export interface RelayAgentDeps<O = unknown> {
 	/** Resolves when the session can take a reply: ACTIVE now, or at the next ACTIVE. A reply sent while a connection
 	 *  is being replaced is dropped by the transport, so every reply of a call waits for it. */
 	whenActive?: () => Promise<void>;
+	/** A request entered or left the in-flight list (inFlightRequests): the status page is rewritten. */
+	onInFlightChange?: () => void;
 	log?: (msg: string) => void;
 }
+
+/** Where an accepted request stands before it is a task row: held for the user to finish, in the work check, or being submitted. */
+export type InFlightStage = 'held' | 'checking' | 'sending';
+export interface InFlightRequest { task: string; stage: InFlightStage }
 
 /** After the user was asked about a request, the next call within this window is sent as it is. */
 export const ONE_ASK_WINDOW_MS = 2 * 60_000;
@@ -593,7 +599,9 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	readonly key = 'relay-agent';
 	private readonly waiting = new Map<string, Waiter>();
 	/** The call waiting for the user to finish speaking, not yet submitted. */
-	private holding: { args: Record<string, unknown>; origin: O | undefined; joined: boolean } | null = null;
+	private holding: { args: Record<string, unknown>; origin: O | undefined; joined: boolean; flight: InFlightRequest } | null = null;
+	/** Requests accepted and not yet a task row: the store has no row for them until the submit returns. */
+	private readonly inFlight = new Set<InFlightRequest>();
 
 	/** When the voice model last took a turn itself (`work`, or a tool that fetches the answer): the turn check does not send it again. */
 	private lastTakenAt = 0;
@@ -610,6 +618,30 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	private lastTurnAt = 0;
 
 	constructor(private readonly deps: RelayAgentDeps<O>) {}
+
+	/**
+	 * Requests accepted and not yet sent, which status answers count as pending (nbe2e 2026-10-21 17:13:24: the
+	 * video request was held for the user and then in the check, no row existed, and get_task_status said
+	 * "pending 0"). A joined call is one entry; an entry leaves as soon as its submit returns, when the row exists.
+	 */
+	inFlightRequests(): InFlightRequest[] {
+		return [...this.inFlight].map((e) => ({ ...e }));
+	}
+
+	private enterFlight(e: InFlightRequest): void {
+		this.inFlight.add(e);
+		this.deps.onInFlightChange?.();
+	}
+
+	private leaveFlight(e: InFlightRequest): void {
+		if (this.inFlight.delete(e)) this.deps.onInFlightChange?.();
+	}
+
+	private flightStage(e: InFlightRequest, stage: InFlightStage): void {
+		if (e.stage === stage) return;
+		e.stage = stage;
+		if (this.inFlight.has(e)) this.deps.onInFlightChange?.();
+	}
 
 	/** Tasks sent and not answered yet, newest last: what a new request is compared with. */
 	openTasks(now = Date.now()): OpenTask[] {
@@ -696,7 +728,15 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 			(this.deps.ask ?? this.deps.notice)?.(line);
 			return;
 		}
-		const submitted = await this.deps.submit({ task: verdict.task }, origin);
+		// Pending while it is submitted, like a work call's request: the row exists only once the submit returns.
+		const flight: InFlightRequest = { task: verdict.task, stage: 'sending' };
+		this.enterFlight(flight);
+		let submitted: Record<string, unknown>;
+		try {
+			submitted = await this.deps.submit({ task: verdict.task }, origin);
+		} finally {
+			this.leaveFlight(flight);
+		}
 		const taskId = submitted.taskId;
 		if (submitted.status !== 'pending' || typeof taskId !== 'string') {
 			this.deps.log?.(`[RelayAgent] turn check: the request was not taken (${String(submitted.status)})`);
@@ -730,106 +770,121 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 	}
 
 	private async run(_task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string | PersistentSubagentResult> {
-		this.lastTakenAt = Date.now();
-		const boundary = this.boundaries;
-		// Taken before the waits below: a room switch during them must not re-address the request.
-		let origin = this.deps.captureOrigin?.();
-		if (this.deps.speech) {
-			// A call made while an earlier one still waits for the user's turn to end: the model has not
-			// answered in between, the user went on speaking, so the two are one request. The earlier
-			// call ends; this one carries both.
-			const earlier = this.holding;
-			if (earlier) {
-				earlier.joined = true;
-				origin = earlier.origin; // the request began with the earlier call
-				args = {
-					...earlier.args,
-					...args,
-					task: joinCutOffRequest(String(earlier.args.task ?? ''), String(args.task ?? '')),
-				};
-				this.deps.log?.('[RelayAgent] the user went on speaking: the earlier request is sent with this one');
+		// Listed from the moment the call is accepted until its submit returns or it ends without one. A returned
+		// promise (a call that waits for its result) is not awaited here, so the finally runs as the call starts waiting.
+		const flight: InFlightRequest = { task: String(args.task ?? ''), stage: this.deps.speech ? 'held' : 'checking' };
+		this.enterFlight(flight);
+		try {
+			this.lastTakenAt = Date.now();
+			const boundary = this.boundaries;
+			// Taken before the waits below: a room switch during them must not re-address the request.
+			let origin = this.deps.captureOrigin?.();
+			if (this.deps.speech) {
+				// A call made while an earlier one still waits for the user's turn to end: the model has not
+				// answered in between, the user went on speaking, so the two are one request. The earlier
+				// call ends; this one carries both.
+				const earlier = this.holding;
+				if (earlier) {
+					earlier.joined = true;
+					origin = earlier.origin; // the request began with the earlier call
+					args = {
+						...earlier.args,
+						...args,
+						task: joinCutOffRequest(String(earlier.args.task ?? ''), String(args.task ?? '')),
+					};
+					// One request from now on: the earlier call's entry goes, this one carries the joined text.
+					this.leaveFlight(earlier.flight);
+					flight.task = String(args.task);
+					this.deps.log?.('[RelayAgent] the user went on speaking: the earlier request is sent with this one');
+				}
+				const mine = { args, origin, joined: false, flight };
+				this.holding = mine;
+				await this.deps.speech.waitTurnOver(signal);
+				// Closed without a turn: the later call's acknowledgement is the one (2026-10-21 17:12:25 nbe2e: this answer,
+				// sent when_idle, was answered "I'm looking into those" before the later call was even submitted).
+				if (mine.joined) return { text: framedSystem(ENDED.continued_in_next), scheduling: 'silent' };
+				if (this.holding === mine) this.holding = null;
 			}
-			const mine = { args, origin, joined: false };
-			this.holding = mine;
-			await this.deps.speech.waitTurnOver(signal);
-			// Closed without a turn: the later call's acknowledgement is the one (2026-10-21 17:12:25 nbe2e: this answer,
-			// sent when_idle, was answered "I'm looking into those" before the later call was even submitted).
-			if (mine.joined) return { text: framedSystem(ENDED.continued_in_next), scheduling: 'silent' };
-			if (this.holding === mine) this.holding = null;
-		}
-		// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
-		if (signal?.aborted) return framedSystem(ENDED.not_sent);
-		let lane: WorkLane | undefined;
-		if (this.deps.check) {
-			// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
-			const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks(), answeredTasks: this.recentlyAnswered() }, signal)
-				.catch((): WorkCheck => ({ action: 'submit' }));
+			// bodhi cancelled the call (tool cancellation, the session closing) while it waited for the user or the check.
 			if (signal?.aborted) return framedSystem(ENDED.not_sent);
-			if (verdict.action === 'submit') lane = verdict.lane;
-			// One question per request: the answer is sent as it is, even if the check still finds it vague
-			// ("the latest one") - the user is not interrogated (review of #5348).
-			if (verdict.action === 'ask' && Date.now() - this.askedAt < ONE_ASK_WINDOW_MS) {
-				this.deps.log?.(`[RelayAgent] the user was already asked about this; sending it as it is`);
-			} else if (verdict.action === 'ask') {
-				this.askedAt = Date.now();
-				this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
-				return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
-			}
-			if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
-				const row = this.deps.store.get(verdict.of)!;
-				// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly.
-				if (row.delivery === 'spoken' && row.at > this.lastUserTurnAt) {
-					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was said; closed without resending`);
-					return framedSystem(ENDED.already_answered);
+			let lane: WorkLane | undefined;
+			if (this.deps.check) {
+				this.flightStage(flight, 'checking');
+				// A request with a blank in it (which PR? which file?) is not submitted: the user is asked.
+				const verdict = await this.deps.check({ task: String(args.task ?? ''), recentConversation: this.deps.recentConversation?.() ?? '', openTasks: this.openTasks(), answeredTasks: this.recentlyAnswered() }, signal)
+					.catch((): WorkCheck => ({ action: 'submit' }));
+				if (signal?.aborted) return framedSystem(ENDED.not_sent);
+				if (verdict.action === 'submit') lane = verdict.lane;
+				// One question per request: the answer is sent as it is, even if the check still finds it vague
+				// ("the latest one") - the user is not interrogated (review of #5348).
+				if (verdict.action === 'ask' && Date.now() - this.askedAt < ONE_ASK_WINDOW_MS) {
+					this.deps.log?.(`[RelayAgent] the user was already asked about this; sending it as it is`);
+				} else if (verdict.action === 'ask') {
+					this.askedAt = Date.now();
+					this.deps.log?.(`[RelayAgent] not submitted, asking the user: ${verdict.question}`);
+					return framedSystem(`Nothing was submitted: the request does not say what it is about. Ask the user now, in their language, exactly: "${verdict.question.replace(/"/g, "'")}" Then, with their answer, call work again.`);
 				}
-				// Returned to its call but not said yet: the answer is there; the model says it instead of waiting for the nudge.
-				if (row.delivery === 'injected') {
-					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again before its result was said; the model is told to say it`);
-					return framedSystem(ENDED.say_now);
+				if (verdict.action === 'duplicate' && this.deps.store.get(verdict.of)?.delivery) {
+					const row = this.deps.store.get(verdict.of)!;
+					// Said already and no user turn since: the model re-issued its own call, an orphan. Closed quietly.
+					if (row.delivery === 'spoken' && row.at > this.lastUserTurnAt) {
+						this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after its result was said; closed without resending`);
+						return framedSystem(ENDED.already_answered);
+					}
+					// Returned to its call but not said yet: the answer is there; the model says it instead of waiting for the nudge.
+					if (row.delivery === 'injected') {
+						this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again before its result was said; the model is told to say it`);
+						return framedSystem(ENDED.say_now);
+					}
+					// Answered, and the user asked again since ("check it again"): a new request.
+					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after a user turn; sent as a new request`);
+				} else if (verdict.action === 'duplicate') {
+					// The same request is already with the core. This call waits for that task's result instead,
+					// unless another call already does; either way the user is told it is on its way.
+					this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
+					// Answered at once: the answer is the acknowledgement (a notice as well was said a second time).
+					if (this.waiting.has(verdict.of)) return framedSystem(DUPLICATE_WAITS);
+					this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
+					if (this.boundaries !== boundary) return framedSystem(ENDED.continuing); // the connection was replaced meanwhile
+					return new Promise<string>((resolve, reject) => {
+						this.waiting.set(verdict.of, { resolve, reject });
+						signal?.addEventListener('abort', () => { this.endCall(verdict.of, 'continuing'); }, { once: true });
+					});
 				}
-				// Answered, and the user asked again since ("check it again"): a new request.
-				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again after a user turn; sent as a new request`);
-			} else if (verdict.action === 'duplicate') {
-				// The same request is already with the core. This call waits for that task's result instead,
-				// unless another call already does; either way the user is told it is on its way.
-				this.deps.log?.(`[RelayAgent] ${verdict.of}: asked again; not sent twice`);
-				// Answered at once: the answer is the acknowledgement (a notice as well was said a second time).
-				if (this.waiting.has(verdict.of)) return framedSystem(DUPLICATE_WAITS);
-				this.deps.notice?.(framedSystem(DUPLICATE_WAITS));
-				if (this.boundaries !== boundary) return framedSystem(ENDED.continuing); // the connection was replaced meanwhile
-				return new Promise<string>((resolve, reject) => {
-					this.waiting.set(verdict.of, { resolve, reject });
-					signal?.addEventListener('abort', () => { this.endCall(verdict.of, 'continuing'); }, { once: true });
-				});
 			}
-		}
-		this.askedAt = 0; // this request goes; the next vague one may be asked about again
-		// The lane is the check's judgement alone: one the voice model wrote into its call is dropped.
-		const { lane: _fromModel, ...ownArgs } = args as Record<string, unknown> & { lane?: unknown };
-		const submitted = await this.deps.submit(lane ? { ...ownArgs, lane } : ownArgs, origin);
-		const taskId = submitted.taskId;
-		if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
-		const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
-		if (replaces) this.supersede(taskId, replaces);
+			this.askedAt = 0; // this request goes; the next vague one may be asked about again
+			// The lane is the check's judgement alone: one the voice model wrote into its call is dropped.
+			const { lane: _fromModel, ...ownArgs } = args as Record<string, unknown> & { lane?: unknown };
+			this.flightStage(flight, 'sending');
+			const submitted = await this.deps.submit(lane ? { ...ownArgs, lane } : ownArgs, origin);
+			// The row was added before the submit returned, with no await between: counted once, as the row.
+			this.leaveFlight(flight);
+			const taskId = submitted.taskId;
+			if (submitted.status !== 'pending' || typeof taskId !== 'string') return JSON.stringify(submitted);
+			const replaces = typeof args.replaces === 'string' ? args.replaces.trim() : '';
+			if (replaces) this.supersede(taskId, replaces);
 
-		// The model is silent while a NON_BLOCKING call is open, so a separate notice acknowledges it (the
-		// call stays open). Sent only once the checks let it through; a queue position or offline core instead.
-		if (signal?.aborted) return framedSystem(ENDED.continuing);
-		if (this.boundaries !== boundary) {
-			// The connection was replaced while this call was in its checks: a call id from the old one.
-			this.deps.log?.(`[RelayAgent] ${taskId}: the connection was replaced before this call could wait; its result goes another way`);
-			return framedSystem(ENDED.continuing);
+			// The model is silent while a NON_BLOCKING call is open, so a separate notice acknowledges it (the
+			// call stays open). Sent only once the checks let it through; a queue position or offline core instead.
+			if (signal?.aborted) return framedSystem(ENDED.continuing);
+			if (this.boundaries !== boundary) {
+				// The connection was replaced while this call was in its checks: a call id from the old one.
+				this.deps.log?.(`[RelayAgent] ${taskId}: the connection was replaced before this call could wait; its result goes another way`);
+				return framedSystem(ENDED.continuing);
+			}
+			const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
+			this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
+			return new Promise<string>((resolve, reject) => {
+				const waiter: Waiter = { resolve, reject };
+				this.waiting.set(taskId, waiter);
+				signal?.addEventListener('abort', () => {
+					if (this.endCall(taskId, 'continuing'))
+						this.deps.log?.(`[RelayAgent] ${taskId}: work call ended before its result; delivering it another way`);
+				}, { once: true });
+			});
+		} finally {
+			this.leaveFlight(flight);
 		}
-		const unusual = (typeof submitted.queuedAhead === 'number' && submitted.queuedAhead > 0) || submitted.watcherOnline === false;
-		this.deps.notice?.(framedSystem(unusual && typeof submitted.message === 'string' ? submitted.message : WORK_ACKNOWLEDGE));
-		return new Promise<string>((resolve, reject) => {
-			const waiter: Waiter = { resolve, reject };
-			this.waiting.set(taskId, waiter);
-			signal?.addEventListener('abort', () => {
-				if (this.endCall(taskId, 'continuing'))
-					this.deps.log?.(`[RelayAgent] ${taskId}: work call ended before its result; delivering it another way`);
-			}, { once: true });
-		});
 	}
 
 	/** A result landed. True when its call is waiting and now returns it. */

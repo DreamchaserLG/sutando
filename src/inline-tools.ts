@@ -875,35 +875,66 @@ export function voiceTaskCounts(rows: VoiceTaskRow[], readText?: (id: string) =>
 	return { pending: working, working, doneNotHeard, unknown };
 }
 
+/** A request the relay agent accepted that has no row yet: held for the user, in the work check, or being submitted. */
+export interface VoiceTaskSending { task: string; stage: string }
+
+// The relay agent's in-flight list (RelayAgent.inFlightRequests), set by the voice agent once it exists.
+let tasksBeingSent: () => VoiceTaskSending[] = () => [];
+export function setVoiceTasksBeingSent(source: () => VoiceTaskSending[]): void { tasksBeingSent = source; }
+export function voiceTasksBeingSent(): VoiceTaskSending[] { return tasksBeingSent(); }
+
+/**
+ * The count and the sentence every status answer gives (get_task_status, get_core_status, /voice-tasks), so there
+ * is one number. A request still being sent is pending: it has no row until its submit returns (nbe2e 2026-10-21
+ * 17:13:24: "pending 0" while the video request was held for the user and then in the check).
+ */
+export function voiceTaskReport(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[] = [], readText?: (id: string) => string | null): {
+	counts: { pending: number; working: number; sending: number; doneNotHeard: number; unknown: number };
+	description: string;
+} {
+	const c = voiceTaskCounts(rows, readText);
+	const counts = { pending: c.working + sending.length, working: c.working, sending: sending.length, doneNotHeard: c.doneNotHeard, unknown: c.unknown };
+	return { counts, description: describeTasks(rows, sending, counts) };
+}
+
 /**
  * The relay agent's table as the user can see it live: `state/voice-task-status.json`, written by the
  * voice agent whenever it changes and served by the web client at /voice-tasks. Same rows, same counts
  * as get_task_status, so there is one number.
  */
-export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now()): {
-	at: number; pending: number; working: number; doneNotHeard: number;
+export function voiceTaskStatusSnapshot(rows: VoiceTaskRow[], now = Date.now(), sending: readonly VoiceTaskSending[] = []): {
+	at: number; pending: number; working: number; sending: number; doneNotHeard: number; unknown: number;
+	beingSent: VoiceTaskSending[];
 	tasks: Array<{ id: string; text: string; submittedAt: number; state: string; delivery: string | null; heard: boolean; retired: boolean; pending: boolean }>;
 } {
-	const c = voiceTaskCounts(rows);
+	const c = voiceTaskReport(rows, sending).counts;
 	const tasks = [...rows].sort((a, b) => b.submittedAt - a.submittedAt).map((r) => {
 		const heard = heardByUser(r);
 		const live = r.state !== 'cancelled' && !r.retired;
 		return { id: r.id, text: r.text, submittedAt: r.submittedAt, state: r.state, delivery: r.delivery ?? null, heard, retired: !!r.retired, pending: live && (r.state === 'queued' || r.state === 'started') };
 	});
-	return { at: now, ...c, tasks };
+	return { at: now, ...c, beingSent: sending.map((e) => ({ task: e.task, stage: e.stage })), tasks };
 }
 
-/** The user's voice tasks in one sentence for the model, grouped by where each stands now. */
-export function describeVoiceTasks(rows: VoiceTaskRow[]): string {
-	if (rows.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
+/** The user's voice tasks in one sentence for the model, grouped by where each stands now: voiceTaskReport's sentence. */
+export function describeVoiceTasks(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[] = []): string {
+	return voiceTaskReport(rows, sending).description;
+}
+
+function describeTasks(rows: VoiceTaskRow[], sending: readonly VoiceTaskSending[], c: ReturnType<typeof voiceTaskReport>['counts']): string {
+	// Nothing asked for only when nothing is being sent either: at 17:13:24 the table was empty and one request was held.
+	if (rows.length === 0 && sending.length === 0) return 'The user has asked for no tasks by voice in the last few hours.';
 	const group = (label: string, pick: (r: VoiceTaskRow) => boolean) => {
 		const hit = rows.filter(pick);
 		return hit.length ? `${hit.length} ${label} (${hit.map((r) => `"${r.text.slice(0, 40)}"`).join(', ')})` : '';
 	};
 	const heard = heardByUser;
-	const c = voiceTaskCounts(rows);
-	const headline = `Pending: ${c.pending} the core is still working on${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}${c.unknown ? `; ${c.unknown} in an unknown state` : ''}. `;
+	const pending = c.sending
+		? `${c.pending} (${[c.working ? `${c.working} the core is still working on` : '', `${c.sending} being sent to the core`].filter(Boolean).join(', ')})`
+		: `${c.pending} the core is still working on`;
+	const headline = `Pending: ${pending}${c.doneNotHeard ? `; ${c.doneNotHeard} finished and not yet told to the user (say those first, they are not pending)` : ''}${c.unknown ? `; ${c.unknown} in an unknown state` : ''}. `;
 	const parts = [
+		sending.length ? `${sending.length} being sent to the core (${sending.map((e) => `"${e.task.slice(0, 40)}"`).join(', ')})` : '',
 		group('the core is working on', (r) => r.state === 'started' && !r.retired),
 		group('queued at the core', (r) => r.state === 'queued' && !r.retired),
 		group('cancelled', (r) => r.state === 'cancelled'),
@@ -937,7 +968,7 @@ export const getCoreStatusTool: ToolDefinition = {
 			// The user's own tasks come from the relay agent's table; the core's queue depth also counts
 			// other channels' tasks, cancel instructions and health checks, so it is not quoted to the user.
 			const rows = voiceTaskRows();
-			const queueNote = ` ${describeVoiceTasks(rows)}`;
+			const queueNote = ` ${voiceTaskReport(rows, voiceTasksBeingSent()).description}`;
 			const yourTasks = rows.map((r) => ({ id: r.id, task: r.text.slice(0, 60), state: r.state, heard: heardByUser(r) }));
 			if (!existsSync(corePath)) {
 				return { status: 'idle', yourTasks, description: 'Core agent is not currently running.' + queueNote };
