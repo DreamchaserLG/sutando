@@ -16,7 +16,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, readdirSync, readFileSync, existsSync, statSync, mkdirSync } from 'node:fs';
-import { join, extname, dirname, delimiter } from 'node:path';
+import { join, extname, dirname, delimiter, isAbsolute, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
 import { requirePython } from './python-binary.js';
@@ -66,10 +66,37 @@ import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool
 
 // --- File-open tool (moved out of recording-tools — generic file open, optionally fullscreen) ---
 
+/**
+ * Where open_file finds a path the core gave relative to the workspace or the repo. Results say
+ * "workspace/data/apps/x.html" in prose, and the model put "~/" in front to make it look absolute
+ * (2026-10-21 17:43:48: "~/workspace/data/apps/injury-recovery.html" missed under $HOME, and the model
+ * sent the core a work task that took 55 s). Only when the literal path misses: a relative or "~/" path
+ * is tried as <workspace>/<rel without a leading "workspace/">, <workspace>/<rel>, <repoRoot>/<rel>,
+ * and a candidate must stay inside its root ("../" does not climb out). Undefined when nothing is there.
+ */
+export function resolveOpenFilePath(raw: string, expanded: string, roots: { workspace: string; repoRoot?: string }): string | undefined {
+	if (existsSync(expanded)) return expanded;
+	let rel: string | undefined;
+	if (raw.startsWith('~/')) rel = raw.slice(2);
+	else if (!isAbsolute(raw) && !raw.startsWith('~') && !raw.startsWith('$')) rel = raw;
+	if (!rel) return undefined;
+	const candidates: Array<[string, string]> = [];
+	// The literal segment, whatever the workspace folder is called: results name it "workspace/".
+	if (rel.startsWith('workspace/')) candidates.push([roots.workspace, rel.slice('workspace/'.length)]);
+	candidates.push([roots.workspace, rel]);
+	if (roots.repoRoot) candidates.push([roots.repoRoot, rel]);
+	for (const [root, r] of candidates) {
+		const base = resolve(root);
+		const abs = resolve(base, r);
+		if (abs.startsWith(base + sep) && existsSync(abs)) return abs;
+	}
+	return undefined;
+}
+
 export const openFileTool: ToolDefinition = {
 	name: 'open_file',
 	description:
-		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). ALWAYS pass an absolute `path` (or one starting with $VAR / ~). ' +
+		'Open a file with the OS default handler (macOS: `open`, Windows: ShellExecute). Pass an absolute `path`, one starting with $VAR / ~, or a workspace-relative path exactly as a result gave it (e.g. workspace/data/apps/x.html); never put ~ in front of a relative path. ' +
 		'Use for: "open the file", "open that", "can you open it". ' +
 		'If the user says "open the log" or similar, ASK which log they mean (voice-agent, discord-bridge, etc.) — do NOT guess. ' +
 		'Known files: "diagnostic tracker" or "diagnostics" = /tmp/phone-diagnostics-tracker.html, ' +
@@ -78,7 +105,7 @@ export const openFileTool: ToolDefinition = {
 		'Pass `app` when the user names a specific app ("open with Sublime Text", "open the SQLite db in TablePlus") OR when recent conversation makes the intended app clear (e.g. user just said "I\'ll review this in VS Code"). Without `app`, the OS picks the default handler for that file type — leave unset when the default is fine. NOTE: the `app` argument is macOS-only; on Windows the file always opens with its default handler. ' +
 		'Pass `fullscreen=true` if the user wants the file opened in fullscreen — macOS sends Cmd+Ctrl+F to whichever app the OS routed the file to. Windows-only ignores this flag.',
 	parameters: z.object({
-		path: z.string().describe('Absolute file path to open.'),
+		path: z.string().describe('File path to open: absolute, $VAR / ~, or workspace-relative exactly as a result gave it (never prepend ~ to a relative path).'),
 		app: z.string().optional().describe('Optional app name (e.g. "Sublime Text", "VS Code", "TablePlus") to open the file with. If omitted, macOS uses its default handler for the file type. Set this when the user names an app explicitly OR recent conversation makes the intended app clear; otherwise leave unset.'),
 		fullscreen: z.boolean().optional().describe('If true, send Cmd+Ctrl+F to the default app right after opening — generic native-fullscreen toggle, works for any file type (video, PDF, image, web page).'),
 	}),
@@ -95,7 +122,7 @@ export const openFileTool: ToolDefinition = {
 			// silently-empty substitution flow through to a generic "file not
 			// found" error below.
 			const unresolvedVars: string[] = [];
-			const filePath = expandHome(path)
+			const expanded = expandHome(path)
 				.replace(/\$\{([A-Z_][A-Z0-9_]*)\}|\$([A-Z_][A-Z0-9_]*)/g, (_, a, b) => {
 					const name = a || b;
 					const val = process.env[name];
@@ -106,10 +133,14 @@ export const openFileTool: ToolDefinition = {
 				console.log(`${ts()} [OpenFile] path "${path}" has unset env var(s): ${unresolvedVars.join(', ')}`);
 				return { error: `Unresolved env var(s) in path: ${unresolvedVars.join(', ')}. Set them before calling open_file, or pass a fully-expanded absolute path.` };
 			}
-			if (!existsSync(filePath)) {
-				console.log(`${ts()} [OpenFile] path "${filePath}" does not exist`);
-				return { error: `File not found: ${filePath}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
+			const resolved = resolveOpenFilePath(path, expanded, { workspace: WORKSPACE_DIR, repoRoot: REPO_ROOT });
+			if (!resolved) {
+				console.log(`${ts()} [OpenFile] path "${expanded}" does not exist`);
+				return { error: `File not found: ${expanded}. Do not invent paths — use the exact path returned by the tool that produced the file (e.g. record_screen_with_narration returns subtitled_path/narrated_path/recording_path). For the most recent recording without a known path, call play_video instead.` };
 			}
+			if (resolved !== expanded) console.log(`${ts()} [OpenFile] resolved "${path}" -> ${resolved}`);
+			// The result names the file actually opened, so the model can say which one it was.
+			const filePath = resolved;
 			// execFileSync — no shell interpolation of caller-controlled filePath
 			// or caller-controlled app name (same CodeQL js/command-line-injection
 			// class as #27). Both are passed as separate argv entries, never spliced
