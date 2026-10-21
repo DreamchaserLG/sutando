@@ -164,6 +164,8 @@ describe('the relay agent lists each accepted call until its submit returns', ()
 		await settle();
 		await w.flush();
 		s.release();
+		await settle();
+		await w.flush(); // in the check, nothing being written: the row's change starts a write of its own
 		s.checkRelease();
 		await settle();
 		await w.flush();
