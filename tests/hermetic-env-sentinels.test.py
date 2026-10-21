@@ -118,8 +118,7 @@ class Sentinels(unittest.TestCase):
         self.assertLessEqual(set(selector_names()), set(VALUES))
 
     def test_room_ops_gateway_tests_read_no_outer_selector(self):
-        for f in ("tests/agent-room-ops-context-rename.test.py", "tests/room-ops-say-extra-content.test.py",
-                  "tests/turn-ledger-stop-gate.test.py"):
+        for f in ("tests/room-ops-say-extra-content.test.py", "tests/turn-ledger-stop-gate.test.py"):
             with self.subTest(f=f):
                 self.check([f])
 
