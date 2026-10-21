@@ -1,6 +1,6 @@
 // One answer is said once. Incidents from the non-blocking test, 2026-10-20 18:05-18:16 UTC (desktop voice-agent.log).
 // Run: npx tsx --test --test-force-exit tests/relay-agent-said-once.test.ts
-import { describe, it, after } from 'node:test';
+import { describe, it, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,8 @@ process.env.SUTANDO_TEST_MODE = '1';
 const MONTH = new Date().toISOString().slice(0, 7);
 for (const d of ['tasks', 'results', join('tasks', 'archive', MONTH), join('results', 'archive', MONTH), join('state', 'activity')]) mkdirSync(join(TMP, d), { recursive: true });
 
-const { RelayAgent, createVoiceTaskStore, DUPLICATE_WAITS, WORK_ACKNOWLEDGE } = await import('../src/relay-agent.js');
+const { RelayAgent, createVoiceTaskStore, createSpeechGate, relayAgentSubagentConfig, DUPLICATE_WAITS, WORK_ACKNOWLEDGE, QUIET_BEFORE_SUBMIT_MS } = await import('../src/relay-agent.js');
+const { PersistentSubagentManager } = await import('bodhi-realtime-agent');
 const { voiceTaskStore, reconcileVoiceTasks } = await import('../src/task-bridge.js');
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
@@ -83,5 +84,61 @@ describe('two tasks answered by one result: the answer is said once', () => {
 		// As the live delivery does: the task's waiting call takes it and the row is recorded handed over.
 		reconcileVoiceTasks((_text, _note, meta) => { owed.push(meta.taskId!); voiceTaskStore.set(meta.taskId!, 'injected'); }, () => false);
 		assert.deepEqual(owed.filter((id) => id === misheard || id === corrected).length, 1, `handed once, got ${owed.join(', ')}`);
+	});
+});
+
+describe('a request joined into the one the user went on to say is acknowledged once', () => {
+	it('the joined call closes silently through bodhi\'s dispatch; the later call\'s acknowledgement is the only one', async () => {
+		// 2026-10-21 17:12 nbe2e (ws-101157): "...made by Sonic China..." was joined into "Not Sonic China s o n i c h i".
+		// The joined call's "Say nothing about it" went back when_idle and the model answered it anyway: turn_5 "I'm
+		// looking into those" began at 17:12:26.25, before the later call was submitted (27.389), so before its notice;
+		// turn_6 "I will let you know" answered the notice.
+		mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+		try {
+			const settle = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+			const store = createVoiceTaskStore();
+			const notices: string[] = [];
+			const submitted: Record<string, unknown>[] = [];
+			const speech = createSpeechGate({ now: () => Date.now() });
+			const relay = new RelayAgent({
+				store,
+				speech,
+				notice: (t) => notices.push(t),
+				check: async () => ({ action: 'submit', lane: 'long' }),
+				submit: async (args) => { submitted.push(args); store.add('task-joined', String(args.task)); return { status: 'pending', taskId: 'task-joined', queuedAhead: 0, watcherOnline: true, message: 'm' }; },
+			});
+			// The session dispatches the work tool through the persistent-subagent manager.
+			const mgr = new PersistentSubagentManager();
+			const cfg = relayAgentSubagentConfig(relay);
+			await mgr.acquirePersistent('relay-agent', cfg, cfg.persistentFactory!);
+			speech.onUserSpeechStarted();
+			speech.onUserSpeechEnded(); // the provider ends the turn mid-sentence
+			const first = mgr.invokeWithScheduling('relay-agent', 'Execute tool: work', { task: 'Check the pull requests made by Sonic China in Sutando repository about AG2 Sparrow' });
+			await settle();
+			mock.timers.tick(500);
+			speech.onUserSpeechStarted(); // the user goes on: the correction
+			mock.timers.tick(1_000);
+			speech.onUserSpeechEnded();
+			const second = mgr.invokeWithScheduling('relay-agent', 'Execute tool: work', { task: 'Not Sonic China s o n i c h i sonichi' });
+			await settle();
+			mock.timers.tick(QUIET_BEFORE_SUBMIT_MS);
+			await settle();
+			const closed = await first;
+			assert.match(closed.text, /sent together with what they said next/);
+			assert.equal(closed.scheduling, 'silent', 'the joined call is closed without a turn of its own');
+			assert.equal(submitted.length, 1, 'one task for both');
+			assert.match(String(submitted[0].task), /cut off mid-sentence: "Check the pull requests made by Sonic China/);
+			assert.ok(relay.isWaiting('task-joined'), 'the later call waits for the result');
+			assert.equal(notices.filter((n) => n.includes(WORK_ACKNOWLEDGE)).length, 1, 'its notice is the one acknowledgement');
+			void second;
+			// Any other answer is delivered as before (when_idle), and invoke() still returns the text.
+			const ac = new AbortController();
+			ac.abort();
+			const notSent = await mgr.invokeWithScheduling('relay-agent', 'Execute tool: work', { task: 'check PR 5333' }, ac.signal);
+			assert.equal(notSent.scheduling, undefined);
+			assert.equal(typeof await relay.invoke('w', { task: 'check PR 5333' }, ac.signal), 'string');
+		} finally {
+			mock.timers.reset();
+		}
 	});
 });
