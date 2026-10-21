@@ -276,6 +276,8 @@ export const fromClient = (e?: SpeechEvent): boolean => e?.source !== 'provider'
 export interface SpeechGate {
 	onUserSpeechStarted(e?: SpeechEvent): void;
 	onUserSpeechEnded(e?: SpeechEvent): void;
+	/** bodhi dropped the open start (a blip, a reset): no end follows. */
+	onUserSpeechAborted(e?: SpeechEvent): void;
 	/** The model started speaking to the user. */
 	onModelAudio(): void;
 	/** Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. */
@@ -296,6 +298,8 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 	return {
 		onUserSpeechStarted(e) { if (!fromClient(e)) return; speaking = true; startedAt = now(); wake(); },
 		onUserSpeechEnded(e) { if (!fromClient(e)) return; speaking = false; endedAt = now(); wake(); },
+		// Not an end: the quiet time runs from the last real one (2026-10-21 17:42:45: a 43 ms blip held a work call to the 30 s cap).
+		onUserSpeechAborted(e) { if (!fromClient(e)) return; speaking = false; wake(); },
 		onModelAudio() { modelAudioAt = now(); wake(); },
 		waitTurnOver(signal) {
 			const since = now();
@@ -326,12 +330,17 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 export interface UserSpeechSink {
 	onUserSpeechStarted(e?: SpeechEvent): void;
 	onUserSpeechEnded(e?: SpeechEvent): void;
+	onUserSpeechAborted(e?: SpeechEvent): void;
 }
 
-/** Subscribes a listener to every user speech event bodhi publishes. One place, so the gate and the pacer hear the same events. */
+/**
+ * Subscribes a listener to every user speech event bodhi publishes. One place, so the gate and the pacer hear the
+ * same events: speech.user_aborted was wired in neither, and a dropped start held both until their caps.
+ */
 export function wireUserSpeech(bus: Pick<IEventBus, 'subscribe'>, sink: UserSpeechSink): void {
 	bus.subscribe('speech.user_started', (e) => sink.onUserSpeechStarted(e));
 	bus.subscribe('speech.user_ended', (e) => sink.onUserSpeechEnded(e));
+	bus.subscribe('speech.user_aborted', (e) => sink.onUserSpeechAborted(e));
 }
 
 /** The request a cut-off call sent, joined to the one the user went on to say. */
@@ -430,6 +439,12 @@ export function createHandoffPacer(deps: {
 			if (!fromClient(e)) return;
 			userSpeaking = false;
 			userEndedAt = now();
+			if (!current) pump();
+		},
+		/** A start bodhi dropped (no end follows): the user is not speaking, and the reply wait still runs from the last real end (2026-10-21 17:46:25). */
+		onUserSpeechAborted(e?: SpeechEvent): void {
+			if (!fromClient(e)) return;
+			userSpeaking = false;
 			if (!current) pump();
 		},
 		onTurnStart(): void {

@@ -1510,6 +1510,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 	wireUserSpeech(session.eventBus, {
 		onUserSpeechStarted: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechStarted(e); },
 		onUserSpeechEnded: (e) => { lastUserSpeechAt = Date.now(); speechGate.onUserSpeechEnded(e); },
+		onUserSpeechAborted: (e) => speechGate.onUserSpeechAborted(e),
 	});
 	session.eventBus.subscribe('response.first_audio', () => speechGate.onModelAudio());
 	// The relay's question for the user waits only while the model is speaking.
