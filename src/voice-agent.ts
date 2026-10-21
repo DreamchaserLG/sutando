@@ -1055,7 +1055,7 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 		// Every finished user turn too, whatever tool the voice model chose: is it a request for the core?
 		// A skill's tools answer some turns themselves (read_room): the check is told, so it does not send those to the core.
 		// What this turn's tools did and what was delivered: a claim with nothing behind it is caught (2026-10-21 17:39:23).
-		thisTurn: (userText) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText),
+		thisTurn: (userText, since) => thisTurnToolLines(sessionRef?.conversationContext.items ?? [], userText, since),
 		classify: RELAY_CHECK ? createGeminiTurnClassifier({ apiKey: () => GEMINI_VOICE_API_KEY, model: RELAY_CHECK.model, log: (m) => console.log(`${ts()} ${m}`), extraRules: personalVoiceSurface.turnCheckRules }) : undefined,
 		notice: (text) => { sessionRef?.tryPublishSystemNotification(text); },
 		// A question for the user is said as live input once the model stops speaking, not queued as a notification.

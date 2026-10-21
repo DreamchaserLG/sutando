@@ -281,8 +281,8 @@ export interface SpeechGate {
 	/** The model started speaking to the user. */
 	onModelAudio(): void;
 	/**
-	 * Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. Model audio at or after
-	 * `answeredSince` (default: the call) counts as the answer.
+	 * Resolves once the user's turn is over, or the hold limit or `signal` ends the wait. Model audio from the call on
+	 * counts as the answer; audio from `answeredSince` on counts only if the user began speaking after it (cut in on it).
 	 */
 	waitTurnOver(signal?: AbortSignal, answeredSince?: number): Promise<void>;
 }
@@ -312,8 +312,9 @@ export function createSpeechGate(opts: { quietMs?: number; maxHoldMs?: number; n
 				function look() {
 					const t = now();
 					if (signal?.aborted || t - since >= maxHoldMs) return done();
-					// The model answered: the user's turn is over, whatever the microphone picks up now.
-					if (modelAudioAt !== null && modelAudioAt >= (answeredSince ?? since)) return done();
+					// The model answered: the user's turn is over, whatever the microphone picks up now. Audio from before the
+					// wait answered it only if she cut in on it; audio over a sentence she was still saying did not.
+					if (modelAudioAt !== null && (modelAudioAt >= since || (answeredSince !== undefined && modelAudioAt >= answeredSince && startedAt > modelAudioAt))) return done();
 					// A speech start with no end (a sound too short to be speech) does not hold the call for good.
 					const stillSpeaking = speaking && t - startedAt < maxHoldMs;
 					const quietFrom = stillSpeaking ? null : (endedAt ?? 0) + quietMs;
@@ -503,23 +504,44 @@ const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…`
 export const TURN_TOOL_LINE_MAX = 200;
 const TURN_TOOL_ARGS_MAX = 120;
 
+/** A tool result as "ok", "ok: …" or "error: …". */
+function resultStatus(r: Record<string, unknown>): string {
+	const out = r.result as unknown;
+	const failed = out && typeof out === 'object' && (out as { ok?: unknown }).ok === false;
+	return typeof r.error === 'string' && r.error ? `error: ${oneLine(r.error)}`
+		: failed ? `error: ${String((out as { error?: unknown }).error ?? JSON.stringify(out))}`
+		: out === null || out === undefined ? 'ok'
+		: `ok: ${oneLine(typeof out === 'string' ? out : JSON.stringify(out))}`;
+}
+
 /**
- * What backs the assistant's words this turn: each tool call after the user's entry (`userText`, else the last real
- * user line) as "name {args} -> ok | error: … | no result yet", and each result or notice delivered to the model as
- * "delivered: …". Each line at most TURN_TOOL_LINE_MAX chars. The turn check compares the assistant's claims with
- * it (2026-10-21 17:39:23: "I've replaced the V2 plan…" with no tool call).
+ * What backs the assistant's words this turn: each tool call in it as "name {args} -> ok | error: … | no result yet",
+ * and each result or notice delivered to the model as "delivered: …", a result for a call of an earlier turn included
+ * (a `work` call's result comes back turns after the call). Each line at most TURN_TOOL_LINE_MAX chars. The turn check
+ * compares the assistant's claims with it (2026-10-21 17:39:23: "I've replaced the V2 plan…" with no tool call).
+ * The turn is what came after `since` (the end of the turn before) when the items are stamped: bodhi can write the
+ * user's line after the turn's tools when the transcription arrives late. Otherwise it starts at the user's entry
+ * (`userText`, else the last real user line).
  */
-export function thisTurnToolLines(items: ReadonlyArray<{ role?: string; content?: string }>, userText?: string): string {
+export function thisTurnToolLines(items: ReadonlyArray<{ role?: string; content?: string; timestamp?: number }>, userText?: string, since?: number): string {
 	const isUser = (i: { role?: string; content?: string }) => i.role === 'user' && !!i.content?.trim() && !isInjected(i.content);
-	let start = -1;
-	const want = userText?.trim();
-	if (want) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k]) && items[k].content!.trim() === want) start = k;
-	if (start < 0) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k])) start = k;
-	if (start < 0) return '';
+	let from = -1;
+	// The session's first turn (since 0) keeps the user-line start: items loaded from an earlier session are stamped too.
+	if (since && typeof items[items.length - 1]?.timestamp === 'number') {
+		from = items.findIndex((i) => typeof i.timestamp === 'number' && i.timestamp > since);
+		if (from < 0) return '';
+	} else {
+		let start = -1;
+		const want = userText?.trim();
+		if (want) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k]) && items[k].content!.trim() === want) start = k;
+		if (start < 0) for (let k = items.length - 1; k >= 0 && start < 0; k--) if (isUser(items[k])) start = k;
+		if (start < 0) return '';
+		from = start + 1;
+	}
 	const lines: Array<{ head: string; status: string }> = [];
 	const byId = new Map<string, { head: string; status: string }>();
 	const parse = (c: string | undefined): Record<string, unknown> | null => { try { const v = JSON.parse(c ?? ''); return v && typeof v === 'object' ? v : null; } catch { return null; } };
-	for (const item of items.slice(start + 1)) {
+	for (const item of items.slice(from)) {
 		const content = item.content ?? '';
 		if (item.role === 'tool_call') {
 			const c = parse(content);
@@ -529,14 +551,11 @@ export function thisTurnToolLines(items: ReadonlyArray<{ role?: string; content?
 			if (typeof c.toolCallId === 'string') byId.set(c.toolCallId, line);
 		} else if (item.role === 'tool_result') {
 			const r = parse(content);
-			const line = r && typeof r.toolCallId === 'string' ? byId.get(r.toolCallId) : undefined;
-			if (!r || !line) continue;
-			const out = r.result as unknown;
-			const failed = out && typeof out === 'object' && (out as { ok?: unknown }).ok === false;
-			line.status = typeof r.error === 'string' && r.error ? `error: ${oneLine(r.error)}`
-				: failed ? `error: ${String((out as { error?: unknown }).error ?? JSON.stringify(out))}`
-				: out === null || out === undefined ? 'ok'
-				: `ok: ${oneLine(typeof out === 'string' ? out : JSON.stringify(out))}`;
+			if (!r) continue;
+			const line = typeof r.toolCallId === 'string' ? byId.get(r.toolCallId) : undefined;
+			// A call from an earlier turn: its result reached the model now ("is it merged?" answered by it was called unbacked).
+			if (line) line.status = resultStatus(r);
+			else lines.push({ head: `delivered: ${String(r.toolName ?? '?')} result`, status: resultStatus(r) });
 		} else if ((item.role === 'user' || item.role === 'assistant') && isInjected(content)) {
 			lines.push({ head: `delivered: ${oneLine(content)}`, status: '' });
 		}
@@ -594,8 +613,8 @@ export interface RelayAgentDeps<O = unknown> {
 	recentConversation?: () => string;
 	/** Looks at every finished user turn, whatever tool the voice model chose: is it a request for the core? */
 	classify?: TurnClassifier;
-	/** This turn's tool calls and delivered results (thisTurnToolLines), from the turn whose user line is `userText`. */
-	thisTurn?: (userText: string) => string;
+	/** This turn's tool calls and delivered results (thisTurnToolLines): after `since`, the end of the turn before, whose user line is `userText`. */
+	thisTurn?: (userText: string, since: number) => string;
 	/** Has the voice model put a question to the user as soon as it stops speaking (falls back to `notice`). */
 	ask?: (text: string) => void;
 	/** Resolves when the session can take a reply: ACTIVE now, or at the next ACTIVE. A reply sent while a connection
@@ -745,9 +764,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		try {
 			while (this.turns.length) {
 				// One request may span several turns: wait until the user is done, then take them together.
-				// Model audio since the previous turn completed is the answer to this one: a turn reaches the check
-				// only when it completes, after the reply began, so audio after the wait began may never come (2026-10-21
-				// 17:38:45: the user cut in on the answer and the check waited the 30 s cap for her to stop).
+				// A reply the model began since the previous turn completed, and the user then cut in on, answers this
+				// one: a turn reaches the check only when it completes, after the reply began, so audio after the wait
+				// began may never come (2026-10-21 17:38:45: the check waited the 30 s cap for her to stop). A reply
+				// over a sentence she is still saying does not end it.
 				if (this.deps.speech) await this.deps.speech.waitTurnOver(undefined, this.lastTurnAt || undefined);
 				const taken = this.turns.splice(0);
 				const since = this.lastTurnAt;
@@ -758,9 +778,18 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 					utterance: taken.map((x) => x.text).join(' '),
 					recentConversation: this.deps.recentConversation?.() ?? '',
 					openTasks,
-					thisTurn: this.deps.thisTurn?.(taken[0].text) ?? '',
+					thisTurn: this.deps.thisTurn?.(taken[0].text, since) ?? '',
 				}).catch(() => ({ action: 'none' as const }));
 				if (this.tookTurn(since)) continue; // the voice model's own call came in while the check ran
+				// Judged early, said once she is quiet: a line put in at turn end talks over her. A newer turn is judged
+				// with her full words instead.
+				if ((verdict.action === 'ask' || verdict.action === 'unbacked') && this.deps.speech) {
+					await this.deps.speech.waitTurnOver();
+					if (this.turns.length || this.tookTurn(since)) {
+						this.deps.log?.(`[RelayAgent] turn check: the user went on; not asking about "${taken.map((x) => x.text).join(' ')}"`);
+						continue;
+					}
+				}
 				await this.actOnTurn(verdict, taken[0].origin);
 			}
 		} catch (err) {

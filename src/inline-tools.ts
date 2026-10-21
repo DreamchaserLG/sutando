@@ -70,21 +70,25 @@ import { setActiveArtifactTool, queryActiveArtifactTool, clearActiveArtifactTool
  * Where open_file finds a path the core gave relative to the workspace or the repo. Results say
  * "workspace/data/apps/x.html" in prose, and the model put "~/" in front to make it look absolute
  * (2026-10-21 17:43:48: "~/workspace/data/apps/injury-recovery.html" missed under $HOME, and the model
- * sent the core a work task that took 55 s). Only when the literal path misses: a relative or "~/" path
- * is tried as <workspace>/<rel without a leading "workspace/">, <workspace>/<rel>, <repoRoot>/<rel>,
- * and a candidate must stay inside its root ("../" does not climb out). Undefined when nothing is there.
+ * sent the core a work task that took 55 s). Only when the literal path misses: a relative path is tried as
+ * <workspace>/<rel without a leading "workspace/">, <workspace>/<rel>, <repoRoot>/<rel>; a "~/" path only as
+ * "~/workspace/…" in the workspace (any other "~/README.md" asked for the home folder, not the repo's file of that
+ * name). A candidate must stay inside its root ("../" does not climb out). Undefined when nothing is there.
  */
 export function resolveOpenFilePath(raw: string, expanded: string, roots: { workspace: string; repoRoot?: string }): string | undefined {
 	if (existsSync(expanded)) return expanded;
+	const home = raw.startsWith('~/');
 	let rel: string | undefined;
-	if (raw.startsWith('~/')) rel = raw.slice(2);
+	if (home) rel = raw.slice(2);
 	else if (!isAbsolute(raw) && !raw.startsWith('~') && !raw.startsWith('$')) rel = raw;
 	if (!rel) return undefined;
 	const candidates: Array<[string, string]> = [];
 	// The literal segment, whatever the workspace folder is called: results name it "workspace/".
 	if (rel.startsWith('workspace/')) candidates.push([roots.workspace, rel.slice('workspace/'.length)]);
-	candidates.push([roots.workspace, rel]);
-	if (roots.repoRoot) candidates.push([roots.repoRoot, rel]);
+	if (!home) {
+		candidates.push([roots.workspace, rel]);
+		if (roots.repoRoot) candidates.push([roots.repoRoot, rel]);
+	}
 	for (const [root, r] of candidates) {
 		const base = resolve(root);
 		const abs = resolve(base, r);
@@ -711,10 +715,16 @@ export const cancelTaskTool: ToolDefinition = {
 
 			// list mode: the user's open voice tasks with where each stands now, no cancel
 			if (list) {
+				// A request still held, checked or being sent is pending too, as get_task_status counts it (17:13:24).
 				const open = voiceTaskRows().filter((r) => r.state === 'queued' || r.state === 'started');
-				console.log(`${ts()} [CancelTask] list: ${open.length} open`);
-				if (open.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
-				return { status: 'pending_tasks', count: open.length, tasks: open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state })) };
+				const sending = voiceTasksBeingSent();
+				console.log(`${ts()} [CancelTask] list: ${open.length} open, ${sending.length} being sent`);
+				if (open.length === 0 && sending.length === 0) return { status: 'nothing_pending', count: 0, tasks: [] };
+				const tasks = [
+					...open.map((r) => ({ id: r.id, preview: r.text.slice(0, 60), state: r.state as string })),
+					...sending.map((e) => ({ preview: e.task.slice(0, 60), state: 'being sent' })),
+				];
+				return { status: 'pending_tasks', count: tasks.length, tasks };
 			}
 
 			// Targeting: by exact id, by query, or the latest open voice task.
