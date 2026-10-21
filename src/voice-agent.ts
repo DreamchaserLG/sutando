@@ -666,6 +666,8 @@ const mainAgentTools: ToolDefinition[] = [workTool, getTaskStatus, switchModeToo
  *  leaves those turns alone, so "cancel that task" is never also sent to the core. A status call is not one:
  *  a request the voice model routed to get_task_status still reaches the turn check. */
 const answeringTools = new Set([...personalVoiceSurface.answeringTools, 'cancel_task']);
+/** Tools that write what the user asked for (a page append): the turn check still judges the turn, even after a read. */
+const writingTools = new Set(personalVoiceSurface.writingTools);
 
 // Injection seam for the tuned factories in voice-agent-config.ts: this
 // module owns the session-gate + mode state; the config module owns the
@@ -1199,7 +1201,8 @@ function whenSessionActive(s: VoiceSession): Promise<void> {
 				// recordToolCall(). Pushing here would duplicate in
 				// session_events.
 				console.log(`${ts()} [Tool] ${e.toolName} (${e.execution})`);
-				if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
+				if (writingTools.has(e.toolName)) relayAgent.noteWritingTool(e.toolName);
+				else if (answeringTools.has(e.toolName)) relayAgent.noteAnsweringTool(e.toolName);
 				// Flag the web-client that a tool is in flight so the avatar
 				// can show the blue `.working` pulse and the menu bar can
 				// switch to the slow-deep-swing signature. `source=tool` pins

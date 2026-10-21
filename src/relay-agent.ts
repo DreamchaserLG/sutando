@@ -605,6 +605,10 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 
 	/** When the voice model last took a turn itself (`work`, or a tool that fetches the answer): the turn check does not send it again. */
 	private lastTakenAt = 0;
+	/** When the voice model last called `work`: a turn it sent is never judged again, whatever else it called. */
+	private lastWorkAt = 0;
+	/** When the voice model last wrote (a page append): that turn is judged even if a read also answered it. */
+	private lastWroteAt = 0;
 	/** When the work check last had the user asked: the next call's answer is sent as it is. */
 	/** When the user last finished a turn: a re-issued call before any user turn is an orphan, after one it is a repeat. */
 	private lastUserTurnAt = 0;
@@ -697,14 +701,14 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 				const taken = this.turns.splice(0);
 				const since = this.lastTurnAt;
 				this.lastTurnAt = taken[taken.length - 1].at;
-				if (this.lastTakenAt > since) continue; // the voice model took it itself
+				if (this.tookTurn(since)) continue; // the voice model took it itself
 				const openTasks = this.openTasks();
 				const verdict = await this.deps.classify!({
 					utterance: taken.map((x) => x.text).join(' '),
 					recentConversation: this.deps.recentConversation?.() ?? '',
 					openTasks,
 				}).catch(() => ({ action: 'none' as const }));
-				if (this.lastTakenAt > since) continue; // the voice model's own call came in while the check ran
+				if (this.tookTurn(since)) continue; // the voice model's own call came in while the check ran
 				await this.actOnTurn(verdict, taken[0].origin);
 			}
 		} catch (err) {
@@ -757,6 +761,20 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		this.deps.log?.(`[RelayAgent] ${name} answers this turn; the turn check sends nothing`);
 	}
 
+	/**
+	 * The voice model wrote something (write_page). Not an answer: asked to replace a page, it appended to it
+	 * (2026-10-21 17:36:55, 17:39:35), so the turn check still judges the turn, even after a read in it.
+	 */
+	noteWritingTool(name: string): void {
+		this.lastWroteAt = Date.now();
+		this.deps.log?.(`[RelayAgent] ${name} writes in this turn; the turn check still judges it`);
+	}
+
+	/** The voice model took the turn after `since`: its own work call, or an answering tool in a turn that wrote nothing. */
+	private tookTurn(since: number): boolean {
+		return this.lastWorkAt > since || (this.lastTakenAt > since && !(this.lastWroteAt > since));
+	}
+
 	/** What bodhi calls for the `work` tool: the answer and how it is delivered (a plain answer goes when_idle). */
 	async invokeWithScheduling(task: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<PersistentSubagentResult> {
 		const out = await this.run(task, args, signal);
@@ -775,7 +793,7 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		const flight: InFlightRequest = { task: String(args.task ?? ''), stage: this.deps.speech ? 'held' : 'checking' };
 		this.enterFlight(flight);
 		try {
-			this.lastTakenAt = Date.now();
+			this.lastTakenAt = this.lastWorkAt = Date.now();
 			const boundary = this.boundaries;
 			// Taken before the waits below: a room switch during them must not re-address the request.
 			let origin = this.deps.captureOrigin?.();
