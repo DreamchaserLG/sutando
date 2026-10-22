@@ -273,10 +273,10 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 	};
 	let modelTurnStartedAt = 0;
 	let modelSpokeInTurn = false;
-	/** The model is in a turn: a nudge due now waits for its end (the turn may be saying that very result). */
+	/** The model is in a turn: a nudge due now waits for its end (the turn may be saying that very result). A cut-off
+	 * turn needs nothing more: bodhi publishes turn.interrupted and then turn.end for it. */
 	let modelInTurn = false;
 	session.eventBus.subscribe('turn.start', () => { modelTurnStartedAt = Date.now(); modelSpokeInTurn = false; modelInTurn = true; });
-	session.eventBus.subscribe('turn.interrupted', () => { modelInTurn = false; });
 	// A fresh dial abandons the old connection's calls and whatever the model held unsaid: a result returned to a
 	// call, or handed to the pacer, is handed over again. A resume keeps the calls and the context, so RECONNECTING
 	// alone changes nothing here.
