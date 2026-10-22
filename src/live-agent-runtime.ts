@@ -61,7 +61,10 @@ export const RETURN_RELEASE_MS = 60_000;
 const EVIDENCE_STOP = new Set(['about', 'after', 'again', 'already', 'also', 'because', 'before', 'being', 'could', 'every', 'first', 'found', 'from', 'have', 'here', 'into', 'just', 'last', 'more', 'most', 'other', 'over', 'ready', 'result', 'results', 'said', 'should', 'since', 'some', 'than', 'that', 'their', 'them', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'under', 'until', 'very', 'were', 'what', 'when', 'where', 'which', 'while', 'will', 'with', 'would', 'your', 'task', 'done', 'request', 'user']);
 /** Short words that are never the noun a number counts: "2 and", "3 are", "1 for". */
 const COUNT_STOP = new Set(['and', 'are', 'but', 'for', 'has', 'had', 'its', 'not', 'nor', 'now', 'our', 'out', 'off', 'per', 'the', 'was', 'yet', 'you', 'ago', 'all', 'any', 'did', 'got', 'left', 'more', 'less', 'times']);
+/** How long or when, never what a result counts: "in three minutes", "two days ago" are said in turns about anything. */
+const TIME_UNITS = new Set(['second', 'sec', 'minute', 'min', 'hour', 'hr', 'day', 'week', 'month', 'year', 'percent', 'time']);
 const countStopped = (w: string) => EVIDENCE_STOP.has(w) || COUNT_STOP.has(w) || EVIDENCE_STOP.has(w.replace(/s$/, '')) || COUNT_STOP.has(w.replace(/s$/, ''));
+const notCountNoun = (w: string) => countStopped(w) || TIME_UNITS.has(w.replace(/s$/, ''));
 /** `phrases`: a small number with the one or two words after it ("3 pull requests", "1 new message", "5 tasks"). A
  *  number under 13 alone proves nothing, but said before the same words it is the answer: "you merged three pull
  *  requests" carries "3 pull requests". Both words must match, so an adjective ("new", "open") never stands for its noun. */
@@ -79,7 +82,7 @@ const evidenceOf = (text: string): ResultEvidence => {
 	for (const m of plain.toLowerCase().matchAll(/\b(\d{1,2})\s+([a-z][a-z'-]{2,})(?:[ \t]+([a-z][a-z'-]{2,}))?/g)) {
 		const [n, w] = [m[1], m[2].replace(/'s$|'$/, '')];
 		const next = m[3]?.replace(/'s$|'$/, '');
-		if (Number(n) >= 13 || countStopped(w)) continue;
+		if (Number(n) >= 13 || notCountNoun(w)) continue;
 		const p: [string, string, string?] = next && !countStopped(next) ? [n, w, next] : [n, w];
 		if (!phrases.some((q) => q.join(' ') === p.join(' '))) phrases.push(p);
 	}
