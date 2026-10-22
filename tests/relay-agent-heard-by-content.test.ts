@@ -23,6 +23,9 @@ const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const until = async (done: () => boolean, ms = 10_000) => { for (let w = 0; w < ms / 100 && !done(); w++) await tick(100); };
 
 const notices: string[] = [];
+/** Notices about one task (its request or its result): a test counts only its own, so one that fails leaves no
+ * nudge or hand-over that makes a later test fail too (they share one session). */
+const about = (s: string) => notices.filter((n) => n.includes(s)).length;
 const items: Array<{ role: string; content: string }> = [];
 const handlers: Record<string, Array<(e?: unknown) => void>> = {};
 const session = {
@@ -85,16 +88,15 @@ describe('a returned result is heard only when the model says it', () => {
 		await tick(0);
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The Use Case 03 video is a 38-second demo: a person and an agent edit one page; the agent formats the notes as a list and adds the missing video link.');
 		await Promise.race([call, tick(5_000)]);
-		const before = notices.length;
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		await tick(600); // past the nudge time, the model still speaking
-		assert.equal(notices.length, before, 'no nudge into a turn in progress');
+		assert.equal(about('Use Case 03'), 0, 'no nudge into a turn in progress');
 		items.push({ role: 'assistant', content: 'The Use Case three video shows a person and an agent collaborating on a document to format a list and add a video link.' });
 		session.emit('turn.end', { turnId: 'tu1' });
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 		await tick(100);
-		assert.equal(notices.length, before, 'and none after it: the turn said it');
+		assert.equal(about('Use Case 03'), 0, 'and none after it: the turn said it');
 	});
 
 	it('a nudge due mid-turn goes as soon as a turn ends without the result', async () => {
@@ -104,21 +106,18 @@ describe('a returned result is heard only when the model says it', () => {
 		await tick(0);
 		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The launch plan has four phases; the beta opens on November 12.');
 		await Promise.race([call, tick(5_000)]);
-		const before = notices.length;
 		session.emit('turn.start');
 		session.emit('response.first_audio');
 		await tick(600);
-		assert.equal(notices.length, before);
+		assert.equal(about('launch plan'), 0);
 		items.push({ role: 'assistant', content: 'Sure, here is a joke about skeletons.' });
 		session.emit('turn.end', { turnId: 'tu2' });
-		assert.equal(notices.length, before + 1, 'nudged once the turn ended');
-		assert.match(notices[notices.length - 1], /summarize the launch plan/);
+		assert.equal(about('summarize the launch plan'), 1, 'nudged once the turn ended');
 		modelSays('The launch plan has four phases and the beta opens on November 12.', 'tu3');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
 	it('a turn that carries a number from the result counts at once, with no nudge', async () => {
-		const before = notices.length;
 		const id = voiceTask('check PR 5617');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
 		const call = relay.invoke('Execute tool: work', { task: 'check PR 5617' });
@@ -128,7 +127,7 @@ describe('a returned result is heard only when the model says it', () => {
 		modelSays('Pull request 5617 was merged on Saturday.', 't4');
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 		await tick(600);
-		assert.equal(notices.length, before, 'no nudge for a result that was said');
+		assert.equal(about('5617'), 0, 'no nudge for a result that was said');
 	});
 
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
