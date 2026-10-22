@@ -117,6 +117,22 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
+	it('a nudge due during a turn with no speech (a tool call only) goes when that turn ends', async () => {
+		const id = voiceTask('list the open milestones');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'list the open milestones' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'Two milestones are open: Beta on November 12 and GA on December 3.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start');
+		await tick(600);
+		assert.equal(about('list the open milestones'), 0, 'no nudge into a turn in progress');
+		session.emit('turn.end', { turnId: 'tu-silent' });
+		assert.equal(about('list the open milestones'), 1, 'nudged as the silent turn ended, not one turn later');
+		modelSays('Two milestones are open: Beta on November 12 and GA on December 3.', 'tu-s2');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
 	it('a turn that carries a number from the result counts at once, with no nudge', async () => {
 		const id = voiceTask('check PR 5617');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
