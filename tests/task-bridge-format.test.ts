@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { buildVoiceTaskHeader, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool, voiceTasksAhead, _pendingTasksForTest } from '../src/task-bridge.js';
+import { buildVoiceTaskHeader, laneDirective, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool, voiceTasksAhead, _pendingTasksForTest } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
 import { localTimeValue } from '../src/local_time.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -59,6 +59,25 @@ describe('task-bridge workTool — PR #460 unified format', () => {
 		createdFiles.push(fn);
 		return fn;
 	}
+
+	it('a long task carries the lane directive in its body, after task: and before the spoken words', async () => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const result = await (workTool.execute as any)({ task: 'draw a picture of a cat', lane: 'long' }, null) as { taskId?: string };
+		assert.ok(result.taskId);
+		const fn = result.taskId + '.txt';
+		createdFiles.push(fn);
+		const content = readFileSync(join(TASK_DIR, fn), 'utf-8');
+		assert.match(content, /^lane: long$/m);
+		const taskAt = content.indexOf('\ntask: draw a picture of a cat');
+		const directiveAt = content.indexOf('--- lane: long (the relay\'s judgement; binding) ---');
+		assert.ok(taskAt > 0 && directiveAt > taskAt, 'the directive follows the task line');
+		const spokenAt = content.indexOf('--- spoken');
+		if (spokenAt >= 0) assert.ok(directiveAt < spokenAt, 'the directive comes before the spoken block');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const plain = await (workTool.execute as any)({ task: 'count the merged PRs' }, null) as { taskId?: string };
+		createdFiles.push(plain.taskId + '.txt');
+		assert.doesNotMatch(readFileSync(join(TASK_DIR, plain.taskId + '.txt'), 'utf-8'), /--- lane:/);
+	});
 
 	it('writes all 7 fields required by the Discord-bridge schema', async () => {
 		const fn = await invokeWorkTool('Test task from format unit test');
@@ -162,6 +181,20 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		].join('\n'));
 		assert.doesNotMatch(header, /^task:/m, 'the header is everything ABOVE task: — the caller appends it');
 		assert.doesNotMatch(header, /^(channel_kind|source_room_id):/m);
+	});
+
+	it('the lane directive spells the rule out in the body: long spawns a subagent that writes the result, quick runs now; no lane, nothing', () => {
+		const long = laneDirective('long');
+		assert.match(long, /^--- lane: long \(the relay's judgement; binding\) ---$/m);
+		assert.match(long, /Spawn a subagent for this task as you read it/);
+		assert.match(long, /writes this task's result file/);
+		assert.match(long, /written the moment the work is done, never held while another task runs/);
+		const quick = laneDirective('quick');
+		assert.match(quick, /^--- lane: quick \(the relay's judgement; binding\) ---$/m);
+		assert.match(quick, /Do it now, inline, before anything else/);
+		assert.equal(laneDirective(undefined), '');
+		// No line of the directive starts with a header key: the body guard must have nothing to defang.
+		for (const line of (long + quick).split('\n')) assert.doesNotMatch(line, /^(lane|task|id|priority|instructions|hint)\s*:/i);
 	});
 
 	it('the lane the check judged goes in above task:; no judgement, no line', () => {
