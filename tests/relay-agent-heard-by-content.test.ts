@@ -243,6 +243,19 @@ describe('resultEvidence / turnSaysResult', () => {
 		assert.deepEqual(resultEvidence('3 tasks.').phrases, [], 'a stop word stays stopped in the plural');
 	});
 
+	// Review of #5774: "three minutes" or "two days" is said in many a turn about something else; a time unit after a
+	// small number is how long or when, never the count a result is about.
+	it('a small number before a time unit is not the result said', () => {
+		const build = resultEvidence('Your build finished in 3 minutes.');
+		assert.equal(turnSaysResult('I will check back in three minutes.', build), false, 'minutes is not a noun the result counts');
+		assert.ok(turnSaysResult('Your build finished in three minutes.', build), 'the result\'s own words still count');
+		const due = resultEvidence('The Acme report is due in 2 days for the renewal.');
+		assert.equal(turnSaysResult('Remind me again in two days.', due), false, 'days is not a noun the result counts');
+		for (const unit of ['seconds', 'minute', 'hours', 'days', 'weeks', 'month', 'years', 'percent', 'times']) {
+			assert.deepEqual(resultEvidence(`It took 3 ${unit}.`).phrases, [], `3 ${unit} is not a count phrase`);
+		}
+	});
+
 	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
 		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
 		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);
