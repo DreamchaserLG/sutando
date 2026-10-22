@@ -28,13 +28,13 @@ writeFileSync(jpgAsPng, JPEG);
 const text = join(dir, 'notes.txt');
 writeFileSync(text, 'hello');
 
-function fake(fail?: string) {
+function fake(fail?: string, uploaded: Record<string, unknown> = { mxc: 'mxc://ag2.space/x' }) {
 	const calls: Array<{ action: string; args: Record<string, unknown>; room: unknown; op: unknown }> = [];
 	const client = {
 		async callTool(_n: string, a: Record<string, unknown>) {
 			calls.push({ action: String(a.action), args: a.arguments as Record<string, unknown>, room: a.room_id, op: a.operation_id });
 			if (a.action === fail) return { isError: true, structuredContent: { code: 'FORBIDDEN', message: 'not allowed here' } };
-			if (a.action === 'room.media.upload') return { structuredContent: { status: 'completed', result: { mxc: 'mxc://ag2.space/x' } } };
+			if (a.action === 'room.media.upload') return { structuredContent: { status: 'completed', result: uploaded } };
 			return { structuredContent: { status: 'completed', result: { file_id: 'f1234567' } } };
 		},
 		close() {},
@@ -58,6 +58,22 @@ describe('uploadMedia', () => {
 		assert.deepEqual(await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng }, fake('room.media.upload').client), { ok: false, error: 'FORBIDDEN', detail: 'not allowed here' });
 		const r = await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng }, fake('room.media.add').client) as { error: string; mxc?: string };
 		assert.deepEqual([r.error, r.mxc], ['FORBIDDEN', 'mxc://ag2.space/x']);
+	});
+
+	it('with --post, posted and event_id are what the server returned', async () => {
+		const f = fake(undefined, { mxc: 'mxc://ag2.space/x', event_id: '$e1' });
+		const r = await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, post: true }, f.client);
+		assert.equal(f.calls[0].args.post, true);
+		assert.ok(r.ok, JSON.stringify(r));
+		if (r.ok) assert.deepEqual([r.posted, r.event_id], [true, '$e1']);
+		const none = await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, post: true }, fake().client);
+		if (none.ok) assert.deepEqual([none.posted, none.event_id], [false, null]);
+		else assert.fail(JSON.stringify(none));
+	});
+
+	it('a listing refused after the picture was posted says it was posted, so a retry does not post it twice', async () => {
+		const r = await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, post: true }, fake('room.media.add', { mxc: 'mxc://ag2.space/x', event_id: '$e1' }).client);
+		assert.deepEqual(r, { ok: false, error: 'FORBIDDEN', detail: 'not allowed here', mxc: 'mxc://ag2.space/x', posted: true, event_id: '$e1' });
 	});
 
 	it('a bad room, folder, file or non-image sends nothing', async () => {
