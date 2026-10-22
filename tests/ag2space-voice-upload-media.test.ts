@@ -6,7 +6,7 @@
  */
 import { describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,7 +16,13 @@ if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => 
 if (PRESENT) {
 const { uploadMedia, sniffImage, fileName, parseArgs } = await import('../skills/ag2space-voice/scripts/upload-media.ts');
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(100, 7)]);
-const dir = mkdtempSync(join(tmpdir(), 'upload-media-'));
+// Under /tmp/sutando-, a prefix the shared attachment allowlist accepts; `outside` is not.
+const dir = mkdtempSync('/tmp/sutando-upload-media-');
+const outside = mkdtempSync(join(tmpdir(), 'upload-media-outside-'));
+const private_ = join(outside, 'screenshot.png');
+writeFileSync(private_, JPEG);
+const link = join(dir, 'innocent.png');
+symlinkSync(private_, link);
 const jpgAsPng = join(dir, 'pineapple.png');
 writeFileSync(jpgAsPng, JPEG);
 const text = join(dir, 'notes.txt');
@@ -60,6 +66,13 @@ describe('uploadMedia', () => {
 		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, folder: 'nope' }, f.client)) as { error: string }).error, 'bad_folder');
 		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: join(dir, 'missing.png') }, f.client)) as { error: string }).error, 'bad_file');
 		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: text }, f.client)) as { error: string }).error, 'not_an_image');
+		assert.equal(f.calls.length, 0);
+	});
+
+	it('a file outside the attachment allowlist, or a symlink out of an allowed root, is refused before any upload', async () => {
+		const f = fake();
+		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: private_ }, f.client)) as { error: string }).error, 'not_allowed');
+		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: link }, f.client)) as { error: string }).error, 'not_allowed');
 		assert.equal(f.calls.length, 0);
 	});
 });
