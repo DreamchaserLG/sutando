@@ -67,7 +67,7 @@ export function fileName(requested: string | undefined, path: string, ext: strin
 
 export type UploadResult =
 	| { ok: true; mxc: string; file_id: string | null; name: string; mime: string; bytes: number; sha256: string; folder_id: string | null; posted: boolean; event_id: string | null }
-	| { ok: false; error: string; detail?: string; mxc?: string };
+	| { ok: false; error: string; detail?: string; mxc?: string; posted?: boolean; event_id?: string | null };
 
 /** The server's own words for a refusal: its message, else the first line of a text reply. */
 function refusal(res: McpToolResult, payload: Record<string, unknown> | null): string | undefined {
@@ -109,13 +109,14 @@ export async function uploadMedia(opts: { room: string; file: string; name?: str
 	const eventId = typeof up.result.event_id === 'string' ? up.result.event_id : null;
 	if (!mxc) return { ok: false, error: 'no_mxc' };
 	const added = await execute(client, opts.room, 'room.media.add', { mxc, name, mime: kind.mime, folder_id: opts.folder ?? null });
-	if (!added.ok) return { ...added, mxc };
+	// The chat message already exists; saying so keeps a retry from posting the picture again.
+	if (!added.ok) return { ...added, mxc, ...(eventId ? { posted: true, event_id: eventId } : {}) };
 	return {
 		ok: true, mxc, name, mime: kind.mime, bytes: bytes.length,
 		file_id: typeof added.result.file_id === 'string' ? added.result.file_id : null,
 		sha256: createHash('sha256').update(bytes).digest('hex'),
 		folder_id: opts.folder ?? null,
-		posted: opts.post === true, event_id: eventId,
+		posted: eventId !== null, event_id: eventId,
 	};
 }
 
