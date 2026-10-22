@@ -183,6 +183,27 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(about('5617'), 0, 'no nudge for a result that was said');
 	});
 
+	it('a release due while the model is mid-turn waits for the turn to end', async () => {
+		// Handed over into a turn, the result lands on top of whatever the model is saying.
+		const id = voiceTask('how many seats are left on the flight');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'how many seats are left on the flight' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'There are 17 seats left on flight UA 857.');
+		await Promise.race([call, tick(5_000)]);
+		await until(() => about('how many seats are left') > 0, 3_000);
+		assert.equal(about('how many seats are left'), 1, 'nudged');
+		session.emit('turn.start');
+		session.emit('response.first_audio');
+		await tick(2_000); // past the release time, the model still speaking
+		assert.equal(about('17 seats left'), 0, 'not handed over into the turn');
+		items.push({ role: 'assistant', content: 'Anything else I can help with?' });
+		session.emit('turn.end', { turnId: 'tu-rel' });
+		await until(() => about('17 seats left') > 0, 3_000);
+		assert.equal(about('17 seats left'), 1, 'handed over again once the turn ended');
+		modelSays('There are 17 seats left on flight UA 857.', 'tu-rel2');
+	});
+
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
 		const id = voiceTask('how many tasks are open in the tracker');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
