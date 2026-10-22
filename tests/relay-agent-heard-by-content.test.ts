@@ -42,7 +42,7 @@ let submitted: Record<string, unknown> = {};
 const relay = new RelayAgent({ submit: async () => submitted, store: voiceTaskStore });
 setVoiceTaskEndedListener((taskId, why) => { relay.endCall(taskId, why); });
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300, handoffConfirmMs: 200, returnNudgeMs: 400, returnReleaseMs: 1_500 });
+wireDurableChannels(session as any, { relay, notReadyRetriesMs: [10, 10], reconcileMs: 300, handoffConfirmMs: 200, returnNudgeMs: 400, returnReleaseMs: 1_500, returnReleaseTurnWaitMs: 2_500 });
 
 let seq = 0;
 function voiceTask(text: string): string {
@@ -202,6 +202,22 @@ describe('a returned result is heard only when the model says it', () => {
 		await until(() => about('17 seats left') > 0, 3_000);
 		assert.equal(about('17 seats left'), 1, 'handed over again once the turn ended');
 		modelSays('There are 17 seats left on flight UA 857.', 'tu-rel2');
+	});
+
+	it('a turn that stays open does not hold the release for good', async () => {
+		const id = voiceTask('which room is the offsite in');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		const call = relay.invoke('Execute tool: work', { task: 'which room is the offsite in' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The offsite is in the Larkspur room on the fourth floor.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('turn.start'); // a turn held open, for example by a blocking call
+		await tick(3_000);
+		assert.equal(about('Larkspur'), 0, 'still waiting for the turn');
+		await until(() => about('Larkspur') > 0, 3_000);
+		assert.equal(about('Larkspur'), 1, 'handed over once the wait ran out, the turn still open');
+		session.emit('turn.end', { turnId: 'tu-open' });
+		modelSays('The offsite is in the Larkspur room on the fourth floor.', 'tu-open2');
 	});
 
 	it('still unsaid after the release time: handed over again by the reconcile loop', async () => {
