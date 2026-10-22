@@ -911,7 +911,7 @@ export function _forwardOfflineThenArchive(
 
 /** Every header line of a voice task above `task:`; one writer for the work and cancel tools. An
  *  origin-bound task stays `source: voice`, takes the target as `channel_id`, and adds the adapter's keys. */
-export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane): string {
+export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId: string, origin: VoiceSessionOrigin | null, lane?: WorkLane, routedTo?: string | null): string {
 	const lines = [
 		`id: ${taskId}`,
 		`timestamp: ${timestamp}`,
@@ -930,6 +930,9 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	// The relay's check judged it quick (one lookup, command or short generation) or long (building, writing,
 	// research): the core does a quick one at once and gives a long one to a subagent, so neither waits on the other.
 	if (lane) lines.push(`lane: ${lane}`);
+	// A long task goes to the long-lane worker when the pool has one (`longLaneWorker`): the router delivers on
+	// `requested_worker`, and the core never sees it. Without one the line is absent and the core takes it.
+	if (lane === 'long' && routedTo) lines.push(`requested_worker: ${routedTo}`);
 	lines.push(`user_id: ${ownerId}`, 'access_tier: owner', 'priority: urgent');
 	return lines.join('\n') + '\n';
 }
@@ -938,7 +941,12 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
  *  `lane: long` alone was read as advice: on 2026-10-22 the core drew a `lane: long` picture in its own lane,
  *  sent it at 21:48 and reported it at 21:52 together with an app build it had kept working on. Each line
  *  starts with `---` or a verb, never a header key, so the body guard has nothing to defang. */
-export function laneDirective(lane?: WorkLane): string {
+export function laneDirective(lane?: WorkLane, routedTo?: string | null): string {
+	if (lane === 'long' && routedTo) {
+		return '\n\n--- lane: long (the relay\'s judgement; routed to the long-lane worker) ---\n' +
+			'This task is yours alone: do it here, now, and write this task\'s result file, with python3 src/result_publish.py, ' +
+			'the moment the work is done. Nothing waits for a check or for another task.';
+	}
 	if (lane === 'long') {
 		return '\n\n--- lane: long (the relay\'s judgement; binding) ---\n' +
 			'Spawn a subagent for this task as you read it, in the background (Claude: the Agent tool with run_in_background: true), ' +
@@ -953,6 +961,39 @@ export function laneDirective(lane?: WorkLane): string {
 			'If it turns out to need building, writing or research, treat it as lane: long.';
 	}
 	return '';
+}
+
+/** The roster label of the worker that takes long voice tasks. `SUTANDO_VOICE_LONG_LANE_WORKER` names another
+ *  label, or `none` to keep every task on the core. */
+export const LONG_LANE_WORKER_LABEL = 'long-lane';
+export function longLaneWorkerLabel(env: NodeJS.ProcessEnv = process.env): string | null {
+	const v = (env.SUTANDO_VOICE_LONG_LANE_WORKER ?? '').trim();
+	if (v.toLowerCase() === 'none') return null;
+	return v || LONG_LANE_WORKER_LABEL;
+}
+/** The label when a worker on this roster carries it (as its label or display label); else null. Pure. */
+export function longLaneWorkerFrom(roster: unknown, label: string | null): string | null {
+	if (!label || !roster || typeof roster !== 'object') return null;
+	const workers = (roster as { workers?: unknown }).workers;
+	if (!workers || typeof workers !== 'object') return null;
+	for (const row of Object.values(workers as Record<string, unknown>)) {
+		if (!row || typeof row !== 'object') continue;
+		const r = row as { label?: unknown; display_label?: unknown };
+		if (r.label === label || r.display_label === label) return label;
+	}
+	return null;
+}
+/** The long-lane worker on the pool's roster (`<workspace>/state/roster.json`, the pool skill's artifact), or null
+ *  when there is no pool or no such worker. Read per task: a worker created mid-session is routed to at once. The
+ *  core did two `lane: long` pictures in its own lane on 2026-10-22 whatever the task said; a worker is not asked. */
+export function longLaneWorker(rosterPath: string = join(REPO_DIR, 'state', 'roster.json'), env: NodeJS.ProcessEnv = process.env): string | null {
+	const label = longLaneWorkerLabel(env);
+	if (!label) return null;
+	try {
+		return longLaneWorkerFrom(JSON.parse(readFileSync(rosterPath, 'utf-8')), label);
+	} catch {
+		return null;
+	}
 }
 
 /** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
@@ -1311,9 +1352,11 @@ export const workTool: ToolDefinition = {
 			// guidance line; without one the task keeps `channel_id: local-voice`.
 			const originGuidance = origin?.contextLine ? `\n${origin.contextLine.replace(/[\r\n]+/g, ' ')}` : '';
 			_rememberTaskOrigin(taskId, origin);
+			const routedTo = lane === 'long' ? longLaneWorker() : null;
+			if (routedTo) console.log(`${ts()} [TaskBridge] ${taskId}: lane long, addressed to the ${routedTo} worker`);
 			const content =
-				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
-				`task: ${confineUserContent(task)}${originGuidance}${laneDirective(lane)}${spokenBlock}${contextBlock}\n`;
+				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane, routedTo) +
+				`task: ${confineUserContent(task)}${originGuidance}${laneDirective(lane, routedTo)}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
 			_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry

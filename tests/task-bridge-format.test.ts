@@ -1,9 +1,9 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveWorkspace } from '../src/workspace_default.js';
-import { buildVoiceTaskHeader, laneDirective, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool, voiceTasksAhead, _pendingTasksForTest } from '../src/task-bridge.js';
+import { buildVoiceTaskHeader, laneDirective, longLaneWorker, longLaneWorkerFrom, longLaneWorkerLabel, LONG_LANE_WORKER_LABEL, queuedAheadInstruction, setVoiceSessionOrigin, getVoiceSessionOrigin, workTool, voiceTasksAhead, _pendingTasksForTest } from '../src/task-bridge.js';
 import { readQueueDepth } from '../src/inline-tools.js';
 import { localTimeValue } from '../src/local_time.js';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -212,6 +212,41 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		assert.equal(laneDirective(undefined), '');
 		// A body line that opens with a header key reads as a header to a lenient consumer; none may.
 		for (const line of (long + quick).split('\n')) assert.doesNotMatch(line, /^[A-Za-z_][A-Za-z0-9_]*:/);
+	});
+
+	it('a long task is addressed to the long-lane worker when the roster has one; the directive then says do it here', () => {
+		const roster = { version: 3, workers: { '7c54b230a8d94ea9b86f52d70134ac68': { label: 'long-lane' }, 'aaaa': { label: 'reviewer', display_label: 'Code reviewer' } } };
+		assert.equal(longLaneWorkerFrom(roster, 'long-lane'), 'long-lane');
+		assert.equal(longLaneWorkerFrom(roster, 'Code reviewer'), 'Code reviewer', 'a display label addresses too');
+		assert.equal(longLaneWorkerFrom(roster, 'painter'), null);
+		assert.equal(longLaneWorkerFrom(roster, null), null);
+		assert.equal(longLaneWorkerFrom({ workers: 'junk' }, 'long-lane'), null);
+		assert.equal(longLaneWorkerFrom(null, 'long-lane'), null);
+		assert.equal(longLaneWorkerLabel({}), LONG_LANE_WORKER_LABEL);
+		assert.equal(longLaneWorkerLabel({ SUTANDO_VOICE_LONG_LANE_WORKER: 'painter' }), 'painter');
+		assert.equal(longLaneWorkerLabel({ SUTANDO_VOICE_LONG_LANE_WORKER: 'none' }), null, '`none` keeps every task on the core');
+		// From disk: a roster file, a missing one, a malformed one.
+		const dir = mkdtempSync(join(tmpdir(), 'lane-roster-'));
+		try {
+			const file = join(dir, 'roster.json');
+			assert.equal(longLaneWorker(file, {}), null, 'no roster, no worker');
+			writeFileSync(file, JSON.stringify(roster));
+			assert.equal(longLaneWorker(file, {}), 'long-lane');
+			assert.equal(longLaneWorker(file, { SUTANDO_VOICE_LONG_LANE_WORKER: 'none' }), null);
+			writeFileSync(file, '{not json');
+			assert.equal(longLaneWorker(file, {}), null);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+		const header = buildVoiceTaskHeader('task-6', TS, 'owner-1', null, 'long', 'long-lane');
+		assert.match(header, /^lane: long\nrequested_worker: long-lane\nuser_id: owner-1$/m, 'addressed right under the lane, above task:');
+		assert.doesNotMatch(buildVoiceTaskHeader('task-7', TS, 'owner-1', null, 'quick', 'long-lane'), /requested_worker/, 'a quick task stays with the core');
+		assert.doesNotMatch(buildVoiceTaskHeader('task-8', TS, 'owner-1', null, 'long', null), /requested_worker/);
+		const routed = laneDirective('long', 'long-lane');
+		assert.match(routed, /^--- lane: long \(the relay's judgement; routed to the long-lane worker\) ---$/m);
+		assert.match(routed, /This task is yours alone: do it here, now/);
+		assert.doesNotMatch(routed, /Spawn a subagent/);
+		for (const line of routed.split('\n')) assert.doesNotMatch(line, /^[A-Za-z_][A-Za-z0-9_]*:/);
 	});
 
 	it('the lane the check judged goes in above task:; no judgement, no line', () => {

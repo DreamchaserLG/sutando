@@ -31,6 +31,21 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
+## The long-lane worker for voice
+
+A voice task the relay judges `lane: long` (building, writing, research, a picture) is addressed
+to the worker labelled `long-lane` when the roster has one — the voice bridge writes
+`requested_worker: long-lane` above `task:` and the router delivers it there, so the core's own
+lane stays free for quick tasks and nothing waits behind an app build. Create it once, from the
+checkout the core runs:
+
+```bash
+python3 skills/worker-pool/scripts/create_worker.py --folder "$PWD" --label long-lane
+```
+
+`SUTANDO_VOICE_LONG_LANE_WORKER` names another label, or `none` keeps every task on the core.
+With no such worker the line is absent and the core takes the task, as before.
+
 ## Codex CLI workers
 
 `python3 skills/worker-pool/scripts/create_worker.py --runtime codex --folder
