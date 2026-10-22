@@ -10,15 +10,45 @@
  *
  * Prints one JSON line: {"ok":true,"mxc","file_id","name","mime","bytes","sha256","folder_id","posted","event_id"} or {"ok":false,"error",...}.
  */
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolvePython } from '../../../src/python-binary.js';
 import { createMcpStdioClient, findAg2SpaceMcpEntry, mcpPayload, type McpClient, type McpToolResult } from '../room-read.js';
 
 /** room.media.add's limit, the media read cap. */
 export const MAX_BYTES = 25 * 1024 * 1024;
 const CALL_TIMEOUT_MS = 120_000;
+
+const SRC_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'src');
+// The bridge's [file:] route and this one must refuse the same paths, so this runs that policy rather than a copy of it.
+const POLICY_PY = [
+	'import json, os, sys',
+	'sys.path.insert(0, sys.argv[1])',
+	'from policy.egress.attachment import classify_attachment',
+	'outcome, path = classify_attachment(sys.argv[2])',
+	'print(json.dumps({"outcome": outcome, "real": os.path.realpath(path) if path else ""}))',
+].join('\n');
+
+export type PathCheck = (file: string) => { ok: true; real: string } | { ok: false; error: string; detail: string };
+
+/** src/policy/egress/attachment.py's verdict on `file`: its real path when sendable, else why not. */
+export function sendablePath(file: string): ReturnType<PathCheck> {
+	const py = resolvePython();
+	if (!py) return { ok: false, error: 'no_policy', detail: 'no python3 to run the attachment policy' };
+	let verdict: { outcome?: string; real?: string };
+	try {
+		const out = execFileSync(py, ['-c', POLICY_PY, SRC_DIR, file], { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
+		verdict = JSON.parse(out.trim().split('\n').pop() ?? '{}');
+	} catch (err) {
+		return { ok: false, error: 'no_policy', detail: err instanceof Error ? err.message.split('\n')[0] : String(err) };
+	}
+	if (verdict.outcome === 'send' && verdict.real) return { ok: true, real: verdict.real };
+	if (verdict.outcome === 'refused') return { ok: false, error: 'not_allowed', detail: 'not under an allowed root (src/policy/egress/attachment.py); generated images in <workspace>/results/media are' };
+	return { ok: false, error: 'bad_file', detail: `no such file: ${file}` };
+}
 
 /** The type read from the bytes, never from the name: a JPEG saved as .png is still a JPEG. */
 export function sniffImage(b: Buffer): { mime: string; ext: string } | null {
@@ -56,13 +86,16 @@ async function execute(client: McpClient, room: string, action: string, args: Re
 	return { ok: true, result: (payload.result ?? payload) as Record<string, unknown> };
 }
 
-export async function uploadMedia(opts: { room: string; file: string; name?: string; folder?: string; post?: boolean }, client: McpClient): Promise<UploadResult> {
+export async function uploadMedia(opts: { room: string; file: string; name?: string; folder?: string; post?: boolean }, client: McpClient, check: PathCheck = sendablePath): Promise<UploadResult> {
 	if (!/^![^:\s]+:\S+$/.test(opts.room)) return { ok: false, error: 'bad_room', detail: 'pass the room id, e.g. !abc:ag2.space' };
 	if (opts.folder && !/^[a-z0-9]{8}$/.test(opts.folder)) return { ok: false, error: 'bad_folder', detail: 'a folder id is 8 lowercase letters or digits' };
+	const allowed = check(opts.file);
+	if (!allowed.ok) return allowed;
+	// Read the path the policy resolved, so a symlink swapped after the check is not followed.
 	let bytes: Buffer;
 	try {
-		if (statSync(opts.file).size > MAX_BYTES) return { ok: false, error: 'too_large', detail: `over ${MAX_BYTES} bytes` };
-		bytes = readFileSync(opts.file);
+		if (statSync(allowed.real).size > MAX_BYTES) return { ok: false, error: 'too_large', detail: `over ${MAX_BYTES} bytes` };
+		bytes = readFileSync(allowed.real);
 	} catch (err) {
 		return { ok: false, error: 'bad_file', detail: err instanceof Error ? err.message : String(err) };
 	}
