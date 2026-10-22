@@ -9,8 +9,11 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
   relay makes this call before the task reaches you and writes it in the header: `lane: long`
   (building, writing, research, a picture to generate, many steps) → spawn the subagent as soon as
   you read the task and let it write the result file; `lane: quick` (one lookup, command, count,
-  message, file sent) → do it inline, now, before anything else. A header without a lane counts as long when the queue is
-  busy. One long Write run inline held three quick tasks for five minutes.
+  message, file sent) → do it inline, now, before anything else. The task body repeats the lane as a binding
+  rule. Whoever does the work writes the result file the moment it is done; a finished result is never held
+  while another task runs. A header without a lane counts as long when the queue is busy. One long Write run
+  inline held three quick tasks for five minutes; one picture drawn in the main lane was sent at 21:48 and
+  reported at 21:52 with an app build (2026-10-22).
 - A task splits into two or more independent workstreams where parallelism materially cuts latency.
 - The work is **heavy**: sustained work that would hold this thread for more than a few minutes
   (investigations, test runs, scans, long reviews), or that would consume the main session's context:
@@ -30,8 +33,12 @@ or self-development gates.
 ## Bounded scope and checkpoint
 
 A spawned worker gets a bounded brief: scope (one question or deliverable), the files it may touch,
-and what it must not do. It also gets a checkpoint: when it reports back. The main thread verifies
-the result before reporting it; a subagent's "done" is a claim, not evidence.
+and what it must not do. It also gets a checkpoint: when it reports back. For a voice task with
+`lane: long` the subagent writes the task's result file itself, the moment the work is done
+(`python3 src/result_publish.py`), and reports back after; the main thread's check follows the
+result, and a wrong one is corrected with a second result, never held back for the check (holding it
+is the 21:48/21:52 incident). Elsewhere the main thread verifies the result before reporting it; a
+subagent's "done" is a claim, not evidence.
 
 If there is no capacity to spawn, see "When no delegation mechanism is available" below.
 

@@ -84,6 +84,7 @@ describe('the session-end task', () => {
 		assert.match(body, /^priority: low$/m);
 		assert.match(body, /^task: VOICE_SESSION_ENDED:/m);
 		assert.match(body, /--- the session's spoken lines[^\n]*---\n[\s\S]*user: check PR 5308/);
+		assert.doesNotMatch(body, /--- lane:/, 'a session-end task carries no lane directive');
 		assert.equal(readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt')).length, 1);
 	});
 

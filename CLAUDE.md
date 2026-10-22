@@ -18,8 +18,10 @@ reason TO delegate, not to hand it back. If no mechanism is available, do it inl
 never report work as delegated when nothing was spawned. Heavy work (defined in `docs/subagent-delegation.md`) also goes to a
 subagent unasked, with the quota tier in mind (little or none when the budget is tight); if you keep it, run it inline and say so. A voice task header's `lane: long` is the
 same trigger, judged by the relay before the task reaches you: spawn the subagent as you read the task;
-`lane: quick` is done inline, now. Escapes, model choice, lanes, per-runtime mechanism and the do-not-delegate list:
-`docs/subagent-delegation.md`.
+`lane: quick` is done inline, now. Either way the result file is written the moment the work is done, never
+held while another task runs (2026-10-22: a `lane: long` picture drawn in the main lane was sent at 21:48 and
+reported at 21:52, together with an app build the core had kept working on). Escapes, model choice, lanes,
+per-runtime mechanism and the do-not-delegate list: `docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
 error, a code identifier, a term with no good translation), say so in one clause. A stated
@@ -103,7 +105,7 @@ This applies to all work — proactive loop passes, voice tasks, user requests, 
 
 ## Chat-path task tracking (issue #585)
 
-> **Core-only — automation/one-shot agents MUST skip this and every other runtime-operational section below** (task/result writing, the task watcher, the proactive loop, status/heartbeat/liveness writes). These mechanics belong to the *single live Sutando core* that owns this checkout. If you are instead a scheduled or one-shot agent that merely opened this repo — a Codex/Claude **review** automation, a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd — you are a **guest in this checkout, not the core**: do NOT write `task-*` / `task-chat-*` / `results/` files, do NOT start the watcher, do NOT run the proactive loop, do NOT write `state/` liveness. Doing so injects fake tasks into the core's queue that it will process as real owner requests. (2026-07-11 incident: a Codex automation with `cwds=[this repo]` auto-loaded AGENTS.md and self-wrote a `task-chat` every 10 min; the core swallowed each one. Fix: run such automations in an isolated `/private/tmp` worktree with no repo cwd, per the safe pattern.)
+> **Core-only — automation/one-shot agents MUST skip this and every other runtime-operational section below** (task/result writing, the task watcher, the proactive loop, status/heartbeat/liveness writes). These mechanics belong to the *single live Sutando core* that owns this checkout. If you are instead a scheduled or one-shot agent that merely opened this repo — a Codex/Claude **review** automation, a `codex exec`/headless run, a PR-review or branch-hygiene cron, or any agent that auto-loaded this file by virtue of the repo being your cwd — you are a **guest in this checkout, not the core**: do NOT write `task-*` / `task-chat-*` / `results/` files (a subagent the core spawned for a task file is the core's hand, not a guest: it writes that task's `results/<id>.txt`), do NOT start the watcher, do NOT run the proactive loop, do NOT write `state/` liveness. Doing so injects fake tasks into the core's queue that it will process as real owner requests. (2026-07-11 incident: a Codex automation with `cwds=[this repo]` auto-loaded AGENTS.md and self-wrote a `task-chat` every 10 min; the core swallowed each one. Fix: run such automations in an isolated `/private/tmp` worktree with no repo cwd, per the safe pattern.)
 
 When you accept a non-trivial commitment from the user via **chat** (direct text input, not through voice/Discord/Telegram bridges), write a task file so the dashboard can track it.
 
