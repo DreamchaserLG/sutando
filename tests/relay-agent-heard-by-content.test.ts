@@ -117,6 +117,43 @@ describe('a returned result is heard only when the model says it', () => {
 		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
 	});
 
+	it('a result returned while the model is mid-turn counts when that turn says it: no nudge after it', async () => {
+		// The turn that calls the tool goes on and says the answer once it is back; on a turn longer than the
+		// nudge time, the nudge held for its end would have it said a second time.
+		const id = voiceTask('when is the design review');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		session.emit('turn.start');
+		await tick(5);
+		const call = relay.invoke('Execute tool: work', { task: 'when is the design review' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The design review is on Thursday afternoon in the Juniper room.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('response.first_audio');
+		await tick(600);
+		items.push({ role: 'assistant', content: 'The design review is Thursday afternoon, in the Juniper room.' });
+		session.emit('turn.end', { turnId: 'tu-mid' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken', 'the turn said it');
+		await tick(100);
+		assert.equal(about('design review'), 0, 'no nudge');
+	});
+
+	it('a result returned mid-turn is not heard by a turn that says something else', async () => {
+		const id = voiceTask('what is the wifi password');
+		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
+		session.emit('turn.start');
+		await tick(5);
+		const call = relay.invoke('Execute tool: work', { task: 'what is the wifi password' });
+		await tick(0);
+		writeFileSync(join(TMP, 'results', `${id}.txt`), 'The guest wifi password is marigold-harbor.');
+		await Promise.race([call, tick(5_000)]);
+		session.emit('response.first_audio');
+		items.push({ role: 'assistant', content: 'Let me look that up for you.' });
+		session.emit('turn.end', { turnId: 'tu-mid2' });
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'injected');
+		modelSays('The guest wifi password is marigold-harbor.', 'tu-mid3');
+		assert.equal(voiceTaskStore.get(id)?.delivery, 'spoken');
+	});
+
 	it('a nudge due during a turn with no speech (a tool call only) goes when that turn ends', async () => {
 		const id = voiceTask('list the open milestones');
 		submitted = { status: 'pending', taskId: id, queuedAhead: 0, watcherOnline: true };
