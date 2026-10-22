@@ -129,7 +129,7 @@ def report(made: dict, roster: dict, room, orphans: list) -> str:
         f"  label     {made.get('label') or made['worker_id']}",
         f"  folder    {made.get('cwd', '?')}",
         f"  delivery  {made.get('delivery_dir', '?')}",
-        f"  session   tmux -S {tmux.get('socket', '?')} attach -t {tmux.get('session_name', '?')}",
+        f"  session   {sw.attach_command(tmux.get('socket', '?'), tmux.get('session_name', '?'))}",
         f"  roster    v{roster['version']} ({len(roster['workers'])} worker(s))",
     ]
     lines.append(f"  room      {room}" if room else
