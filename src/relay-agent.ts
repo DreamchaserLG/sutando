@@ -1101,7 +1101,11 @@ export class RelayAgent<O = unknown> implements PersistentSubagentInstance {
 		}
 	}
 
-	/** Whether the model spoke in the call's turn, decided once that turn is over (or after ASK_WAIT_MAX_MS). */
+	/**
+	 * Whether the model spoke in the call's turn, decided once that turn is over (or after ASK_WAIT_MAX_MS). Any speech
+	 * counts, even about something else: no verdict on what it said exists here (the turn check skips a turn the
+	 * model's own work call took), and a second "I'm on it" is the louder failure (2026-10-21 18:56:42).
+	 */
 	private async spokeIn(mark: TurnMark): Promise<boolean> {
 		if (!mark.ended) {
 			let timer: ReturnType<typeof setTimeout> | undefined;
