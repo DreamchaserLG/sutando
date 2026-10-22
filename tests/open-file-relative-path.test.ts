@@ -7,7 +7,7 @@
  * Nothing is opened on the test machine: `open` (and `xdg-open`) on PATH are stubs that record their argv,
  * HOME and the workspace are temp dirs.
  *
- * Run: npx tsx --test --test-force-exit tests/open-file-relative-path.test.ts
+ * Run: npx tsx --test tests/open-file-relative-path.test.ts
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -37,7 +37,8 @@ process.env.SUTANDO_WORKSPACE = WS;
 process.env.HOME = HOME;
 process.env.PATH = `${BIN}:${process.env.PATH}`;
 
-const mod = await import('../src/inline-tools.js');
+// Not inline-tools.js: its load imports every skill, and one with a live connection kept the run from exiting.
+const mod = await import('../src/open-file-tool.js');
 const { openFileTool } = mod;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const resolveOpenFilePath = (mod as any).resolveOpenFilePath as (raw: string, expanded: string, roots: { workspace: string; repoRoot?: string }) => string | undefined;
