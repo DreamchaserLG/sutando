@@ -18,8 +18,10 @@ const { voiceTaskStore, reconcileVoiceTasks } = await import('../src/task-bridge
 
 after(() => rmSync(TMP, { recursive: true, force: true }));
 const tick = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// A broken store can leave a call waiting for good: the test fails instead of holding the run open.
+const TIMEOUT = 10_000;
 
-describe('a request found already open is acknowledged once', () => {
+describe('a request found already open is acknowledged once', { timeout: TIMEOUT }, () => {
 	it('when another call already waits for that task, the call\'s own answer is the only acknowledgement', async () => {
 		// 18:08:26 "not Sonic China, S O N I C H I" was found a duplicate of the open task; the model got the
 		// "already sent" text twice (a notice and the call's answer) and said "I've updated the request…" twice.
@@ -58,7 +60,7 @@ describe('a request found already open is acknowledged once', () => {
 	});
 });
 
-describe('two tasks answered by one result: the answer is said once', () => {
+describe('two tasks answered by one result: the answer is said once', { timeout: TIMEOUT }, () => {
 	it('heard through either task, the task it shares the answer with is heard too', () => {
 		const store = createVoiceTaskStore();
 		store.add('task-misheard', 'Check the pull requests made by sonic-china');
