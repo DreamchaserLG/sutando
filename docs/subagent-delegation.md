@@ -9,8 +9,11 @@ Extends the CLAUDE.md rule that "at background" / "in parallel" means SPAWN A SU
   relay makes this call before the task reaches you and writes it in the header: `lane: long`
   (building, writing, research, a picture to generate, many steps) → spawn the subagent as soon as
   you read the task and let it write the result file; `lane: quick` (one lookup, command, count,
-  message, file sent) → do it inline, now, before anything else. A header without a lane counts as long when the queue is
-  busy. One long Write run inline held three quick tasks for five minutes.
+  message, file sent) → do it inline, now, before anything else. The task body repeats the lane as a binding
+  rule. Whoever does the work writes the result file the moment it is done; a finished result is never held
+  while another task runs. A header without a lane counts as long when the queue is busy. One long Write run
+  inline held three quick tasks for five minutes; one picture drawn in the main lane was sent at 21:48 and
+  reported at 21:52 with an app build (2026-10-22).
 - A task splits into two or more independent workstreams where parallelism materially cuts latency.
 - The work is **heavy**: sustained work that would hold this thread for more than a few minutes
   (investigations, test runs, scans, long reviews), or that would consume the main session's context:

@@ -18,8 +18,10 @@ reason TO delegate, not to hand it back. If no mechanism is available, do it inl
 never report work as delegated when nothing was spawned. Heavy work (defined in `docs/subagent-delegation.md`) also goes to a
 subagent unasked, with the quota tier in mind (little or none when the budget is tight); if you keep it, run it inline and say so. A voice task header's `lane: long` is the
 same trigger, judged by the relay before the task reaches you: spawn the subagent as you read the task;
-`lane: quick` is done inline, now. Escapes, model choice, lanes, per-runtime mechanism and the do-not-delegate list:
-`docs/subagent-delegation.md`.
+`lane: quick` is done inline, now. Either way the result file is written the moment the work is done, never
+held while another task runs (2026-10-22: a `lane: long` picture drawn in the main lane was sent at 21:48 and
+reported at 21:52, together with an app build the core had kept working on). Escapes, model choice, lanes,
+per-runtime mechanism and the do-not-delegate list: `docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted
 error, a code identifier, a term with no good translation), say so in one clause. A stated

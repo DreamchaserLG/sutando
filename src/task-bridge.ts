@@ -934,6 +934,23 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 	return lines.join('\n') + '\n';
 }
 
+/** The relay's lane, spelled out in the task body as the rule the core follows for it. The header line
+ *  `lane: long` alone was read as advice: on 2026-10-22 the core drew a `lane: long` picture in its own lane,
+ *  sent it at 21:48 and reported it at 21:52 together with an app build it had kept working on. Each line
+ *  starts with `---` or a verb, never a header key, so the body guard has nothing to defang. */
+export function laneDirective(lane?: WorkLane): string {
+	if (lane === 'long') {
+		return '\n\n--- lane: long (the relay\'s judgement; binding) ---\n' +
+			'Spawn a subagent for this task as you read it: the subagent does the work and writes this task\'s result file, ' +
+			'and your own lane stays free for quick tasks. The result is written the moment the work is done, never held while another task runs.';
+	}
+	if (lane === 'quick') {
+		return '\n\n--- lane: quick (the relay\'s judgement; binding) ---\n' +
+			'Do it now, inline, before anything else, and write this task\'s result the moment it is done.';
+	}
+	return '';
+}
+
 /** Tells the core a voice session ended: its facts as the task line, its spoken lines below. Low priority. */
 export async function submitVoiceSessionEndTask(summary: string, transcript: string): Promise<string> {
 	const taskId = `task-${Date.now()}`;
@@ -1292,7 +1309,7 @@ export const workTool: ToolDefinition = {
 			_rememberTaskOrigin(taskId, origin);
 			const content =
 				buildVoiceTaskHeader(taskId, timestamp, ownerId, origin, lane) +
-				`task: ${confineUserContent(task)}${originGuidance}${spokenBlock}${contextBlock}\n`;
+				`task: ${confineUserContent(task)}${originGuidance}${laneDirective(lane)}${spokenBlock}${contextBlock}\n`;
 			await _delegation.submitTask(taskId, content);
 		} catch (err) {
 			_pendingTasks.delete(taskId);   // nothing was written: the reservation must not dedup a retry
