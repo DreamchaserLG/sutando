@@ -6,7 +6,7 @@
  */
 import { describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,7 +14,7 @@ const PRESENT = existsSync(join(process.cwd(), 'skills', 'ag2space-voice', 'scri
 if (!PRESENT) test('ag2space-voice plugin not installed', { skip: true }, () => {});
 
 if (PRESENT) {
-const { uploadMedia, sniffImage, fileName, parseArgs } = await import('../skills/ag2space-voice/scripts/upload-media.ts');
+const { uploadMedia, sniffImage, fileName, parseArgs, MAX_BYTES } = await import('../skills/ag2space-voice/scripts/upload-media.ts');
 const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(100, 7)]);
 // Under /tmp/sutando-, a prefix the shared attachment allowlist accepts; `outside` is not.
 const dir = mkdtempSync('/tmp/sutando-upload-media-');
@@ -74,6 +74,25 @@ describe('uploadMedia', () => {
 	it('a listing refused after the picture was posted says it was posted, so a retry does not post it twice', async () => {
 		const r = await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, post: true }, fake('room.media.add', { mxc: 'mxc://ag2.space/x', event_id: '$e1' }).client);
 		assert.deepEqual(r, { ok: false, error: 'FORBIDDEN', detail: 'not allowed here', mxc: 'mxc://ag2.space/x', posted: true, event_id: '$e1' });
+	});
+
+	it('a file over the 25 MB cap is refused before any upload', async () => {
+		const big = join(dir, 'big.jpg');
+		writeFileSync(big, JPEG);
+		truncateSync(big, MAX_BYTES + 1);
+		const f = fake();
+		assert.equal(((await uploadMedia({ room: '!r:ag2.space', file: big }, f.client)) as { error: string }).error, 'too_large');
+		assert.equal(f.calls.length, 0);
+	});
+
+	it('an upload waiting on approval stops there and says needs_approval', async () => {
+		const calls: string[] = [];
+		const client = {
+			async callTool(_n: string, a: Record<string, unknown>) { calls.push(String(a.action)); return { structuredContent: { status: 'needs_approval', approval_id: 'ap1' } }; },
+			close() {},
+		};
+		assert.deepEqual(await uploadMedia({ room: '!r:ag2.space', file: jpgAsPng, post: true }, client), { ok: false, error: 'needs_approval' });
+		assert.deepEqual(calls, ['room.media.upload']);
 	});
 
 	it('a bad room, folder, file or non-image sends nothing', async () => {
