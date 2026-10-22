@@ -296,9 +296,11 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 		if (noticesSuspect && (session.sessionManager as { state?: string }).state !== 'RECONNECTING') noticesSuspect = false;
 		const words = turnWords();
 		for (const r of [...returnedUnheard]) {
-			if (r.at > modelTurnStartedAt) continue;
 			// Nothing distinctive to look for (the result only restates the request): the turn after the nudge counts.
 			const noEvidence = !r.evidence.numbers.length && !r.evidence.words.length;
+			// A turn begun before the result came back may still say it (the turn that called the tool goes on), but
+			// only its words can show that it did.
+			if (r.at > modelTurnStartedAt && (noEvidence || words === null || !turnSaysResult(words, r.evidence))) continue;
 			if (words !== null && (noEvidence ? !r.nudged : !turnSaysResult(words, r.evidence))) {
 				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result; still waiting for it`);
 				continue;
