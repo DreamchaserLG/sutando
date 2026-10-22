@@ -941,12 +941,16 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
 export function laneDirective(lane?: WorkLane): string {
 	if (lane === 'long') {
 		return '\n\n--- lane: long (the relay\'s judgement; binding) ---\n' +
-			'Spawn a subagent for this task as you read it: the subagent does the work and writes this task\'s result file, ' +
-			'and your own lane stays free for quick tasks. The result is written the moment the work is done, never held while another task runs.';
+			'Spawn a subagent for this task as you read it, in the background (Claude: the Agent tool with run_in_background: true), ' +
+			'and give it the task file and this task\'s result path: it does the work and writes the result file itself, with ' +
+			'python3 src/result_publish.py, the moment the work is done. Nothing waits for your check or for your turn to end; ' +
+			'a wrong result is corrected with a second one. Your own lane stays free for quick tasks. ' +
+			'If you cannot spawn one, do it inline, write the result the moment it is done, and say in it that it ran inline.';
 	}
 	if (lane === 'quick') {
 		return '\n\n--- lane: quick (the relay\'s judgement; binding) ---\n' +
-			'Do it now, inline, before anything else, and write this task\'s result the moment it is done.';
+			'Do it now, inline, before any other task, and write this task\'s result the moment it is done. ' +
+			'If it turns out to need building, writing or research, treat it as lane: long.';
 	}
 	return '';
 }

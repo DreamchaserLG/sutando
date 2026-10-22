@@ -33,8 +33,12 @@ or self-development gates.
 ## Bounded scope and checkpoint
 
 A spawned worker gets a bounded brief: scope (one question or deliverable), the files it may touch,
-and what it must not do. It also gets a checkpoint: when it reports back. The main thread verifies
-the result before reporting it; a subagent's "done" is a claim, not evidence.
+and what it must not do. It also gets a checkpoint: when it reports back. For a voice task with
+`lane: long` the subagent writes the task's result file itself, the moment the work is done
+(`python3 src/result_publish.py`), and reports back after; the main thread's check follows the
+result, and a wrong one is corrected with a second result, never held back for the check (holding it
+is the 21:48/21:52 incident). Elsewhere the main thread verifies the result before reporting it; a
+subagent's "done" is a claim, not evidence.
 
 If there is no capacity to spawn, see "When no delegation mechanism is available" below.
 
