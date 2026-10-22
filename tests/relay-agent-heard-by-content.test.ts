@@ -151,6 +151,22 @@ describe('resultEvidence / turnSaysResult', () => {
 		assert.equal(turnSaysResult('Five tasks are open.', asked), false, 'a phrase the request already had is not the answer');
 	});
 
+	// Review of #5774 (2026-10-22): the word after a small number was taken as its noun even when it was an adjective
+	// ("new", "open") or a function word ("and"), so an unrelated turn with the same number counted as the result said,
+	// and that result was never nudged or handed over again.
+	it('a small number counts only before the result\'s own noun, never its adjective or a function word', () => {
+		const msg = resultEvidence('You have 1 new message from Alice about invoice 4521.');
+		assert.equal(turnSaysResult('You have one new task in the queue.', msg), false, 'same number and adjective, another noun');
+		assert.ok(turnSaysResult('You have one new message from Alice.', msg), 'the noun after the adjective is said');
+		const prs = resultEvidence('There are 2 open pull requests waiting for your review.');
+		assert.equal(turnSaysResult('I have two open questions.', prs), false, 'same number and adjective, another noun');
+		assert.ok(turnSaysResult('There are two open pull requests waiting.', prs), 'the noun after the adjective is said');
+		assert.equal(turnSaysResult('one and two and three', resultEvidence('Found 2 and closed them.')), false, 'a function word is not a noun');
+		const invoices = resultEvidence('You have 3 invoices waiting.');
+		assert.ok(turnSaysResult('You have three invoices.', invoices), 'the noun ending its sentence counts');
+		assert.deepEqual(resultEvidence('3 tasks.').phrases, [], 'a stop word stays stopped in the plural');
+	});
+
 	it('a number the transcript spells out counts: English, hyphen-free, pairwise for four digits, Chinese', () => {
 		const prs = resultEvidence('98 PRs merged in sonichi/sutando in the last seven days — 2026-10-12 through today. Newest is #5717.');
 		assert.equal(turnSaysResult('To follow up on the PRs, there were ninetyeight merged in the repository last week.', prs), true);
