@@ -329,7 +329,7 @@ export function createGeminiTurnClassifier(opts: { apiKey: () => string | undefi
 		if (r.text === null && r.blocked && opts.extraRules?.length) r = await ask();
 		if (r.text === null) return { action: 'none' };
 		const verdict = parseTurnVerdict(r.text, input.openTasks);
-		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}${verdict.corrects ? ` [corrects ${verdict.corrects}]` : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task: ${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
+		const detail = verdict.action === 'work' ? ` (${verdict.task})${verdict.acknowledged ? ' [already acknowledged]' : ''}${verdict.corrects ? ` [corrects ${verdict.corrects}]` : ''}` : verdict.action === 'unbacked' ? ` ("${verdict.claim}"${verdict.task ? `; task=${verdict.task}` : ''})` : verdict.action === 'ask' ? ` (${verdict.question})` : verdict.action === 'duplicate' ? ` of ${verdict.of}` : '';
 		opts.log?.(`[RelayAgent] turn check: ${verdict.action}${detail} in ${Date.now() - t0}ms`);
 		return verdict;
 	};

@@ -416,21 +416,24 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			if (decided) return;
 			decided = true;
 			clearTimeout(timer);
-			for (const r of batch) {
-				r.judging--;
-				// Heard through another turn, released, or a reconnect handed it over again.
-				if (!returnedUnheard.includes(r)) continue;
-				if (told ? told.includes(r.ids[0]) : heardByRule(r, last)) {
-					console.log(`${ts()} [RelayAgent] ${r.ids[0]}: ${told ? 'the heard check says the turn told it' : 'no heard verdict; by the rule the turn said it'}`);
-					markHeard(r, endedAt);
-					continue;
+			try {
+				for (const r of batch) r.judging--;
+				for (const r of batch) {
+					// Heard through another turn, released, or a reconnect handed it over again.
+					if (!returnedUnheard.includes(r)) continue;
+					if (told ? told.includes(r.ids[0]) : heardByRule(r, last)) {
+						console.log(`${ts()} [RelayAgent] ${r.ids[0]}: ${told ? 'the heard check says the turn told it' : 'no heard verdict; by the rule the turn said it'}`);
+						markHeard(r, endedAt);
+						continue;
+					}
+					console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result${told ? '' : ' (no heard verdict; by the rule)'}; still waiting for it`);
+					if (r.judging) continue;
+					if (r.releaseAfterVerdict) releaseReturned(r);
+					else if (r.nudgeAfterTurn) sendNudge(r);
 				}
-				console.log(`${ts()} [RelayAgent] ${r.ids[0]}: the model spoke, but not the result${told ? '' : ' (no heard verdict; by the rule)'}; still waiting for it`);
-				if (r.judging) continue;
-				if (r.releaseAfterVerdict) releaseReturned(r);
-				else if (r.nudgeAfterTurn) sendNudge(r);
+			} finally {
+				settle(); // a repeat of the request waits on this; it must end on every path
 			}
-			settle();
 		};
 		const timer = setTimeout(() => {
 			if (!decided) console.log(`${ts()} [RelayAgent] ${batch[0].ids[0]}: no heard verdict in time; the rule decides`);
