@@ -1,10 +1,6 @@
 /**
- * upload-media — put a local image into an AG2 Space room's media, optionally filed in a Commons folder, and with
- * --post also into the room's chat (a picture sent to a room or DM; without it the picture is on the Media page only).
- *
- * room.media.upload takes the bytes as base64 inside the call. A model that writes that argument itself
- * spends minutes on it and corrupts it; this reads the file from disk, so the bytes never pass through a
- * model. It talks to the same ag2-space MCP server the agent uses, as the same agent.
+ * upload-media — put an allowlisted local image into a room's media (and with --post its chat), reading the
+ * bytes from disk so they never pass through a model's base64 argument.
  *
  *   npx tsx skills/ag2space-voice/scripts/upload-media.ts --room '!abc:ag2.space' --file pic.jpg [--name pineapple.jpg] [--folder a499a739] [--post]
  *

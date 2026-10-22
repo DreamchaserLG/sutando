@@ -55,14 +55,16 @@ In a task result this goes in the result file; in a direct reply, in the message
 image goes where it was asked (it is your own work, not private data): the room the request came
 from, or the DM when that is where it was asked.
 
-## Send it to an AG2 Space room or DM
+## Send it to a different AG2 Space room or DM
 
-A picture asked for in a room or DM, or to be sent to one ("send the boba tea picture to our AG2
-Space DM"), goes into that room's chat with one call: the upload script with `--post`. A voice task
-carries every room's id in its "known to the voice assistant" block: take the id from there, never
-`room_list`. The DM with a person is the two-member room named after the two of you ("Maddy-susan");
-only when the block is missing, `room_list` then `room_inspect`. The result's `event_id` is the chat
-message; a read of that event is the check.
+A picture for the room or DM the request came from goes with `[file:]` (above). Only a picture for
+another room ("send the boba tea picture to our AG2 Space DM") uses the upload script with `--post`,
+because the bridge uploads `[file:]` only to the task's own room. A voice task carries every room's
+id in its "known to the voice assistant" block: take the id from there, never `room_list`. The DM
+with a person is the two-member room named after the two of you ("Maddy-susan"); only when the block
+is missing, `room_list` then `room_inspect`. `posted: true` with an `event_id` means the chat message
+exists; a read of that event is the check. The script lives in the ag2space-voice skill, so this
+needs that skill installed.
 
 ```bash
 U="<repo>/skills/ag2space-voice/scripts/upload-media.ts"
@@ -87,7 +89,9 @@ image is filed in that project folder, where Typst's `#image("<name>")` and LaTe
 `\includegraphics{<name>}` find it. Then change the file with `room.commons.changes.apply` to
 reference that `name`, and compile once (`room.commons.typst.compile` or `latex.compile`, passing
 the folder's media) to check the build. `{"ok": false, "error": "needs_approval"}` means the room
-requires an approval first: say so; any other error carries `detail`, say it.
+requires an approval first: say so. `not_allowed` means the file is outside the attachment allowlist
+(generated images in `results/media` are inside it); any other error carries `detail`, say it. An
+error that still has `posted: true` means the picture is already in the chat: do not post it again.
 
 ## What to say when it fails (verbatim)
 
