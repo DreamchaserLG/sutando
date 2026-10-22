@@ -87,7 +87,7 @@ export async function uploadMedia(opts: { room: string; file: string; name?: str
 	if (opts.folder && !/^[a-z0-9]{8}$/.test(opts.folder)) return { ok: false, error: 'bad_folder', detail: 'a folder id is 8 lowercase letters or digits' };
 	const allowed = check(opts.file);
 	if (!allowed.ok) return allowed;
-	// Read the path the policy resolved, so a symlink swapped after the check is not followed.
+	// Read the path the policy resolved (its realpath), not the one given.
 	let bytes: Buffer;
 	try {
 		if (statSync(allowed.real).size > MAX_BYTES) return { ok: false, error: 'too_large', detail: `over ${MAX_BYTES} bytes` };

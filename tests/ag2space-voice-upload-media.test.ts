@@ -4,9 +4,9 @@
  * Pins: the type comes from the bytes, the file is uploaded then listed in the folder, and every
  * failure is one JSON answer.
  */
-import { describe, it, test } from 'node:test';
+import { after, describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(
 // Under /tmp/sutando-, a prefix the shared attachment allowlist accepts; `outside` is not.
 const dir = mkdtempSync('/tmp/sutando-upload-media-');
 const outside = mkdtempSync(join(tmpdir(), 'upload-media-outside-'));
+after(() => { for (const d of [dir, outside]) rmSync(d, { recursive: true, force: true }); });
 const private_ = join(outside, 'screenshot.png');
 writeFileSync(private_, JPEG);
 const link = join(dir, 'innocent.png');
