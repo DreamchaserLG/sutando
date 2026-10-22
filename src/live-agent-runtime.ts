@@ -421,7 +421,8 @@ export function wireDurableChannels(session: VoiceSession, opts: DurableChannelO
 			}).catch(err => console.error(`${ts()} [CartesiaTTS] ${err.message}`));
 		}
 	};
-	// 2026-10-20 18:14:09: a nudge sent while the model was saying that result made it say it a second time.
+	// A nudge tells the model the user has not heard the result: sent while a turn may be saying it, the model says it
+	// again, so a nudge due mid-turn waits for the turn's end (and the turn's words) first.
 	function sendNudge(r: Returned): void {
 		if (!returnedUnheard.includes(r) || !canSpeak() || r.nudged) return;
 		if (modelInTurn) { r.nudgeAfterTurn = true; return; }
