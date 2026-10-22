@@ -30,7 +30,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
-from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ, isolated_child_env  # noqa: E402
 from _helpers.subprocess_coverage import covered_code  # noqa: E402
 
 # Before anything below reads the environment: no outer credential selector survives.
@@ -246,7 +246,7 @@ class Measure(unittest.TestCase):
 
 # ── `ag2-sparrow-claude-local`: the installed local shape ─────────────
 
-from ag2_sparrow import _dirs, connect_common as cm, holder_lock, tmux_pane_keys, tmux_probe  # noqa: E402
+from ag2_sparrow import _dirs, connect_common as cm, holder_lock, service_manager as sm, tmux_pane_keys, tmux_probe  # noqa: E402
 from ag2_sparrow import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli, detector, hmac_policy, hold as hold_mod, inbox, launcher, trust  # noqa: E402
@@ -403,7 +403,7 @@ def oplock_free():
 
 
 class Runner:
-    """A manager command table for connect_common._run: (program, verb) -> rc or (rc, out, err); None =
+    """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`, install identity
     `install`) holding the root's lock, a stop verb ends it (after `stop_delay`), and the probes answer
     from the manager's own state unless the table says otherwise: `show` LoadState from the unit file or
@@ -536,7 +536,7 @@ class ConnectBase(unittest.TestCase):
             os.environ.pop(key, None)
         # No test reaches the host's systemctl, loginctl or launchctl; the bounds are 2 s and 1 s, not 30.
         self.calls = []
-        self.patches = [mock.patch.object(cm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
+        self.patches = [mock.patch.object(sm, "_run", side_effect=lambda cmd, timeout=30: self.calls.append(cmd)),
                         mock.patch.object(cm, "is_macos", return_value=False),
                         mock.patch.object(cm, "console_script", return_value=str(self.bin / cli.COMMAND)),
                         mock.patch.object(cm, "CONFIRM_TIMEOUT_S", 2.0), mock.patch.object(cm, "OP_WAIT_S", 1.0),
@@ -565,14 +565,15 @@ class ConnectBase(unittest.TestCase):
                          "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
     def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
             return self.install(*extra)
 
     def values(self, **over):
         v = {"CLAUDE": str(self.claude), "PLUGIN_DIR": str(self.plugin), "INBOX_DIR": str(self.inbox),
              "RESULTS_DIR": str(self.results), "CLAUDE_CONFIG_DIR": str(self.home / ".claude-sutando"),
              "HMAC_KEY_FILE": str(self.home / "task-hmac.key"), "HMAC_STRICT": "", "PERMISSION_MODE": "bypassPermissions",
-             "SESSION_ID": SESSION_ID, "HITL_STORE": str(cli.hitl_store_root()), "ROOT": str(self.work)}
+             "SESSION_ID": SESSION_ID, "HITL_STORE": str(cli.hitl_store_root()), "ROOT": str(self.work),
+             "BRIDGE_STATE_DIR": str(_dirs.state_dir())}
         v.update(over)
         return v
 
@@ -599,7 +600,7 @@ class ConnectBase(unittest.TestCase):
         return json.loads(p.read_text()) if p.exists() else None
 
     def hold_env(self, root=None, **extra):
-        env = dict(os.environ, PYTHONPATH=str(PKG))
+        env = isolated_child_env(PYTHONPATH=str(PKG))
         env.update({hold_mod.ENV_ROOT: root or str(self.work), hold_mod.ENV_CONFIG_DIR: str(cli.config_dir()),
                     hold_mod.ENV_SESSION_ID: SESSION_ID, hold_mod.ENV_HITL_STORE: str(cli.hitl_store_root())})
         env.update(extra)
@@ -916,7 +917,7 @@ class ConnectRoot(ConnectBase):
         self.assertIn("the inbox must be <work>/tasks", err)
         self.assertFalse(cli.config_path().exists())
         runner = self.runner()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), "--work", str(self.work))
         self.assertEqual(rc, 0, err)
         cfg = cli.read_config(cli.config_path())
@@ -930,7 +931,7 @@ class ConnectRoot(ConnectBase):
             odd = self.home / name
             (odd / "tasks").mkdir(parents=True)
             for flags in (("--work", str(odd)), ("--inbox", str(odd / "tasks"))):
-                with mock.patch.object(cm, "_run", side_effect=self.runner()) as run:
+                with mock.patch.object(sm, "_run", side_effect=self.runner()) as run:
                     rc, _, err = self.main("install", "--plugin-dir", str(self.plugin), *flags)
                 self.assertEqual((rc, "line break" in err), (2, True), (flags, err))
                 self.assertFalse(cli.config_path().exists(), "nothing written")
@@ -1090,7 +1091,7 @@ class ConnectSerialize(ConnectBase):
         self.runners[-1].stop_session()
         other = hold(None, script=OP_HOLDER)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "operation is in progress" in err), (1, True))
             self.assertTrue(cli.config_path().exists())
@@ -1103,7 +1104,7 @@ class ConnectSerialize(ConnectBase):
         src = Path(launcher.__file__).read_text() + Path(cli.__file__).read_text().split("def run(")[1].split("\ndef ")[0]
         self.assertNotIn("operation_lock", src.split("def install(")[0] if "def install(" in src else src,
                          "neither the launcher nor run names the operation lock")
-        with mock.patch.object(cm, "_run", side_effect=self.runner({})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({})):
             self.assertEqual(self.main("uninstall")[0], 0)
         self.assertTrue(cm.oplock_path(L).exists(), "the mutex file is never unlinked")
 
@@ -1141,7 +1142,7 @@ class ConnectUninstall(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         runner.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"])
@@ -1150,7 +1151,7 @@ class ConnectUninstall(ConnectBase):
         self.assertLess(out.index(f"removed: {cli.service_path()}"), out.index(f"removed: {cli.config_path()}"), "config last")
         self.assertEqual(self.relay.read_text(), f"REMOTE_TASK_TOKEN={TOKEN}\n", "Sparrow's token file is untouched")
         self.assertTrue((self.plugin / ".claude-plugin" / "plugin.json").exists())
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             self.assertIn("nothing to remove", self.main("uninstall")[1])
 
     def test_a_partial_systemd_teardown_keeps_the_config_and_completes_on_retry(self):
@@ -1160,7 +1161,7 @@ class ConnectUninstall(ConnectBase):
                            ({("systemctl", "show"): SHOW("loaded", "inactive", "disabled")}, "still known to systemd (LoadState loaded)")):
             self.configure()
             cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
-            with mock.patch.object(cm, "_run", side_effect=self.runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=self.runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn(why, err)
@@ -1168,39 +1169,39 @@ class ConnectUninstall(ConnectBase):
             self.assertTrue(cli.config_path().exists(), "the config stays, so the rerun knows the root")
             self.assertIn("kept so a rerun knows the work root", err)
             runner = self.runner()
-            with mock.patch.object(cm, "_run", side_effect=runner):
+            with mock.patch.object(sm, "_run", side_effect=runner):
                 rc, out, err = self.main("uninstall")
             self.assertEqual(rc, 0, err)
             self.assertEqual(runner.verbs("systemctl"), ["show", "daemon-reload", "show"], "the retry finishes from where it stopped")
             self.assertFalse(cli.config_path().exists())
         self.assertEqual(self.install_with(self.runner())[0], 0)
         self.runners[-1].stop_session()
-        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({("systemctl", "show"): SHOW("loaded", "inactive", "enabled")})):
             rc, _, err = self.main("uninstall")
         self.assertEqual((rc, "is still inactive and enabled after the stop" in err), (1, True))
         self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=self.runner()):
+        with mock.patch.object(sm, "_run", side_effect=self.runner()):
             self.assertEqual(self.main("uninstall")[0], 0)
 
     def test_a_registered_job_without_files_is_still_torn_down(self):
         self.configure()
         runner = self.runner(registered=True)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("systemctl"), ["show", "stop", "disable", "show", "daemon-reload", "show"],
                          "the manager is probed and the job stopped, disabled, reloaded away")
         self.assertFalse(cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             self.assertIn("nothing to remove", self.main("uninstall")[1])
         runner = self.runner(registered=True)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, err = self.main("uninstall")
         self.assertEqual((rc, runner.verbs("systemctl")), (0, ["show", "stop", "disable", "show", "daemon-reload", "show"]),
                          "no files at all, a registered job: still torn down")
         self.assertNotIn("nothing to remove", out)
         mac = self.runner(registered=True)
-        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(cm, "_run", side_effect=mac):
+        with mock.patch.object(cm, "is_macos", return_value=True), mock.patch.object(sm, "_run", side_effect=mac):
             rc, out, _ = self.main("uninstall")
         self.assertEqual((rc, mac.calls), (0, [["launchctl", "print", SERVICE_TARGET], ["launchctl", "bootout", "--wait", SERVICE_TARGET],
                                                ["launchctl", "print", SERVICE_TARGET]]))
@@ -1208,7 +1209,7 @@ class ConnectUninstall(ConnectBase):
     def test_uninstall_waits_a_bounded_time_for_the_root_to_free_after_the_stop(self):
         runner = self.runner(stop_delay=0.6)
         self.assertEqual(self.install_with(runner)[0], 0)
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 0, "the launcher reaps within the bound: " + err)
         self.assertFalse(cli.config_path().exists())
@@ -1217,7 +1218,7 @@ class ConnectUninstall(ConnectBase):
         runner = self.runner()
         self.assertEqual(self.install_with(runner, True)[0], 0)
         runner.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=True):
+        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=True):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(runner.verbs("launchctl"), ["print", "bootout", "print"])
@@ -1230,13 +1231,13 @@ class ConnectUninstall(ConnectBase):
                       {("launchctl", "bootout"): None, ("launchctl", "print"): None}):
             self.assertEqual(self.install_with(self.runner(), True)[0], 0)
             self.runners[-1].stop_session()
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)), mock.patch.object(cm, "is_macos", return_value=True):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)), mock.patch.object(cm, "is_macos", return_value=True):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertTrue(plist.exists() and cli.config_path().exists(), "kept after an unconfirmed stop")
             self.assertIn(f"Manual recovery: 1. stop the job by hand: launchctl bootout --wait {SERVICE_TARGET}", err)
             self.assertIn(f"3. re-run {cli.COMMAND} uninstall", err)
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "bootout"): 3, ("launchctl", "print"): NOT_LOADED})), \
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "bootout"): 3, ("launchctl", "print"): NOT_LOADED})), \
                     mock.patch.object(cm, "is_macos", return_value=True):
                 self.assertEqual(self.main("uninstall")[0], 0, "bootout said no such process and print confirms it: absent")
 
@@ -1246,7 +1247,7 @@ class ConnectUninstall(ConnectBase):
         keeper = runner.session
         runner.session = None                                  # the stop verb reaches nobody: the holder stays
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn(f"{self.work} is held by launcher pid {keeper.pid}; ", err)
@@ -1257,7 +1258,7 @@ class ConnectUninstall(ConnectBase):
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         finally:
             unhold(keeper)
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({})):
             self.assertEqual(self.main("uninstall")[0], 0, "re-run once the root is free")
         self.assertFalse(cli.config_path().exists())
 
@@ -1269,7 +1270,7 @@ class ConnectUninstall(ConnectBase):
         cm._write(cli.service_path(), cm.render_service(L, "/x"), 0o644)
         holder = hold(str(self.work), script=UNPUBLISHED)
         try:
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn("held by an unrecorded holder", err)
@@ -1284,23 +1285,23 @@ class ConnectUninstall(ConnectBase):
         self.runners[-1].stop_session()
         for table in ({("systemctl", "stop"): 0, ("systemctl", "show"): SHOW("loaded", "active", "enabled")},
                       {("systemctl", "stop"): None}):
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1, table)
             self.assertIn("Manual recovery", err)
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
         for table in ({("systemctl", "stop"): 1, ("systemctl", "show"): (1, "", "Failed to connect to bus\n")},
                       {("systemctl", "show"): None}):
-            with mock.patch.object(cm, "_run", side_effect=Runner(table)):
+            with mock.patch.object(sm, "_run", side_effect=Runner(table)):
                 rc, _, err = self.main("uninstall")
             self.assertEqual((rc, "state is unknown; nothing was removed" in err), (1, True), table)
             self.assertTrue(cli.service_path().exists() and cli.config_path().exists())
-        with mock.patch.object(cm, "_run", side_effect=self.runner()), mock.patch.object(cm, "lock_held", return_value="unknown"):
+        with mock.patch.object(sm, "_run", side_effect=self.runner()), mock.patch.object(cm, "lock_held", return_value="unknown"):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 1)
         self.assertIn("unknown (the lock of", err)
         self.assertTrue(cli.config_path().exists(), "a lock error keeps everything")
-        with mock.patch.object(cm, "_run", side_effect=self.runner({("systemctl", "stop"): 1})):
+        with mock.patch.object(sm, "_run", side_effect=self.runner({("systemctl", "stop"): 1})):
             self.assertEqual(self.main("uninstall")[0], 0, "stop failed but the unit is confirmed inactive and disabled")
 
     def test_files_install_did_not_write_are_kept_and_named(self):
@@ -1745,7 +1746,7 @@ class ConnectOwnership(ConnectBase):
             self.assertIn("is not parsable", err)
             self.assertFalse(other.exists())
             self.assertEqual(cfg.read_text(), bad, "preserved")
-            with mock.patch.object(cm, "_run", side_effect=self.runner()) as r:
+            with mock.patch.object(sm, "_run", side_effect=self.runner()) as r:
                 rc, _, err = self.main("uninstall")
             self.assertEqual(rc, 1)
             self.assertIn("is not parsable", err)
@@ -1778,8 +1779,8 @@ class ConnectBranches(ConnectBase):
                 mock.patch.object(cm.shutil, "which", return_value=None):
             self.assertEqual(cm.console_script(L), "")
             self.assertIn("was not found beside", cm.render_supervisor(L)[1])
-        self.assertTrue(cm._ok(cm._run(["true"])))
-        self.assertIsNone(cm._run([str(self.home / "no-such-program")]))
+        self.assertTrue(cm._ok(sm._run(["true"])))
+        self.assertIsNone(sm._run([str(self.home / "no-such-program")]))
         self.assertEqual(cm._why(None), "could not run")
         self.assertEqual(cm._why(subprocess.CompletedProcess([], 4, "", "")), "exit 4")
         self.assertEqual(cm._why(subprocess.CompletedProcess([], 1, "", "a\nlast line\n")), "last line")
@@ -1805,20 +1806,20 @@ class ConnectBranches(ConnectBase):
                           (SHOW("loaded", "inactive", "disabled"), "registered"), (SHOW("not-found", "inactive", "enabled"), "registered"),
                           (SHOW("loaded", "inactive", "enabled"), "registered"), ((1, "", "Failed to connect to bus\n"), "unknown"),
                           (SHOW("odd", "inactive", "disabled"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): got})) as r:
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): got})) as r:
                 self.assertEqual(cm.unit_active(L), want, got)
-            self.assertEqual(r.side_effect.calls[0], ["systemctl", "--user", "--no-ask-password", "show", "-p",
+            self.assertEqual(r.side_effect.calls[0], ["systemctl", "--no-ask-password", "--user", "show", "-p",
                                                       "LoadState,ActiveState,UnitFileState", "--value", cli.SERVICE_NAME])
         for got, want in ((0, "active"), (NOT_LOADED, "absent"), ((113, "", "Bad request\n"), "unknown"), (None, "unknown")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})) as r:
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): got})) as r:
                 self.assertEqual(cm.agent_loaded(L), want, got)
             self.assertEqual(r.side_effect.calls[0], ["launchctl", "print", SERVICE_TARGET])
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             self.assertEqual(cm.unit_load_state(L), "unknown")
         with mock.patch.object(cm, "is_macos", return_value=True), \
-                mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): 0})):
+                mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): 0})):
             self.assertEqual(cm.manager_state(L), "active")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("loginctl", "enable-linger"): 1})), \
+        with mock.patch.object(sm, "_run", side_effect=Runner({("loginctl", "enable-linger"): 1})), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             cm.linger(L)
         self.assertIn("enable-linger owner failed", out.getvalue())
@@ -2020,7 +2021,7 @@ class ConnectVerify(ConnectBase):
         self.assertEqual(self.install_with(runner)[0], 0)
         (self.home / "task-hmac.key").write_text("ab" * 32)
         self.status()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertEqual(rc, 0, out)
         self.assertEqual(set(self.checks(out).values()), {"PASS"}, out)
@@ -2032,11 +2033,17 @@ class ConnectVerify(ConnectBase):
         self.assertNotIn("launcher pid", out)
         self.assertIn("INFO session id: %s" % cli.read_config(cli.config_path())["SESSION_ID"], out)
         self.assertIn(f"INFO attach: {cli.COMMAND} attach", out)
-        self.assertIn("PASS hitl store: %s (the bridge's, beside its default store)" % cli.hitl_store_root(), out)
+        self.assertIn("PASS hitl store: %s (the bridge's, beside its default store under %s)"
+                      % (cli.hitl_store_root(), _dirs.state_dir()), out)
         runner.stop_session()
         self.assertIn(f"INFO session: {self.work} free", self.main("verify")[1])
         self.configure(HITL_STORE="/elsewhere/hitl/requirements")
         self.assertEqual(self.checks(self.main("verify")[1])["hitl"], "FAIL", "the store must be the bridge's")
+        self.configure(BRIDGE_STATE_DIR="", HITL_STORE="/elsewhere/hitl/requirements-claude-local")
+        out = self.main("verify")[1]
+        self.assertNotIn("hitl", self.checks(out), "a config from before the key: no row derived from the store itself")
+        self.assertIn(f"INFO hitl store: /elsewhere/hitl/requirements-claude-local (a config from before BRIDGE_STATE_DIR: "
+                      f"the bridge's state dir is read as its parent; run {cli.COMMAND} install to record it)", out)
         self.configure()
         (self.plugin / ".claude-plugin" / "plugin.json").unlink()
         self.assertEqual(self.checks(self.main("verify")[1])["plugin"], "FAIL")
@@ -2134,7 +2141,7 @@ class AgentRootBase(ConnectBase):
         return BridgeFake(runner)
 
     def install_default(self, fake, *extra, mac=False):
-        with mock.patch.object(cm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
+        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
             return self.main("install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
                              "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
@@ -2193,7 +2200,7 @@ class ConnectAgentRoot(AgentRootBase):
         state = cli.bridge_home(self.root) / "state"
         self.status(state, agent_id=AGENT, tasks_dir=os.path.realpath(self.root / "tasks"),
                     results_dir=os.path.realpath(self.root / "results"))
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, _ = self.main("verify")
             checks = ConnectVerify.checks(None, out)
             self.assertEqual((checks["bridge"], checks["relay"], checks["hitl"]), ("PASS", "PASS", "PASS"), out)
@@ -2221,7 +2228,7 @@ class ConnectAgentRoot(AgentRootBase):
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
         fake.calls.clear()
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertEqual(fake.verbs(), ["show", "stop", "disable", "show"])
@@ -2232,7 +2239,7 @@ class ConnectAgentRoot(AgentRootBase):
         fake = self.bridged()
         self.assertEqual(self.install_default(fake)[0], 0)
         cm.service_path(cli.BRIDGE).write_text("[Service]\nExecStart=/mine\n")
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, _, err = self.main("uninstall")
         self.assertEqual(rc, 1)
         self.assertIn("was not written by install", err)
@@ -2249,14 +2256,14 @@ class ConnectAgentRoot(AgentRootBase):
             self.assertIn(why, err)
             fake.table = {}
         fake.table = {"show": None}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, _, err = self.main("uninstall")
         self.assertEqual((rc, "state is unknown" in err), (1, True))
         fake.table = {"stop": None}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 1)
         fake.table = {}
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         with mock.patch.object(cm, "console_script",
                                side_effect=lambda shape: "" if shape is cli.BRIDGE else str(self.bin / shape.command)):
@@ -2298,7 +2305,7 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(self.cfg()["ROOT"], str(bound), "bind first: the host's binding names its own token's agent")
         other = self.home / "second.env"
         other.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
         rc, _, err = self.install_default(self.bridged(), "--token-env-file", str(other))
         self.assertEqual(rc, 2)
@@ -2340,6 +2347,50 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertFalse(cm.service_path(cli.BRIDGE).exists(), "an explicit root's bridge is yours")
         self.assertEqual(cli.bridge_mode({}), "external", "a config from before BRIDGE existed")
 
+    def test_install_records_the_bridges_state_dir_once_and_verify_reads_the_bridge_there(self):
+        """One record, BRIDGE_STATE_DIR: the unit's AGENT_CONNECT_STATE_DIR, verify's bridge row and the HITL
+        store all name it; an explicit root names the bridge you run with --bridge-state-dir, so a bridge on
+        another state dir passes the row and projects from the store beside it."""
+        fake = self.bridged()
+        self.assertEqual(self.install_default(fake)[0], 0)
+        beside = cli.bridge_home(self.root) / "state"
+        self.assertEqual((self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"], cli.bridge_state(self.cfg())),
+                         (str(beside), str(card.store_root(beside)), beside))
+        self.assertIn(f'Environment="AGENT_CONNECT_STATE_DIR={beside}"', cm.service_path(cli.BRIDGE).read_text(),
+                      "the unit is written from the recorded dir")
+        rc, _, err = self.install_default(fake, "--bridge-state-dir", str(self.home / "elsewhere"))
+        self.assertEqual(rc, 2)
+        self.assertIn(f"--bridge-state-dir is for a bridge you run (an explicit root); this install's bridge keeps its "
+                      f"state beside the root, {beside}", err)
+        with mock.patch.object(sm, "_run", side_effect=fake):
+            self.assertEqual(self.main("uninstall")[0], 0)
+        other = self.home / "other-bridge" / "state"
+        runner = self.runner()
+        rc, _, err = self.install_with(runner, False, "--work", str(self.work), "--bridge-state-dir", str(other))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["BRIDGE"], self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"]),
+                         ("external", str(other), str(card.store_root(other))))
+        self.status(other, agent_id=AGENT)
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            rc, out, _ = self.main("verify")
+            checks = ConnectVerify.checks(None, out)
+            self.assertEqual((checks["bridge"], checks["hitl"]), ("PASS", "PASS"), out)
+            self.assertIn(f"PASS hitl store: {card.store_root(other)} (the bridge's, beside its default store under {other})", out)
+            shutil.rmtree(other)
+            out = self.main("verify")[1]
+            self.assertIn(f"FAIL bridge: no bridge wrote a status under {other}", out)
+            self.assertIn(f"AGENT_CONNECT_STATE_DIR={other}", out, "the fix names the recorded dir")
+        runner.stop_session()
+        rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.cfg()["BRIDGE_STATE_DIR"], self.cfg()["HITL_STORE"]),
+                         (str(_dirs.state_dir()), str(cli.hitl_store_root())), "without the flag: Sparrow's state dir")
+        old = {k: v for k, v in self.cfg().items() if k != "BRIDGE_STATE_DIR"}
+        self.assertEqual(cli.bridge_state(old), _dirs.state_dir(), "a config from before the key: the HITL store's")
+        self.assertEqual(cli.bridge_state({"HITL_STORE": str(card.store_root(beside))}), beside)
+        self.assertEqual(cli.bridge_state({"ROOT": str(self.root), "BRIDGE": "sparrowd"}), beside,
+                         "a host supervisor's declaration is written from the dir beside the root, as sparrowd recomputes it")
+
 
 class ConnectHostSupervised(AgentRootBase):
     """Under a host supervisor (injected through _dirs) install writes a declaration, never a job."""
@@ -2378,14 +2429,14 @@ class ConnectHostSupervised(AgentRootBase):
         for a, b in (("probe.agent_ag2.space", "probe-agent_ag2.space"), ("a_b", "a.b")):
             self.assertNotEqual(cli.worker_name(a), cli.worker_name(b), "two agents never share a worker name")
             self.assertNotEqual(cli.vault_key(a), cli.vault_key(b))
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             out = self.main("verify")[1]
         self.assertIn(f"INFO relay token: the vault key {cli.vault_key(seg)}, read by sparrowd at start", out)
         self.assertIn(f"FAIL bridge: no bridge wrote a status under {self.root}.bridge/state", out)
-        self.assertIn(f"sparrowd reads its workers only at start: restart it after install (src/sparrowd.py) so "
-                      f"it runs {self.decl()}", out)
+        self.assertIn(f"sparrowd runs {self.decl()} on its next scan of the declarations: start it if it is not "
+                      f"running (src/sparrowd.py)", out)
         self.assertNotIn("relay token:", [ln.split(" ", 1)[1][:12] for ln in out.splitlines() if ln.startswith(("PASS", "FAIL"))])
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, err)
         self.assertIn(f"removed: {self.decl()}", out)
@@ -2401,11 +2452,11 @@ class ConnectHostSupervised(AgentRootBase):
             self.assertEqual(rc, 2, err)
             self.assertIn("was not written by install", err)
             self.assertEqual(self.decl().read_text(), text)
-            with mock.patch.object(cm, "_run", side_effect=fake):
+            with mock.patch.object(sm, "_run", side_effect=fake):
                 self.assertEqual(self.main("uninstall")[0], 1)
             self.assertTrue(cli.config_path().exists())
         self.decl().unlink()
-        with mock.patch.object(cm, "_run", side_effect=fake):
+        with mock.patch.object(sm, "_run", side_effect=fake):
             self.assertEqual(self.main("uninstall")[0], 0)
 
     def test_the_host_names_no_token_file_and_needs_the_id_from_the_environment(self):
@@ -2435,7 +2486,7 @@ class ConnectOccupancy(ConnectBase):
         self.configure()
         work = str(self.work)
         restarting = SHOWING(LoadState="loaded", ActiveState="activating", SubState="auto-restart", UnitFileState="enabled")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): restarting})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): restarting})):
             out = self.main("verify")[1]
         self.assertIn(f"INFO session: {work} restarting (manager activating/auto-restart, lock free)", out)
         self.assertNotIn(f"INFO session: {work} free", out)
@@ -2443,35 +2494,35 @@ class ConnectOccupancy(ConnectBase):
         holder = hold(work, "claude-local")
         try:
             running = SHOWING(LoadState="loaded", ActiveState="active", SubState="running", UnitFileState="enabled")
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): running})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): running})):
                 out = self.main("verify")[1]
             self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager active/running)", out)
-            with mock.patch.object(cm, "_run", side_effect=Runner({})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({})):
                 self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager absent)", self.main("verify")[1])
         finally:
             unhold(holder)
-        with mock.patch.object(cm, "_run", side_effect=Runner({})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({})):
             self.assertIn(f"INFO session: {work} free (no job)", self.main("verify")[1])
         stopped = SHOWING(LoadState="loaded", ActiveState="inactive", SubState="dead", UnitFileState="disabled")
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): stopped})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): stopped})):
             self.assertIn(f"INFO session: {work} free (manager inactive/dead)", self.main("verify")[1])
-        with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): None})):
+        with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): None})):
             self.assertIn(f"INFO session: {work} free (manager unknown)", self.main("verify")[1])
         live = (0, "ai.ag2.sparrow.claude-local = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n", "")
         with mock.patch.object(cm, "is_macos", return_value=True):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): live})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): live})):
                 out = self.main("verify")[1]
             self.assertIn(f"INFO session: {work} restarting (manager pid 4242, state running, lock free)", out)
             self.assertNotIn("KillMode", out)
             self.assertIn(f"INFO launchd respawns the launcher after {cm.THROTTLE_S} s; the session in its tmux pane is not in "
                           "the launcher's process group and survives a launcher death until the next launcher adopts it", out)
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): (0, "\tstate = waiting\n", "")})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): (0, "\tstate = waiting\n", "")})):
                 self.assertIn(f"INFO session: {work} restarting (manager state waiting, lock free)", self.main("verify")[1])
-            with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): NOT_LOADED})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): NOT_LOADED})):
                 self.assertIn(f"INFO session: {work} free (no job)", self.main("verify")[1])
             holder = hold(work, "claude-local")
             try:
-                with mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): live})):
+                with mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): live})):
                     self.assertIn(f"INFO session: {work} held by hold pid {holder.pid}, no live claude attached (manager pid 4242, state running)",
                                   self.main("verify")[1])
             finally:
@@ -2480,12 +2531,12 @@ class ConnectOccupancy(ConnectBase):
     def test_manager_detail_reads_explicit_outputs_only(self):
         for got, want in (((0, "", ""), "loaded"), ((1, "", "odd\n"), "unknown"), (NOT_LOADED, "absent"), (None, "unknown")):
             with mock.patch.object(cm, "is_macos", return_value=True), \
-                    mock.patch.object(cm, "_run", side_effect=Runner({("launchctl", "print"): got})):
+                    mock.patch.object(sm, "_run", side_effect=Runner({("launchctl", "print"): got})):
                 self.assertEqual(cm.manager_detail(L), want, got)
         for got, want in ((None, "unknown"), ((1, "", "bus\n"), "unknown"), ((0, "\n\n", ""), "unknown"),
                           (SHOWING(LoadState="not-found", ActiveState="inactive", SubState="dead", UnitFileState="disabled"), "absent"),
                           (SHOWING(LoadState="loaded", ActiveState="failed", SubState="failed", UnitFileState="enabled"), "failed/failed")):
-            with mock.patch.object(cm, "_run", side_effect=Runner({("systemctl", "show"): got})):
+            with mock.patch.object(sm, "_run", side_effect=Runner({("systemctl", "show"): got})):
                 self.assertEqual(cm.manager_detail(L), want, got)
 
 
@@ -3037,7 +3088,7 @@ class InboxCli(ConnectBase):
     def test_a_resolving_interrupt_clears_the_durable_stuck_mark_whatever_the_mod_remembers(self):
         t = self.task("task-marked")
         self.assertEqual(self.verb("progress", "--stuck", t, "--stuck-detail", "parked before a restart")[0], 0)
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertIn("FAIL unanswered", self.main("verify")[1])
             rc, out = self.verb("interrupt", t)
             self.assertEqual((rc, out["resolved"], out["answered"]), (0, True, True))
@@ -3056,7 +3107,7 @@ class InboxCli(ConnectBase):
         self.assertEqual(self.verb("progress", "--stuck", "task-gone", "--stuck-detail", "parked")[0], 0)
         self.assertIn("task-gone", records.load_plugin(self.root)["stuck"])
         (self.results / "task-gone.txt").write_text("published by another route\n")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertNotIn("unanswered", self.main("verify")[1])
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
         with mock.patch.object(lc.tm, "capture", return_value="pane"):
@@ -3464,7 +3515,7 @@ class InboxCli(ConnectBase):
         with mock.patch.object(records, "write_progress", side_effect=records.RecordError("still broken")):
             self.assertEqual(self.verb("claim", t)[0], 3)
         self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], alarm["since"], "the first failure's time")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             out = self.main("verify")[1]
         self.assertIn("FAIL progress: progress record unwritable since", out)
         lc = launcher.Launcher(dict(cli.read_config(cli.config_path()), ROOT=self.root), cli.config_dir())
@@ -3475,12 +3526,12 @@ class InboxCli(ConnectBase):
         self.assertIn("still broken", obs["stall"]["checks"])
         self.assertEqual(self.verb("progress", "--intake", "open")[0], 0, "the first durable write")
         self.assertEqual(records.read_progress_alarm(cli.config_dir()), {})
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertNotIn("FAIL progress", self.main("verify")[1])
         self.assertIsNone(detector.derive({}, "pane", records.load_plugin(self.root), 1.0)["stall"])
         records.progress_alarm_path(cli.config_dir()).write_text("[")
         self.assertEqual(records.read_progress_alarm(cli.config_dir())["since"], None, "an unreadable alarm stays raised")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             self.assertIn("since an unknown time", self.main("verify")[1])
         obs = detector.derive({}, "pane", {"progress_unwritable": {"since": None, "error": "x"}}, 5.0)
         self.assertEqual(obs["stall"]["since"], 5.0)
@@ -3499,7 +3550,7 @@ class InboxCli(ConnectBase):
         self.assertEqual((obs["stall"]["reason"], obs["stall"]["task"]), ("abnormal:task-unanswered", "task-s"))
         self.assertEqual(detector.derive(obs, "other pane", records.load_plugin(self.root), 2000.0)["stall"], obs["stall"],
                          "the same stall across ticks, so one card")
-        with mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+        with mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             out = self.main("verify")[1]
         self.assertIn("FAIL unanswered: tasks without an answer, retried with backoff: task-s since", out)
         self.assertIn("(still parked)", out)
@@ -3592,8 +3643,687 @@ class InboxCli(ConnectBase):
         rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply")
         self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn aborted without a reply"))
         self.assertIn("ended without a reply (turn aborted without a reply)", (self.results / "task-a.txt").read_text())
+        delivered = (self.results / "task-a.txt").read_bytes()
+        rc, out = self.verb("park", t, "turn-1", "--detail", "turn aborted without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn aborted without a reply"),
+                         "the identical park again is its own answer: settled, the protocol failure named")
         rc, out = self.verb("park", t, "turn-1")
-        self.assertEqual(rc, 1, "a settled claim parks nothing again")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", False), "another detail: not what was delivered")
+        self.assertEqual((self.results / "task-a.txt").read_bytes(), delivered, "a settled claim parks nothing again")
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"late\n")[0], 1, "and stages nothing")
+
+    def test_a_park_whose_reply_was_lost_after_it_settled_answers_settled_on_the_identical_retry(self):
+        """The compound I/O case: the park's publication settled, the lock's release failed and the claim could
+        not be re-read (retry); the Mod's identical park then answers settled, never 'staging parked', so it
+        retires the offer instead of retaining it until a restart."""
+        t = self.task("task-lost-park")
+        attempt = self.verb("claim", t)[1]["attempt"]
+        token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
+        self.assertEqual(self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")[0], 0)
+        real, releases = records.flocked, []
+
+        @contextlib.contextmanager
+        def release_fails(path, blocking=True):
+            with real(path, blocking) as fd:
+                yield fd
+            if Path(path).name == records.CLAIMS_LOCK:
+                releases.append(path)
+                if len(releases) == 2:      # the park's stage released; its publish, SETTLED, cannot
+                    raise OSError(errno.EIO, "unlock I/O error")
+        with mock.patch.object(records, "flocked", release_fails), mock.patch.object(inbox, "_committed", return_value=None):
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out.get("retry"), len(releases)), (1, True, 2), out)
+        self.assertIn("could not be re-read", out["refused"])
+        self.assertEqual(inbox._lifecycle(self.root).claims.load(t)["phase"], inbox.lifecycle.SETTLED)
+        delivered = (self.results / (t + ".txt")).read_bytes()
+        self.assertIn(b"ended without a reply (turn completed without a reply)", delivered, "the result exists")
+        rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn completed without a reply"), out)
+        self.assertEqual((self.results / (t + ".txt")).read_bytes(), delivered, "published once")
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
+
+    def test_a_publication_that_fails_on_io_is_the_pre_commit_retry_with_the_call_again_hint(self):
+        """An unwritable results dir: publish answers retry (the step did not commit), as the Mod's reply tool
+        turns into 'call ag2space_reply again'; never the soft 'publication parked'. The turn-end park of a
+        staged answer carries the same retry."""
+        if os.geteuid() == 0:
+            self.skipTest("root writes an unwritable dir")
+        lc = inbox._lifecycle(self.root)
+        t, p = "task-ro-results", "task-ro-park"
+        self.confirmed(t)
+        self.confirmed(p)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the answer\n")[0], 0)
+        self.results.chmod(0)
+        self.addCleanup(self.results.chmod, 0o755)
+        try:
+            rc, out = self.verb("publish", t)
+            self.assertEqual((rc, out.get("retry")), (1, True), out)
+            self.assertIn("the step did not commit (StateWriteError: refusing to serve: cannot publish %s"
+                          % (self.results / (t + ".txt")), out["refused"])
+            self.assertNotIn("publication parked", out["refused"])
+            self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED, "the claim is as it was")
+            rc, out = self.verb("park", t, "turn-1", "--detail", "turn completed without a reply")
+            self.assertEqual((rc, out.get("retry")), (1, True), "the turn's end gets the same retry")
+            rc, out = self.verb("park", p, "turn-1", "--detail", "turn completed without a reply")
+            self.assertEqual((rc, out.get("retry")), (1, True), "the failure staged, its publication a retry")
+            self.assertEqual(lc.claims.load(p)["phase"], inbox.lifecycle.RESULT_STAGED)
+        finally:
+            self.results.chmod(0o755)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "read_final", side_effect=OSError(errno.EIO, "I/O error")):
+            rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        self.assertIn("%s: the result landed, its durability unknown (refusing to serve: %s landed, then [Errno 5] I/O error); retried"
+                      % (t, self.results / (t + ".txt")), out["refused"], "after the rename, never 'did not commit'")
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the answer\n", "visible already")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED)
+        rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out["outcome"]), (0, "settled"), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the answer\n", "the staged answer, once")
+        self.assertEqual(lc.claims.load(t)["published"]["won"], True, "settled on the result it found")
+        self.assertEqual(self.verb("publish", t)[1]["outcome"], "settled", "idempotent at SETTLED")
+        self.assertEqual(lc.publish_and_settle("task-none"), "parked", "the default still parks")
+        rc, out = self.verb("park", p, "turn-1", "--detail", "turn completed without a reply")
+        self.assertEqual((rc, out["outcome"], out["parked"]), (0, "settled", "turn completed without a reply"),
+                         "the identical park names the protocol failure it delivered, never 'the accepted answer'")
+        self.assertIn("ended without a reply (turn completed without a reply)", (self.results / (p + ".txt")).read_text())
+
+    def test_an_interruption_whose_claim_rename_landed_without_its_directory_fsync_is_resumed_by_the_next_claim(self):
+        """EIO at the directory fsync after the claim.json rename inside the live reclaim's interruption: the
+        reply is hard with the committed phase RESULT_STAGED (one durable transition, no intermediate), and
+        the next same-generation claim publishes the durable interrupted body, never retiring the task; a
+        record an older write left committed at OUTCOME_UNKNOWN is resumed the same way. No holder death."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-fsync-after-rename"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        real_replace, real_fsync_dir, last, hits = os.replace, inbox.lifecycle.fsync_dir, [], []
+
+        def replace_noting(src, dst):
+            last[:] = [Path(dst).name]
+            return real_replace(src, dst)
+
+        def fsync_dir_eio_after_claim_rename(path):
+            if last == ["claim.json"] and not hits:
+                hits.append(path)
+                raise OSError(errno.EIO, "I/O error")
+            return real_fsync_dir(path)
+        with mock.patch.object(inbox.lifecycle.os, "replace", replace_noting), \
+                mock.patch.object(inbox.lifecycle, "fsync_dir", fsync_dir_eio_after_claim_rename):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("hard"), out.get("phase"), len(hits)), (3, True, inbox.lifecycle.RESULT_STAGED, 1), out)
+        self.assertIn("claim.json was replaced, then its directory fsync failed", out["error"])
+        self.assertFalse((self.results / (t + ".txt")).exists(), "the publication never ran")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, "its staged answer is published now" in out["refused"]), (1, False, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "the durable body, published")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED)
+        u = "task-outcome-unknown"
+        self.confirmed(u)
+        rec = lc.claims.load(u)
+        lc.claims.stage(u, inbox.INTERRUPTED_BODY.encode("utf-8"))
+        lc.claims.save(dict(rec, phase=inbox.lifecycle.OUTCOME_UNKNOWN, staged=None,
+                            outcome={"kind": "unknown", "detail": "an older write", "at": 1.0}))
+        rc, out = self.verb("claim", u)
+        self.assertEqual((rc, "retry" in out, out["refused"]),
+                         (1, False, "%s: its recorded outcome, interrupted, is published now; only ABSENT may be submitted" % u))
+        self.assertEqual((self.results / (u + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "a committed intermediate is resumed, never retired")
+        self.assertEqual(self.verb("claim", u)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % u)
+
+    def test_one_recovery_pass_then_the_live_claim_delivers_a_dead_generations_verified_answer_once(self):
+        """Hold's cadence: ONE recovery pass per start, then the new generation's live claims; no second pass.
+        A verifying blob with the blob writer failing is delivered by that one pass (no blob write); one a pass
+        could not publish (results I/O) or never touched (lineage unknown) is delivered by the live claim, once."""
+        lc = inbox._lifecycle(self.root)
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+
+        def staged_then_rolled_back(t, body):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=body)[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED, generation=dead))
+        a, b = "task-dead-blob-eio", "task-dead-publish-eio"
+        staged_then_rolled_back(a, b"the verified answer\n")
+        staged_then_rolled_back(b, b"the other answer\n")
+        real_publish = inbox.lifecycle.Lifecycle._publish
+
+        def publish_eio_for_b(life, rec):
+            if rec["task_id"] == b:
+                raise OSError(errno.EIO, "I/O error")
+            return real_publish(life, rec)
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob, \
+                mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", publish_eio_for_b), \
+                mock.patch.object(task_io, "verify_lineage", return_value=False):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1)
+        self.assertEqual(blob.call_count, 0, "a verified blob is final: never written again")
+        self.assertEqual(((self.results / (a + ".txt")).read_text(), lc.claims.load(a)["phase"]),
+                         ("the verified answer\n", inbox.lifecycle.SETTLED), "delivered by the one pass")
+        self.assertEqual((lc.claims.load(b)["phase"], (self.results / (b + ".txt")).exists()), (inbox.lifecycle.RESULT_STAGED, False))
+        rc, out = self.verb("claim", b)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s: its staged answer is published now; only ABSENT may be submitted" % b), out)
+        self.assertEqual(((self.results / (b + ".txt")).read_text(), lc.claims.load(b)["phase"]), ("the other answer\n", inbox.lifecycle.SETTLED))
+        self.assertEqual(self.verb("claim", a)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % a)
+        c = "task-unknown-lineage"
+        staged_then_rolled_back(c, b"the third answer\n")
+        with mock.patch.object(task_io, "verify_lineage", return_value=None):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 0, "lineage unknown: recovery leaves it")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
+            rc, out = self.verb("claim", c)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"], blob.call_count), (1, True, 0), out)
+        self.assertEqual(((self.results / (c + ".txt")).read_text(), lc.claims.load(c)["phase"]), ("the third answer\n", inbox.lifecycle.SETTLED))
+        for t in (a, b, c):
+            self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "published once")
+
+    def test_a_lost_claims_publication_whose_read_back_fails_after_the_rename_settles_and_clears_in_flight(self):
+        """read_final faults after the result rename landed, inside the lost claim's publication: that claim is
+        a retry; the next claim finds the result, settles the claim on it, drops the in-flight mirror with the
+        stuck mark, and the detector sees nothing in flight (no stall)."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-lost-publish-rename"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
+        neighbor = {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-9"}
+        records.write_progress(self.root, lambda rec: dict(
+            rec, inflight=dict(rec.get("inflight") or {}, **{t: {"phase": inbox.lifecycle.TURN_CONFIRMED, "turn_id": "turn-1"},
+                                                            "task-neighbor": neighbor}),
+            stuck=dict(rec.get("stuck") or {}, **{t: {"since": 1}, "task-neighbor": {"since": 2}})))
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "read_final", side_effect=OSError(errno.EIO, "I/O error")):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        self.assertEqual(((self.results / (t + ".txt")).read_text(), lc.claims.load(t)["phase"]),
+                         ("the accepted answer\n", inbox.lifecycle.RESULT_STAGED), "the rename landed")
+        plugin = records.load_plugin(self.root)
+        self.assertEqual((t in plugin["inflight"], t in plugin["stuck"]), (True, True), "both still seeded")
+        with mock.patch.object(records, "write_progress", wraps=records.write_progress) as writes:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        self.assertEqual(writes.call_count, 1, "the in-flight mirror and the stuck mark dropped in one production write")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.SETTLED, "settled on the result it found")
+        plugin = records.load_plugin(self.root)
+        self.assertNotIn(t, plugin.get("inflight") or {}, "no claim path leaves a finished task in flight")
+        self.assertNotIn(t, plugin.get("stuck") or {}, "nor its stuck mark")
+        self.assertEqual((plugin["inflight"].get("task-neighbor"), plugin["stuck"].get("task-neighbor")),
+                         (neighbor, {"since": 2}), "an unrelated task's entries are untouched")
+        # The neighbor is still owed, so the detector reads the record without it: this task adds nothing.
+        own = dict(plugin, inflight={k: v for k, v in plugin["inflight"].items() if k != "task-neighbor"},
+                   stuck={k: v for k, v in plugin["stuck"].items() if k != "task-neighbor"})
+        obs = detector.derive({}, "idle\n", own, 0.0, stall_min_s=10)
+        obs = detector.derive(obs, "idle\n", own, 601.0, stall_min_s=10)
+        self.assertIsNone(obs["stall"], "no false stall")
+        self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1)
+
+    def test_a_settlement_whose_ledger_append_failed_is_completed_by_the_next_claim_and_compacts(self):
+        """The settled-ids append faults once after the SETTLED save: that claim is a retry (SETTLED, no ledger
+        entry); the next claim completes the settlement (ledger entry, staged body gone) before its cleanup and
+        final refusal; the dead generation's recovery, once the claim is due, compacts it."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-ledger-fault"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
+        lc.claims.stage(t, b"a legacy staged body\n")       # a real file, so an unstage that does nothing fails
+        real_add, hits = inbox.lifecycle.SettledIds.add, []
+
+        def add_faults_once(ledger, task_id):
+            if not hits:
+                hits.append(task_id)
+                raise inbox.lifecycle.LedgerIOError("cannot append to settled-ids ([Errno 5] I/O error)")
+            return real_add(ledger, task_id)
+        with mock.patch.object(inbox.lifecycle.SettledIds, "add", add_faults_once):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), hits), (1, True, [t]), out)
+        ledger = lambda: inbox._lifecycle(self.root).settled.ids     # noqa: E731
+        self.assertEqual((lc.claims.load(t)["phase"], t in ledger()), (inbox.lifecycle.SETTLED, False))
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n")
+        self.assertTrue((lc.claims.dir(t) / "body").is_file(), "the body is still there after the fault")
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        self.assertIn(t, ledger(), "the settlement completed before the final refusal")
+        self.assertFalse((lc.claims.dir(t) / "body").exists(), "the real staged body removed")
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {})
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, generation=dead, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        with mock.patch.object(task_io, "verify_lineage", return_value=False):
+            self.assertEqual(inbox.recover_dead_generation(self.root), 1, "a claim due for compaction brings its generation in")
+        self.assertIsNone(lc.claims.load(t), "compacted")
+        self.assertIn(t, ledger())
+        self.assertEqual(sum(1 for p in self.results.iterdir() if p.name == t + ".txt"), 1, "nothing published twice")
+
+    def test_a_hard_publish_reply_claims_settled_only_over_a_complete_settlement(self):
+        """The SETTLED claim.json rename lands and its directory fsync fails: the hard reply names the phase but
+        not outcome=settled (the ledger entry and the body removal never ran), so the Mod retries; the identical
+        publish again completes the settlement and only then answers settled. park routes the same way."""
+        lc = inbox._lifecycle(self.root)
+        real_save, real_remove = inbox.lifecycle.ClaimStore.save, inbox.lifecycle.ClaimStore.remove
+        for t, call in (("task-hard-publish", lambda t: self.verb("publish", t)),
+                        ("task-hard-park", lambda t: self.verb("park", t, "turn-1", "--detail", "aborted"))):
+            self.confirmed(t)
+            if t == "task-hard-publish":
+                self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.stage(t, b"legacy\n")
+            once = []
+
+            def save(store, rec):
+                if not once and rec["phase"] == inbox.lifecycle.SETTLED:
+                    once.append(1)
+                    real_save(store, rec)
+                    raise inbox.lifecycle.StateCommitted("claim.json was replaced, then its directory fsync failed")
+                return real_save(store, rec)
+            with mock.patch.object(inbox.lifecycle.ClaimStore, "save", save):
+                rc, out = call(t)
+            self.assertEqual((rc, out.get("hard"), out.get("phase"), "outcome" in out, once), (3, True, inbox.lifecycle.SETTLED, False, [1]), out)
+            self.assertFalse(lc.settlement_complete(t))
+            rc, out = call(t)
+            self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+            self.assertEqual((inbox._lifecycle(self.root).settlement_complete(t), (lc.claims.dir(t) / "body").exists()), (True, False))
+
+    def test_settlement_property_every_entry_path_by_every_fault_by_every_schedule_converges(self):
+        """The settlement invariant as one property. For every entry path that settles (publish, park, a non-admitted
+        claim, interrupt, a lost claim, recovery's no-result settle, recovery's publication) x one fault at each step
+        (the ledger append fails, the append is torn and an already-loaded writer runs next, the whole record lands
+        but its fsync fails, the staged-body unlink fails, the SETTLED claim.json rename lands and its directory
+        fsync fails, the progress-mirror write fails) x each schedule production can run (the Mod retries; a
+        restart's one recovery pass, then claims; the task file gone, only that recovery pass; and that pass with
+        the claim due for compaction), driven to quiescence: no body or claim is removed before the id's ledger
+        sync succeeded (the crash-after-remove window), every reply,
+        the first after the fault included, that reports final comes over a complete settlement, and at the end
+        the result exists exactly once (none for the no-result settle), the ledger holds the id exactly once and
+        still opens, and the real staged body is gone."""
+        self.maxDiff = None
+        lc = inbox._lifecycle(self.root)
+        dead = {"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}
+        ledger_path = Path(lc.settled.path)
+        real_add, real_unstage, real_write_progress = (inbox.lifecycle.SettledIds.add, inbox.lifecycle.ClaimStore.unstage,
+                                                       records.write_progress)
+        real_lifecycle = inbox._lifecycle
+        real_save, real_remove = inbox.lifecycle.ClaimStore.save, inbox.lifecycle.ClaimStore.remove
+
+        def recovery():
+            with mock.patch.object(task_io, "verify_lineage", return_value=False):
+                try:
+                    inbox.recover_dead_generation(self.root)
+                except Exception as e:                          # a hold start that fails: the next start retries
+                    return str(e)
+            return ""
+
+        def rolled_back(t, generation=None):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED, **({"generation": generation} if generation else {})))
+            lc.claims.stage(t, b"legacy\n")
+
+        def e_publish(t):
+            self.confirmed(t)
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+            lc.claims.stage(t, b"legacy\n")
+            go = lambda: self.verb("publish", t)       # noqa: E731
+            return go, go, "answer\n"
+
+        def e_park(t):
+            self.confirmed(t)
+            lc.claims.stage(t, b"legacy\n")
+            go = lambda: self.verb("park", t, "turn-1", "--detail", "aborted")     # noqa: E731
+            return go, go, inbox.PROTOCOL_FAILURE % "aborted"
+
+        def e_refused(t):
+            self.task(t, "guest")
+            go = lambda: self.verb("claim", t)         # noqa: E731
+            return go, go, task_io.NON_OWNER_REFUSED
+
+        def e_interrupt(t):
+            self.task(t)
+            go = lambda: self.verb("interrupt", t, "--detail", "stopped")     # noqa: E731
+            return go, go, inbox.INTERRUPTED_BODY
+
+        def e_lost(t):
+            rolled_back(t)
+            go = lambda: self.verb("claim", t)         # noqa: E731
+            return go, go, "answer\n"
+
+        def e_no_result(t):
+            self.task(t)
+            self.assertEqual(self.verb("claim", t)[0], 0)
+            lc.claims.save(dict(lc.claims.load(t), generation=dead))
+            lc.claims.stage(t, b"legacy\n")
+            task_file = self.inbox / (t + ".txt")
+            text = task_file.read_text()
+            task_file.unlink()
+
+            def first():
+                out = recovery()
+                task_file.write_text(text)                 # the task file comes back; its claims must see the debt
+                return None, {"recovery": out}
+            return first, lambda: self.verb("claim", t), None
+
+        def e_recovered(t):
+            rolled_back(t, dead)
+            return (lambda: (None, {"recovery": recovery()})), (lambda: self.verb("claim", t)), "answer\n"
+
+        entries = {"publish": e_publish, "park": e_park, "refused": e_refused, "interrupt": e_interrupt,
+                   "lost": e_lost, "noresult": e_no_result, "recovered": e_recovered}
+
+        def fault(kind, fired, t, undurable):
+            """One fault, once, on this case's task only."""
+            once = []
+
+            def add(led, task_id):
+                if not once and task_id == t:
+                    once.append(1); fired.append(kind)
+                    if kind == "torn":
+                        with open(led.path, "ab") as f:
+                            f.write((task_id + "\n").encode()[:3])
+                    if kind == "fsync":
+                        # The whole record lands and is visible; its fsync fails: durable only after a later sync.
+                        if (task_id + "\n") not in ledger_path.read_text():
+                            with open(led.path, "ab") as f:
+                                f.write((task_id + "\n").encode())
+                        undurable.add(task_id)
+                        raise inbox.lifecycle.LedgerIOError("cannot fsync the ledger ([Errno 5] I/O error)")
+                    raise inbox.lifecycle.LedgerIOError("cannot append ([Errno 5] I/O error)")
+                return real_add(led, task_id)
+
+            def unstage(store, task_id):
+                if not once and task_id == t and (store.dir(task_id) / "body").exists():
+                    once.append(1); fired.append(kind)
+                    raise inbox.lifecycle.StateIOError("cannot remove body ([Errno 5] I/O error)")
+                return real_unstage(store, task_id)
+
+            def save(store, rec):
+                # The claim.json rename lands, then its directory fsync fails: the step is committed, the reply hard.
+                if not once and rec["task_id"] == t and rec["phase"] == inbox.lifecycle.SETTLED:
+                    once.append(1); fired.append(kind)
+                    real_save(store, rec)
+                    raise inbox.lifecycle.StateCommitted("claim.json was replaced, then its directory fsync failed")
+                return real_save(store, rec)
+
+            def write_progress(root, mutate):
+                if not once:
+                    once.append(1); fired.append(kind)
+                    raise records.RecordError("progress.json: [Errno 5] I/O error")
+                return real_write_progress(root, mutate)
+            if kind in ("append", "torn", "fsync"):
+                return mock.patch.object(inbox.lifecycle.SettledIds, "add", add)
+            if kind == "unlink":
+                return mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage)
+            if kind == "rename":
+                return mock.patch.object(inbox.lifecycle.ClaimStore, "save", save)
+            return mock.patch.object(records, "write_progress", write_progress)
+
+        @contextlib.contextmanager
+        def durability_watch(undurable, problems):
+            """A visible id becomes durable only by a successful fsync of the ledger. Removing the body or the claim
+            of an id not yet durable is the crash window the invariant forbids: a crash there loses the only witness."""
+            real_fsync = inbox.lifecycle.os.fsync
+
+            def fsync(fd):
+                real_fsync(fd)
+                if undurable and fd_path(fd) == os.path.realpath(ledger_path):
+                    undurable.clear()
+
+            def unstage(store, task_id):
+                if task_id in undurable and (store.dir(task_id) / "body").exists():
+                    problems.append("the body removed before a successful ledger sync")
+                return real_unstage(store, task_id)
+
+            def remove(store, task_id):
+                if task_id in undurable:
+                    problems.append("the claim compacted before a successful ledger sync")
+                return real_remove(store, task_id)
+            with mock.patch.object(inbox.lifecycle.os, "fsync", fsync), \
+                    mock.patch.object(inbox.lifecycle.ClaimStore, "unstage", unstage), \
+                    mock.patch.object(inbox.lifecycle.ClaimStore, "remove", remove):
+                yield
+
+        def final(rc, out):
+            return rc == 0 or (rc == 3 and (out.get("resolved") is True or out.get("outcome") == "settled")) \
+                or (rc == 1 and not out.get("retry"))
+
+        def check(t, reply, where, problems, undurable):
+            """final => complete (and durable), on every reply; True when the reply is final."""
+            rc, out = reply
+            if final(rc, out) and (not complete(t) or t in undurable):
+                problems.append("%s, final %r, over an incomplete settlement" % (where, out))
+            return final(rc, out)
+
+        def complete(t):
+            try:
+                ids = inbox.lifecycle.SettledIds(ledger_path)         # still opens: no torn or merged record
+            except inbox.lifecycle.LedgerError:
+                return False
+            return (t in ids.ids and ledger_path.read_text().count(t + "\n") == 1
+                    and not (lc.claims.dir(t) / "body").exists())
+
+        def aged(t):
+            rec = lc.claims.load(t)
+            if rec and rec["phase"] == inbox.lifecycle.SETTLED:
+                lc.claims.save(dict(rec, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        failures, fired_cases, cases = [], 0, 0
+        for e_name, entry in entries.items():
+            for f_name in ("append", "torn", "fsync", "unlink", "rename", "mirror"):
+                for s_name in ("retry", "restart", "gone", "late"):
+                    t = "task-p-%s-%s-%s" % (e_name, f_name, s_name)
+                    cases += 1
+                    first, again, expected = entry(t)
+                    fired, problems, undurable = [], [], set()
+                    preloaded = real_lifecycle(self.root)            # a writer loaded before the fault, run next
+                    with durability_watch(undurable, problems):
+                        with fault(f_name, fired, t, undurable):
+                            reply = first()
+                        fired_cases += bool(fired)
+                        done = isinstance(reply[0], int) and check(t, reply, "the first reply after the fault", problems,
+                                                                   undurable)
+                        stale = [preloaded] if f_name == "torn" and fired else []
+                        with mock.patch.object(inbox, "_lifecycle", lambda root: stale.pop() if stale else real_lifecycle(root)):
+                            if s_name in ("gone", "late"):
+                                (self.inbox / (t + ".txt")).unlink(missing_ok=True)
+                                if s_name == "late":
+                                    aged(t)                      # due for compaction: the crash-after-remove window
+                                recovery()
+                            else:
+                                if s_name == "restart":
+                                    recovery()
+                                    again = (lambda t=t: self.verb("claim", t)) if e_name not in ("noresult", "recovered") else again
+                                for _ in range(0 if done and s_name == "retry" else 8):
+                                    if check(t, again(), "a retry", problems, undurable):
+                                        break
+                                else:
+                                    if not (done and s_name == "retry"):
+                                        problems.append("no final report")
+                                if not check(t, self.verb("claim", t), "a later claim", problems, undurable):
+                                    problems.append("a later claim is not final")
+                                recovery()
+                    if not complete_safe(ledger_path):
+                        problems.append("the ledger does not open")
+                    elif not complete(t) or t in undurable:
+                        problems.append("settlement incomplete at quiescence")
+                    got = [p.name for p in self.results.iterdir() if p.name == t + ".txt"]
+                    body = (self.results / (t + ".txt")).read_text() if got else None
+                    if body != expected:
+                        problems.append("result %r, expected %r" % (body, expected))
+                    if problems:
+                        failures.append("%s x %s x %s: %s" % (e_name, f_name, s_name, "; ".join(dict.fromkeys(problems))))
+                    if not complete_safe(ledger_path):
+                        ledger_path.write_text("".join(sorted(x + "\n" for x in real_ids(ledger_path))))
+        self.assertEqual(failures, [])
+        self.assertEqual(cases, 168)
+        self.assertEqual(fired_cases, 156, "every fault fired except the mirror write where the first call writes no mirror "
+                         "(the non-admitted claim's refusal, and the two recovery-first entries): 168 - 12")
+
+    def test_every_settle_path_completes_its_settlement_after_one_ledger_fault_before_reporting_final(self):
+        """The settled-ids append faults once on each path that settles: publish, park, a non-admitted claim, an
+        interrupt, and a call-less claim nobody claims again (recovery). The first call is a retry, never final;
+        the next completes the settlement (ledger entry, the real staged body gone) before it says settled or final."""
+        lc = inbox._lifecycle(self.root)
+        real_add = inbox.lifecycle.SettledIds.add
+        ledger = lambda: inbox._lifecycle(self.root).settled.ids     # noqa: E731
+        body = lambda t: lc.claims.dir(t) / "body"                     # noqa: E731
+
+        def faulted_once(call):
+            hits = []
+
+            def add_faults_once(led, task_id):
+                if not hits:
+                    hits.append(task_id)
+                    raise inbox.lifecycle.LedgerIOError("cannot append to settled-ids ([Errno 5] I/O error)")
+                return real_add(led, task_id)
+            with mock.patch.object(inbox.lifecycle.SettledIds, "add", add_faults_once):
+                out = call()
+            self.assertEqual(len(hits), 1)
+            return out
+
+        def debt(t):
+            self.assertEqual((lc.claims.load(t)["phase"], t in ledger(), body(t).is_file()), (inbox.lifecycle.SETTLED, False, True))
+
+        def whole(t):
+            self.assertEqual((t in ledger(), body(t).exists()), (True, False), t)
+            self.assertEqual(open(inbox._lifecycle(self.root).settled.path).read().count(t + "\n"), 1)
+        t = "task-sweep-publish"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"answer\n")[0], 0)
+        lc.claims.stage(t, b"legacy\n")
+        rc, out = faulted_once(lambda: self.verb("publish", t))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("publish", t)
+        self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+        whole(t)
+        t = "task-sweep-park"
+        self.confirmed(t)
+        lc.claims.stage(t, b"legacy\n")
+        rc, out = faulted_once(lambda: self.verb("park", t, "turn-1", "--detail", "aborted"))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("park", t, "turn-1", "--detail", "aborted")
+        self.assertEqual((rc, out.get("outcome")), (0, "settled"), out)
+        whole(t)
+        t = self.task("task-sweep-guest", "guest")
+        rc, out = faulted_once(lambda: self.verb("claim", t))
+        self.assertEqual((rc, out.get("retry")), (1, True), out)
+        debt(t)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s is LIVE_READY; only ABSENT may be submitted" % t), out)
+        whole(t)
+        t = self.task("task-sweep-interrupt")
+        rc, out = faulted_once(lambda: self.verb("interrupt", t, "--detail", "stopped"))
+        self.assertEqual((rc, out.get("retry"), out.get("resolved")), (1, True, None), out)
+        debt(t)
+        rc, out = self.verb("interrupt", t, "--detail", "stopped")
+        self.assertEqual((rc, out["resolved"]), (0, True), out)
+        whole(t)
+        t = self.task("task-sweep-unbound", "guest")
+        faulted_once(lambda: self.verb("claim", t))
+        debt(t)
+        self.assertEqual(inbox.recover_dead_generation(self.root), 0, "no generation: the call-less claim is still reconciled")
+        whole(t)
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, settled_at=rec["settled_at"] - inbox.lifecycle.COMPACT_AFTER - 1))
+        inbox.recover_dead_generation(self.root)
+        self.assertIsNone(lc.claims.load(t), "a call-less claim compacts once due")
+
+    def test_a_claim_the_mod_lost_past_its_call_is_finished_or_interrupted_at_once(self):
+        """A Mod that lost its offers (a reload inside the generation) claims the task afresh: a descriptor
+        with no verifying blob is answered as interrupted now, a verifying blob whose phase move was lost is
+        published, a staged answer is published; a CALLING claim and one confirmed with nothing accepted still
+        wait for the next generation, and a dead generation's claim is left to hold's recovery."""
+        lc = inbox._lifecycle(self.root)
+        t = "task-lost-blob"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"accepted text\n")[1].get("retry"), True)
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.TURN_CONFIRMED)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "retry" in out), (1, False), out)
+        self.assertIn("answered as interrupted now; only ABSENT may be submitted", out["refused"])
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "the interrupted line, not silence")
+        rec = lc.claims.load(t)
+        self.assertEqual((rec["phase"], rec["outcome"]["detail"]), (inbox.lifecycle.SETTLED, "turn confirmed, the accepted answer's staging was lost"))
+        self.assertNotIn(t, records.load_plugin(self.root).get("inflight") or {}, "the mirror is released")
+        self.assertEqual(self.verb("claim", t)[1]["refused"], "%s is LIVE_READY; only ABSENT may be submitted" % t)
+        t = "task-lost-move"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))     # the move's last save never landed
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the accepted answer\n", "the accepted answer, exactly")
+        t = "task-lost-corrupt"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the accepted answer\n")[0], 0)
+        rec = lc.claims.load(t)
+        lc.claims.save(dict(rec, phase=inbox.lifecycle.TURN_CONFIRMED))
+        (lc.claims.dir(t) / rec["staged"]["blob"]).write_bytes(b"not those bytes\n")     # a committed blob that does not verify
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "answered as interrupted now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY, "never the bytes that do not verify")
+        self.assertEqual(lc.claims.load(t)["outcome"]["detail"], "turn confirmed, the accepted answer's staging was lost "
+                         "(the committed result does not match its descriptor)", "the one decision, recovery's, names it")
+        t = "task-lost-eio"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"the verified answer\n")[0], 0)
+        lc.claims.save(dict(lc.claims.load(t), phase=inbox.lifecycle.TURN_CONFIRMED))
+        real_write, hits = inbox.lifecycle.write_durable, []
+
+        def claim_save_eio_once(path, data):
+            # One EIO in the claim save that moves the verified blob on; the blob itself is never written again.
+            if not hits and Path(path).name == "claim.json":
+                hits.append(path)
+                raise OSError(errno.EIO, "I/O error")
+            return real_write(path, data)
+        with mock.patch.object(inbox.lifecycle, "write_durable", claim_save_eio_once), \
+                mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry"), len(hits), blob.call_count), (1, True, 1, 0), out)
+        rec = lc.claims.load(t)
+        self.assertEqual((rec["phase"], bool(rec.get("staged"))), (inbox.lifecycle.TURN_CONFIRMED, True),
+                         "one I/O failure while finishing a verifying blob is a retry, never an interrupt")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_commit_blob", side_effect=OSError(errno.EIO, "x")) as blob:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "staged and never published, is published now" in out["refused"], blob.call_count), (1, True, 0), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "the verified answer\n", "the accepted answer, nothing interrupted")
+        t = "task-lost-delegated"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "close_turn", return_value="parked") as closed:
+            rc, out = self.verb("claim", t)
+        self.assertEqual((closed.call_count, rc, out.get("retry")), (1, 1, True), "the decision is close_turn's alone")
+        self.assertIn("could not be closed now", out["refused"])
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.TURN_CONFIRMED, "parked: nothing moved")
+        t = "task-lost-staged"
+        self.confirmed(t)
+        self.assertEqual(self.verb("stage", t, "turn-1", stdin=b"staged answer\n")[0], 0)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "its staged answer is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), "staged answer\n")
+        for t, phase in (("task-lost-calling", inbox.lifecycle.CALLING), ("task-lost-confirmed", inbox.lifecycle.TURN_CONFIRMED)):
+            self.task(t)
+            attempt = self.verb("claim", t)[1]["attempt"]
+            token = self.verb("authorize", t, str(attempt), "--text-hash", "h1")[1]["token"]
+            if phase == inbox.lifecycle.TURN_CONFIRMED:
+                self.verb("confirm", t, "turn-1", token, "--text-hash", "h1")
+            rc, out = self.verb("claim", t)
+            self.assertEqual((rc, "retry" in out, out["refused"]), (1, False, "%s: attempt %s is %s" % (t, attempt, phase)), out)
+            self.assertFalse((self.results / (t + ".txt")).exists(), "%s waits for the next generation" % phase)
+        t = "task-dead-gen"
+        self.confirmed(t)
+        lc.claims.save(dict(lc.claims.load(t), staged={"blob": "blob.1.none", "length": 1, "sha256": "0" * 64, "identity": {}},
+                            generation={"pid": 2 ** 22 - 1, "start": "2026-01-01T00:00:00Z"}))
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out["refused"]), (1, "%s: attempt 1 is TURN_CONFIRMED" % t), "another generation's: not ours to answer")
+        self.assertFalse((self.results / (t + ".txt")).exists())
+        t = "task-lost-parked"
+        self.confirmed(t)
+        with mock.patch.object(inbox.lifecycle.os, "link", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            self.verb("stage", t, "turn-1", stdin=b"accepted text\n")
+        with mock.patch.object(inbox.lifecycle.Lifecycle, "_publish", return_value=None):
+            rc, out = self.verb("claim", t)
+        self.assertEqual((rc, out.get("retry")), (1, True), "interrupted, its publication parked: the next claim retries")
+        self.assertEqual(lc.claims.load(t)["phase"], inbox.lifecycle.RESULT_STAGED)
+        rc, out = self.verb("claim", t)
+        self.assertEqual((rc, "its staged answer is published now" in out["refused"]), (1, True), out)
+        self.assertEqual((self.results / (t + ".txt")).read_text(), inbox.INTERRUPTED_BODY)
 
     def test_a_progress_write_failure_is_the_hard_exit_3_with_the_lifecycle_step_applied(self):
         """The step stands, the answer carries it with `hard`, and the Mod closes intake on 3."""
@@ -3685,6 +4415,31 @@ class InboxCli(ConnectBase):
         with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, {inbox.ROOT_VAR: "relative"}):
             rc = cli.main(["inbox", "check-inode", "--expect", "1:1"])
         self.assertEqual((rc, "must be absolute" in json.loads(out.getvalue())["refused"]), (1, True))
+
+
+def fd_path(fd):
+    """The path an open fd names (macOS F_GETPATH, Linux /proc), or '' when it cannot be read."""
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            return os.path.realpath(fcntl.fcntl(fd, 50, b"\0" * 1024).split(b"\0", 1)[0].decode())
+        return os.path.realpath(os.readlink("/proc/self/fd/%d" % fd))
+    except OSError:
+        return ""
+
+
+def complete_safe(path):
+    """Whether the ledger still opens (a corrupted one is reset so later property cases stay independent)."""
+    try:
+        inbox.lifecycle.SettledIds(path)
+        return True
+    except inbox.lifecycle.LedgerError:
+        return False
+
+
+def real_ids(path):
+    return [line for line in Path(path).read_text(errors="replace").splitlines()
+            if inbox.lifecycle.local_task_protocol.valid_task_id(line)]
 
 
 class Detector(unittest.TestCase):
@@ -3984,7 +4739,7 @@ class LauncherTmux(ConnectBase):
         real_free, real_stray = cm._await_free, cli.stop_stray
         with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
                 mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
-                mock.patch.object(cm, "_run", side_effect=self.runner(root=False)):
+                mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(order[:2], ["stray", "free"], "the session stopped through the fence before the root must read free")
@@ -5098,7 +5853,7 @@ class OldMainHitl(CardBase):
         fixture = repo / "tests" / "fixtures" / "old_main" / "hitl_pre_local"
         self.assertTrue((fixture / "hitl" / "manager.py").is_file(), "the checked-in fixture")
         r = subprocess.run([sys.executable, "-c", "import sys; sys.path[:0] = [%r, %r]\n%s" % (str(fixture), str(repo / "src"), code)],
-                           capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=""))
+                           capture_output=True, text=True, env=isolated_child_env(PYTHONPATH=""))
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout
 
@@ -5333,13 +6088,13 @@ class StartupDialogAndRefusals(ConnectBase):
 
     def test_verify_fails_on_a_pane_waiting_at_a_dialog_and_reports_the_trust_record(self):
         runner = self.runner()
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             rc, out, _ = self.main("verify")
         self.assertIn(f"INFO folder trust: {self.inbox} not recorded (the launcher records it before it creates the session)", out)
         self.assertNotIn("FAIL session", out)
         self.assertEqual(trust.record(self.cfg["CLAUDE_CONFIG_DIR"], str(self.inbox)), "")
         records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=GEN))
-        with mock.patch.object(cm, "_run", side_effect=runner), \
+        with mock.patch.object(sm, "_run", side_effect=runner), \
                 mock.patch.object(launcher.Tmux, "has_session", return_value=True), \
                 mock.patch.object(launcher.Tmux, "capture", return_value=TRUST_PANE):
             rc, out, _ = self.main("verify")
@@ -5353,7 +6108,7 @@ class StartupDialogAndRefusals(ConnectBase):
                 self.assertIsNone(cli.pane_dialog(records.load_supervisor(str(self.work))))
         self.assertIsNone(cli.pane_dialog({}))
         Path(trust.config_file(self.cfg["CLAUDE_CONFIG_DIR"])).write_text("[1]")
-        with mock.patch.object(cm, "_run", side_effect=runner):
+        with mock.patch.object(sm, "_run", side_effect=runner):
             out = self.main("verify")[1]
         self.assertIn(f"INFO folder trust: {self.inbox} unreadable (it is not a JSON object)", out)
 
@@ -5383,7 +6138,7 @@ class StartupDialogAndRefusals(ConnectBase):
         self.relay.unlink()
         self.assertEqual(cm.kept_line(cli.LOCAL), "kept: the Claude login")
         cli.config_path().unlink()
-        with mock.patch.object(cm, "_run", side_effect=Runner()):
+        with mock.patch.object(sm, "_run", side_effect=Runner()):
             rc, out, _ = self.main("uninstall")
         self.assertEqual(rc, 0)
         self.assertIn("nothing to remove", out)
