@@ -81,11 +81,8 @@ result="$(printf '%s' "$items" | jq -c --arg agent "$AGENT" --argjson st "$state
   | . as $items
   | def seen: . as $t | ($seen0 | index($t)) != null;
     def own: ((.sender // "") | ascii_downcase) == ($agent | ascii_downcase);
-    # Seen before woken was recorded: count it as one wake now. Each hold keepawake releases
-    # restarts the count once (rearmed records which release did), so a capped item wakes again.
-    def woken: ($woken0[.task_id] // {at: $now, n: 1}) as $w
-      | if (.released_at // 0) > ($w.rearmed // 0) then {at: 0, n: 0, rearmed: .released_at}
-        else $w end;
+    # Seen before woken was recorded: count it as one wake now.
+    def woken: $woken0[.task_id] // {at: $now, n: 1};
   ([$items[] | select(.task_id | seen | not)]) as $fresh
   | ([$items[] | select((.task_id | seen) and (own | not))]) as $open
   | ([$open[] | woken as $w | select($now - $w.at >= $after and $w.n < $max)
@@ -106,8 +103,7 @@ result="$(printf '%s' "$items" | jq -c --arg agent "$AGENT" --argjson st "$state
                   woken: ([$open[], $matches[] | . as $m | woken as $w
                            | {key: .task_id,
                               value: (if ($hit | index($m.task_id)) != null
-                                      then ($w | del(.at, .n, .capped))
-                                           + {at: $now, n: (if $m.rewake then $w.n + 1 else 1 end)}
+                                      then {at: $now, n: (if $m.rewake then $w.n + 1 else 1 end)}
                                       elif ($capped | index($m.task_id)) != null
                                       then $w + {capped: true}
                                       else $w end)}]

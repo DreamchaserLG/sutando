@@ -772,10 +772,11 @@ def check_sparrow(state_dir: Path, now: float | None = None,
     except (OSError, ValueError, KeyError, TypeError) as e:
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
                        f"this state dir; {restart_hint()}")
-    age = int((time.time() if now is None else now) - ts)
-    if age < -SPARROW_STATUS_FUTURE_SKEW_S:
-        return SPARROW_DOWN, (f"{path} is dated {-age}s in the future, so it is not Sparrow's "
+    delta = (time.time() if now is None else now) - ts
+    if delta < -SPARROW_STATUS_FUTURE_SKEW_S:
+        return SPARROW_DOWN, (f"{path} is dated {-delta:.1f}s in the future, so it is not Sparrow's "
                               f"current status; {restart_hint()}")
+    age = int(delta)
     if age > SPARROW_STATUS_MAX_AGE_S:
         return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
                        f"reaches the hook; {restart_hint()}")
@@ -1122,26 +1123,10 @@ def _line_claimed(result_dir: Path, notice: Path) -> bool:
 
 
 def _line_parked(result_dir: Path, notice: Path) -> bool:
-    """Parked as never to be sent: the failure resolver keeps the queued name, a retire adds a time."""
-    parked = result_dir / delivery_destination.UNDELIVERED_DIR
-    return (parked / notice.name).exists() or any(parked.glob(f"{notice.stem}-*.txt"))
-
-
-def withdraw_undelivered_line(result_dir: Path, tid: str) -> "str | None":
-    """'withdrawn' when this call removed the still-queued line (the unlink is the decision: the
-    drain claims by renaming that same name, so a line it has claimed is never removed here),
-    'parked' when the line was parked unsent; None while it is claimed, delivered, or unconfirmed."""
-    notice = _hold_notice(result_dir, tid)
-    if hold_line_outcome(result_dir, tid) == "delivered" or _line_claimed(result_dir, notice):
-        return None
-    try:
-        notice.unlink()
-        return "withdrawn"
-    except FileNotFoundError:
-        pass
-    if _line_claimed(result_dir, notice):
-        return None
-    return "parked" if _line_parked(result_dir, notice) else None
+    """Parked by the drain's failure resolver, which keeps the queued name exactly. The only other
+    park, `<stem>-<epoch>.txt` for an oversized body, never holds a hold line, and its name could be
+    another valid task's (`task-a` and `task-a-123`), so it is not matched."""
+    return (result_dir / delivery_destination.UNDELIVERED_DIR / notice.name).is_file()
 
 
 def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":

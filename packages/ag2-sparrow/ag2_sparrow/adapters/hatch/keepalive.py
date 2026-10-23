@@ -42,8 +42,8 @@ HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
 # A healthy row's reason while a task waits on a deliberate hold, never a problem.
 TASK_HELD = "task-held-for-owner"
-# A hold whose room line the drain has not delivered this long is stuck: the line is still queued
-# or parked (undelivered), or it is gone with no receipt (unconfirmed). Keepawake releases it.
+# A hold whose room line the drain has not delivered this long is reported, never acted on: the
+# line is still queued, being sent or parked (undelivered), or gone with no receipt (unconfirmed).
 TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
 TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
@@ -55,8 +55,9 @@ REASON_HINTS = {
                         "without running hold",
     TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
     TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
-                           "room notice is still queued or was parked unsent, so the asker has "
-                           "heard nothing: check Sparrow's proactive drain",
+                           "room notice is still queued, being sent, or was parked after failed "
+                           "sends, so the asker may have heard nothing: check Sparrow's proactive "
+                           "drain and the room",
     TASK_HELD_UNCONFIRMED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
                            "room notice left the queue, but its delivery can't be confirmed (no "
                            "receipt): check the room and Sparrow's log",
@@ -486,52 +487,8 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
         time.sleep(0.5)
 
 
-def release_stuck_holds(cfg: dict, log: Path, now: float) -> list:
-    """Release every hold over HELD_LINE_DELIVER_S whose line is provably unsent: still queued
-    (withdrawn here, atomically against the drain's claim) or parked. A hold whose line is claimed,
-    delivered or unconfirmed is kept. The released task reads task-not-picked-up and the hook wakes
-    its worker again. One log line per release; the released task ids."""
-    agent = (cfg.get("AGENT_MXID") or "").lower()
-    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
-    try:
-        items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
-                                            result_dir, instance=None)
-    except OSError:
-        return []
-    released = []
-    for item in items:
-        tid = item["task_id"]
-        if (item.get("sender") or "").lower() == agent:
-            continue
-        mark = task_hold.read(result_dir, tid)
-        if mark is None or now - mark["since"] <= HELD_LINE_DELIVER_S:
-            continue
-        try:
-            outcome = task_hold.release_if(result_dir, tid, mark["token"],
-                                           lambda: _cli.withdraw_undelivered_line(result_dir, tid), now)
-        except (OSError, ValueError):
-            outcome = None
-        if outcome:
-            _log_line(log, f"{_utc(now)} released-hold task={tid} line={outcome} "
-                           f"held_since={_utc(mark['since'])}")
-            released.append(tid)
-    return released
-
-
-def _log_line(log: Path, line: str) -> None:
-    """Append to the keepalive log, best effort: a log that cannot be written goes to stderr."""
-    try:
-        log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
-    except OSError as e:
-        print(f"keepalive log not written ({e})", file=sys.stderr)
-    print(line)
-
-
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     now = time.time() if now is None else now
-    release_stuck_holds(cfg, log, now)
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)
@@ -555,6 +512,17 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         + (f" reason={reason}" if reason else "")
     _log_line(log, line)
     return rc
+
+
+def _log_line(log: Path, line: str) -> None:
+    """Append to the keepalive log, best effort: a log that cannot be written goes to stderr."""
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        print(f"keepalive log not written ({e})", file=sys.stderr)
+    print(line)
 
 
 def last_keepawake(log: Path) -> float | None:

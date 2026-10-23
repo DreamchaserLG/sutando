@@ -590,7 +590,7 @@ minutes old. The drain's own state decides which reason applies:
 
 | The hold's line | `reason` |
 | --- | --- |
-| still queued or being sent, or parked in `RESULT_DIR/undelivered/` as never to be sent | `task-held-line-undelivered`: the asker has heard nothing |
+| still queued or being sent, or parked in `RESULT_DIR/undelivered/` under its own name after failed sends | `task-held-line-undelivered`: the asker may have heard nothing |
 | gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
 
 When more than one applies, `reason` names the first of
@@ -598,21 +598,14 @@ When more than one applies, `reason` names the first of
 `task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
 is when that one went bad.
 
-Such a hold heals itself when its line provably never went out. The next `keepawake` run takes
-the hold lock for each hold past those 10 minutes and, while the marker still carries the same
-token, releases it only in two cases:
-- its line is still queued as `.txt`: keepawake withdraws it, and that removal is the decision,
-  since the drain claims a line by renaming the same name, so a line the drain has claimed is
-  never removed;
-- its line is parked unsent in `RESULT_DIR/undelivered/`.
+These two reasons report a held task; nothing acts on it. Keepawake never releases or changes a
+hold, and nothing re-sends, withdraws or re-routes its line. The owner sees the row and decides.
 
-A hold whose line is claimed (`.sending.<pid>`), delivered, or unconfirmed (a post may have
-landed) is kept. A release removes the hold and its notice record, so a later `hold` queues a
-fresh line through a valid lane. It also records the release time, and the hook uses that to
-restart the task's wake count once, so even a task already woken `MAX_WAKES` times is woken
-again. Each release writes one `released-hold task=<id> line=<withdrawn|parked>` line to the
-keepalive log. When that log cannot be written, the line goes to stderr and keepawake still checks
-Sparrow. A false hold is released within 10 minutes plus one keepawake interval (15 minutes). A task a worker handed off to the main session
+The labels describe where the line sits, not whether anyone saw it. A send that timed out or was
+accepted without an event id may have reached the room, and the drain still returns it to the
+queue under its plain `.txt` name, or parks it under the same name after the retry limit. Such a
+line reads `task-held-line-undelivered` even though it may have been delivered, because nothing on
+disk records that a send was attempted. A task a worker handed off to the main session
 stays open, so it also reads `task-not-picked-up` until it is answered, unless
 the worker parked it with `hold`: a task with a whole, well-formed hold marker is
 not counted, and with nothing else wrong the row is `healthy` with reason

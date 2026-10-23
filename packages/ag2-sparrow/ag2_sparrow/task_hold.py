@@ -232,68 +232,6 @@ def _notice_name(tid: str) -> str:
     return f"{_name(tid)[:-len('.json')]}.notice"
 
 
-def _released_name(tid: str) -> str:
-    return f"{_name(tid)[:-len('.json')]}.released"
-
-
-def release_if(result_dir: Path, tid: str, token: str, decide, now: "float | None" = None) -> "str | None":
-    """Under the hold lock, while the marker is still `token`'s: call `decide()`, and when it
-    returns an outcome, remove the marker and the notice record (so a later hold queues afresh)
-    and record the release time, which the hook reads to wake the worker again. The outcome,
-    or None with nothing changed."""
-    name = _name(tid)
-    dfd = _open_dir(result_dir, create=False)
-    if dfd is None:
-        return None
-    try:
-        with _locked(dfd):
-            mark = _read_at(dfd, name)
-            if mark is None or mark.get("token") != token:
-                return None
-            outcome = decide()
-            if not outcome:
-                return None
-            os.unlink(name, dir_fd=dfd)
-            _quietly(os.unlink, _notice_name(tid), dir_fd=dfd)
-            at = time.time() if now is None else now
-            tmp = f".{_released_name(tid)}.{secrets.token_hex(8)}.tmp"
-            try:
-                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
-                             dir_fd=dfd)
-                try:
-                    os.write(fd, json.dumps({"at": at}).encode("utf-8"))
-                finally:
-                    os.close(fd)
-                os.replace(tmp, _released_name(tid), src_dir_fd=dfd, dst_dir_fd=dfd)
-            except OSError:
-                _quietly(os.unlink, tmp, dir_fd=dfd)  # the release stands; only the re-wake hint is lost
-            return outcome
-    finally:
-        os.close(dfd)
-
-
-def released_at(result_dir: Path, tid: str) -> "float | None":
-    """When keepawake last released this task's hold, or None."""
-    try:
-        dfd = _open_dir(result_dir, create=False)
-    except (OSError, ValueError):
-        return None
-    if dfd is None:
-        return None
-    try:
-        fd = os.open(_released_name(tid), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        try:
-            raw = os.read(fd, _MAX_BYTES + 1)
-        finally:
-            os.close(fd)
-        record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    finally:
-        os.close(dfd)
-    return bounded_number(record.get("at"), 0, _MAX_EPOCH) if isinstance(record, dict) else None
-
-
 def mark_notice(result_dir: Path, tid: str) -> "str | None":
     """Record, durably and once, that this caller queues the task's one notice: its token,
     or None when another caller already did."""
@@ -338,8 +276,7 @@ def prune(result_dir: Path, task_dir: Path) -> None:
         return
     try:
         for name in os.listdir(dfd):
-            tid = next((name[:-len(x)] for x in (".json", ".notice", ".released")
-                        if name.endswith(x)), "")
+            tid = next((name[:-len(x)] for x in (".json", ".notice") if name.endswith(x)), "")
             if valid_tid(tid) and not (Path(task_dir) / f"{tid}.txt").exists():
                 _unlink_owned(dfd, name, None)
     finally:

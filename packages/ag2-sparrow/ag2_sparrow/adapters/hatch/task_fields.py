@@ -11,7 +11,7 @@ import re
 import sys
 from pathlib import Path
 
-from ... import gateway_instance, local_task_protocol, task_hold
+from ... import gateway_instance, local_task_protocol
 from ...task_io import attested_headers
 
 SNIPPET_MAX = 500
@@ -109,9 +109,6 @@ def task_fields(task_file: Path, result_dir: Path, instance: "str | None" = "") 
         "task_file": str(task_file),
         "result_file": str(result_dir / f"{tid}.txt"),
     }
-    released = task_hold.released_at(result_dir, tid)
-    if released is not None:
-        item["released_at"] = released  # keepawake released its hold: the hook wakes it again
     if reply is not None:
         label = reply["label"]
         item["reply_context"] = {"sender": reply["sender"][:SNIPPET_MAX],
