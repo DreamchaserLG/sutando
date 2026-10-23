@@ -255,7 +255,14 @@ Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
 with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
-main session. For a sender who is not the owner, the
+main session. An item that waits for the owner's go is parked with
+`ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it records a
+hold marker (`RESULT_DIR/.task-holds/<task id>.json`) and queues one line,
+"Waiting for my owner's go on this.", to the item's room (in its thread when it
+has one), once. It refuses an item that already has a result or a settled
+outbox entry, and a room the proactive drain would not deliver to. The item's
+result_file stays free for the real answer, and `reply` withdraws a hold line
+that is still queued when the answer is written. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker
@@ -566,7 +573,11 @@ fresh keepawake line never hides a stopped hook:
 When more than one applies, `reason` names the first of
 `keepawake-not-running`, `hook-not-running`, `task-not-picked-up`, and `since`
 is when that one went bad. A task a worker handed off to the main session
-stays open, so it also reads `task-not-picked-up` until it is answered.
+stays open, so it also reads `task-not-picked-up` until it is answered, unless
+the worker parked it with `hold`: a task with a whole, committed hold marker is
+not counted, and with nothing else wrong the row is `healthy` with reason
+`task-held-for-owner` and `since` the earliest hold. An absent, pending,
+partial or unreadable marker is not a hold, so that task still counts.
 
 The command prints `motion` as `unknown`, so Sparrow sends its own: `moving`
 from when it pulls a message until that message's reply (or `--no-send`) is

@@ -1982,6 +1982,30 @@ class Keepalive(Base):
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
         self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
 
+    def test_a_marker_that_is_not_a_whole_committed_hold_still_reads_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        marker = task_hold.marker_path(self.results, tid)
+        task_hold.reserve(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP, "pending")
+        for torn in ("", "{", '{"reason": "owner-go"}'):
+            marker.write_text(torn)
+            self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP, repr(torn))
+        task_hold.release(self.results, tid)
+        task_hold.place(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD, "control: a whole hold")
+        if os.geteuid() != 0:
+            marker.chmod(0)
+            self.addCleanup(marker.chmod, 0o600)
+            self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP, "chmod 000")
+
+    def test_an_unlistable_task_dir_reports_neither_held_nor_stuck(self):
+        with mock.patch.object(task_fields, "list_open_tasks", side_effect=OSError("gone")):
+            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None))
+
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
         self.assertEqual(shlex.split(command),
@@ -3322,12 +3346,186 @@ class Hold(Base):
         self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
         self.assertIsNone(task_hold.read(self.results, self.TID), "a retry must still post")
 
+    def room_task(self, room):
+        text = task_text(self.TID, "$ev1", "@bob:ag2.space").replace("!room:ag2.space", room)
+        self.add_task(self.TID, "$ev1", text=text)
+
+    def test_a_result_file_outside_the_payload_is_refused(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.home / "elsewhere" / f"{self.TID}.txt"))
+        self.assertEqual(r.returncode, 2)
+        self.assertIsNone(task_hold.state(self.results, self.TID))
+
+    def test_a_room_the_drain_would_not_deliver_to_is_refused(self):
+        for room in ("!missing-server", "#alias:ag2.space", "C0123"):
+            with self.subTest(room=room):
+                self.room_task(room)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, 2, r.stdout)
+                self.assertIsNone(task_hold.state(self.results, self.TID))
+                self.assertFalse(self.notice.exists())
+
+    def test_an_item_the_outbox_already_settled_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        outbox.record_delivered(self.results / ".outbox", self.TID)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.state(self.results, self.TID))
+
+    def test_the_answer_withdraws_a_still_queued_notice(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks))
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], env)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertFalse(self.notice.exists(), "a hold line never follows the answer")
+
+    def test_an_answer_landing_mid_hold_withdraws_the_notice(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_answered", side_effect=[False, True]):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIn("answered meanwhile", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.state(self.results, self.TID))
+
+    def test_a_crash_before_the_notice_is_redone_once_stale(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.reserve(self.results, self.TID)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, "a live hold is in progress")
+        self.assertFalse(self.notice.exists())
+        task_hold.release(self.results, self.TID)
+        task_hold.reserve(self.results, self.TID, now=time.time() - hatch_cli.HOLD_PENDING_STALE_S - 1)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(self.notice.exists())
+        self.assertEqual(task_hold.read(self.results, self.TID)["reason"], task_hold.OWNER_GO)
+
+    def test_a_crash_after_queueing_commits_without_queueing_again(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.reserve(self.results, self.TID, now=time.time() - hatch_cli.HOLD_PENDING_STALE_S - 1)
+        self.notice.write_text("queued before the crash\n")
+        real = hatch_cli.result_publish.publish_text
+        with mock.patch.object(hatch_cli.result_publish, "publish_text", side_effect=real) as publish:
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertNotIn(self.notice, [Path(c.args[0]) for c in publish.call_args_list])
+        self.assertEqual(self.notice.read_text(), "queued before the crash\n")
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unreadable_marker_is_started_over(self):
+        self.add_task(self.TID, "$ev1")
+        path = task_hold.marker_path(self.results, self.TID)
+        path.parent.mkdir()
+        path.write_text("{")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(self.notice.exists())
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_losing_the_restart_race_is_not_confirmed(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "reserve", return_value=False):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertFalse(self.notice.exists())
+
     def test_an_archived_task_drops_its_hold(self):
         self.add_task(self.TID, "$ev1")
         task_hold.place(self.results, self.TID)
         (self.tasks / f"{self.TID}.txt").unlink()
         task_hold.prune(self.results, self.tasks)
         self.assertIsNone(task_hold.read(self.results, self.TID))
+
+
+class TaskHold(unittest.TestCase):
+    """The generic hold record: bounded to its dir, whole or absent, and only HELD counts."""
+
+    def setUp(self):
+        self.results = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.results)
+
+    def test_ids_that_could_leave_the_hold_dir_are_refused(self):
+        bad = ("../escaped", "task-../../escaped", "../../task-1", "/tmp/task-1", "task-a/b",
+               "task-a\\b", "task-1\x00", "", "task-blue~../x", "task-~1", "task-..", None)
+        for tid in bad:
+            with self.subTest(tid=tid):
+                with self.assertRaises(ValueError):
+                    task_hold.place(self.results, tid)
+                self.assertIsNone(task_hold.state(self.results, tid))
+                self.assertIsNone(task_hold.read(self.results, tid))
+        self.assertEqual([p for p in self.results.parent.glob("escaped*")], [])
+        self.assertEqual(list(self.results.rglob("*.json")), [])
+
+    def test_a_symlinked_marker_leaving_the_hold_dir_is_refused(self):
+        outside = self.results.parent / f"{self.results.name}-outside.json"
+        self.addCleanup(outside.unlink, missing_ok=True)
+        (self.results / task_hold.HOLD_DIR).mkdir()
+        (self.results / task_hold.HOLD_DIR / "task-1784700000001.json").symlink_to(outside)
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertFalse(outside.exists())
+
+    def test_a_second_place_is_refused(self):
+        self.assertTrue(task_hold.place(self.results, "task-1784700000001"))
+        self.assertFalse(task_hold.place(self.results, "task-1784700000001"))
+
+    def test_a_named_instance_id_is_a_task_id(self):
+        self.assertTrue(task_hold.place(self.results, "task-blue~task-1784700000004", now=5))
+        self.assertEqual(task_hold.read(self.results, "task-blue~task-1784700000004"),
+                         {"reason": task_hold.OWNER_GO, "since": 5.0})
+
+    def test_only_a_whole_committed_marker_is_a_hold(self):
+        tid = "task-1784700000001"
+        self.assertTrue(task_hold.reserve(self.results, tid, now=5))
+        self.assertEqual(task_hold.state(self.results, tid)["state"], task_hold.PENDING)
+        self.assertIsNone(task_hold.read(self.results, tid), "pending is not held")
+        self.assertFalse(task_hold.reserve(self.results, tid), "one reservation")
+        task_hold.commit(self.results, tid)
+        self.assertEqual(task_hold.read(self.results, tid), {"reason": "owner-go", "since": 5.0})
+        path = task_hold.marker_path(self.results, tid)
+        for torn in ("", "{", "[]", '{"reason": "owner-go", "state": "held", "since": true}',
+                     '{"reason": "Bad Reason", "state": "held", "since": 1}'):
+            path.write_text(torn)
+            self.assertIsNone(task_hold.read(self.results, tid), repr(torn))
+        if os.geteuid() != 0:
+            task_hold.place(self.results, "task-1784700000002")
+            other = task_hold.marker_path(self.results, "task-1784700000002")
+            other.chmod(0)
+            self.addCleanup(other.chmod, 0o600)
+            self.assertIsNone(task_hold.read(self.results, "task-1784700000002"), "chmod 000")
+
+    def test_a_failed_write_leaves_no_marker(self):
+        tid = "task-1784700000001"
+        with mock.patch.object(task_hold.result_publish.os, "fsync", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                task_hold.place(self.results, tid)
+        self.assertFalse(task_hold.marker_path(self.results, tid).exists())
+        self.assertEqual(list((self.results / task_hold.HOLD_DIR).iterdir()), [])
+
+    def test_bad_reasons_and_missing_markers_are_refused(self):
+        with self.assertRaises(ValueError):
+            task_hold.place(self.results, "task-1784700000001", reason="Owner Go")
+        with self.assertRaises(ValueError):
+            task_hold.commit(self.results, "task-1784700000001")
+
+    def test_prune_keeps_open_tasks_and_ignores_foreign_names(self):
+        tasks = self.results / "tasks"
+        tasks.mkdir()
+        (tasks / "task-1784700000001.txt").write_text("x")
+        task_hold.place(self.results, "task-1784700000001")
+        task_hold.place(self.results, "task-1784700000002")
+        stray = self.results / task_hold.HOLD_DIR / "notes.json"
+        stray.write_text("{}")
+        task_hold.prune(self.results, tasks)
+        self.assertIsNotNone(task_hold.read(self.results, "task-1784700000001"))
+        self.assertIsNone(task_hold.read(self.results, "task-1784700000002"))
+        self.assertTrue(stray.exists())
+        task_hold.prune(self.results / "absent", tasks)
 
 
 if __name__ == "__main__":
