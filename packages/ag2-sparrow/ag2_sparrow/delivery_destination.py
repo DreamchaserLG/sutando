@@ -21,7 +21,10 @@ CLAIM_INFIX = ".sending."
 
 
 def claim_path(queued: Path, pid: int) -> Path:
-    """The name the drain renames `queued` to while process `pid` sends it."""
+    """The name the drain renames `queued` to while process `pid` sends it; ValueError for a pid
+    outside `valid_pid`, whose name `claim_pid` would reject."""
+    if valid_pid(pid) is None:
+        raise ValueError(f"pid {pid!r} is outside the pid domain")
     return queued.with_suffix(f"{CLAIM_INFIX}{pid}")
 
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -80,6 +81,11 @@ except ImportError:  # Windows: no lane record; Hatch, the only reader, is POSIX
     fcntl = None
 LANE_SUPPORTED = fcntl is not None
 _LANE_MAX_BYTES = 4096
+# A record is a heartbeat: the live drain rewrites it at least every LANE_REFRESH_S, and a reader
+# treats one older than LANE_FRESH_S (or dated past LANE_SKEW_S ahead) as missing.
+LANE_REFRESH_S = 10.0
+LANE_FRESH_S = 30.0
+LANE_SKEW_S = 5.0
 
 
 def _lane_name(instance: str) -> str:
@@ -87,23 +93,33 @@ def _lane_name(instance: str) -> str:
 
 
 def _auth_dir(state_dir, create: bool) -> "int | None":
-    """An fd on `<state>/auth`, opened without following a symlink; None when it is absent."""
+    """An fd on `<state>/auth`, opened without following a symlink. Absent: None, or with `create`
+    it is made again a few times and then OSError, so no caller ever gets None to mean the CWD."""
     if not LANE_SUPPORTED:
         raise OSError("no lane record on this platform")
     path = Path(state_dir) / "auth"
+    for _ in range(3 if create else 1):
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            continue  # removed after the mkdir
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{path} is a symlink or not a directory")
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        if os.fstat(fd).st_ino != st.st_ino:
+            os.close(fd)
+            raise OSError(f"{path} changed while it was opened")
+        return fd
     if create:
-        path.mkdir(parents=True, exist_ok=True)
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        return None
-    if not stat.S_ISDIR(st.st_mode):
-        raise OSError(f"{path} is a symlink or not a directory")
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    if os.fstat(fd).st_ino != st.st_ino:
+        raise OSError(f"{path} kept disappearing while it was created")
+    return None
+
+
+def _close(fd) -> None:
+    if isinstance(fd, int) and not isinstance(fd, bool):
         os.close(fd)
-        raise OSError(f"{path} changed while it was opened")
-    return fd
 
 
 @contextlib.contextmanager
@@ -180,13 +196,15 @@ def _invalidate_at(dfd: int, name: str, instance: str) -> None:
     os.close(fd)
 
 
-def _valid_lane(rec: "dict | None", instance: str) -> "dict | None":
+def _valid_lane(rec: "dict | None", instance: str, now: float) -> "dict | None":
     if not isinstance(rec, dict) or rec.get("instance") != (instance or "") or rec.get("retracted"):
         return None
     pid, agent, ts = rec.get("pid"), rec.get("agent_id"), rec.get("ts")
     if not isinstance(agent, str) or valid_pid(pid) is None \
-            or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            or not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts):
         return None
+    if not now - LANE_FRESH_S <= ts <= now + LANE_SKEW_S:
+        return None  # a drain that can no longer write cannot refresh it
     return {**rec, "agent_id": agent.strip()}
 
 
@@ -208,7 +226,7 @@ def publish_lane(state_dir, instance: str, agent_id: str) -> dict:
                 _invalidate_at(dfd, _lane_name(instance), instance)
                 raise
     finally:
-        os.close(dfd)
+        _close(dfd)
     return record
 
 
@@ -222,18 +240,20 @@ def retract_lane(state_dir, instance: str, pid: "int | None" = None, ts: "float 
         try:
             with _lane_locked(dfd, instance):
                 if pid is not None:
-                    rec = _valid_lane(_read_at(dfd, _lane_name(instance)), instance) or {}
-                    if rec.get("pid") != pid or (ts is not None and rec.get("ts") != ts):
+                    rec = _read_at(dfd, _lane_name(instance)) or {}
+                    if rec.get("instance") != (instance or "") or rec.get("pid") != pid \
+                            or (ts is not None and rec.get("ts") != ts):
                         return
                 _invalidate_at(dfd, _lane_name(instance), instance)
         finally:
-            os.close(dfd)
+            _close(dfd)
 
 
-def published_lane_record(state_dir, instance: str) -> "dict | None":
-    """`instance`'s lane record, read under the lane lock, when well formed, not retracted and its
-    own (agent_id str, instance equal, a valid_pid, numeric ts); None otherwise. Whether the
-    pid is still the live drain is the reader's check."""
+def published_lane_record(state_dir, instance: str, now: "float | None" = None) -> "dict | None":
+    """`instance`'s lane record, read under the lane lock, when well formed, not retracted, its own
+    (agent_id str, instance equal, a valid_pid) and fresh (a finite `ts` within LANE_FRESH_S of
+    `now`, at most LANE_SKEW_S ahead); None otherwise. Whether the pid is the live drain is the
+    reader's check."""
     if state_dir is None:
         return None
     try:
@@ -244,10 +264,10 @@ def published_lane_record(state_dir, instance: str) -> "dict | None":
             with _lane_locked(dfd, instance):
                 rec = _read_at(dfd, _lane_name(instance))
         finally:
-            os.close(dfd)
+            _close(dfd)
     except OSError:
         return None
-    return _valid_lane(rec, instance)
+    return _valid_lane(rec, instance, time.time() if now is None else now)
 
 
 def resolve(state_dir, channel_value, environ=None) -> str:

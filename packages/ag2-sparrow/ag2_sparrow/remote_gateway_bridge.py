@@ -5451,16 +5451,22 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
 
 def _lane_identity() -> str:
     """The identity the deliverability predicate uses, republished whenever this instance's lane
-    record does not already say it, so Hatch judges rooms by it without reading the credential env."""
+    record does not say it or is due a heartbeat, so Hatch judges rooms by it without reading the
+    credential env. A drain that cannot write lets the record go stale, and Hatch then refuses."""
     identity = _reenroll_identity()
     if not agent_identity.LANE_SUPPORTED:
         return identity
     rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
-    if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip():
+    if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip() \
+            or time.time() - rec.get("ts", 0) >= agent_identity.LANE_REFRESH_S:
         try:
             _LANE_OWNED.update(agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity))
-        except OSError as e:  # publish_lane has already invalidated the old record
-            _log(f"lane identity record not written ({e}); Hatch holds fail closed until it is")
+            _LANE_OWNED["failing"] = False
+        except OSError as e:  # publish_lane has already tried to invalidate the old record
+            if not _LANE_OWNED.get("failing"):
+                _log(f"lane identity record not written ({e}); Hatch holds fail closed once the "
+                     f"record is {agent_identity.LANE_FRESH_S:g}s old")
+            _LANE_OWNED["failing"] = True
     return identity
 
 
@@ -5469,7 +5475,7 @@ _LANE_OWNED: dict = {}
 
 def _retract_own_lane() -> None:
     """At clean exit: invalidate the lane record only if it is still the one this process wrote."""
-    if _LANE_OWNED:
+    if "pid" in _LANE_OWNED:
         agent_identity.retract_lane(_STATE, GATEWAY_INSTANCE, _LANE_OWNED["pid"], _LANE_OWNED["ts"])
 
 

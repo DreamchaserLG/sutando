@@ -3328,7 +3328,7 @@ class Hold(Base):
         (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
         if self.lane_record:
             (auth / "lane-identity.json").write_text(json.dumps(
-                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": 0}))
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": time.time()}))
         return env
 
     def hold(self, *args, cfg=None, env=None):
@@ -3707,7 +3707,7 @@ class Hold(Base):
                 auth = self.home / "state" / "auth"
                 auth.mkdir(parents=True, exist_ok=True)
                 (auth / "lane-identity.json").write_text(
-                    json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": 1}))
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": time.time()}))
                 r = self.hold(str(self.result_file))
                 self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
                 self.assertFalse(self.notice.exists())
@@ -3720,7 +3720,7 @@ class Hold(Base):
         dead.wait()
         auth = self.home / "state" / "auth"
         auth.mkdir(parents=True, exist_ok=True)
-        (auth / "lane-identity.json").write_text(json.dumps({"agent_id": AGENT, "instance": "", "pid": dead.pid, "ts": 1}))
+        (auth / "lane-identity.json").write_text(json.dumps({"agent_id": AGENT, "instance": "", "pid": dead.pid, "ts": time.time()}))
         r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
         self.assertFalse(self.notice.exists())
@@ -4234,7 +4234,7 @@ class DeliveryDestination(unittest.TestCase):
         (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "no enrollment fallback")
         lane = state / "auth" / "lane-identity.json"
-        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": 0}))
+        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
 
     def test_every_pid_predicate_rejects_the_same_out_of_domain_values(self):
@@ -4249,10 +4249,109 @@ class DeliveryDestination(unittest.TestCase):
                 if not isinstance(pid, bool):
                     self.assertIsNone(delivery_destination.claim_pid(f"proactive-a.sending.{pid}"))
                 (state / "auth" / "lane-identity.json").write_text(
-                    json.dumps({"agent_id": "@a:ag2.space", "instance": "", "pid": pid, "ts": 1}))
+                    json.dumps({"agent_id": "@a:ag2.space", "instance": "", "pid": pid, "ts": time.time()}))
                 self.assertIsNone(agent_identity.published_lane_record(state, ""))
                 self.assertIsNone(outbox.valid_pid(pid))
         self.assertEqual(outbox.valid_pid(outbox.PID_MAX), outbox.PID_MAX)
+
+    def test_a_lane_record_past_the_freshness_bound_is_no_lane(self):
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        lane, now = state / "auth" / "lane-identity.json", time.time()
+        for ts, server in ((now - 29, "ag2.space"), (now - 31, ""), (now + 60, ""),
+                           (float("inf"), ""), (float("nan"), ""), (float("-inf"), "")):
+            with self.subTest(age=now - ts):
+                lane.write_text(json.dumps({"agent_id": "@a:ag2.space", "instance": "",
+                                            "pid": os.getpid(), "ts": ts}))
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), server)
+
+    def test_a_drain_that_cannot_write_lets_its_lane_go_stale(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bits this relies on")
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        auth, record = state / "auth", state / "auth" / "lane-identity.json"
+        record.chmod(0o400)
+        auth.chmod(0o500)
+        self.addCleanup(record.chmod, 0o600)
+        self.addCleanup(auth.chmod, 0o700)
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertEqual(json.loads(record.read_text())["agent_id"], "@old:ag2.space", "nothing could change it")
+        later = time.time() + 31
+        with mock.patch.object(agent_identity.time, "time", return_value=later):
+            self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                             "the unrefreshed record has gone stale")
+
+    def test_the_drain_refreshes_its_lane_as_a_heartbeat(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.dict(os.environ, {"AGENT_MXID": "@a:ag2.space"}):
+            gb._lane_identity()
+            first = json.loads((state / "auth" / "lane-identity.json").read_text())["ts"]
+            gb._lane_identity()
+            self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first,
+                             "no rewrite while it is fresh")
+            with mock.patch.object(agent_identity.time, "time", return_value=first + 11):
+                gb._lane_identity()
+        self.assertEqual(json.loads((state / "auth" / "lane-identity.json").read_text())["ts"], first + 11)
+
+    def test_auth_removed_after_its_mkdir_never_reaches_the_cwd(self):
+        from ag2_sparrow import agent_identity
+        for always in (False, True):
+            with self.subTest(always=always):
+                state, cwd = self.lane_state(), self.lane_state()
+                auth = state / "auth"
+                real, removed, busy = os.lstat, [], []
+
+                def lstat(path, *a, **k):
+                    if not busy and os.fspath(path) == os.fspath(auth) and (always or not removed):
+                        removed.append(True)
+                        busy.append(True)
+                        try:
+                            shutil.rmtree(auth, ignore_errors=True)
+                        finally:
+                            busy.clear()
+                    return real(path, *a, **k)
+                here = os.getcwd()
+                os.chdir(cwd)
+                try:
+                    with mock.patch("os.lstat", side_effect=lstat):
+                        if always:
+                            with self.assertRaises(OSError):
+                                agent_identity.publish_lane(state, "", "@a:ag2.space")
+                        else:
+                            agent_identity.publish_lane(state, "", "@a:ag2.space")
+                finally:
+                    os.chdir(here)
+                self.assertEqual(sorted(p.name for p in cwd.iterdir()), [], "nothing written to the CWD")
+                self.assertTrue(removed)
+                if not always:
+                    self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:ag2.space")
+        self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), 2**31)
+        self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), True)
+
+    def test_a_persisted_claim_pid_is_never_coerced(self):
+        root = self.lane_state()
+        claim = outbox._claim_path(root, "item")
+        claim.parent.mkdir(parents=True)
+        for field, raw in (("pid", "true"), ("pid", "1.9"), ("pid", '"1"'), ("pid", "Infinity"),
+                           ("start_usec", "Infinity"), ("claimed_at", "Infinity")):
+            with self.subTest(field=field, raw=raw):
+                body = {"item_id": "item", "drainer_id": "d", "pid": "PID", "start_usec": None, "claimed_at": 1.0}
+                body[field] = "RAW"
+                claim.write_text(json.dumps(body).replace('"PID"', str(os.getpid())).replace('"RAW"', raw))
+                rec = outbox.read_delivery_claim(root, "item")
+                self.assertEqual(rec.state, "UNKNOWN", "a wrong type is a claim nobody can read")
+                self.assertFalse(outbox.may_reclaim_delivery(root, "item", 0))
+        claim.write_text(json.dumps({"item_id": "item", "drainer_id": "d", "pid": 2**31,
+                                     "start_usec": None, "claimed_at": 1.0}))
+        rec = outbox.read_delivery_claim(root, "item")
+        self.assertEqual((rec.state, rec.pid), ("HELD", 2**31))
+        self.assertIs(outbox.process_identity(rec.pid).state, outbox.OwnerState.DEAD, "no live owner")
+        self.assertTrue(outbox.may_reclaim_delivery(root, "item", 0))
 
     def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
         state = self.lane_state()
@@ -4261,14 +4360,14 @@ class DeliveryDestination(unittest.TestCase):
         lane = state / "auth" / "lane-identity.json"
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
-        for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": 1},
-                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "ts": 1},
-                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "ts": 1},
-                    {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": 1}):
+        for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": time.time()}):
             with self.subTest(rec=rec):
                 lane.write_text(json.dumps(rec))
                 self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
-        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "ts": 1}))
+        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
         with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": 4242}), \
                 mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242):
             self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "the lock names another live drain")
