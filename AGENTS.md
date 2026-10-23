@@ -20,7 +20,11 @@ subagent unasked, with the quota tier in mind (little or none when the budget is
 same trigger, judged by the relay before the task reaches you: spawn the subagent as you read the task;
 `lane: quick` is done inline, now. Either way the result file is written the moment the work is done, never
 held while another task runs (2026-10-22: a `lane: long` picture drawn in the main lane was sent at 21:48 and
-reported at 21:52, together with an app build the core had kept working on). Escapes, model choice, lanes,
+reported at 21:52, together with an app build the core had kept working on). A task you come across by listing
+`tasks/` is not yours by that fact: one with `requested_worker:` naming a worker, or a sentinel in
+`deliveries/<worker>/`, is that worker's — never act on it, spawn nothing for it, write no result for it
+(`src/result_publish.py` refuses; 2026-10-23 the core redrew a routed picture it found by `ls` during
+`/startup`). Your tasks reach you through the watcher's `TASK_FILE:` line. Escapes, model choice, lanes,
 per-runtime mechanism and the do-not-delegate list: `docs/subagent-delegation.md`.
 
 **Reply in the language your owner wrote in.** When you deliberately answer in English (a quoted

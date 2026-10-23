@@ -33,6 +33,14 @@ ls "$WS/tasks/"task-*.txt 2>/dev/null | head -200
 
 If no live tasks, emit "orphan-check: no live tasks, nothing to recover" and idle.
 
+**A listing is an inventory, never an intake.** A file this `ls` shows is not thereby yours: only step 2's
+classifier says what each one is, and a task it calls `worker-held` (a sentinel in `deliveries/<worker>/`,
+or `requested_worker:` above `task:` naming a worker) belongs to that worker — do not read it further,
+spawn nothing for it, write no result for it. A task that arrives while this check runs reaches you
+through the watcher's `TASK_FILE:` line if it is yours, and through nothing else. On 2026-10-23 the core
+found two freshly routed `lane: long` tasks in this listing, "dispatched" them to its own subagents, and
+drew a picture the long-lane worker was already drawing.
+
 ### Step 2 — Classify each task
 
 **Run the classifier; do not re-derive the verdicts by hand:**
