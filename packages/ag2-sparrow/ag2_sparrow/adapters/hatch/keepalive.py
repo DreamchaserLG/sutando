@@ -554,8 +554,9 @@ def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None]":
             continue
         mark = task_hold.read(result_dir, item["task_id"])
         ts = _mtime(Path(item["task_file"]))
-        if mark is not None:
-            held = min(t for t in (held, mark["since"] or ts, now) if t is not None)
+        # A task whose answer the outbox already has is a failed cleanup, never a hold.
+        if mark is not None and not _cli.task_settled(result_dir, item["task_id"]):
+            held = min(t for t in (held, mark["since"], now) if t is not None)
         elif oldest is None and ts is not None:
             oldest = ts
     return oldest, held

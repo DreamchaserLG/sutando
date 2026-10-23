@@ -313,6 +313,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
+from . import proactive_destination
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -5419,40 +5420,12 @@ def _gate_failed(name: str, exc: Exception) -> None:
 # matter how often they are retried; they are dead-lettered instead of looping.
 _PROACTIVE_MAX_BODY_B = 48 * 1024
 
-# Destination FORMAT validation is this bridge's own job ("the bridge
-# validates the id format for its platform when applying" — result_markers).
-_MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+_MATRIX_ROOM_RE = proactive_destination.MATRIX_ROOM_RE
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """('send', room_or_None, stripped-body) | ('foreign', None, '') |
-    ('drop', None, '').
-
-    Marker grammar comes SOLELY from parse_markers() (no private parser —
-    CLAUDE.md result-marker contract); this function only applies the actions
-    this transport supports:
-      * skip markers   → 'drop' (archive silently, deliver nothing)
-      * [dm-only]      → parse_markers already suppressed any redirect, so the
-                         body falls through to the default (owner) room
-      * [channel: !r:s]→ 'send' to that room, marker stripped
-      * [channel: C…/digits] → 'foreign' — that bridge owns the file (review
-                         blocker: claiming it here would leak the raw body)
-      * attach markers → stripped by the parser; uploads are unsupported on
-                         the room-message op, so the actions are ignored
-      * [thread: $root]→ stripped here; the send reads it via
-                         _proactive_thread_root and posts in that thread
-      * bare [thread]  → task results only; stripped and ignored here
-    """
-    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
-    if any(a.kind == "skip" for a in parsed.actions):
-        return ("drop", None, "")
-    redirect = next((a for a in parsed.actions if a.kind == "redirect"), None)
-    if redirect is not None:
-        dest = redirect.value
-        if _MATRIX_ROOM_RE.match(dest):
-            return ("send", dest, parsed.body)
-        return ("foreign", None, "")
-    return ("send", None, parsed.body)
+    """The drain's routing of a proactive body; the policy is proactive_destination's."""
+    return proactive_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
@@ -5479,21 +5452,11 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
 def _own_homeserver() -> str:
     """The server this lane's agent lives on, from its enrolled identity;
     "" when the identity is unknown (then nothing below can discriminate)."""
-    mxid = _reenroll_identity()
-    # FIRST colon: the server part may itself carry a port or an IPv6 bracket.
-    return mxid.split(":", 1)[1] if mxid.startswith("@") and ":" in mxid else ""
+    return proactive_destination.homeserver_of(_reenroll_identity())
 
 
 def _room_is_deliverable_here(room: str) -> bool:
-    """A gateway posts only to rooms on its own homeserver. Another lane's room
-    must be left for that lane: claiming it here fails at the gateway and the
-    retry budget then parks deliverable work as undeliverable."""
-    own = _own_homeserver()
-    if not own:
-        return True  # identity unknown: today's behaviour, deliberately
-    if ":" not in room:
-        return False  # names no server: deliverable nowhere, strands visibly
-    return room.split(":", 1)[1] == own
+    return proactive_destination.deliverable_here(room, _own_homeserver())
 
 
 def _record_proactive_receipt(item_id: str, room: str) -> None:
@@ -5501,7 +5464,7 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
     room rotates; this outlives it. Fail-open: a receipt write must never
     unwind a delivery that already happened."""
     try:
-        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+        record_delivered(RESULTS_DIR / proactive_destination.RECEIPT_DIR, item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {e} "

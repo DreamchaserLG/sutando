@@ -29,7 +29,7 @@ from importlib import resources
 from pathlib import Path
 
 from ... import (_dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox,
-                 result_publish, task_hold, workspace_lock)
+                 proactive_destination, task_hold, workspace_lock)
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
@@ -60,8 +60,6 @@ REPLY_PLACEHOLDER = "<REPLY_COMMAND>"
 # `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
 REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
 HOLD_NOTICE = "Waiting for my owner's go on this."
-# A pending hold this old is a crashed one, and a later hold redoes it.
-HOLD_PENDING_STALE_S = 60.0
 REPLY_WAIT_S, REPLY_WAIT_MAX_S, REPLY_MAX_BYTES = 30.0, 300.0, 64 * 1024
 SPARROW_COMMAND = "ag2-sparrow"
 SERVICE_NAME = "ag2-sparrow.service"
@@ -1064,29 +1062,42 @@ def _hold_notice(result_dir: Path, tid: str) -> Path:
     return result_dir / f"proactive-hold-{tid}.txt"
 
 
-def _answered(result_dir: Path, tid: str, item: str, instance: str) -> bool:
-    """The task has a result, or the outbox already settled one for it."""
+def task_settled(result_dir: Path, tid: str) -> bool:
+    """The task has a result, or its instance's outbox already has a record of one."""
+    instance = tid[len("task-"):].split("~", 1)[0] if "~" in tid else ""
+    item = item_id(tid, instance)
     root = gateway_instance.outbox_root(result_dir, instance)
-    return (result_dir / f"{tid}.txt").exists() or outbox.item_status(root, item) is not None
+    return ((result_dir / f"{tid}.txt").exists()
+            or (item is not None and outbox.item_status(root, item) is not None))
 
 
-def _drain_room(body: str) -> "str | None":
-    """The room the proactive drain would post `body` to, by the drain's own router."""
-    from ... import remote_gateway_bridge
-    route, room, _ = remote_gateway_bridge._proactive_route(body)
-    return room if route == "send" else None
+def _notice_sent(result_dir: Path, tid: str) -> bool:
+    """The hold line is queued, being sent, or the drain's receipt says it was delivered."""
+    notice = _hold_notice(result_dir, tid)
+    receipts = result_dir / proactive_destination.RECEIPT_DIR
+    return (notice.exists() or any(result_dir.glob(f"{notice.stem}.sending*"))
+            or outbox.item_status(receipts, notice.stem) == "DELIVERED")
 
 
 def hold(args) -> int:
-    """Park one wake item for the owner's go: mark it held and post HOLD_NOTICE once."""
-    found = _wake_item(_installed_config(), Path(args.result_file).expanduser())
+    """Park one wake item for the owner's go: queue HOLD_NOTICE once, then mark it held."""
+    cfg = _installed_config()
+    found = _wake_item(cfg, Path(args.result_file).expanduser())
     if found is None:
         return 2
-    result_dir, task_dir, tid, item, instance = found
-    task_hold.prune(result_dir, task_dir)
-    if _answered(result_dir, tid, item, instance):
+    result_dir, task_dir, tid, _item, instance = found
+    try:
+        task_hold.prune(result_dir, task_dir)
+        held = task_hold.read(result_dir, tid)
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if task_settled(result_dir, tid):
         print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
         return REPLY_NOT_POSTED
+    if held is not None:
+        print(f"held: {tid} was already held; nothing posted again")
+        return REPLY_POSTED
     fields = task_fields(task_dir / f"{tid}.txt", result_dir, instance) or {}
     room, sender = fields.get("room_id") or "", fields.get("sender") or ""
     lines = [f"[channel: {room}]"]
@@ -1094,36 +1105,33 @@ def hold(args) -> int:
         lines.append(f"[thread: {fields['thread_root']}]")
     lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
     body = "\n".join(lines) + "\n"
-    if not room or _drain_room(body) != room:
+    own = proactive_destination.homeserver_of(cfg.get("AGENT_MXID") or "")
+    if not room or proactive_destination.drain_room(body, own) != room:
         print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
               file=sys.stderr)
         return 2
-    if not task_hold.reserve(result_dir, tid, task_hold.OWNER_GO):
-        mark = task_hold.state(result_dir, tid)
-        if mark is not None and mark["state"] == task_hold.HELD:
+    notice = _hold_notice(result_dir, tid)
+    # Line first: a crash before the marker leaves the task reading stuck, never silent.
+    try:
+        if not _notice_sent(result_dir, tid):
+            _publish_once(notice, body)
+        token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
+    except (OSError, ValueError) as e:
+        print(f"NOT confirmed: the hold was not recorded ({e}); the task still reads "
+              "task-not-picked-up. Run hold again; the line is never queued twice",
+              file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if token is None:
+        if task_hold.read(result_dir, tid) is not None:
             print(f"held: {tid} was already held; nothing posted again")
             return REPLY_POSTED
-        if mark is not None and time.time() - mark["since"] < HOLD_PENDING_STALE_S:
-            print(f"NOT confirmed: another hold of {tid} is in progress", file=sys.stderr)
-            return REPLY_UNCONFIRMED
-        # A crashed or unreadable reservation is started over.
-        task_hold.release(result_dir, tid)
-        if not task_hold.reserve(result_dir, tid, task_hold.OWNER_GO):
-            print(f"NOT confirmed: another hold of {tid} is in progress", file=sys.stderr)
-            return REPLY_UNCONFIRMED
-    notice = _hold_notice(result_dir, tid)
-    try:
-        if not notice.exists():  # a crashed hold's queued notice is not queued twice
-            result_publish.publish_text(notice, body, 0o600)
-        if _answered(result_dir, tid, item, instance):
-            notice.unlink(missing_ok=True)
-            task_hold.release(result_dir, tid)
-            print(f"NOT held: {tid} was answered meanwhile; notice withdrawn", file=sys.stderr)
-            return REPLY_NOT_POSTED
-        task_hold.commit(result_dir, tid)
-    except (OSError, ValueError) as e:
-        task_hold.release(result_dir, tid)
-        print(f"NOT held: could not queue the notice ({e}); nothing posted", file=sys.stderr)
+        print(f"NOT confirmed: an unreadable hold marker for {tid} is in the way; the task "
+              "still reads task-not-picked-up", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if task_settled(result_dir, tid):
+        notice.unlink(missing_ok=True)
+        task_hold.release(result_dir, tid, token)
+        print(f"NOT held: {tid} was answered meanwhile; notice withdrawn", file=sys.stderr)
         return REPLY_NOT_POSTED
     print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
     return REPLY_POSTED
@@ -1152,6 +1160,10 @@ def reply(args) -> int:
         print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",
               file=sys.stderr)
         return REPLY_NOT_POSTED
+    try:
+        task_hold.release(result_dir, tid)  # the answer ends any hold
+    except ValueError:
+        pass
     if args.no_send:
         print(f"closed: {result_file.name}, nothing posted")
         return REPLY_POSTED
