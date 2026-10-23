@@ -1090,6 +1090,16 @@ def _line_state(result_dir: Path, tid: str, body: str) -> str:
     return "unknown"
 
 
+def hold_line_delivered(result_dir: Path, tid: str) -> bool:
+    """Whether the drain's receipt shows `tid`'s hold line delivered; False when unreadable."""
+    try:
+        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR,
+                                  _hold_notice(result_dir, tid).stem)
+    except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
+        return False
+    return record is not None and record.get("status") == "DELIVERED"
+
+
 def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":
     """One pass in the order the drain moves a line (queued, claimed, delivered); None when
     a file vanished under it and nothing later explains where it went."""

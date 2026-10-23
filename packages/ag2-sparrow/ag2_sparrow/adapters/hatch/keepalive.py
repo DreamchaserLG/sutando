@@ -11,7 +11,8 @@ environment) and sends the row on its heartbeat. The row is healthy while the la
 keepawake line is under two intervals old, unknown while a task that has not run yet
 is that young, else abnormal (`keepawake-not-running`). A fresh keepawake line does not
 mask the hook: the row is also abnormal when the hook has not run in HOOK_STALE_S
-(`hook-not-running`) or a task has waited over TASK_PICKUP_S (`task-not-picked-up`).
+(`hook-not-running`), a task has waited over TASK_PICKUP_S (`task-not-picked-up`), or a held
+task's room line is still undelivered after HELD_LINE_DELIVER_S (`task-held-line-undelivered`).
 `keepalive report` lists the log's gaps, and reads the lines of the earlier
 watchdog-and-probe pair too."""
 from __future__ import annotations
@@ -39,6 +40,8 @@ HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
 # A healthy row's reason while a task waits on a deliberate hold, never a problem.
 TASK_HELD = "task-held-for-owner"
+# A hold whose room line the drain has not delivered this long is stuck: the asker heard nothing.
+TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
@@ -47,6 +50,9 @@ REASON_HINTS = {
                         "the hook is not waking a worker for it, or a worker handed it off "
                         "without running hold",
     TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
+    TASK_HELD_UNDELIVERED: f"a task was held over {HELD_LINE_DELIVER_S // 60} minutes ago and its "
+                           "room notice has not been delivered, so the asker has heard nothing: "
+                           "check Sparrow's proactive drain",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -538,17 +544,17 @@ def hook_last_run(cfg: dict) -> "float | None":
     return run[0] if run is not None else _mtime(_cli.installed_marker_path())
 
 
-def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None]":
-    """(mtime of the oldest open task nobody holds, earliest deliberate hold) across every
-    instance, the agent's own tasks excepted."""
+def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None, float | None]":
+    """(mtime of the oldest open task nobody holds, earliest deliberate hold, earliest hold whose
+    room line is not yet delivered) across every instance, the agent's own tasks excepted."""
     agent = (cfg.get("AGENT_MXID") or "").lower()
     result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     try:
         items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
                                             result_dir, instance=None)
     except OSError:
-        return None, None
-    oldest = held = None
+        return None, None, None
+    oldest = held = undelivered = None
     for item in items:
         if (item.get("sender") or "").lower() == agent:
             continue
@@ -557,9 +563,11 @@ def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None]":
         # A task whose answer the outbox already has is a failed cleanup, never a hold.
         if mark is not None and not _cli.task_settled(result_dir, item["task_id"]):
             held = min(t for t in (held, mark["since"], now) if t is not None)
+            if not _cli.hold_line_delivered(result_dir, item["task_id"]):
+                undelivered = min(t for t in (undelivered, mark["since"], now) if t is not None)
         elif oldest is None and ts is not None:
             oldest = ts
-    return oldest, held
+    return oldest, held, undelivered
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
@@ -580,9 +588,11 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     hook = hook_last_run(cfg)
     if hook is not None and not _within(now, hook, HOOK_STALE_S):
         problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
-    oldest, held = open_tasks(cfg, now)
+    oldest, held, undelivered = open_tasks(cfg, now)
     if oldest is not None and now - oldest > TASK_PICKUP_S:
         problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
+    if undelivered is not None and now - undelivered > HELD_LINE_DELIVER_S:
+        problems.append((TASK_HELD_UNDELIVERED, undelivered + HELD_LINE_DELIVER_S))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
     reason, since = (problems[0] if problems else (TASK_HELD, held) if held is not None

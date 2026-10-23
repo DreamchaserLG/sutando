@@ -86,6 +86,8 @@ _LANE_MAX_BYTES = 4096
 LANE_REFRESH_S = 10.0
 LANE_FRESH_S = 30.0
 LANE_SKEW_S = 5.0
+# A ts beyond this is not a time any writer produced; it reads as missing, never raises.
+_LANE_TS_MAX = 2**53
 
 
 def _lane_name(instance: str) -> str:
@@ -201,7 +203,13 @@ def _valid_lane(rec: "dict | None", instance: str, now: float) -> "dict | None":
         return None
     pid, agent, ts = rec.get("pid"), rec.get("agent_id"), rec.get("ts")
     if not isinstance(agent, str) or valid_pid(pid) is None \
-            or not isinstance(ts, (int, float)) or isinstance(ts, bool) or not math.isfinite(ts):
+            or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    if isinstance(ts, int):
+        if not -_LANE_TS_MAX <= ts <= _LANE_TS_MAX:
+            return None
+        ts = float(ts)
+    if not math.isfinite(ts):
         return None
     if not now - LANE_FRESH_S <= ts <= now + LANE_SKEW_S:
         return None  # a drain that can no longer write cannot refresh it

@@ -1962,6 +1962,7 @@ class Keepalive(Base):
         tid = "task-1784700000005"
         self.add_task(tid, "$held", mtime=old)
         task_hold.place(self.results, tid, task_hold.OWNER_GO, now=old + 30)
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, f"proactive-hold-{tid}")
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("healthy", keepalive.TASK_HELD))
         self.assertAlmostEqual(row["since"], old + 30, delta=1)
@@ -1969,6 +1970,30 @@ class Keepalive(Base):
         # Kill control: the same task without its marker is the stuck one.
         task_hold.release(self.results, tid)
         self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_a_hold_whose_room_line_never_delivers_reports_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        bound = 10 * 60
+        since = time.time() - bound - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-undelivered"))
+        self.assertAlmostEqual(row["since"], since + bound, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        self.assertEqual((keepalive.TASK_HELD_UNDELIVERED, keepalive.HELD_LINE_DELIVER_S),
+                         ("task-held-line-undelivered", bound))
+        self.assertIn(keepalive.TASK_HELD_UNDELIVERED, keepalive.REASON_HINTS)
+        # Controls: a delivered line is a healthy hold, and so is a young undelivered one.
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, f"proactive-hold-{tid}")
+        self.assertEqual((self.health()["condition"], self.health()["reason"]), ("healthy", keepalive.TASK_HELD))
+        task_hold.release(self.results, tid)
+        shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=time.time() - 60)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD)
 
     def test_a_hold_never_masks_a_stuck_task_beside_it(self):
         self.installed()
@@ -2019,7 +2044,7 @@ class Keepalive(Base):
 
     def test_an_unlistable_task_dir_reports_neither_held_nor_stuck(self):
         with mock.patch.object(task_fields, "list_open_tasks", side_effect=OSError("gone")):
-            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None))
+            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None, None))
 
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
@@ -3708,6 +3733,22 @@ class Hold(Base):
                 auth.mkdir(parents=True, exist_ok=True)
                 (auth / "lane-identity.json").write_text(
                     json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": time.time()}))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_an_unrepresentable_lane_ts_fails_closed_without_crashing(self):
+        from ag2_sparrow import agent_identity
+        self.lane_record = False
+        for ts in (10**400, -10**400):
+            with self.subTest(sign=ts > 0):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": os.getpid(), "ts": ts}))
+                self.assertIsNone(agent_identity.published_lane_record(self.home / "state", ""))
                 r = self.hold(str(self.result_file))
                 self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
                 self.assertFalse(self.notice.exists())
