@@ -477,8 +477,9 @@ running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
-`sparrow` check when that file is missing, not connected, or older than 3
-minutes, and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
+`sparrow` check when that file is missing, not connected, older than 3
+minutes, or dated more than 5 seconds in the future (a timestamp that is not a bounded
+number reads as missing), and `ag2-sparrow-hatch sparrow` runs the same check alone, exiting 10
 when Sparrow is not running and 11 when it is running but not connected. The
 5-minute heartbeat runs it too:
 
@@ -597,14 +598,21 @@ When more than one applies, `reason` names the first of
 `task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
 is when that one went bad.
 
-Such a hold heals itself: the next `keepawake` run releases every hold past those 10 minutes
-whose line is not delivered, checking the hold's token under the hold lock, and writes one
-`released-hold task=<id> line=<undelivered|unconfirmed>` line to the keepalive log for each. The
-task then reads `task-not-picked-up` again, so the hook wakes its worker, which can hold again
-through a lane that is now valid, or answer. A hold whose line was delivered is never released.
-No line is re-sent. A false hold (for example one taken in the 30 seconds before a drain that
-can no longer write let its lane record go stale) is released within 10 minutes plus one
-keepawake interval (15 minutes). A task a worker handed off to the main session
+Such a hold heals itself when its line provably never went out. The next `keepawake` run takes
+the hold lock for each hold past those 10 minutes and, while the marker still carries the same
+token, releases it only in two cases:
+- its line is still queued as `.txt`: keepawake withdraws it, and that removal is the decision,
+  since the drain claims a line by renaming the same name, so a line the drain has claimed is
+  never removed;
+- its line is parked unsent in `RESULT_DIR/undelivered/`.
+
+A hold whose line is claimed (`.sending.<pid>`), delivered, or unconfirmed (a post may have
+landed) is kept. A release removes the hold and its notice record, so a later `hold` queues a
+fresh line through a valid lane. It also records the release time, and the hook uses that to
+restart the task's wake count once, so even a task already woken `MAX_WAKES` times is woken
+again. Each release writes one `released-hold task=<id> line=<withdrawn|parked>` line to the
+keepalive log. When that log cannot be written, the line goes to stderr and keepawake still checks
+Sparrow. A false hold is released within 10 minutes plus one keepawake interval (15 minutes). A task a worker handed off to the main session
 stays open, so it also reads `task-not-picked-up` until it is answered, unless
 the worker parked it with `hold`: a task with a whole, well-formed hold marker is
 not counted, and with nothing else wrong the row is `healthy` with reason

@@ -329,6 +329,30 @@ class HookScript(Base):
         self.assertEqual(self.stored()["woken"]["task-1784700000001"],
                          {"at": 1, "n": 3, "capped": True})
 
+    def test_a_capped_item_whose_hold_keepawake_released_is_woken_again(self):
+        tid = "task-1784700000001"
+        self.add_task(tid, "$reply", mtime=time.time() - 30 * 60)
+        now_ms = int(time.time()) * 1000
+        self.state.write_text(json.dumps({
+            "seen_ids": [tid], "last_wake_ms": now_ms,
+            "woken": {tid: {"at": now_ms - 3600000, "n": 3, "capped": True}}}))
+        self.run_script()
+        self.assertEqual(self.events_list(), ["STATE_SET", "SILENT"], "control: capped, no wake")
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        (self.results / f"proactive-hold-{tid}.txt").write_text("[channel: !room:ag2.space]\nheld\n")
+        cfg = {"RESULT_DIR": str(self.results), "TASK_DIR": str(self.tasks)}
+        self.assertEqual(keepalive.release_stuck_holds(cfg, self.home / "release.log", time.time()), [tid])
+        self.reset()
+        self.run_script()
+        self.assertIn("WAKE", self.events_list())
+        (m,) = self.payload()["matches"]
+        self.assertEqual((m["task_id"], m["rewake"]), (tid, True))
+        self.assertEqual(self.stored()["woken"][tid]["n"], 1, "the count starts again")
+        self.reset()
+        self.run_script()
+        self.assertNotIn("WAKE", self.events_list(), "one re-arm per release, then the usual delay")
+
     def test_an_item_at_the_cap_is_logged_once(self):
         self.add_task("task-1784700000001", "$reply")
         now_ms = int(time.time()) * 1000  # the hook counts whole seconds
@@ -1171,6 +1195,17 @@ class Cli(Base):
         self.assertEqual(code, hatch_cli.SPARROW_DOWN)
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
+
+    def test_a_status_dated_in_the_future_or_stale_reads_down(self):
+        self.state.mkdir()
+        status = self.state / "gateway-status.json"
+        now = 1_800_000_000
+        for ts, want in ((1e11, hatch_cli.SPARROW_DOWN), (now + 60, hatch_cli.SPARROW_DOWN),
+                         (now - 181, hatch_cli.SPARROW_DOWN), (now + 2, hatch_cli.SPARROW_OK),
+                         (now - 10, hatch_cli.SPARROW_OK)):
+            with self.subTest(age=now - ts):
+                status.write_text(json.dumps({"connected": True, "ts": ts}))
+                self.assertEqual(hatch_cli.check_sparrow(self.state, now=now, instance="")[0], want)
 
     def test_an_unrepresentable_status_ts_reads_down_without_crashing(self):
         self.state.mkdir()
@@ -2091,7 +2126,9 @@ class Keepalive(Base):
         self.assertIsNotNone(task_hold.read(self.results, kept), "a delivered hold is never released")
         released = [l for l in self.log.read_text().splitlines() if " released-hold " in l]
         self.assertEqual(len(released), 1, released)
-        self.assertIn(f"task={stale} line=undelivered", released[0])
+        self.assertIn(f"task={stale} line=withdrawn", released[0])
+        self.assertFalse((self.results / f"proactive-hold-{stale}.txt").exists(),
+                         "the unsent line is withdrawn, so the drain can never post it later")
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP),
                          "the released task reads stuck, so its worker is woken again")
@@ -2099,6 +2136,69 @@ class Keepalive(Base):
             self.cli("keepalive", "keepawake")
         self.assertEqual(sum(" released-hold " in l for l in self.log.read_text().splitlines()), 1,
                          "one line per release")
+
+    def stale_hold(self, tid):
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        return self.results / f"proactive-hold-{tid}.txt"
+
+    def release_pass(self):
+        cfg = {"RESULT_DIR": str(self.results), "TASK_DIR": str(self.tasks)}
+        return keepalive.release_stuck_holds(cfg, self.home / "release.log", time.time())
+
+    def test_a_line_the_drain_claims_mid_release_keeps_its_hold(self):
+        tid = "task-1784700000005"
+        notice = self.stale_hold(tid)
+        notice.write_text("[channel: !room:ag2.space]\nheld\n")
+        claim = notice.with_suffix(".sending.4242")
+        real = getattr(hatch_cli, "_line_claimed", None)
+
+        def drain_claims_first(result_dir, n):
+            if notice.exists():
+                os.rename(notice, claim)  # the drain wins the race to the queued name
+                return False
+            return real(result_dir, n)
+        with mock.patch.object(hatch_cli, "_line_claimed", side_effect=drain_claims_first, create=True), \
+                mock.patch.object(hatch_cli, "hold_line_outcome", return_value="undelivered"):
+            self.assertEqual(self.release_pass(), [])
+        self.assertIsNotNone(task_hold.read(self.results, tid), "a claimed line keeps its hold")
+        self.assertTrue(claim.exists(), "and the drain's claim is untouched")
+        self.assertEqual(self.release_pass(), [], "a claim already in place keeps it too")
+
+    def test_an_unconfirmed_line_is_never_released(self):
+        tid = "task-1784700000005"
+        self.stale_hold(tid)
+        (self.results / "archive").mkdir()
+        (self.results / "archive" / f"proactive-hold-{tid}-1784700000.txt").write_text("held\n")
+        self.assertEqual(self.release_pass(), [])
+        self.assertIsNotNone(task_hold.read(self.results, tid), "a post may have landed")
+
+    def test_a_line_parked_under_the_resolvers_own_name_is_released(self):
+        tid = "task-1784700000005"
+        notice = self.stale_hold(tid)
+        parked = self.results / delivery_destination.UNDELIVERED_DIR
+        parked.mkdir()
+        (parked / notice.name).write_text("held\n")  # send_failure_policy keeps the queued name
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered")
+        self.assertEqual(self.release_pass(), [tid])
+        self.assertIn(f"task={tid} line=parked", (self.home / "release.log").read_text())
+        self.assertIsNone(task_hold.read(self.results, tid))
+
+    def test_an_unwritable_log_never_stops_the_listener_check(self):
+        self.installed()
+        tid = "task-1784700000005"
+        self.stale_hold(tid).write_text("[channel: !room:ag2.space]\nheld\n")
+        self.log.parent.mkdir(parents=True, exist_ok=True)
+        self.log.unlink(missing_ok=True)
+        self.log.mkdir()  # any write to it fails
+        with mock.patch.object(keepalive, "listener_up", return_value=False), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "test")) as restart:
+            r = self.cli("keepalive", "keepawake")
+        restart.assert_called_once()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("keepalive log not written", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, tid), "the release stands")
 
     def test_a_far_future_or_unrepresentable_hold_time_is_no_hold(self):
         self.installed()

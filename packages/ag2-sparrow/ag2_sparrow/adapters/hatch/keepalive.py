@@ -487,9 +487,10 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
 
 
 def release_stuck_holds(cfg: dict, log: Path, now: float) -> list:
-    """Release, token-checked, every hold over HELD_LINE_DELIVER_S whose room line is not delivered,
-    so the task reads task-not-picked-up and its worker is woken again; a delivered one is kept.
-    One log line per release. The released task ids."""
+    """Release every hold over HELD_LINE_DELIVER_S whose line is provably unsent: still queued
+    (withdrawn here, atomically against the drain's claim) or parked. A hold whose line is claimed,
+    delivered or unconfirmed is kept. The released task reads task-not-picked-up and the hook wakes
+    its worker again. One log line per release; the released task ids."""
     agent = (cfg.get("AGENT_MXID") or "").lower()
     result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     try:
@@ -505,21 +506,27 @@ def release_stuck_holds(cfg: dict, log: Path, now: float) -> list:
         mark = task_hold.read(result_dir, tid)
         if mark is None or now - mark["since"] <= HELD_LINE_DELIVER_S:
             continue
-        outcome = _cli.hold_line_outcome(result_dir, tid)
-        if outcome == "delivered":
-            continue
         try:
-            done = task_hold.release(result_dir, tid, mark["token"])
+            outcome = task_hold.release_if(result_dir, tid, mark["token"],
+                                           lambda: _cli.withdraw_undelivered_line(result_dir, tid), now)
         except (OSError, ValueError):
-            done = False
-        if done:
-            line = f"{_utc(now)} released-hold task={tid} line={outcome} held_since={_utc(mark['since'])}"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with log.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-            print(line)
+            outcome = None
+        if outcome:
+            _log_line(log, f"{_utc(now)} released-hold task={tid} line={outcome} "
+                           f"held_since={_utc(mark['since'])}")
             released.append(tid)
     return released
+
+
+def _log_line(log: Path, line: str) -> None:
+    """Append to the keepalive log, best effort: a log that cannot be written goes to stderr."""
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as e:
+        print(f"keepalive log not written ({e})", file=sys.stderr)
+    print(line)
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
@@ -546,10 +553,7 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
                 rc = 1
     line = f"{_utc(now)} keepawake listener={'up' if up else 'down'} restarted={restarted}" \
         + (f" reason={reason}" if reason else "")
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-    print(line)
+    _log_line(log, line)
     return rc
 
 

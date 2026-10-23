@@ -755,6 +755,8 @@ def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
 
 
 _STATUS_TS_MAX = 1e11  # a wall-clock second no status file will carry
+# A status dated further ahead than this is not Sparrow's current one, so it reads as down.
+SPARROW_STATUS_FUTURE_SKEW_S = 5
 
 
 def check_sparrow(state_dir: Path, now: float | None = None,
@@ -771,6 +773,9 @@ def check_sparrow(state_dir: Path, now: float | None = None,
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
                        f"this state dir; {restart_hint()}")
     age = int((time.time() if now is None else now) - ts)
+    if age < -SPARROW_STATUS_FUTURE_SKEW_S:
+        return SPARROW_DOWN, (f"{path} is dated {-age}s in the future, so it is not Sparrow's "
+                              f"current status; {restart_hint()}")
     if age > SPARROW_STATUS_MAX_AGE_S:
         return SPARROW_DOWN, (f"{path} last written {age}s ago; Sparrow is not running, so no task "
                        f"reaches the hook; {restart_hint()}")
@@ -1107,11 +1112,36 @@ def hold_line_outcome(result_dir: Path, tid: str) -> str:
         record = None
     if record is not None and record.get("status") == "DELIVERED":
         return "delivered"
-    pending = notice.exists() or any(
-        delivery_destination.claim_base(p.name) == notice.stem
-        for p in result_dir.glob(f"{notice.stem}.sending.*"))
-    parked = any((result_dir / delivery_destination.UNDELIVERED_DIR).glob(f"{notice.stem}-*.txt"))
-    return "undelivered" if pending or parked else "unconfirmed"
+    pending = notice.exists() or _line_claimed(result_dir, notice)
+    return "undelivered" if pending or _line_parked(result_dir, notice) else "unconfirmed"
+
+
+def _line_claimed(result_dir: Path, notice: Path) -> bool:
+    return any(delivery_destination.claim_base(p.name) == notice.stem
+               for p in result_dir.glob(f"{notice.stem}.sending.*"))
+
+
+def _line_parked(result_dir: Path, notice: Path) -> bool:
+    """Parked as never to be sent: the failure resolver keeps the queued name, a retire adds a time."""
+    parked = result_dir / delivery_destination.UNDELIVERED_DIR
+    return (parked / notice.name).exists() or any(parked.glob(f"{notice.stem}-*.txt"))
+
+
+def withdraw_undelivered_line(result_dir: Path, tid: str) -> "str | None":
+    """'withdrawn' when this call removed the still-queued line (the unlink is the decision: the
+    drain claims by renaming that same name, so a line it has claimed is never removed here),
+    'parked' when the line was parked unsent; None while it is claimed, delivered, or unconfirmed."""
+    notice = _hold_notice(result_dir, tid)
+    if hold_line_outcome(result_dir, tid) == "delivered" or _line_claimed(result_dir, notice):
+        return None
+    try:
+        notice.unlink()
+        return "withdrawn"
+    except FileNotFoundError:
+        pass
+    if _line_claimed(result_dir, notice):
+        return None
+    return "parked" if _line_parked(result_dir, notice) else None
 
 
 def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":
