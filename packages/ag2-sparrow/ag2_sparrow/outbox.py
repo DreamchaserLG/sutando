@@ -61,6 +61,18 @@ class ProcessIdentity:
     start_usec: Optional[int] = None
 
 
+# The largest pid any supported OS hands out; native probes narrow a pid to a C int.
+PID_MAX = 2**31 - 1
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None. Every pid
+    read from a file goes through here first; no process can own a pid outside it."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
+
+
 _PROC_PIDTBSDINFO = 3
 _PROC_BSDINFO_SIZE = 136          # measured; verified against ctypes.sizeof below
 
@@ -147,7 +159,10 @@ def _windows_process_identity(pid: int) -> ProcessIdentity:
         api = _windows_api()
     except (OSError, AttributeError):
         return unknown
-    handle = api.OpenProcess(0x101000, False, pid)
+    try:
+        handle = api.OpenProcess(0x101000, False, pid)
+    except (OverflowError, ctypes.ArgumentError):
+        return unknown
     if not handle:
         if ctypes.get_last_error() == 87:
             return ProcessIdentity(pid, OwnerState.DEAD)
@@ -178,6 +193,8 @@ def process_identity(pid: int) -> ProcessIdentity:
     one case a two-state probe gets catastrophically wrong, because "unknown"
     then reads as "dead" and the claim gets stolen from a running worker.
     """
+    if valid_pid(pid) is None:
+        return ProcessIdentity(pid, OwnerState.DEAD)  # no process owns it: not a live owner
     if os.name == "nt":
         return _windows_process_identity(pid)
     linux = _linux_process_identity(pid)
@@ -197,8 +214,11 @@ def _darwin_process_identity(pid: int) -> ProcessIdentity:  # pragma: no cover -
     info = _ProcBsdInfo()
     ctypes.set_errno(0)
     size = ctypes.sizeof(info)
-    ret = libproc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDTBSDINFO),
-                               ctypes.c_uint64(0), ctypes.byref(info), ctypes.c_int(size))
+    try:
+        ret = libproc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDTBSDINFO),
+                                   ctypes.c_uint64(0), ctypes.byref(info), ctypes.c_int(size))
+    except (OverflowError, ctypes.ArgumentError):
+        return ProcessIdentity(pid, OwnerState.UNKNOWN)
     if ret == size:
         return ProcessIdentity(pid, OwnerState.ALIVE,
                                int(info.pbi_start_tvsec) * 1_000_000 + int(info.pbi_start_tvusec))

@@ -3684,6 +3684,35 @@ class Hold(Base):
                 self.assertTrue((self.results / f"proactive-a{infix}.sending.{infix}.txt").exists(),
                                 "a dead claim goes back to the name the drain claimed it from")
 
+    def test_a_pid_past_the_native_range_is_no_claim(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                alias = self.results / f"{self.notice.stem}.sending.{pid}"
+                alias.write_text(self.line())
+                self.assertIsNone(delivery_destination.claim_pid(alias.name))
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                alias.unlink()
+        self.assertEqual(delivery_destination.claim_pid(f"x.sending.{2**31 - 1}"), 2**31 - 1)
+
+    def test_an_out_of_domain_lane_pid_fails_closed_without_crashing(self):
+        self.lane_record = False
+        for pid in (os.getpid() + 2**32, 2**31):
+            with self.subTest(pid=pid):
+                self.add_task(self.TID, "$ev1")
+                auth = self.home / "state" / "auth"
+                auth.mkdir(parents=True, exist_ok=True)
+                (auth / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": pid, "ts": 1}))
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
     def test_a_dead_drains_stale_lane_records_no_hold(self):
         self.add_task(self.TID, "$ev1")  # the live drain is on other.space and refuses this room
         self.lane_record = False
@@ -4208,6 +4237,23 @@ class DeliveryDestination(unittest.TestCase):
         lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": 0}))
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
 
+    def test_every_pid_predicate_rejects_the_same_out_of_domain_values(self):
+        from ag2_sparrow import agent_identity, outbox, proactive_recovery, remote_gateway_bridge as gb
+        state = self.lane_state()
+        (state / "auth").mkdir()
+        for pid in (2**31, os.getpid() + 2**32, -1, True):
+            with self.subTest(pid=pid):
+                self.assertTrue(hatch_cli.process_gone(pid), "Hatch: no live owner")
+                self.assertFalse(gb._pid_alive(pid), "drain recovery: no live owner")
+                self.assertFalse(proactive_recovery.claim_owner_may_be_alive(pid))
+                if not isinstance(pid, bool):
+                    self.assertIsNone(delivery_destination.claim_pid(f"proactive-a.sending.{pid}"))
+                (state / "auth" / "lane-identity.json").write_text(
+                    json.dumps({"agent_id": "@a:ag2.space", "instance": "", "pid": pid, "ts": 1}))
+                self.assertIsNone(agent_identity.published_lane_record(state, ""))
+                self.assertIsNone(outbox.valid_pid(pid))
+        self.assertEqual(outbox.valid_pid(outbox.PID_MAX), outbox.PID_MAX)
+
     def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
         state = self.lane_state()
         cfg = {"STATE_DIR": str(state)}
@@ -4241,7 +4287,7 @@ class DeliveryDestination(unittest.TestCase):
         for inst, server in (("blue", "blue.space"), ("green", "green.space"), ("", "")):
             with self.subTest(instance=inst):
                 self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, inst), server)
-        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir() if p.suffix == ".json"),
                          ["lane-identity.blue.json", "lane-identity.green.json"])
 
     def test_concurrent_publishes_leave_one_whole_record(self):
@@ -4268,7 +4314,8 @@ class DeliveryDestination(unittest.TestCase):
         reader.join()
         self.assertNotIn(None, seen, "a reader never sees a partial record")
         self.assertIn(agent_identity.published_lane_record(state, "")["agent_id"], ids)
-        self.assertEqual([p.name for p in (state / "auth").iterdir()], ["lane-identity.json"])
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
 
     def test_the_drain_publishes_on_a_pass_with_no_proactive_file_and_at_start(self):
         import inspect
@@ -4281,7 +4328,7 @@ class DeliveryDestination(unittest.TestCase):
         main = inspect.getsource(gb.main)
         self.assertLess(main.index("_lane_identity()"), main.index("_start_outbound_worker("),
                         "published at drain start, before the first pass")
-        self.assertIn("atexit.register(agent_identity.retract_lane", main, "retracted at clean exit")
+        self.assertIn("atexit.register(_retract_own_lane)", main, "retracted at clean exit")
 
     def test_the_published_lane_record_never_holds_a_token(self):
         from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
@@ -4296,22 +4343,147 @@ class DeliveryDestination(unittest.TestCase):
         self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts"})
         self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
         self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
-        self.assertEqual([p.name for p in (state / "auth").iterdir()], ["lane-identity.json"])
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.json", "lane-identity.lock"])
+
+    @staticmethod
+    def failing_first_replace():
+        real, calls = os.replace, []
+
+        def replace(*a, **k):
+            calls.append(a)
+            if len(calls) == 1:
+                raise OSError("disk")
+            return real(*a, **k)
+        return replace
+
+    @staticmethod
+    def refusing_record_unlink(name="lane-identity.json"):
+        real = os.unlink
+
+        def unlink(path, *a, **k):
+            if os.path.basename(os.fspath(path)) == name:
+                raise PermissionError("unlink")
+            return real(path, *a, **k)
+        return unlink
 
     def test_a_failed_publish_or_a_clean_exit_retracts_the_record(self):
         from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
         state = self.lane_state()
         agent_identity.publish_lane(state, "", "@old:other.space")
         with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
-                mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk")), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": "@new:ag2.space"}):
             gb._room_is_deliverable_here("!r:ag2.space")
         self.assertIsNone(agent_identity.published_lane_record(state, ""), "readers fail closed")
-        agent_identity.publish_lane(state, "", "@a:ag2.space")
+        own = agent_identity.publish_lane(state, "", "@a:ag2.space")
         agent_identity.retract_lane(state, "", os.getpid() + 1)
         self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "only its publisher retracts it")
-        agent_identity.retract_lane(state, "", os.getpid())
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"] + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "nor a later record of its pid")
+        agent_identity.retract_lane(state, "", own["pid"], own["ts"])
         self.assertIsNone(agent_identity.published_lane_record(state, ""))
+
+    def test_a_failed_publish_and_a_failed_unlink_read_as_missing(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")  # this process's old lane
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch("os.replace", side_effect=self.failing_first_replace()), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts)
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "",
+                         "the predicates agree: Hatch has no lane either")
+
+    def test_a_failed_publish_whose_tombstone_also_fails_empties_the_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch("os.replace", side_effect=OSError("disk")), \
+                mock.patch("os.unlink", side_effect=self.refusing_record_unlink()), \
+                self.assertRaises(OSError):
+            agent_identity.publish_lane(state, "", "@new:other.space")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
+        self.assertEqual((state / "auth" / "lane-identity.json").read_bytes(), b"")
+
+    def interleave(self, first, successor):
+        """Run `first` until it is about to unlink or replace the record, run `successor`, then let
+        `first` finish; the record must be the successor's."""
+        from ag2_sparrow import agent_identity
+        real_unlink, real_replace = os.unlink, os.replace
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def pause(path):
+            if threading.current_thread() is holder.get("t") and \
+                    os.path.basename(os.fspath(path)) == "lane-identity.json":
+                paused.set()
+                go.wait(5)
+                return True
+            return False
+
+        def unlink(path, *a, **k):
+            pause(path)
+            return real_unlink(path, *a, **k)
+
+        def replace(src, dst, *a, **k):
+            if pause(dst):
+                raise OSError("disk")
+            return real_replace(src, dst, *a, **k)
+        with mock.patch("os.unlink", side_effect=unlink), mock.patch("os.replace", side_effect=replace):
+            t = holder["t"] = threading.Thread(target=first)
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=successor)
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind `first`
+            go.set()
+            t.join(5)
+            succ.join(5)
+        return agent_identity
+
+    def test_a_successor_published_during_a_stale_retract_survives(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        paused, go, holder = threading.Event(), threading.Event(), {}
+
+        def after_read(real):
+            def read(*a, **k):
+                rec = real(*a, **k)
+                if threading.current_thread() is holder.get("t"):  # the retract's ownership read
+                    paused.set()
+                    go.wait(5)
+                return rec
+            return read
+        patches = [mock.patch.object(agent_identity, name, side_effect=after_read(getattr(agent_identity, name)))
+                   for name in ("_read_at", "published_lane_record") if hasattr(agent_identity, name)]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            t = holder["t"] = threading.Thread(target=agent_identity.retract_lane, args=(state, "", os.getpid()))
+            t.start()
+            self.assertTrue(paused.wait(5))
+            succ = threading.Thread(target=agent_identity.publish_lane, args=(state, "", "@new:other.space"))
+            succ.start()
+            succ.join(0.5)  # finishes only when nothing serializes it behind the retract
+            go.set()
+            t.join(5)
+            succ.join(5)
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
+
+    def test_a_successor_published_during_a_failed_publish_survives(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:ag2.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@mid:ag2.space"}):
+            self.interleave(gb._lane_identity,
+                            lambda: agent_identity.publish_lane(state, "", "@new:other.space"))
+        self.assertEqual((agent_identity.published_lane_record(state, "") or {}).get("agent_id"),
+                         "@new:other.space")
 
     def test_the_drain_delegates_to_it(self):
         from ag2_sparrow import remote_gateway_bridge as gb

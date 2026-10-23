@@ -8,6 +8,7 @@ import re
 
 from pathlib import Path
 
+from .outbox import valid_pid
 from .result_markers import parse_markers
 
 # Destination FORMAT validation is the bridge's own job ("the bridge
@@ -30,9 +31,9 @@ def claim_pid(name: str) -> "int | None":
     parts = name.rsplit(CLAIM_INFIX, 1)
     if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
         return None
-    pid = int(parts[1])
-    # Only the spelling claim_path writes: no leading zeros, no zero.
-    return pid if pid > 0 and str(pid) == parts[1] else None
+    pid = valid_pid(int(parts[1]))
+    # Only the spelling claim_path writes: no leading zeros.
+    return pid if pid is not None and str(pid) == parts[1] else None
 
 
 def claim_base(name: str) -> "str | None":

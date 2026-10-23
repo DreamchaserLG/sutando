@@ -5453,14 +5453,24 @@ def _lane_identity() -> str:
     """The identity the deliverability predicate uses, republished whenever this instance's lane
     record does not already say it, so Hatch judges rooms by it without reading the credential env."""
     identity = _reenroll_identity()
+    if not agent_identity.LANE_SUPPORTED:
+        return identity
     rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
     if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip():
         try:
-            agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity)
-        except OSError as e:
-            agent_identity.retract_lane(_STATE, GATEWAY_INSTANCE)  # never leave a stale lane behind
+            _LANE_OWNED.update(agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity))
+        except OSError as e:  # publish_lane has already invalidated the old record
             _log(f"lane identity record not written ({e}); Hatch holds fail closed until it is")
     return identity
+
+
+_LANE_OWNED: dict = {}
+
+
+def _retract_own_lane() -> None:
+    """At clean exit: invalidate the lane record only if it is still the one this process wrote."""
+    if _LANE_OWNED:
+        agent_identity.retract_lane(_STATE, GATEWAY_INSTANCE, _LANE_OWNED["pid"], _LANE_OWNED["ts"])
 
 
 def _own_homeserver() -> str:
@@ -7505,7 +7515,7 @@ def main() -> None:
         sys.exit(75)
     _start_lock_heartbeat()
     _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
-    atexit.register(agent_identity.retract_lane, _STATE, GATEWAY_INSTANCE, os.getpid())
+    atexit.register(_retract_own_lane)
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     for sweep in (_retire_delivered_marks, _sweep_held_dir):

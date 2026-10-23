@@ -469,12 +469,15 @@ def _proc_stat(pid: int) -> bytes:
 
 
 def process_gone(pid: int) -> bool:
-    """Whether `pid` has exited, a zombie included; False when that cannot be told."""
+    """Whether `pid` has exited, a zombie included; False when that cannot be told. A pid outside
+    `outbox.valid_pid` is gone: no process can own it."""
+    if outbox.valid_pid(pid) is None:
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
-    except OSError:
+    except (OSError, OverflowError):
         return False
     stat = _proc_stat(pid)
     return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
