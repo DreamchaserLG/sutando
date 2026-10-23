@@ -16,6 +16,8 @@ from .result_markers import parse_markers
 MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 # Where the drain records a confirmed proactive delivery, keyed by the file's stem.
 RECEIPT_DIR = ".outbox-ag2space-proactive"
+# Where the drain parks a line it will never send, as `<stem>-<epoch>.txt`.
+UNDELIVERED_DIR = "undelivered"
 # The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
 CLAIM_INFIX = ".sending."
 

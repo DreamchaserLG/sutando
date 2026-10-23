@@ -31,6 +31,7 @@ from pathlib import Path
 from ... import (_dirs, agent_identity, delivery_destination, gateway_credential_io,
                  gateway_credentials, gateway_instance, outbox, result_ready, task_hold,
                  workspace_lock)
+from ...persisted_number import bounded_number
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
@@ -753,6 +754,9 @@ def sparrow_status_path(state_dir: Path, instance: str | None = None) -> Path:
     return state_dir / f"gateway-status{'.' + instance if instance else ''}.json"
 
 
+_STATUS_TS_MAX = 1e11  # a wall-clock second no status file will carry
+
+
 def check_sparrow(state_dir: Path, now: float | None = None,
                   instance: str | None = None) -> tuple[int, str]:
     """SPARROW_OK, SPARROW_DOWN or SPARROW_NOT_CONNECTED, with a detail, judged by the
@@ -760,7 +764,9 @@ def check_sparrow(state_dir: Path, now: float | None = None,
     path = sparrow_status_path(state_dir, instance)
     try:
         status = json.loads(path.read_text(encoding="utf-8"))
-        ts = float(status["ts"])
+        ts = bounded_number(status["ts"], 0, _STATUS_TS_MAX)
+        if ts is None:
+            raise ValueError("ts is not a bounded number")
     except (OSError, ValueError, KeyError, TypeError) as e:
         return SPARROW_DOWN, (f"{path} unreadable ({type(e).__name__}); Sparrow has not run with "
                        f"this state dir; {restart_hint()}")
@@ -1090,14 +1096,22 @@ def _line_state(result_dir: Path, tid: str, body: str) -> str:
     return "unknown"
 
 
-def hold_line_delivered(result_dir: Path, tid: str) -> bool:
-    """Whether the drain's receipt shows `tid`'s hold line delivered; False when unreadable."""
+def hold_line_outcome(result_dir: Path, tid: str) -> str:
+    """Where `tid`'s hold line stands, by the drain's own state: 'delivered' (its receipt says so),
+    'undelivered' (still queued or claimed, or parked as never to be sent), else 'unconfirmed'
+    (gone with no receipt: the post may have happened and only the best-effort receipt failed)."""
+    notice = _hold_notice(result_dir, tid)
     try:
-        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR,
-                                  _hold_notice(result_dir, tid).stem)
+        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
     except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
-        return False
-    return record is not None and record.get("status") == "DELIVERED"
+        record = None
+    if record is not None and record.get("status") == "DELIVERED":
+        return "delivered"
+    pending = notice.exists() or any(
+        delivery_destination.claim_base(p.name) == notice.stem
+        for p in result_dir.glob(f"{notice.stem}.sending.*"))
+    parked = any((result_dir / delivery_destination.UNDELIVERED_DIR).glob(f"{notice.stem}-*.txt"))
+    return "undelivered" if pending or parked else "unconfirmed"
 
 
 def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":

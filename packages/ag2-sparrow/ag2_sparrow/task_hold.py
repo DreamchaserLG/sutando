@@ -9,7 +9,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
-import math
 import os
 import re
 import secrets
@@ -18,6 +17,7 @@ import time
 from pathlib import Path
 
 from . import gateway_instance, local_task_protocol
+from .persisted_number import bounded_number
 
 HOLD_DIR = ".task-holds"
 LOCK_NAME = ".lock"
@@ -26,6 +26,7 @@ _REASON_RE = re.compile(r"[a-z0-9-]{1,40}")
 _MAX_BYTES = 4096
 # Epoch seconds before year 5138: bounds `since` to a sane, finite range.
 _MAX_EPOCH = 1e11
+SINCE_SKEW_S = 5.0
 
 
 def valid_tid(tid: str) -> bool:
@@ -47,8 +48,10 @@ def _name(tid: str) -> str:
 
 
 def _valid_since(value) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and 0 <= value <= _MAX_EPOCH)
+    """A hold time a writer produced: a bounded number, not ahead of now by more than SINCE_SKEW_S
+    (a far-future time would never age, so it is no hold)."""
+    since = bounded_number(value, 0, _MAX_EPOCH)
+    return since is not None and since <= time.time() + SINCE_SKEW_S
 
 
 def _open_dir(result_dir: Path, create: bool) -> "int | None":

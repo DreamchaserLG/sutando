@@ -366,7 +366,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
 
 # Terminal resting place for proactive nudges that can never be delivered.
 # results/undelivered/ is the repo-wide quarantine convention — health-check's
-UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"
+UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / _delivery_destination.UNDELIVERED_DIR
 # Named-instance support (multi-gateway): one core may run SEVERAL bridge
 # processes, each pointed at a different gateway (e.g. prod + dev homeservers)
 _INSTANCE_RE = gateway_instance.INSTANCE_RE

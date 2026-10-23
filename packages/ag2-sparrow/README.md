@@ -265,10 +265,15 @@ queued, and only the caller that wrote it queues the line. A hold is recorded
 only once the line is proven queued, being sent, or delivered per the drain's
 receipt; with no such proof `hold` exits 3, queues nothing and records no hold. It
 refuses an item that already has a result or an outbox record, a room the
-proactive drain would not deliver to (including a room on another homeserver,
-judged by the identity Sparrow enrolled, `STATE_DIR/auth/ag2space.json`; when
-that is unknown the check is skipped and the drain decides at send time), and a `.task-holds` that
-is a symlink. Exit 3 means the hold is not recorded, so the task still reads
+proactive drain would not deliver to (including a room on another homeserver), and a
+`.task-holds` that is a symlink. The homeserver is judged by the identity the live drain
+publishes, never by the enrollment file or the environment: each Sparrow writes
+`STATE_DIR/auth/lane-identity[.<GATEWAY_INSTANCE>].json` (its agent id, instance, pid and a
+timestamp; never a token) at start and refreshes it at least every 10 seconds while it runs.
+`hold` accepts that record only when it is this instance's, its pid is the live Sparrow (and the
+lock's holder, when a lock is held), and its timestamp is under 30 seconds old (and no more than
+5 seconds ahead). Without such a record (before Sparrow's first pass, after it stops, or when it
+cannot write its state directory) `hold` exits 3: "can't confirm the room is deliverable yet". Exit 3 means the hold is not recorded, so the task still reads
 `task-not-picked-up`; running `hold` again records it when it can. The item's result_file
 stays free for the real answer, and `reply` withdraws a hold line that is
 still queued and ends the hold. For a sender who is not the owner, the
@@ -579,14 +584,24 @@ fresh keepawake line never hides a stopped hook:
 | the hook's last run (`STATE_DIR/hatch-hook-last-run`) is over 5 minutes old; a hook that never ran is timed from when `install` last wrote a script | `hook-not-running` |
 | a task file with no result (any `GATEWAY_INSTANCE`, the agent's own messages excepted) is over 15 minutes old | `task-not-picked-up` |
 
+A held task whose room line has not been delivered is counted too, once the hold is over 10
+minutes old. The drain's own state decides which reason applies:
+
+| The hold's line | `reason` |
+| --- | --- |
+| still queued or being sent, or parked in `RESULT_DIR/undelivered/` as never to be sent | `task-held-line-undelivered`: the asker has heard nothing |
+| gone from the queue with no delivery receipt (the post may have happened and only the best-effort receipt write failed) | `task-held-line-unconfirmed`: delivery can't be confirmed |
+
 When more than one applies, `reason` names the first of
-`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`, and `since`
+`keepawake-not-running`, `hook-not-running`, `task-not-picked-up`,
+`task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
 is when that one went bad. A task a worker handed off to the main session
 stays open, so it also reads `task-not-picked-up` until it is answered, unless
 the worker parked it with `hold`: a task with a whole, well-formed hold marker is
 not counted, and with nothing else wrong the row is `healthy` with reason
 `task-held-for-owner` and `since` the earliest hold. An absent, partial,
-unreadable or malformed marker (including a non-finite `since`) is not a hold,
+unreadable or malformed marker (including a `since` that is not a finite number in range, or
+one more than 5 seconds in the future) is not a hold,
 and neither is one on a task the outbox already has an answer for, so that
 task still counts.
 

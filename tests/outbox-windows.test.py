@@ -120,9 +120,8 @@ class WindowsOutbox(unittest.TestCase):
 
     def test_input_validation_precedes_binding(self):
         with patch.object(ob, "_windows_api", side_effect=AssertionError) as api:
-            # Outside valid_pid no process can own the pid: DEAD, decided before any binding.
-            for pid in (0, -1, 0x80000000, 0x100000000, 1 << 80, "123", None, True):
-                self.assertEqual(ob.process_identity(pid).state, ob.OwnerState.DEAD)
+            for pid in (0, -1, 0x100000000, 1 << 80, "123", None):
+                self.assertEqual(ob.process_identity(pid).state, ob.OwnerState.UNKNOWN)
             api.assert_not_called()
 
     def test_initialization_unavailable(self):

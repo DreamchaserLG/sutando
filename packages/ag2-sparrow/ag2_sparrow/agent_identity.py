@@ -23,7 +23,6 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
-import math
 import os
 import re
 import secrets
@@ -33,6 +32,7 @@ from pathlib import Path
 
 from . import gateway_credential_sources as _sources
 from .outbox import valid_pid
+from .persisted_number import bounded_number
 from .gateway_instance import suffix as _instance_suffix
 
 ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
@@ -201,15 +201,9 @@ def _invalidate_at(dfd: int, name: str, instance: str) -> None:
 def _valid_lane(rec: "dict | None", instance: str, now: float) -> "dict | None":
     if not isinstance(rec, dict) or rec.get("instance") != (instance or "") or rec.get("retracted"):
         return None
-    pid, agent, ts = rec.get("pid"), rec.get("agent_id"), rec.get("ts")
-    if not isinstance(agent, str) or valid_pid(pid) is None \
-            or not isinstance(ts, (int, float)) or isinstance(ts, bool):
-        return None
-    if isinstance(ts, int):
-        if not -_LANE_TS_MAX <= ts <= _LANE_TS_MAX:
-            return None
-        ts = float(ts)
-    if not math.isfinite(ts):
+    pid, agent = rec.get("pid"), rec.get("agent_id")
+    ts = bounded_number(rec.get("ts"), -_LANE_TS_MAX, _LANE_TS_MAX)
+    if not isinstance(agent, str) or valid_pid(pid) is None or ts is None:
         return None
     if not now - LANE_FRESH_S <= ts <= now + LANE_SKEW_S:
         return None  # a drain that can no longer write cannot refresh it

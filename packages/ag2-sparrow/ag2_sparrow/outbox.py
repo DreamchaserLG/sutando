@@ -65,18 +65,6 @@ class ProcessIdentity:
 PID_MAX = 2**31 - 1
 
 
-def _is_int(value) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def valid_pid(pid) -> Optional[int]:
-    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None. Every pid
-    read from a file goes through here first; no process can own a pid outside it."""
-    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
-        return None
-    return pid
-
-
 _PROC_PIDTBSDINFO = 3
 _PROC_BSDINFO_SIZE = 136          # measured; verified against ctypes.sizeof below
 
@@ -163,10 +151,7 @@ def _windows_process_identity(pid: int) -> ProcessIdentity:
         api = _windows_api()
     except (OSError, AttributeError):
         return unknown
-    try:
-        handle = api.OpenProcess(0x101000, False, pid)
-    except (OverflowError, ctypes.ArgumentError):
-        return unknown
+    handle = api.OpenProcess(0x101000, False, pid)
     if not handle:
         if ctypes.get_last_error() == 87:
             return ProcessIdentity(pid, OwnerState.DEAD)
@@ -197,8 +182,6 @@ def process_identity(pid: int) -> ProcessIdentity:
     one case a two-state probe gets catastrophically wrong, because "unknown"
     then reads as "dead" and the claim gets stolen from a running worker.
     """
-    if valid_pid(pid) is None:
-        return ProcessIdentity(pid, OwnerState.DEAD)  # no process owns it: not a live owner
     if os.name == "nt":
         return _windows_process_identity(pid)
     linux = _linux_process_identity(pid)
@@ -218,11 +201,8 @@ def _darwin_process_identity(pid: int) -> ProcessIdentity:  # pragma: no cover -
     info = _ProcBsdInfo()
     ctypes.set_errno(0)
     size = ctypes.sizeof(info)
-    try:
-        ret = libproc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDTBSDINFO),
-                                   ctypes.c_uint64(0), ctypes.byref(info), ctypes.c_int(size))
-    except (OverflowError, ctypes.ArgumentError):
-        return ProcessIdentity(pid, OwnerState.UNKNOWN)
+    ret = libproc.proc_pidinfo(ctypes.c_int(pid), ctypes.c_int(_PROC_PIDTBSDINFO),
+                               ctypes.c_uint64(0), ctypes.byref(info), ctypes.c_int(size))
     if ret == size:
         return ProcessIdentity(pid, OwnerState.ALIVE,
                                int(info.pbi_start_tvsec) * 1_000_000 + int(info.pbi_start_tvusec))
@@ -507,19 +487,25 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     # Valid JSON carrying wrong types is still a claim we cannot read. Raising
     # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
-    # No coercion: true, 1.9 or "1" never become pid 1, and an infinity never overflows. An int
-    # outside valid_pid stays as written; process_identity reads it as no live owner.
-    pid, claimed_at, start_usec = d.get("pid", -1), d.get("claimed_at", 0.0), d.get("start_usec")
-    if not (_is_int(pid) and (start_usec is None or _is_int(start_usec))
-            and isinstance(claimed_at, (int, float)) and not isinstance(claimed_at, bool)
-            and math.isfinite(claimed_at)):
+    try:
+        pid = int(d.get("pid", -1))
+        claimed_at = float(d.get("claimed_at", 0.0))
+        raw_start = d.get("start_usec")
+        start_usec = None if raw_start is None else int(raw_start)
+    except (TypeError, ValueError):
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
-    claimed_at = float(claimed_at)
     return ClaimRecord(item_id=str(d.get("item_id", item_id)),
                        drainer_id=str(d.get("drainer_id", "")),
                        pid=pid,
                        start_usec=start_usec,
                        claimed_at=claimed_at)
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:

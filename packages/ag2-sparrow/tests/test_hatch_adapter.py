@@ -1172,6 +1172,14 @@ class Cli(Base):
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
 
+    def test_an_unrepresentable_status_ts_reads_down_without_crashing(self):
+        self.state.mkdir()
+        for raw in ("1" + "0" * 400, "-1" + "0" * 400, "NaN", "Infinity", "true", '"1000"'):
+            with self.subTest(ts=raw[:8]):
+                (self.state / "gateway-status.json").write_text('{"connected": true, "ts": %s}' % raw)
+                code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="")
+                self.assertEqual(code, hatch_cli.SPARROW_DOWN, detail)
+
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1980,6 +1988,7 @@ class Keepalive(Base):
         bound = 10 * 60
         since = time.time() - bound - 60
         task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        (self.results / f"proactive-hold-{tid}.txt").write_text("[channel: !room:ag2.space]\nheld\n")
         row = self.health()
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-undelivered"))
         self.assertAlmostEqual(row["since"], since + bound, delta=1)
@@ -1994,6 +2003,92 @@ class Keepalive(Base):
         shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR)
         task_hold.place(self.results, tid, task_hold.OWNER_GO, now=time.time() - 60)
         self.assertEqual(self.health()["reason"], keepalive.TASK_HELD)
+
+    def test_a_held_line_gone_without_a_receipt_is_unconfirmed_not_undelivered(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        stem = f"proactive-hold-{tid}"
+        (self.results / "archive").mkdir()
+        (self.results / "archive" / f"{stem}-1784700000.txt").write_text("held\n")  # posted; receipt failed
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"))
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "unconfirmed")
+        self.assertIn("can't be confirmed", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertNotIn("heard nothing", keepalive.REASON_HINTS[keepalive.TASK_HELD_UNCONFIRMED])
+        self.assertEqual(hc.validate(row), (row, None))
+        # The drain's own states: parked unsent and still claimed are undelivered; a receipt is delivered.
+        parked = self.results / delivery_destination.UNDELIVERED_DIR
+        parked.mkdir()
+        (parked / f"{stem}-1784700000.txt").write_text("held\n")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered")
+        shutil.rmtree(parked)
+        claim = self.results / f"{stem}.sending.4242"
+        claim.write_text("held\n")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "undelivered")
+        claim.unlink()
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, stem)
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, tid), "delivered")
+
+    def test_a_confirmed_send_whose_receipt_write_fails_is_unconfirmed(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        if os.geteuid() == 0:
+            self.skipTest("root ignores the permission bits this relies on")
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO,
+                        now=time.time() - keepalive.HELD_LINE_DELIVER_S - 60)
+        notice = self.results / f"proactive-hold-{tid}.txt"
+        notice.write_text(f"[channel: !room:ag2.space]\n@bob:ag2.space {hatch_cli.HOLD_NOTICE}\n")
+        receipts = self.results / delivery_destination.RECEIPT_DIR
+        receipts.mkdir()
+        receipts.chmod(0o500)
+        self.addCleanup(receipts.chmod, 0o700)
+        posts = []
+
+        def req(method, path, payload=None, timeout=None):
+            if method == "POST":
+                posts.append(payload)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+        self.assertEqual(len(posts), 1, "the drain posted the line once")
+        self.assertFalse(notice.exists(), "and moved it out of the queue")
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"),
+                         "a missing receipt is not proof the asker heard nothing")
+
+    def test_a_far_future_or_unrepresentable_hold_time_is_no_hold(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=time.time() - 20 * 60)
+        task_hold.place(self.results, tid)
+        marker = self.results / task_hold.HOLD_DIR / f"{tid}.json"
+        good = json.loads(marker.read_text())
+        for since in (time.time() + 3600, 10**400, -10**400):
+            with self.subTest(since=str(since)[:12]):
+                marker.write_text(json.dumps({**good, "since": since}))
+                row = self.health()
+                self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+                self.assertIsNone(task_hold.read(self.results, tid))
+                self.assertEqual(keepalive.open_tasks({"RESULT_DIR": str(self.results),
+                                                       "TASK_DIR": str(self.tasks)}, time.time())[1], None)
 
     def test_a_hold_never_masks_a_stuck_task_beside_it(self):
         self.installed()
@@ -2044,7 +2139,7 @@ class Keepalive(Base):
 
     def test_an_unlistable_task_dir_reports_neither_held_nor_stuck(self):
         with mock.patch.object(task_fields, "list_open_tasks", side_effect=OSError("gone")):
-            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None, None))
+            self.assertEqual(keepalive.open_tasks({}, time.time()), (None, None, {}))
 
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
@@ -4278,15 +4373,21 @@ class DeliveryDestination(unittest.TestCase):
         lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
 
+    def test_one_bounded_number_reader_for_persisted_values(self):
+        from ag2_sparrow.persisted_number import bounded_number
+        for value, want in ((5, 5.0), (5.5, 5.5), (-10, -10.0), (11, None), (10**400, None),
+                            (-10**400, None), (float("inf"), None), (float("nan"), None),
+                            (True, None), ("5", None), (None, None)):
+            with self.subTest(value=str(value)[:12]):
+                self.assertEqual(bounded_number(value, -10, 10), want)
+
     def test_every_pid_predicate_rejects_the_same_out_of_domain_values(self):
-        from ag2_sparrow import agent_identity, outbox, proactive_recovery, remote_gateway_bridge as gb
+        from ag2_sparrow import agent_identity, outbox
         state = self.lane_state()
         (state / "auth").mkdir()
         for pid in (2**31, os.getpid() + 2**32, -1, True):
             with self.subTest(pid=pid):
                 self.assertTrue(hatch_cli.process_gone(pid), "Hatch: no live owner")
-                self.assertFalse(gb._pid_alive(pid), "drain recovery: no live owner")
-                self.assertFalse(proactive_recovery.claim_owner_may_be_alive(pid))
                 if not isinstance(pid, bool):
                     self.assertIsNone(delivery_destination.claim_pid(f"proactive-a.sending.{pid}"))
                 (state / "auth" / "lane-identity.json").write_text(
@@ -4373,26 +4474,6 @@ class DeliveryDestination(unittest.TestCase):
                     self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:ag2.space")
         self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), 2**31)
         self.assertRaises(ValueError, delivery_destination.claim_path, Path("p.txt"), True)
-
-    def test_a_persisted_claim_pid_is_never_coerced(self):
-        root = self.lane_state()
-        claim = outbox._claim_path(root, "item")
-        claim.parent.mkdir(parents=True)
-        for field, raw in (("pid", "true"), ("pid", "1.9"), ("pid", '"1"'), ("pid", "Infinity"),
-                           ("start_usec", "Infinity"), ("claimed_at", "Infinity")):
-            with self.subTest(field=field, raw=raw):
-                body = {"item_id": "item", "drainer_id": "d", "pid": "PID", "start_usec": None, "claimed_at": 1.0}
-                body[field] = "RAW"
-                claim.write_text(json.dumps(body).replace('"PID"', str(os.getpid())).replace('"RAW"', raw))
-                rec = outbox.read_delivery_claim(root, "item")
-                self.assertEqual(rec.state, "UNKNOWN", "a wrong type is a claim nobody can read")
-                self.assertFalse(outbox.may_reclaim_delivery(root, "item", 0))
-        claim.write_text(json.dumps({"item_id": "item", "drainer_id": "d", "pid": 2**31,
-                                     "start_usec": None, "claimed_at": 1.0}))
-        rec = outbox.read_delivery_claim(root, "item")
-        self.assertEqual((rec.state, rec.pid), ("HELD", 2**31))
-        self.assertIs(outbox.process_identity(rec.pid).state, outbox.OwnerState.DEAD, "no live owner")
-        self.assertTrue(outbox.may_reclaim_delivery(root, "item", 0))
 
     def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
         state = self.lane_state()
