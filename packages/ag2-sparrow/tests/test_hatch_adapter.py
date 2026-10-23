@@ -3649,29 +3649,40 @@ class Hold(Base):
     def test_an_adjacent_infix_claim_is_not_this_notices_claim(self):
         self.add_task(self.TID, "$ev1")
         task_hold.mark_notice(self.results, self.TID)
-        fake = self.results / f"{self.notice.stem}.sending.x.sending.{os.getpid()}"
-        fake.write_text(self.line())
-        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
-        r = self.hold(str(self.result_file))
-        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
-        self.assertIsNone(task_hold.read(self.results, self.TID))
-        self.assertEqual(delivery_destination.claim_base(fake.name), f"{self.notice.stem}.sending.x")
+        for infix in ("x", "5"):  # `<stem>.sending.5.sending.<pid>` parses a canonical pid too
+            with self.subTest(infix=infix):
+                fake = self.results / f"{self.notice.stem}.sending.{infix}.sending.{os.getpid()}"
+                fake.write_text(self.line())
+                self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                base = delivery_destination.claim_base(fake.name)
+                self.assertEqual(base, f"{self.notice.stem}.sending.{infix}")
+                self.assertEqual(delivery_destination.claim_path(
+                    self.results / f"{base}.txt", os.getpid()), fake, "the base is exactly claim_path's")
+                fake.unlink()
         self.assertEqual(delivery_destination.claim_base(
             delivery_destination.claim_path(self.notice, 4242).name), self.notice.stem)
 
     def test_recovery_returns_an_adjacent_infix_claim_to_its_own_name(self):
         from ag2_sparrow import remote_gateway_bridge as gb
-        live = self.results / f"proactive-b.sending.x.sending.{os.getpid()}"
-        dead = self.results / "proactive-a.sending.x.sending.4242"
-        live.write_text("x")
-        dead.write_text("x")
+        for infix in ("x", "5"):
+            live = self.results / f"proactive-b{infix}.sending.{infix}.sending.{os.getpid()}"
+            dead = self.results / f"proactive-a{infix}.sending.{infix}.sending.4242"
+            live.write_text("x")
+            dead.write_text("x")
         with mock.patch.object(gb, "RESULTS_DIR", self.results), mock.patch.object(gb, "_log"), \
                 mock.patch.object(gb, "_pid_alive", side_effect=lambda pid: pid == os.getpid()):
             gb._recover_orphan_proactive()
-        self.assertTrue(live.exists(), "a live pid's claim is left alone")
-        self.assertFalse((self.results / "proactive-a.txt").exists(), "never a shorter, wrong name")
-        self.assertTrue((self.results / "proactive-a.sending.x.txt").exists(),
-                        "a dead claim goes back to the name the drain claimed it from")
+        for infix in ("x", "5"):
+            with self.subTest(infix=infix):
+                self.assertTrue((self.results / f"proactive-b{infix}.sending.{infix}.sending.{os.getpid()}")
+                                .exists(), "a live pid's claim is left alone")
+                self.assertFalse((self.results / f"proactive-a{infix}.txt").exists(),
+                                 "never a shorter, wrong name")
+                self.assertTrue((self.results / f"proactive-a{infix}.sending.{infix}.txt").exists(),
+                                "a dead claim goes back to the name the drain claimed it from")
 
     def test_a_dead_drains_stale_lane_records_no_hold(self):
         self.add_task(self.TID, "$ev1")  # the live drain is on other.space and refuses this room
