@@ -5449,20 +5449,17 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     return None
 
 
-_LANE_PUBLISHED: "dict[str, str | None]" = {"id": None}
-
-
 def _lane_identity() -> str:
-    """The identity the deliverability predicate uses, published to the lane record whenever it
-    changes, so Hatch judges rooms by it without reading the credential env."""
+    """The identity the deliverability predicate uses, republished whenever this instance's lane
+    record does not already say it, so Hatch judges rooms by it without reading the credential env."""
     identity = _reenroll_identity()
-    if _LANE_PUBLISHED["id"] != identity:
+    rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
+    if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip():
         try:
-            agent_identity.publish_lane(_STATE, identity)
-            _LANE_PUBLISHED["id"] = identity
+            agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity)
         except OSError as e:
-            agent_identity.retract_lane(_STATE)  # a stale record must not outlive the change
-            _log(f"lane identity record not written ({e}); readers fall back to enrollment")
+            agent_identity.retract_lane(_STATE, GATEWAY_INSTANCE)  # never leave a stale lane behind
+            _log(f"lane identity record not written ({e}); Hatch holds fail closed until it is")
     return identity
 
 
@@ -5512,7 +5509,9 @@ def _recover_orphan_proactive() -> None:
                     continue
             except OSError:
                 continue
-        target = f.with_name(name.split(".sending")[0] + ".txt")
+        base = (_delivery_destination.claim_base(name) if _delivery_destination.CLAIM_INFIX in name
+                else name[:-len(".sending")])
+        target = f.with_name(base + ".txt")
         if target.exists():
             continue  # collision — leave for an operator, never clobber
         try:
@@ -6725,9 +6724,11 @@ def _owner_mention_dm_name(tid: str) -> str:
 
 def _owner_mention_dm_queued(tid: str) -> bool:
     """A copy already handed to the proactive leg (pending, claimed, sent or parked)."""
-    stem = glob.escape(_owner_mention_dm_name(tid))
-    return ((RESULTS_DIR / f"{_owner_mention_dm_name(tid)}.txt").exists()
-            or any(RESULTS_DIR.glob(f"{stem}.sending*"))
+    name = _owner_mention_dm_name(tid)
+    stem = glob.escape(name)
+    return ((RESULTS_DIR / f"{name}.txt").exists() or (RESULTS_DIR / f"{name}.sending").exists()
+            or any(_delivery_destination.claim_base(p.name) == name
+                   for p in RESULTS_DIR.glob(f"{stem}.sending.*"))
             or any(ARCHIVE_RESULTS_DIR.glob(f"{stem}-*.txt"))
             or any(UNDELIVERABLE_RESULTS_DIR.glob(f"{stem}-*.txt")))
 
@@ -7503,6 +7504,8 @@ def main() -> None:
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
     _start_lock_heartbeat()
+    _lane_identity()  # published at start, so Hatch's fail-closed window is only startup
+    atexit.register(agent_identity.retract_lane, _STATE, GATEWAY_INSTANCE, os.getpid())
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()
     for sweep in (_retire_delivered_marks, _sweep_held_dir):

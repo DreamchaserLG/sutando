@@ -6,8 +6,9 @@ then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then
 install derives its root from exactly the identity the bridge will report. A .env file's lines
 are parsed by the credential owner, gateway_credential_sources. Stdlib only.
 
-`publish_lane` is the one writer of `<state>/auth/lane-identity.json`: the id the live drain judges
-rooms by, with a timestamp and pid, never a credential. `published_lane` reads it back.
+`publish_lane` is the one writer of `<state>/auth/lane-identity[.<instance>].json`: the id the live
+drain of that gateway instance judges rooms by, with its instance, pid and a timestamp, never a
+credential. `published_lane_record` reads it back; `retract_lane` removes it.
 
 `root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
 `SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
@@ -22,10 +23,12 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
 from . import gateway_credential_sources as _sources
+from .gateway_instance import suffix as _instance_suffix
 
 ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
 FILE_KEYS = ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID")
@@ -67,39 +70,51 @@ def enrolled(state_dir) -> str:
         return ""
 
 
-def _lane_record(state_dir) -> Path:
-    return Path(state_dir) / "auth" / "lane-identity.json"
+def _lane_record(state_dir, instance: str) -> Path:
+    return Path(state_dir) / "auth" / f"lane-identity{_instance_suffix(instance)}.json"
 
 
-def publish_lane(state_dir, agent_id: str) -> None:
-    """Atomically record the identity the live drain resolved, so a reader that must not open the
-    credential env sees the drain's lane. Holds the id, a timestamp and the pid only; OSError on failure."""
-    path = _lane_record(state_dir)
+def publish_lane(state_dir, instance: str, agent_id: str) -> None:
+    """Atomically record the identity the live drain of `instance` resolved, so a reader that must
+    not open the credential env sees that drain's lane. Holds the id, instance, pid and a timestamp
+    only; OSError on failure."""
+    path = _lane_record(state_dir, instance)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        tmp.write_text(json.dumps({"agent_id": agent_id or "", "ts": time.time(), "pid": os.getpid()}))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"agent_id": (agent_id or "").strip(), "instance": instance or "",
+                       "pid": os.getpid(), "ts": time.time()}, fh)
         os.replace(tmp, path)
     finally:
         with contextlib.suppress(OSError):
-            tmp.unlink()
+            os.unlink(tmp)
 
 
-def retract_lane(state_dir) -> None:
-    """Remove the published lane record, so readers fall back to the binding; never raises."""
+def retract_lane(state_dir, instance: str, pid: "int | None" = None) -> None:
+    """Remove `instance`'s lane record (only if `pid` published it, when given); never raises."""
+    path = _lane_record(state_dir, instance)
+    if pid is not None and (published_lane_record(state_dir, instance) or {}).get("pid") != pid:
+        return
     with contextlib.suppress(OSError):
-        _lane_record(state_dir).unlink()
+        path.unlink()
 
 
-def published_lane(state_dir) -> str:
-    """The `agent_id` the live drain last published, '' when absent, unreadable or malformed."""
+def published_lane_record(state_dir, instance: str) -> "dict | None":
+    """`instance`'s lane record when well formed and its own (agent_id str, instance equal, pid a
+    positive int); None otherwise. Whether its pid is still the live drain is the reader's check."""
     if state_dir is None:
-        return ""
+        return None
     try:
-        v = json.loads(_lane_record(state_dir).read_text()).get("agent_id")
-        return v.strip() if isinstance(v, str) else ""
+        rec = json.loads(_lane_record(state_dir, instance).read_text())
     except Exception:
-        return ""
+        return None
+    if not isinstance(rec, dict) or rec.get("instance") != (instance or ""):
+        return None
+    pid, agent = rec.get("pid"), rec.get("agent_id")
+    if not isinstance(agent, str) or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return {**rec, "agent_id": agent.strip()}
 
 
 def resolve(state_dir, channel_value, environ=None) -> str:

@@ -35,6 +35,14 @@ def claim_pid(name: str) -> "int | None":
     return pid if pid > 0 and str(pid) == parts[1] else None
 
 
+def claim_base(name: str) -> "str | None":
+    """The queued stem a drain claim name came from (the inverse of claim_path); None for any name
+    claim_path never writes. `<stem>.sending.x.sending.<pid>` is a claim of `<stem>.sending.x`."""
+    if claim_pid(name) is None:
+        return None
+    return name.rsplit(CLAIM_INFIX, 1)[0]
+
+
 def route(body: str, skip_after_channel: bool = True) -> "tuple[str, str | None, str]":
     """('send', room_or_None, stripped-body) | ('foreign', None, '') |
     ('drop', None, '').

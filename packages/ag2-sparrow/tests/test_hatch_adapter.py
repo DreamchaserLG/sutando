@@ -3317,6 +3317,7 @@ class Hold(Base):
         self.result_file = self.results / f"{self.TID}.txt"
         self.notice = self.results / f"proactive-hold-{self.TID}.txt"
         self.mxid = AGENT
+        self.lane_record = True  # the drain has published its lane, as self.mxid
 
     def env(self):
         env = py_env(self.home)
@@ -3325,6 +3326,9 @@ class Hold(Base):
         auth = self.home / "state" / "auth"
         auth.mkdir(parents=True, exist_ok=True)
         (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
+        if self.lane_record:
+            (auth / "lane-identity.json").write_text(json.dumps(
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": 0}))
         return env
 
     def hold(self, *args, cfg=None, env=None):
@@ -3412,9 +3416,9 @@ class Hold(Base):
         self.assertFalse(self.notice.exists())
         self.assertIsNone(task_hold.read(self.results, self.TID))
 
-    def test_the_enrolled_identity_wins_over_snapshot_and_environment(self):
+    def test_the_published_lane_wins_over_snapshot_and_environment(self):
         self.add_task(self.TID, "$ev1")
-        self.mxid = "@watch-agent:other.space"  # what Sparrow enrolled
+        self.mxid = "@watch-agent:other.space"  # what the drain published
         with mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
             r = self.hold(str(self.result_file), cfg={"AGENT_MXID": AGENT},
                           env={"AGENT_MXID": AGENT, "AGENT_ID": AGENT})
@@ -3534,22 +3538,22 @@ class Hold(Base):
         self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
         self.assertIsNotNone(task_hold.read(self.results, self.TID))
 
-    def test_missing_or_unreadable_enrollment_records_no_hold(self):
-        # An AGENT_MXID override is not consulted: Hatch never reads the credential env.
-        for enrollment in (None, "{", '{"agent_id": 7}'):
-            with self.subTest(enrollment=enrollment):
-                self.room_task("!foreign:other.space")
+    def test_no_published_lane_records_no_hold_even_with_enrollment(self):
+        # Enrollment names the room's server and AGENT_MXID agrees: neither is consulted.
+        for lane in (None, "{", '{"agent_id": 7}', '{"agent_id": ""}'):
+            with self.subTest(lane=lane):
+                self.add_task(self.TID, "$ev1")
                 env = self.env()
-                record = self.home / "state" / "auth" / "ag2space.json"
-                if enrollment is None:
+                record = self.home / "state" / "auth" / "lane-identity.json"
+                if lane is None:
                     record.unlink()
                 else:
-                    record.write_text(enrollment)
+                    record.write_text(lane)
                 with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
                     r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
-                                 {**env, "AGENT_MXID": "@watch-agent:ag2.space"})
+                                 {**env, "AGENT_MXID": AGENT})
                 self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
-                self.assertIn("can't confirm the room is deliverable", r.stderr)
+                self.assertIn("can't confirm the room is deliverable yet", r.stderr)
                 self.assertFalse(self.notice.exists())
                 self.assertIsNone(task_hold.read(self.results, self.TID))
 
@@ -3620,9 +3624,9 @@ class Hold(Base):
     def test_a_drain_identity_that_differs_from_enrollment_decides_the_room(self):
         from ag2_sparrow import remote_gateway_bridge as gb
         self.add_task(self.TID, "$ev1")  # room !room:ag2.space; enrolled as @watch-agent:ag2.space
+        self.lane_record = False  # the drain below publishes it
         state = self.home / "state"
         with mock.patch.object(gb, "_STATE", state), \
-                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
             drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
         self.assertFalse(drain_accepts, "the live drain refuses the room")
@@ -3635,12 +3639,67 @@ class Hold(Base):
         from ag2_sparrow import remote_gateway_bridge as gb
         self.add_task(self.TID, "$ev1")
         self.mxid = "@watch-agent:other.space"  # a stale enrollment the live lane overrides
+        self.lane_record = False  # the drain below publishes it
         with mock.patch.object(gb, "_STATE", self.home / "state"), \
-                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
             self.assertTrue(gb._room_is_deliverable_here("!room:ag2.space"))
         r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+
+    def test_an_adjacent_infix_claim_is_not_this_notices_claim(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        fake = self.results / f"{self.notice.stem}.sending.x.sending.{os.getpid()}"
+        fake.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(delivery_destination.claim_base(fake.name), f"{self.notice.stem}.sending.x")
+        self.assertEqual(delivery_destination.claim_base(
+            delivery_destination.claim_path(self.notice, 4242).name), self.notice.stem)
+
+    def test_recovery_returns_an_adjacent_infix_claim_to_its_own_name(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        live = self.results / f"proactive-b.sending.x.sending.{os.getpid()}"
+        dead = self.results / "proactive-a.sending.x.sending.4242"
+        live.write_text("x")
+        dead.write_text("x")
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_pid_alive", side_effect=lambda pid: pid == os.getpid()):
+            gb._recover_orphan_proactive()
+        self.assertTrue(live.exists(), "a live pid's claim is left alone")
+        self.assertFalse((self.results / "proactive-a.txt").exists(), "never a shorter, wrong name")
+        self.assertTrue((self.results / "proactive-a.sending.x.txt").exists(),
+                        "a dead claim goes back to the name the drain claimed it from")
+
+    def test_a_dead_drains_stale_lane_records_no_hold(self):
+        self.add_task(self.TID, "$ev1")  # the live drain is on other.space and refuses this room
+        self.lane_record = False
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "lane-identity.json").write_text(json.dumps({"agent_id": AGENT, "instance": "", "pid": dead.pid, "ts": 1}))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_failed_lane_publish_records_no_hold_on_stale_enrollment(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # enrolled as @watch-agent:ag2.space, the room's server
+        self.lane_record = False
+        writer = getattr(agent_identity, "publish_lane", None)
+        with mock.patch.object(gb, "_STATE", self.home / "state"), mock.patch.object(gb, "_log"), \
+                mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk"), create=True), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            self.assertFalse(gb._room_is_deliverable_here("!room:ag2.space"))
+        self.assertIsNotNone(writer)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
 
     def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
         self.add_task(self.TID, "$ev1")
@@ -4122,43 +4181,126 @@ class DeliveryDestination(unittest.TestCase):
         self.assertTrue((results / "proactive-a.sending.x").exists(), "never a drain claim")
         self.assertTrue((results / "proactive-b.txt").exists(), "a dead pid's claim recovers")
 
-    def test_hold_reads_the_enrolled_identity_record(self):
+    def lane_state(self):
         state = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, state)
-        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "")
+        return state
+
+    def test_hold_reads_only_the_published_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
         (state / "auth").mkdir()
         (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
-        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "enrolled.space")
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "no enrollment fallback")
+        lane = state / "auth" / "lane-identity.json"
+        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": 0}))
+        self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
+
+    def test_a_stale_dead_or_foreign_lane_record_is_no_lane(self):
+        state = self.lane_state()
+        cfg = {"STATE_DIR": str(state)}
+        (state / "auth").mkdir()
+        lane = state / "auth" / "lane-identity.json"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": 1},
+                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "ts": 1},
+                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "ts": 1},
+                    {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": 1}):
+            with self.subTest(rec=rec):
+                lane.write_text(json.dumps(rec))
+                self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
+        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "ts": 1}))
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": 4242}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "the lock names another live drain")
+        with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": os.getpid()}), \
+                mock.patch.object(hatch_cli, "live_lock_holder", return_value=os.getpid()):
+            self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "ag2.space")
+
+    def test_two_instances_sharing_state_keep_their_own_lanes(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = self.lane_state()
+        for inst, mxid in (("blue", "@blue:blue.space"), ("green", "@green:green.space"),
+                           ("blue", "@blue:blue.space")):
+            with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "GATEWAY_INSTANCE", inst), \
+                    mock.patch.dict(os.environ, {"AGENT_MXID": mxid}):
+                gb._room_is_deliverable_here("!r:blue.space")
+        for inst, server in (("blue", "blue.space"), ("green", "green.space"), ("", "")):
+            with self.subTest(instance=inst):
+                self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, inst), server)
+        self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),
+                         ["lane-identity.blue.json", "lane-identity.green.json"])
+
+    def test_concurrent_publishes_leave_one_whole_record(self):
+        from ag2_sparrow import agent_identity
+        state = self.lane_state()
+        ids = [f"@a{i}:lane.space" for i in range(8)]
+        seen, stop = [], threading.Event()
+
+        def read():
+            while not stop.is_set():
+                path = state / "auth" / "lane-identity.json"
+                if path.exists():
+                    seen.append(agent_identity.published_lane_record(state, ""))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        writers = [threading.Thread(target=lambda m=m: [agent_identity.publish_lane(state, "", m)
+                                                         for _ in range(25)]) for m in ids]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        reader.join()
+        self.assertNotIn(None, seen, "a reader never sees a partial record")
+        self.assertIn(agent_identity.published_lane_record(state, "")["agent_id"], ids)
+        self.assertEqual([p.name for p in (state / "auth").iterdir()], ["lane-identity.json"])
+
+    def test_the_drain_publishes_on_a_pass_with_no_proactive_file_and_at_start(self):
+        import inspect
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state, results = self.lane_state(), self.lane_state()
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "RESULTS_DIR", results), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space"}):
+            gb._post_proactive()
+        self.assertEqual(agent_identity.published_lane_record(state, "")["agent_id"], "@a:lane.space")
+        main = inspect.getsource(gb.main)
+        self.assertLess(main.index("_lane_identity()"), main.index("_start_outbound_worker("),
+                        "published at drain start, before the first pass")
+        self.assertIn("atexit.register(agent_identity.retract_lane", main, "retracted at clean exit")
 
     def test_the_published_lane_record_never_holds_a_token(self):
         from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
-        state = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, state)
+        state = self.lane_state()
         secret = "lane-secret-token-ZZZZ9999"
         with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "TOKEN", secret), \
-                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space", "REMOTE_TASK_TOKEN": secret}):
             gb._room_is_deliverable_here("!r:lane.space")
         raw = (state / "auth" / "lane-identity.json").read_text()
         self.assertNotIn(secret, raw)
         rec = json.loads(raw)
-        self.assertEqual(set(rec), {"agent_id", "ts", "pid"})
-        self.assertEqual(rec["agent_id"], "@a:lane.space")
-        self.assertEqual(agent_identity.published_lane(state), "@a:lane.space")
-        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "lane.space")
+        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts"})
+        self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
         self.assertEqual([p.name for p in (state / "auth").iterdir()], ["lane-identity.json"])
 
-    def test_a_failed_lane_publish_removes_the_stale_record(self):
+    def test_a_failed_publish_or_a_clean_exit_retracts_the_record(self):
         from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
-        state = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, state)
-        agent_identity.publish_lane(state, "@old:other.space")
+        state = self.lane_state()
+        agent_identity.publish_lane(state, "", "@old:other.space")
         with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
-                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk")), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": "@new:ag2.space"}):
             gb._room_is_deliverable_here("!r:ag2.space")
-        self.assertEqual(agent_identity.published_lane(state), "", "readers fall back to enrollment")
+        self.assertIsNone(agent_identity.published_lane_record(state, ""), "readers fail closed")
+        agent_identity.publish_lane(state, "", "@a:ag2.space")
+        agent_identity.retract_lane(state, "", os.getpid() + 1)
+        self.assertIsNotNone(agent_identity.published_lane_record(state, ""), "only its publisher retracts it")
+        agent_identity.retract_lane(state, "", os.getpid())
+        self.assertIsNone(agent_identity.published_lane_record(state, ""))
 
     def test_the_drain_delegates_to_it(self):
         from ag2_sparrow import remote_gateway_bridge as gb
@@ -4166,7 +4308,6 @@ class DeliveryDestination(unittest.TestCase):
         self.addCleanup(shutil.rmtree, state)
         with mock.patch.object(delivery_destination, "deliverable_here", return_value=False) as d, \
                 mock.patch.object(gb, "_STATE", state), \
-                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.object(gb, "_reenroll_identity", return_value="@a:ag2.space"):
             self.assertFalse(gb._room_is_deliverable_here("!r:ag2.space"))
         d.assert_called_once_with("!r:ag2.space", "ag2.space")

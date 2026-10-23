@@ -1105,7 +1105,7 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
     if notice.exists() and matches(notice):
         return "queued"
     claims = sorted(p for p in result_dir.glob(f"{notice.stem}.sending.*")
-                    if delivery_destination.claim_pid(p.name) is not None)
+                    if delivery_destination.claim_base(p.name) == notice.stem)
     if any(matches(p) for p in claims):
         return "queued"
     if seen and not moved:
@@ -1121,12 +1121,17 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
     return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
 
 
-def _lane_homeserver(cfg: dict) -> str:
-    """The homeserver of the identity the live drain published, else the one Sparrow enrolled;
-    "" when neither is readable, which `hold` refuses rather than guess."""
+def _lane_homeserver(cfg: dict, instance: str) -> str:
+    """The homeserver the live drain of `instance` published; "" when there is none, it is another
+    instance's, or its publisher is not that live drain, which `hold` refuses rather than guess."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    lane = agent_identity.published_lane(state) or agent_identity.enrolled(state)
-    return delivery_destination.homeserver_of(lane)
+    rec = agent_identity.published_lane_record(state, instance)
+    if rec is None or process_gone(rec["pid"]):
+        return ""
+    holder = _lock_record(state, instance)
+    if holder is not None and live_lock_holder(holder) != rec["pid"]:
+        return ""  # a lock names the live drain, and it is not the publisher
+    return delivery_destination.homeserver_of(rec["agent_id"])
 
 
 def hold(args) -> int:
@@ -1155,10 +1160,10 @@ def hold(args) -> int:
         lines.append(f"[thread: {fields['thread_root']}]")
     lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
     body = "\n".join(lines) + "\n"
-    lane = _lane_homeserver(cfg)
+    lane = _lane_homeserver(cfg, instance)
     if not lane:
-        print(f"NOT confirmed: can't confirm the room is deliverable, as Sparrow's enrollment "
-              f"is missing or unreadable; no hold recorded and {tid} still reads "
+        print(f"NOT confirmed: can't confirm the room is deliverable yet, as no live Sparrow drain "
+              f"has published its lane identity; no hold recorded and {tid} still reads "
               "task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if not room or delivery_destination.drain_room(body, lane) != room:
