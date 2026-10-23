@@ -595,7 +595,16 @@ minutes old. The drain's own state decides which reason applies:
 When more than one applies, `reason` names the first of
 `keepawake-not-running`, `hook-not-running`, `task-not-picked-up`,
 `task-held-line-undelivered`, `task-held-line-unconfirmed`, and `since`
-is when that one went bad. A task a worker handed off to the main session
+is when that one went bad.
+
+Such a hold heals itself: the next `keepawake` run releases every hold past those 10 minutes
+whose line is not delivered, checking the hold's token under the hold lock, and writes one
+`released-hold task=<id> line=<undelivered|unconfirmed>` line to the keepalive log for each. The
+task then reads `task-not-picked-up` again, so the hook wakes its worker, which can hold again
+through a lane that is now valid, or answer. A hold whose line was delivered is never released.
+No line is re-sent. A false hold (for example one taken in the 30 seconds before a drain that
+can no longer write let its lane record go stale) is released within 10 minutes plus one
+keepawake interval (15 minutes). A task a worker handed off to the main session
 stays open, so it also reads `task-not-picked-up` until it is answered, unless
 the worker parked it with `hold`: a task with a whole, well-formed hold marker is
 not counted, and with nothing else wrong the row is `healthy` with reason

@@ -43,7 +43,7 @@ TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
 # A healthy row's reason while a task waits on a deliberate hold, never a problem.
 TASK_HELD = "task-held-for-owner"
 # A hold whose room line the drain has not delivered this long is stuck: the line is still queued
-# or parked (undelivered), or it is gone with no receipt (unconfirmed).
+# or parked (undelivered), or it is gone with no receipt (unconfirmed). Keepawake releases it.
 TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
 TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
@@ -486,8 +486,45 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
         time.sleep(0.5)
 
 
+def release_stuck_holds(cfg: dict, log: Path, now: float) -> list:
+    """Release, token-checked, every hold over HELD_LINE_DELIVER_S whose room line is not delivered,
+    so the task reads task-not-picked-up and its worker is woken again; a delivered one is kept.
+    One log line per release. The released task ids."""
+    agent = (cfg.get("AGENT_MXID") or "").lower()
+    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
+    try:
+        items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
+                                            result_dir, instance=None)
+    except OSError:
+        return []
+    released = []
+    for item in items:
+        tid = item["task_id"]
+        if (item.get("sender") or "").lower() == agent:
+            continue
+        mark = task_hold.read(result_dir, tid)
+        if mark is None or now - mark["since"] <= HELD_LINE_DELIVER_S:
+            continue
+        outcome = _cli.hold_line_outcome(result_dir, tid)
+        if outcome == "delivered":
+            continue
+        try:
+            done = task_hold.release(result_dir, tid, mark["token"])
+        except (OSError, ValueError):
+            done = False
+        if done:
+            line = f"{_utc(now)} released-hold task={tid} line={outcome} held_since={_utc(mark['since'])}"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            print(line)
+            released.append(tid)
+    return released
+
+
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
     now = time.time() if now is None else now
+    release_stuck_holds(cfg, log, now)
     up, restarted, rc, reason = listener_up(cfg, now), 0, 0, None
     if not up:
         ok, how = restart_listener(cfg)

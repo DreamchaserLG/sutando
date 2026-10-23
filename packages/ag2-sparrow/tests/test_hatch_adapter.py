@@ -2072,6 +2072,34 @@ class Keepalive(Base):
         self.assertEqual((row["condition"], row["reason"]), ("abnormal", "task-held-line-unconfirmed"),
                          "a missing receipt is not proof the asker heard nothing")
 
+    def test_keepawake_releases_a_hold_whose_line_never_delivered_and_keeps_a_delivered_one(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        stale, kept = "task-1784700000005", "task-1784700000006"
+        since = time.time() - keepalive.HELD_LINE_DELIVER_S - 60
+        for tid in (stale, kept):
+            self.add_task(tid, "$held", mtime=time.time() - 30 * 60)
+            task_hold.place(self.results, tid, task_hold.OWNER_GO, now=since)
+        # The stale-lane case: its line was queued for a room the drain will not post to.
+        (self.results / f"proactive-hold-{stale}.txt").write_text("[channel: !room:ag2.space]\nheld\n")
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, f"proactive-hold-{kept}")
+        self.assertEqual(self.health()["reason"], keepalive.TASK_HELD_UNDELIVERED, "precondition")
+        with mock.patch.object(keepalive, "restart_listener", return_value=(False, "test")):
+            self.cli("keepalive", "keepawake")
+        self.assertIsNone(task_hold.read(self.results, stale), "the undelivered hold is released")
+        self.assertIsNotNone(task_hold.read(self.results, kept), "a delivered hold is never released")
+        released = [l for l in self.log.read_text().splitlines() if " released-hold " in l]
+        self.assertEqual(len(released), 1, released)
+        self.assertIn(f"task={stale} line=undelivered", released[0])
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP),
+                         "the released task reads stuck, so its worker is woken again")
+        with mock.patch.object(keepalive, "restart_listener", return_value=(False, "test")):
+            self.cli("keepalive", "keepawake")
+        self.assertEqual(sum(" released-hold " in l for l in self.log.read_text().splitlines()), 1,
+                         "one line per release")
+
     def test_a_far_future_or_unrepresentable_hold_time_is_no_hold(self):
         self.installed()
         self.keepawake_at(time.time() - 60)
