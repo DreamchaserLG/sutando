@@ -147,9 +147,10 @@ def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
     finally:
         try:
             os.unlink(tmp, dir_fd=dfd)
-        except FileNotFoundError:
-            pass
-        os.close(dfd)
+        except OSError:
+            pass  # best-effort: a leftover dot-temp never reads as a record
+        finally:
+            os.close(dfd)
 
 
 def read(result_dir: Path, tid: str) -> "dict | None":

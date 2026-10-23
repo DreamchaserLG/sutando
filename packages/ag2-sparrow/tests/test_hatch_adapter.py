@@ -3331,6 +3331,10 @@ class Hold(Base):
         with mock.patch.object(hatch_cli, "_installed_config", return_value=cfg or {}):
             return run_main(hatch_cli.main, ["hold", *args], {**self.env(), **(env or {})})
 
+    def line(self):
+        """The body hold queues for the default task."""
+        return f"[channel: !room:ag2.space]\n@bob:ag2.space {hatch_cli.HOLD_NOTICE}\n"
+
     def delivered_without_receipt(self):
         """The drain posted the line and archived it, but its best-effort receipt failed."""
         self.notice.unlink()
@@ -3466,7 +3470,7 @@ class Hold(Base):
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
         self.assertFalse(self.notice.exists())
         with mock.patch.object(outbox, "read_item", side_effect=OSError("io")):
-            self.assertEqual(hatch_cli._line_state(self.results, self.TID), "unknown")
+            self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
 
     def test_a_line_that_failed_to_queue_is_queued_by_the_retry(self):
         self.add_task(self.TID, "$ev1")
@@ -3487,10 +3491,55 @@ class Hold(Base):
 
     def test_a_line_being_sent_is_not_queued_again(self):
         self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
         claimed = self.results / f"{self.notice.stem}.sending.4242"
-        claimed.write_text("in flight\n")
+        claimed.write_text(self.line())
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
         self.assertFalse(self.notice.exists())
+
+    def test_a_pre_existing_empty_line_file_is_not_queued(self):
+        self.add_task(self.TID, "$ev1")
+        self.notice.write_text("")  # an empty proactive-hold-<tid>.txt the drain never sends
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+
+    def test_an_empty_or_foreign_queued_file_is_no_proof(self):
+        for content in ("", "   \n", "something else\n"):
+            with self.subTest(content=content):
+                self.add_task(self.TID, "$ev1")
+                task_hold.mark_notice(self.results, self.TID)
+                self.notice.write_text(content)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                shutil.rmtree(self.results / task_hold.HOLD_DIR)
+                self.notice.unlink()
+
+    def test_a_temp_cleanup_error_after_the_link_still_holds(self):
+        self.add_task(self.TID, "$ev1")
+        real = os.unlink
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).startswith(".") and str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_missing_enrollment_skips_the_homeserver_check(self):
+        # Pinned limit: with no enrollment the drain is the final authority.
+        self.room_task("!foreign:other.space")
+        env = self.env()
+        (self.home / "state" / "auth" / "ag2space.json").unlink()
+        with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
+            r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
+                         {**env, "AGENT_MXID": "@watch-agent:ag2.space"})
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(self.notice.exists())
 
     def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
         self.add_task(self.TID, "$ev1")
@@ -3861,6 +3910,31 @@ class TaskHold(unittest.TestCase):
         self.dir.symlink_to(self.root)
         self.assertTrue(task_hold.notice_marked(self.results, tid), "a refused dir counts as queued")
 
+    def test_a_temp_cleanup_error_after_the_link_is_success_and_closes_the_dir(self):
+        real_unlink, real_close = os.unlink, os.close
+        closed = []
+
+        def temp_unlink_fails(path, *a, **k):
+            if str(path).endswith(".tmp"):
+                raise PermissionError("cleanup")
+            return real_unlink(path, *a, **k)
+
+        def tracking_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+        real_held, opened = task_hold._held_dir, []
+
+        def tracking_held(*a, **k):
+            opened.append(real_held(*a, **k))
+            return opened[-1]
+        with mock.patch.object(task_hold.os, "unlink", side_effect=temp_unlink_fails), \
+                mock.patch.object(task_hold.os, "close", side_effect=tracking_close), \
+                mock.patch.object(task_hold, "_held_dir", side_effect=tracking_held):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+        self.assertIn(opened[0], closed, "the dir fd is closed")
+
     def test_a_dir_swapped_while_opened_is_refused(self):
         self.dir.mkdir()
         with mock.patch.object(task_hold.os, "fstat",
@@ -3911,7 +3985,7 @@ class DeliveryDestination(unittest.TestCase):
         self.addCleanup(shutil.rmtree, results)
         with mock.patch.object(gb, "RESULTS_DIR", results):
             gb._record_proactive_receipt("proactive-hold-task-1784700000001", "!r:ag2.space")
-        self.assertEqual(hatch_cli._line_state(results, "task-1784700000001"), "delivered")
+        self.assertEqual(hatch_cli._line_state(results, "task-1784700000001", "x"), "delivered")
 
     def test_hold_reads_the_enrolled_identity_record(self):
         state = Path(tempfile.mkdtemp())

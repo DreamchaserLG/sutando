@@ -29,7 +29,8 @@ from importlib import resources
 from pathlib import Path
 
 from ... import (_dirs, agent_identity, delivery_destination, gateway_credential_io,
-                 gateway_credentials, gateway_instance, outbox, task_hold, workspace_lock)
+                 gateway_credentials, gateway_instance, outbox, result_ready, task_hold,
+                 workspace_lock)
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
@@ -1071,12 +1072,16 @@ def task_settled(result_dir: Path, tid: str) -> bool:
             or (item is not None and outbox.item_status(root, item) is not None))
 
 
-def _line_state(result_dir: Path, tid: str) -> str:
-    """'queued' while the hold line waits or is being sent, 'delivered' on the drain's
-    receipt, 'new' when it was never queued, else 'unknown' (queued once, no readable proof)."""
+def _line_state(result_dir: Path, tid: str, body: str) -> str:
+    """'queued' while `body` itself waits ready to send or is being sent, 'delivered' on the
+    drain's receipt, 'new' when no line was ever queued, else 'unknown' (no proof)."""
     notice = _hold_notice(result_dir, tid)
-    if notice.exists() or any(result_dir.glob(f"{notice.stem}.sending*")):
-        return "queued"
+    queued = [notice, *result_dir.glob(f"{notice.stem}.sending*")]
+    present = [p for p in queued if p.exists()]
+    if present:
+        # The drain's own readiness predicate: an empty or partial file is not a line.
+        ready = {result_ready.read_ready_result(p) for p in present}
+        return "queued" if body.strip() in ready else "unknown"
     try:
         record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
     except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
@@ -1089,6 +1094,8 @@ def _line_state(result_dir: Path, tid: str) -> str:
 def _lane_homeserver(cfg: dict) -> str:
     """The homeserver of the identity Sparrow enrolled (its durable, non-credential record);
     "" when unknown, so the pre-check passes and the drain decides at send time."""
+    # Limit: the drain's live identity lives in its credential env, which Hatch must not read;
+    # with missing or stale enrollment the pre-check passes and the drain alone can refuse.
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     return delivery_destination.homeserver_of(agent_identity.enrolled(state))
 
@@ -1126,7 +1133,7 @@ def hold(args) -> int:
     notice = _hold_notice(result_dir, tid)
     # Line first: a crash before the marker leaves the task reading stuck, never silent.
     try:
-        line = _line_state(result_dir, tid)
+        line = _line_state(result_dir, tid, body)
         if line == "unknown":
             print(f"NOT confirmed: the hold line for {tid} was queued before and nothing proves "
                   "it was delivered; it is not queued again and the task still reads "
@@ -1140,7 +1147,7 @@ def hold(args) -> int:
                 task_hold.clear_notice(result_dir, tid, owner)
                 raise
         # A hold stands only on a line proven queued or delivered, whoever queued it.
-        if _line_state(result_dir, tid) not in ("queued", "delivered"):
+        if _line_state(result_dir, tid, body) not in ("queued", "delivered"):
             print(f"NOT confirmed: the hold line for {tid} is not proven queued; the task "
                   "still reads task-not-picked-up", file=sys.stderr)
             return REPLY_UNCONFIRMED
