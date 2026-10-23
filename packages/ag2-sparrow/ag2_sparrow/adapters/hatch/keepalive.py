@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs
+from ... import _dirs, task_hold
 from . import cli as _cli, task_fields
 
 TASK, INTERVAL_MIN = "sparrow-keepawake", 15
@@ -37,12 +37,16 @@ STALE_S = 2 * INTERVAL_MIN * 60
 NOT_RUNNING = "keepawake-not-running"
 HOOK_NOT_RUNNING, HOOK_STALE_S = "hook-not-running", 5 * 60
 TASK_NOT_PICKED_UP, TASK_PICKUP_S = "task-not-picked-up", 15 * 60
+# A healthy row's reason while a task waits on a deliberate hold, never a problem.
+TASK_HELD = "task-held-for-owner"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
     TASK_NOT_PICKED_UP: f"an AG2 Space task has been open over {TASK_PICKUP_S // 60} minutes: "
-                        "the hook is not waking a worker for it, or a worker handed it off",
+                        "the hook is not waking a worker for it, or a worker handed it off "
+                        "without running hold",
+    TASK_HELD: "a worker parked an AG2 Space task for your go (ag2-sparrow-hatch hold)",
 }
 RUN_TIMEOUT_S = 120
 GAP_MINUTES = 16
@@ -534,21 +538,27 @@ def hook_last_run(cfg: dict) -> "float | None":
     return run[0] if run is not None else _mtime(_cli.installed_marker_path())
 
 
-def oldest_open_task(cfg: dict) -> "float | None":
-    """mtime of the oldest task of any instance with no result, the agent's own excepted."""
+def open_tasks(cfg: dict, now: float) -> "tuple[float | None, float | None]":
+    """(mtime of the oldest open task nobody holds, earliest deliberate hold) across every
+    instance, the agent's own tasks excepted."""
     agent = (cfg.get("AGENT_MXID") or "").lower()
+    result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     try:
         items = task_fields.list_open_tasks(Path(cfg.get("TASK_DIR") or _dirs.task_dir()),
-                                            Path(cfg.get("RESULT_DIR") or _dirs.result_dir()),
-                                            instance=None)
+                                            result_dir, instance=None)
     except OSError:
-        return None
+        return None, None
+    oldest = held = None
     for item in items:
-        if (item.get("sender") or "").lower() != agent:
-            ts = _mtime(Path(item["task_file"]))
-            if ts is not None:
-                return ts
-    return None
+        if (item.get("sender") or "").lower() == agent:
+            continue
+        mark = task_hold.read(result_dir, item["task_id"])
+        ts = _mtime(Path(item["task_file"]))
+        if mark is not None:
+            held = min(t for t in (held, mark["since"] or ts, now) if t is not None)
+        elif oldest is None and ts is not None:
+            oldest = ts
+    return oldest, held
 
 
 def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
@@ -569,12 +579,13 @@ def health_row(cfg: dict, log: Path, now: float | None = None) -> dict | None:
     hook = hook_last_run(cfg)
     if hook is not None and not _within(now, hook, HOOK_STALE_S):
         problems.append((HOOK_NOT_RUNNING, hook + HOOK_STALE_S))
-    oldest = oldest_open_task(cfg)
+    oldest, held = open_tasks(cfg, now)
     if oldest is not None and now - oldest > TASK_PICKUP_S:
         problems.append((TASK_NOT_PICKED_UP, oldest + TASK_PICKUP_S))
     # Fresh but never run: no evidence either way yet.
     condition = "abnormal" if problems else "healthy" if ran is not None else "unknown"
-    reason, since = problems[0] if problems else (None, None)
+    reason, since = (problems[0] if problems else (TASK_HELD, held) if held is not None
+                     else (None, None))
     return {"alive": alive, "motion": "unknown", "condition": condition,
             "reason": reason, "since": since}
 

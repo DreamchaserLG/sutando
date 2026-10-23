@@ -32,7 +32,8 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm  # noqa: E402
+from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm, task_hold  # noqa: E402
+from ag2_sparrow.result_markers import parse_markers  # noqa: E402
 from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
@@ -315,6 +316,7 @@ class HookScript(Base):
         self.assertEqual((m["task_id"], m["rewake"], m["wakes"]), ("task-1784700000001", True, 1))
         self.assertIn("rewake: true", p["worker_note"])
         self.assertIn("repeat its HANDOFF block", p["worker_note"])
+        self.assertIn("hold <its result_file>` once", p["worker_note"])
         self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 2)
 
     def test_rewakes_stop_at_the_cap(self):
@@ -1952,6 +1954,34 @@ class Keepalive(Base):
         self.assertIn("health=abnormal (task-not-picked-up); an AG2 Space task has been open "
                       "over 15 minutes", self.cli("verify").stdout)
 
+    def test_a_deliberately_held_task_reports_held_not_stuck(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        tid = "task-1784700000005"
+        self.add_task(tid, "$held", mtime=old)
+        task_hold.place(self.results, tid, task_hold.OWNER_GO, now=old + 30)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("healthy", keepalive.TASK_HELD))
+        self.assertAlmostEqual(row["since"], old + 30, delta=1)
+        self.assertEqual(hc.validate(row), (row, None))
+        # Kill control: the same task without its marker is the stuck one.
+        task_hold.release(self.results, tid)
+        self.assertEqual(self.health()["reason"], keepalive.TASK_NOT_PICKED_UP)
+
+    def test_a_hold_never_masks_a_stuck_task_beside_it(self):
+        self.installed()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran()
+        old = time.time() - 20 * 60
+        self.add_task("task-1784700000005", "$held", mtime=old - 60)
+        task_hold.place(self.results, "task-1784700000005")
+        self.add_task("task-1784700000006", "$stuck", mtime=old)
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", keepalive.TASK_NOT_PICKED_UP))
+        self.assertAlmostEqual(row["since"], old + keepalive.TASK_PICKUP_S, delta=1)
+
     def test_the_health_command_survives_a_path_with_a_space(self):
         command = keepalive.health_command("/opt/my tools/ag2-sparrow-hatch")
         self.assertEqual(shlex.split(command),
@@ -3238,6 +3268,67 @@ class ReplyWithoutAnswering(Base):
         r = self.reply(str(result), "--body", "@chi:ag2.space yes", "--wait", "0")
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
         self.assertEqual(result.read_text(), "@chi:ag2.space yes")
+
+class Hold(Base):
+    """`hold`: a parked item gets one room line and a hold marker; its result slot stays open."""
+    TID = "task-1784700000001"
+
+    def setUp(self):
+        super().setUp()
+        self.result_file = self.results / f"{self.TID}.txt"
+        self.notice = self.results / f"proactive-hold-{self.TID}.txt"
+
+    def hold(self, *args):
+        env = py_env(self.home)
+        env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
+        return run_main(hatch_cli.main, ["hold", *args], env)
+
+    def test_one_room_line_and_a_marker_once(self):
+        self.add_task(self.TID, "$ev1")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        body = self.notice.read_text()
+        parsed = parse_markers(body, skip_after_channel=True)
+        self.assertEqual([(a.kind, a.value) for a in parsed.actions],
+                         [("redirect", "!room:ag2.space")])
+        self.assertEqual(parsed.body.strip(), f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}")
+        self.assertEqual(task_hold.read(self.results, self.TID)["reason"], task_hold.OWNER_GO)
+        self.assertFalse(self.result_file.exists(), "the real answer still owns the result slot")
+        self.notice.unlink()  # the drain delivered and archived it
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "a second hold never posts again")
+
+    def test_a_threaded_message_gets_the_line_in_its_thread(self):
+        self.add_task(self.TID, "$ev1", thread_root="$root")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        kinds = [(a.kind, a.value) for a in parse_markers(self.notice.read_text()).actions]
+        self.assertIn(("thread", "$root"), kinds)
+
+    def test_an_answered_item_is_not_held(self):
+        self.add_task(self.TID, "$ev1")
+        self.result_file.write_text("done\n")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertFalse(self.notice.exists())
+
+    def test_a_failed_notice_leaves_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli.result_publish, "publish_text", side_effect=OSError("full")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertIsNone(task_hold.read(self.results, self.TID), "a retry must still post")
+
+    def test_an_archived_task_drops_its_hold(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.place(self.results, self.TID)
+        (self.tasks / f"{self.TID}.txt").unlink()
+        task_hold.prune(self.results, self.tasks)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
 
 if __name__ == "__main__":
     unittest.main()

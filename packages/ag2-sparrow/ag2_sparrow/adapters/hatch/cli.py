@@ -28,10 +28,11 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import (_dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox,
+                 result_publish, task_hold, workspace_lock)
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
-from .task_fields import item_id, valid_mxid
+from .task_fields import item_id, task_fields, valid_mxid
 
 HOOK_ID = "ag2-sparrow-hatch"
 SCRIPT_NAME = f"{HOOK_ID}.sh"
@@ -58,6 +59,7 @@ REPLY_COMMAND = "ag2-sparrow-hatch"
 REPLY_PLACEHOLDER = "<REPLY_COMMAND>"
 # `reply` exit codes: posted, not posted, usage, sent to Sparrow but not yet confirmed.
 REPLY_POSTED, REPLY_NOT_POSTED, REPLY_UNCONFIRMED = 0, 1, 3
+HOLD_NOTICE = "Waiting for my owner's go on this."
 REPLY_WAIT_S, REPLY_WAIT_MAX_S, REPLY_MAX_BYTES = 30.0, 300.0, 64 * 1024
 SPARROW_COMMAND = "ag2-sparrow"
 SERVICE_NAME = "ag2-sparrow.service"
@@ -1035,11 +1037,11 @@ def _publish_once(result_file: Path, body: str) -> bool:
         Path(tmp).unlink(missing_ok=True)
 
 
-def reply(args) -> int:
-    cfg = _installed_config()
+def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
+    """(result_dir, task_dir, tid, item, instance) for an open wake item's result_file,
+    else None after printing why."""
     result_dir = Path(cfg.get("RESULT_DIR") or _dirs.result_dir())
     task_dir = Path(cfg.get("TASK_DIR") or _dirs.task_dir())
-    result_file = Path(args.result_file).expanduser()
     tid = result_file.stem
     # The instance the bridge runs as, read as install recorded it (else as the bridge reads it).
     instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
@@ -1049,10 +1051,56 @@ def reply(args) -> int:
             and result_file.parent.resolve() == result_dir.resolve()):
         print(f"error: {result_file} is not a result_file from the wake payload "
               f"(task-<id>.txt in {result_dir})", file=sys.stderr)
-        return 2
+        return None
     if not (task_dir / f"{tid}.txt").is_file():
         print(f"error: no open task {tid} in {task_dir}", file=sys.stderr)
+        return None
+    return result_dir, task_dir, tid, item, instance
+
+
+def hold(args) -> int:
+    """Park one wake item for the owner's go: mark it held and post HOLD_NOTICE once."""
+    found = _wake_item(_installed_config(), Path(args.result_file).expanduser())
+    if found is None:
         return 2
+    result_dir, task_dir, tid, _item, instance = found
+    task_hold.prune(result_dir, task_dir)
+    if (result_dir / f"{tid}.txt").exists():
+        print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
+        return REPLY_NOT_POSTED
+    fields = task_fields(task_dir / f"{tid}.txt", result_dir, instance) or {}
+    room, sender = fields.get("room_id") or "", fields.get("sender") or ""
+    lines = [f"[channel: {room}]"]
+    if fields.get("thread_root"):
+        lines.append(f"[thread: {fields['thread_root']}]")
+    lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
+    body = "\n".join(lines) + "\n"
+    # Routed by the drain's own grammar: a room it would not deliver to is refused here.
+    routes = [a.value for a in parse_markers(body, skip_after_channel=True).actions
+              if a.kind == "redirect"]
+    if not (room.startswith("!") and routes == [room]):
+        print(f"error: task {tid} names no AG2 Space room to reply in", file=sys.stderr)
+        return 2
+    if not task_hold.place(result_dir, tid, task_hold.OWNER_GO):
+        print(f"held: {tid} was already held; nothing posted again")
+        return REPLY_POSTED
+    try:
+        result_publish.publish_text(result_dir / f"proactive-hold-{tid}.txt", body, 0o600)
+    except OSError as e:
+        task_hold.release(result_dir, tid)
+        print(f"NOT held: could not queue the notice ({e}); nothing posted", file=sys.stderr)
+        return REPLY_NOT_POSTED
+    print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
+    return REPLY_POSTED
+
+
+def reply(args) -> int:
+    cfg = _installed_config()
+    result_file = Path(args.result_file).expanduser()
+    found = _wake_item(cfg, result_file)
+    if found is None:
+        return 2
+    result_dir, task_dir, tid, item, instance = found
     if not (math.isfinite(args.wait) and 0 <= args.wait <= REPLY_WAIT_MAX_S):
         print(f"error: --wait must be 0 to {REPLY_WAIT_MAX_S:g} seconds", file=sys.stderr)
         return 2
@@ -1162,6 +1210,10 @@ def main(argv=None) -> int:
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    h = sub.add_parser("hold", help="park one wake item for your owner's go: mark it held and "
+                       "post one line saying so in its room, once")
+    h.add_argument("result_file", help="the item's result_file from the wake payload")
+    h.set_defaults(func=hold)
     args = ap.parse_args(argv)
     return args.func(args)
 
