@@ -3554,6 +3554,47 @@ class Hold(Base):
             r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
         self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
 
+    def test_a_failed_hold_release_never_fails_a_posted_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        sent = []
+
+        def sparrow():  # the drain sends the reply and records the delivery
+            deadline = time.monotonic() + 10
+            while not self.result_file.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            sent.append(self.result_file.read_text())
+            outbox.record_delivered(self.results / ".outbox", self.TID)
+            self.result_file.unlink()
+        t = threading.Thread(target=sparrow)
+        t.start()
+        self.addCleanup(t.join)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                          "@bob:ag2.space done", "--wait", "10"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("posted:", r.stdout)
+        self.assertEqual(sent, ["@bob:ag2.space done"])
+        self.assertIn("could not release the hold", r.stderr)
+
+    def test_a_failed_hold_release_never_fails_a_closed_reply(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        with mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = run_main(hatch_cli.main, ["reply", str(self.result_file), "--no-send"], self.env())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertEqual(self.result_file.read_text(), "[no-send]\n")
+
+    def test_a_failed_release_after_an_answer_mid_hold_is_not_fatal(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]), \
+                mock.patch.object(task_hold, "release", side_effect=OSError("io")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
+        self.assertFalse(self.notice.exists())
+
     def test_an_answer_landing_mid_hold_withdraws_the_notice(self):
         self.add_task(self.TID, "$ev1")
         with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]):

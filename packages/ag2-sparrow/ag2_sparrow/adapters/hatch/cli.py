@@ -1159,11 +1159,21 @@ def hold(args) -> int:
         return REPLY_UNCONFIRMED
     if task_settled(result_dir, tid):
         notice.unlink(missing_ok=True)
-        task_hold.release(result_dir, tid, token)
+        _release_quietly(result_dir, tid, token)
         print(f"NOT held: {tid} was answered meanwhile; notice withdrawn", file=sys.stderr)
         return REPLY_NOT_POSTED
     print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
     return REPLY_POSTED
+
+
+def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:
+    """Release a hold once the task is answered, never failing the command over it."""
+    try:
+        task_hold.release(result_dir, tid, token)
+    except (OSError, ValueError) as e:
+        # A hold left behind is harmless: health ignores holds on answered tasks.
+        print(f"note: could not release the hold on {tid} ({e}); it reads as answered",
+              file=sys.stderr)
 
 
 def reply(args) -> int:
@@ -1189,10 +1199,7 @@ def reply(args) -> int:
         print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",
               file=sys.stderr)
         return REPLY_NOT_POSTED
-    try:
-        task_hold.release(result_dir, tid)  # the answer ends any hold
-    except ValueError:
-        pass
+    _release_quietly(result_dir, tid)  # the answer ends any hold
     if args.no_send:
         print(f"closed: {result_file.name}, nothing posted")
         return REPLY_POSTED
