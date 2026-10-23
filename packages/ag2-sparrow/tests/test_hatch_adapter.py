@@ -3687,21 +3687,52 @@ class TaskHold(unittest.TestCase):
                 task_hold.place(self.results, "task-1784700000001")
         self.assertEqual(list(self.dir.iterdir()), [])
 
+    def successor_during(self, tid, call):
+        """Patch os.`call` so that, on its first use by release, another thread retires the
+        old hold and places its own, given a moment to finish before release goes on."""
+        real = getattr(os, call)
+        new, threads = [], []
+
+        def successor():
+            task_hold.release(self.results, tid)
+            new.append(task_hold.place(self.results, tid))
+
+        def hooked(*a, **k):
+            if not threads:
+                threads.append(threading.Thread(target=successor))
+                threads[0].start()
+                threads[0].join(0.5)
+            return real(*a, **k)
+        return mock.patch.object(task_hold.os, call, side_effect=hooked), new, threads
+
     def test_an_old_token_never_erases_a_successor_placed_mid_release(self):
         tid = "task-1784700000001"
         old = task_hold.place(self.results, tid)
-        real = os.stat
-        new = []
-
-        def successor_acts(path, *a, **k):
-            if not new and str(path).endswith(".json"):
-                task_hold.release(self.results, tid)
-                new.append(task_hold.place(self.results, tid))
-            return real(path, *a, **k)
-        with mock.patch.object(task_hold.os, "stat", side_effect=successor_acts):
-            self.assertFalse(task_hold.release(self.results, tid, old))
+        patch, new, threads = self.successor_during(tid, "read")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
         self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0])
-        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"], "nothing hidden")
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"], "nothing hidden")
+
+    def test_a_successor_between_the_check_and_the_unlink_survives(self):
+        tid = "task-1784700000001"
+        old = task_hold.place(self.results, tid)
+        patch, new, threads = self.successor_during(tid, "unlink")
+        with patch:
+            task_hold.release(self.results, tid, old)
+        threads[0].join()
+        self.assertIsNotNone(new[0])
+        self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0],
+                         "the old token's release removed only the old hold")
+
+    def test_a_symlinked_lock_file_is_refused(self):
+        self.dir.mkdir()
+        (self.dir / task_hold.LOCK_NAME).symlink_to(self.root / "elsewhere")
+        with self.assertRaises(OSError):
+            task_hold.place(self.results, "task-1784700000001")
+        self.assertFalse((self.root / "elsewhere").exists())
 
     def test_a_stale_releaser_dying_mid_release_hides_nothing(self):
         tid = "task-1784700000001"
@@ -3713,7 +3744,8 @@ class TaskHold(unittest.TestCase):
                 task_hold.release(self.results, tid, token)
         self.assertEqual(task_hold.read(self.results, tid)["token"], token,
                          "still visible under its own name")
-        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"])
+        self.assertEqual(sorted(n for n in os.listdir(self.dir) if n != task_hold.LOCK_NAME),
+                         [f"{tid}.json"])
 
     def test_a_tokened_release_of_an_unreadable_or_foreign_marker_removes_nothing(self):
         tid = "task-1784700000001"
@@ -3744,12 +3776,12 @@ class TaskHold(unittest.TestCase):
         self.assertIsNotNone(token)
         self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
 
-    def test_a_mismatched_token_puts_the_marker_back(self):
+    def test_a_mismatched_token_leaves_the_marker(self):
         tid = "task-1784700000001"
         token = task_hold.place(self.results, tid)
         self.assertFalse(task_hold.release(self.results, tid, "not-the-token"))
         self.assertEqual(task_hold.read(self.results, tid)["token"], token)
-        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"], "no tombstone left")
+        self.assertEqual(sorted(os.listdir(self.dir)), [task_hold.LOCK_NAME, f"{tid}.json"])
 
     def test_a_vanished_hold_dir_never_writes_into_the_cwd(self):
         cwd = self.root / "cwd"

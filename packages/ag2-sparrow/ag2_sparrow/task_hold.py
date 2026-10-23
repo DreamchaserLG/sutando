@@ -6,6 +6,8 @@ confined to the literal RESULT_DIR/.task-holds directory and never follows a sym
 only a whole, well-formed marker counts, anything else is not a hold."""
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import math
 import os
@@ -18,6 +20,7 @@ from pathlib import Path
 from . import gateway_instance, local_task_protocol
 
 HOLD_DIR = ".task-holds"
+LOCK_NAME = ".lock"
 OWNER_GO = "owner-go"
 _REASON_RE = re.compile(r"[a-z0-9-]{1,40}")
 _MAX_BYTES = 4096
@@ -132,7 +135,8 @@ def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
         finally:
             os.close(fd)
         try:
-            os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            with _locked(dfd):
+                os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         except FileExistsError:
             return False
         try:
@@ -163,34 +167,44 @@ def read(result_dir: Path, tid: str) -> "dict | None":
         os.close(dfd)
 
 
-def _unlink_owned(dfd: int, name: str, token: "str | None") -> bool:
-    """Unlink `name` when `token` is None or is the token the file records, and the name
-    still points at the inode that was read. A successor placed in the instant between the
-    inode check and the unlink is the one window this leaves."""
-    if token is not None:
-        try:
-            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-        except OSError:
-            return False
-        try:
-            ino, raw = os.fstat(fd).st_ino, os.read(fd, _MAX_BYTES + 1)
-        except OSError:
-            return False
-        finally:
-            os.close(fd)
-        try:
-            record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
-        except (UnicodeDecodeError, ValueError):
-            return False
-        if not (isinstance(record, dict) and record.get("token") == token):
-            return False
+@contextlib.contextmanager
+def _locked(dfd: int):
+    """Exclusive lock on the hold dir's own `.lock` (opened through `dfd`, never a symlink):
+    every create and owned unlink in it is serialized against each other."""
+    fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
     try:
-        if token is not None and os.stat(name, dir_fd=dfd, follow_symlinks=False).st_ino != ino:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _unlink_owned(dfd: int, name: str, token: "str | None") -> bool:
+    """Unlink `name` when `token` is None or is the token the file records; under the
+    dir lock, so the file read is the file removed."""
+    with _locked(dfd):
+        if token is not None:
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+            except OSError:
+                return False
+            try:
+                raw = os.read(fd, _MAX_BYTES + 1)
+            except OSError:
+                return False
+            finally:
+                os.close(fd)
+            try:
+                record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
+            except (UnicodeDecodeError, ValueError):
+                return False
+            if not (isinstance(record, dict) and record.get("token") == token):
+                return False
+        try:
+            os.unlink(name, dir_fd=dfd)
+        except FileNotFoundError:
             return False
-        os.unlink(name, dir_fd=dfd)
-    except FileNotFoundError:
-        return False
-    return True
+        return True
 
 
 def release(result_dir: Path, tid: str, token: "str | None" = None) -> bool:
@@ -255,9 +269,6 @@ def prune(result_dir: Path, task_dir: Path) -> None:
         for name in os.listdir(dfd):
             tid = next((name[:-len(x)] for x in (".json", ".notice") if name.endswith(x)), "")
             if valid_tid(tid) and not (Path(task_dir) / f"{tid}.txt").exists():
-                try:
-                    os.unlink(name, dir_fd=dfd)
-                except FileNotFoundError:
-                    pass
+                _unlink_owned(dfd, name, None)
     finally:
         os.close(dfd)
