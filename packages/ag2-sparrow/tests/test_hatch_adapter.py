@@ -3322,13 +3322,14 @@ class Hold(Base):
         env = py_env(self.home)
         env.update(AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
                    AGENT_CONNECT_STATE_DIR=str(self.home / "state"))
-        if self.mxid:
-            env["AGENT_MXID"] = self.mxid
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True, exist_ok=True)
+        (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
         return env
 
-    def hold(self, *args, cfg=None):
+    def hold(self, *args, cfg=None, env=None):
         with mock.patch.object(hatch_cli, "_installed_config", return_value=cfg or {}):
-            return run_main(hatch_cli.main, ["hold", *args], self.env())
+            return run_main(hatch_cli.main, ["hold", *args], {**self.env(), **(env or {})})
 
     def delivered_without_receipt(self):
         """The drain posted the line and archived it, but its best-effort receipt failed."""
@@ -3403,21 +3404,46 @@ class Hold(Base):
         self.mxid = ""
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
 
-    def test_the_live_identity_wins_over_the_installed_snapshot(self):
+    def test_the_enrolled_identity_wins_over_snapshot_and_environment(self):
         self.add_task(self.TID, "$ev1")
-        self.mxid = "@watch-agent:other.space"  # what the drain resolves now
-        r = self.hold(str(self.result_file), cfg={"AGENT_MXID": AGENT})  # stale ag2.space
-        self.assertEqual(r.returncode, 2, r.stdout)
+        self.mxid = "@watch-agent:other.space"  # what Sparrow enrolled
+        with mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
+            r = self.hold(str(self.result_file), cfg={"AGENT_MXID": AGENT},
+                          env={"AGENT_MXID": AGENT, "AGENT_ID": AGENT})
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertFalse(self.notice.exists())
 
-    def test_the_running_sparrows_environment_is_the_identity_source(self):
+    def test_hold_never_reads_another_process_environment(self):
         self.add_task(self.TID, "$ev1")
         with mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242), \
-                mock.patch.object(keepalive, "sparrow_env",
-                                  return_value={"AGENT_MXID": "@watch-agent:other.space"}):
+                mock.patch.object(keepalive, "sparrow_env", side_effect=AssertionError("read")):
             r = self.hold(str(self.result_file))
-        self.assertEqual(r.returncode, 2, r.stdout)
-        self.assertFalse(self.notice.exists())
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+
+    def test_a_notice_loser_never_installs_a_hold_on_an_unqueued_line(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(task_hold, "mark_notice", return_value=None):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIn("not proven queued", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_the_owner_failing_after_a_loser_checked_leaves_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        owner = task_hold.mark_notice(self.results, self.TID)  # caller A, mid-queue
+        r = self.hold(str(self.result_file))  # caller B finds A's record, no line yet
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        task_hold.clear_notice(self.results, self.TID, owner)  # A's queue write failed
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertTrue(self.notice.exists(), "the retry queues the line A never queued")
+
+    def test_a_publish_that_wrote_nothing_installs_no_hold(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(hatch_cli, "_publish_once", return_value=False):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
 
     def test_a_line_delivered_without_a_receipt_is_never_queued_again(self):
         self.add_task(self.TID, "$ev1")
@@ -3664,41 +3690,65 @@ class TaskHold(unittest.TestCase):
     def test_an_old_token_never_erases_a_successor_placed_mid_release(self):
         tid = "task-1784700000001"
         old = task_hold.place(self.results, tid)
-        real = task_hold._read_at
+        real = os.stat
         new = []
 
-        def successor_acts(dfd, name):
-            record = real(dfd, name)
-            if not new:  # another actor retires the old hold and places its own
+        def successor_acts(path, *a, **k):
+            if not new and str(path).endswith(".json"):
                 task_hold.release(self.results, tid)
                 new.append(task_hold.place(self.results, tid))
-            return record
-        with mock.patch.object(task_hold, "_read_at", side_effect=successor_acts):
-            task_hold.release(self.results, tid, old)
-        self.assertIsNotNone(new[0])
+            return real(path, *a, **k)
+        with mock.patch.object(task_hold.os, "stat", side_effect=successor_acts):
+            self.assertFalse(task_hold.release(self.results, tid, old))
         self.assertEqual((task_hold.read(self.results, tid) or {}).get("token"), new[0])
+        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"], "nothing hidden")
+
+    def test_a_stale_releaser_dying_mid_release_hides_nothing(self):
+        tid = "task-1784700000001"
+        token = task_hold.place(self.results, tid)
+        with mock.patch.object(task_hold.os, "unlink", side_effect=RuntimeError("crash")):
+            self.assertFalse(task_hold.release(self.results, tid, "an-old-token"),
+                             "a stale token stops before touching the name")
+            with self.assertRaises(RuntimeError):
+                task_hold.release(self.results, tid, token)
+        self.assertEqual(task_hold.read(self.results, tid)["token"], token,
+                         "still visible under its own name")
+        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"])
+
+    def test_a_tokened_release_of_an_unreadable_or_foreign_marker_removes_nothing(self):
+        tid = "task-1784700000001"
+        path = self.dir / f"{tid}.json"
+        task_hold.place(self.results, tid)
+        for body in (b"{", b"[]"):
+            path.write_bytes(body)
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+            self.assertTrue(path.exists())
+        with mock.patch.object(task_hold.os, "read", side_effect=OSError("io")):
+            self.assertFalse(task_hold.release(self.results, tid, "t"))
+        path.unlink()
+        path.symlink_to(self.root)
+        self.assertFalse(task_hold.release(self.results, tid, "t"))
+        self.assertTrue(path.is_symlink())
+
+    def test_a_failed_dir_fsync_after_the_link_still_reports_the_published_marker(self):
+        real = os.fsync
+        calls = []
+
+        def dir_fsync_fails(fd):
+            calls.append(fd)
+            if len(calls) > 1:
+                raise OSError("dir fsync")
+            return real(fd)
+        with mock.patch.object(task_hold.os, "fsync", side_effect=dir_fsync_fails):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
 
     def test_a_mismatched_token_puts_the_marker_back(self):
         tid = "task-1784700000001"
         token = task_hold.place(self.results, tid)
         self.assertFalse(task_hold.release(self.results, tid, "not-the-token"))
         self.assertEqual(task_hold.read(self.results, tid)["token"], token)
-        self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"], "no tombstone left")
-
-    def test_a_newer_hold_placed_during_a_mismatched_release_stands(self):
-        tid = "task-1784700000001"
-        task_hold.place(self.results, tid)
-        real = task_hold._read_at
-        newer = []
-
-        def third_places(dfd, name):
-            record = real(dfd, name)
-            if not newer:
-                newer.append(task_hold.place(self.results, tid))
-            return record
-        with mock.patch.object(task_hold, "_read_at", side_effect=third_places):
-            self.assertFalse(task_hold.release(self.results, tid, "not-the-token"))
-        self.assertEqual(task_hold.read(self.results, tid)["token"], newer[0])
         self.assertEqual(sorted(os.listdir(self.dir)), [f"{tid}.json"], "no tombstone left")
 
     def test_a_vanished_hold_dir_never_writes_into_the_cwd(self):
@@ -3723,11 +3773,14 @@ class TaskHold(unittest.TestCase):
     def test_the_notice_record_is_once_and_confined(self):
         tid = "task-1784700000001"
         self.assertFalse(task_hold.notice_marked(self.results, tid))
-        self.assertTrue(task_hold.mark_notice(self.results, tid))
-        self.assertFalse(task_hold.mark_notice(self.results, tid))
+        owner = task_hold.mark_notice(self.results, tid)
+        self.assertIsNotNone(owner)
+        self.assertIsNone(task_hold.mark_notice(self.results, tid))
         self.assertTrue(task_hold.notice_marked(self.results, tid))
-        task_hold.clear_notice(self.results, tid)
-        task_hold.clear_notice(self.results, tid)
+        task_hold.clear_notice(self.results, tid, "someone-else")
+        self.assertTrue(task_hold.notice_marked(self.results, tid), "only its owner clears it")
+        task_hold.clear_notice(self.results, tid, owner)
+        task_hold.clear_notice(self.results, tid, owner)
         self.assertFalse(task_hold.notice_marked(self.results, tid))
         with mock.patch.object(task_hold.os, "stat", side_effect=PermissionError("no")):
             self.assertTrue(task_hold.notice_marked(self.results, tid), "unreadable counts as queued")
@@ -3787,17 +3840,13 @@ class DeliveryDestination(unittest.TestCase):
             gb._record_proactive_receipt("proactive-hold-task-1784700000001", "!r:ag2.space")
         self.assertEqual(hatch_cli._line_state(results, "task-1784700000001"), "delivered")
 
-    def test_hold_resolves_the_identity_the_drain_does(self):
-        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+    def test_hold_reads_the_enrolled_identity_record(self):
         state = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, state)
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "")
         (state / "auth").mkdir()
         (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
-        for env in ({}, {"AGENT_MXID": "@a:env.space"}):
-            with mock.patch.dict(os.environ, env, clear=True), \
-                    mock.patch.object(gb, "_STATE", state):
-                self.assertEqual(agent_identity.lane_identity(state, dict(env)),
-                                 gb._reenroll_identity(), env)
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "enrolled.space")
 
     def test_the_drain_delegates_to_it(self):
         from ag2_sparrow import remote_gateway_bridge as gb

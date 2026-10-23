@@ -1087,13 +1087,10 @@ def _line_state(result_dir: Path, tid: str) -> str:
 
 
 def _lane_homeserver(cfg: dict) -> str:
-    """The homeserver the drain resolves at send time: the live Sparrow's environment when
-    readable, else this one, through the bridge's own identity resolver."""
+    """The homeserver of the identity Sparrow enrolled (its durable, non-credential record);
+    "" when unknown, so the pre-check passes and the drain decides at send time."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    pid = live_lock_holder(_lock_record(state, cfg.get("GATEWAY_INSTANCE") or ""))
-    from . import keepalive
-    env = (keepalive.sparrow_env(pid) if pid is not None else None) or os.environ
-    return delivery_destination.homeserver_of(agent_identity.lane_identity(state, env))
+    return delivery_destination.homeserver_of(agent_identity.enrolled(state))
 
 
 def hold(args) -> int:
@@ -1135,12 +1132,18 @@ def hold(args) -> int:
                   "it was delivered; it is not queued again and the task still reads "
                   "task-not-picked-up", file=sys.stderr)
             return REPLY_UNCONFIRMED
-        if line == "new" and task_hold.mark_notice(result_dir, tid):
+        owner = task_hold.mark_notice(result_dir, tid) if line == "new" else None
+        if owner is not None:
             try:
                 _publish_once(notice, body)
             except OSError:
-                task_hold.clear_notice(result_dir, tid)
+                task_hold.clear_notice(result_dir, tid, owner)
                 raise
+        # A hold stands only on a line proven queued or delivered, whoever queued it.
+        if _line_state(result_dir, tid) not in ("queued", "delivered"):
+            print(f"NOT confirmed: the hold line for {tid} is not proven queued; the task "
+                  "still reads task-not-picked-up", file=sys.stderr)
+            return REPLY_UNCONFIRMED
         token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
     except (OSError, ValueError) as e:
         print(f"NOT confirmed: the hold was not recorded ({e}); the task still reads "

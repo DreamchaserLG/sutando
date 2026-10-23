@@ -135,7 +135,10 @@ def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
             os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         except FileExistsError:
             return False
-        os.fsync(dfd)
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass  # the link already published the whole record; it stands
         return True
     finally:
         try:
@@ -160,52 +163,72 @@ def read(result_dir: Path, tid: str) -> "dict | None":
         os.close(dfd)
 
 
+def _unlink_owned(dfd: int, name: str, token: "str | None") -> bool:
+    """Unlink `name` when `token` is None or is the token the file records, and the name
+    still points at the inode that was read. A successor placed in the instant between the
+    inode check and the unlink is the one window this leaves."""
+    if token is not None:
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        except OSError:
+            return False
+        try:
+            ino, raw = os.fstat(fd).st_ino, os.read(fd, _MAX_BYTES + 1)
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+        try:
+            record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
+        except (UnicodeDecodeError, ValueError):
+            return False
+        if not (isinstance(record, dict) and record.get("token") == token):
+            return False
+    try:
+        if token is not None and os.stat(name, dir_fd=dfd, follow_symlinks=False).st_ino != ino:
+            return False
+        os.unlink(name, dir_fd=dfd)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def release(result_dir: Path, tid: str, token: "str | None" = None) -> bool:
-    """Remove the marker; with `token`, only the hold that token placed. True when removed.
-    The marker is first renamed to a private tombstone, so the check and the removal act
-    on one inode and a successor's marker is never the one deleted."""
+    """Remove the marker; with `token`, only the hold that token placed. True when removed."""
     name = _name(tid)
     dfd = _open_dir(result_dir, create=False)
     if dfd is None:
         return False
-    tomb = f".{name}.{secrets.token_hex(8)}.released"
     try:
-        try:
-            os.rename(name, tomb, src_dir_fd=dfd, dst_dir_fd=dfd)
-        except FileNotFoundError:
-            return False
-        if token is not None and (_read_at(dfd, tomb) or {}).get("token") != token:
-            try:
-                os.link(tomb, name, src_dir_fd=dfd, dst_dir_fd=dfd)
-            except FileExistsError:
-                pass  # a newer hold took the name meanwhile; it stands, this one is gone
-            os.unlink(tomb, dir_fd=dfd)
-            return False
-        os.unlink(tomb, dir_fd=dfd)
-        return True
+        return _unlink_owned(dfd, name, token)
     finally:
         os.close(dfd)
 
 
-def mark_notice(result_dir: Path, tid: str) -> bool:
-    """Record, durably and once, that this task's one notice was queued; False when it was."""
-    return _create_at(result_dir, f"{_name(tid)[:-len('.json')]}.notice", b"queued\n")
+def _notice_name(tid: str) -> str:
+    return f"{_name(tid)[:-len('.json')]}.notice"
 
 
-def clear_notice(result_dir: Path, tid: str) -> None:
-    """Forget a notice record whose notice was never queued."""
+def mark_notice(result_dir: Path, tid: str) -> "str | None":
+    """Record, durably and once, that this caller queues the task's one notice: its token,
+    or None when another caller already did."""
+    token = secrets.token_hex(16)
+    body = json.dumps({"token": token}).encode("utf-8")
+    return token if _create_at(result_dir, _notice_name(tid), body) else None
+
+
+def clear_notice(result_dir: Path, tid: str, token: str) -> None:
+    """Forget this caller's notice record, whose notice was never queued."""
     dfd = _held_dir(result_dir, create=False)
     try:
-        os.unlink(f"{_name(tid)[:-len('.json')]}.notice", dir_fd=dfd)
-    except FileNotFoundError:
-        pass
+        _unlink_owned(dfd, _notice_name(tid), token)
     finally:
         os.close(dfd)
 
 
 def notice_marked(result_dir: Path, tid: str) -> bool:
     """Whether a notice was ever queued for this task; an unreadable dir counts as queued."""
-    name = f"{_name(tid)[:-len('.json')]}.notice"
+    name = _notice_name(tid)
     try:
         dfd = _open_dir(result_dir, create=False)
     except (OSError, ValueError):
