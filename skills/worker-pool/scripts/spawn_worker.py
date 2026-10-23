@@ -53,14 +53,18 @@ def inherited_env(drop=()) -> dict:
 DEFAULT_SOCKET = "/tmp/sutando-tmux.sock"
 
 
+def attach_argv(socket, session_name) -> list[str]:
+    """Attach to exactly this session, never a session sharing its prefix."""
+    return ["tmux", "-S", str(socket), "attach-session", "-t", f"={session_name}"]
+
+
 def attach_command(socket, session_name) -> str:
     """A copyable Bash/Zsh command targeting exactly this worker session."""
     # shlex.quote leaves '=' bare, but Zsh expands a word starting with '='.
-    socket_arg, target = (
+    return " ".join(
         "'" + str(arg).replace("'", "'\"'\"'") + "'"
-        for arg in (socket, f"={session_name}")
+        for arg in attach_argv(socket, session_name)
     )
-    return f"tmux -S {socket_arg} attach -t {target}"
 
 
 def default_socket() -> str:

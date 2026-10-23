@@ -273,11 +273,13 @@ class TestAttachReport(Base):
         fmt.assert_called_once_with(socket, "w-" + self.spawned[0])
         self.assertIn("  session   formatted attach\n", out.getvalue())
 
-    def test_partial_report_keeps_its_coordinate_fallbacks(self):
-        with mock.patch.object(sw, "attach_command", return_value="fallback") as fmt:
-            report = cw.report({"worker_id": "a" * 32}, {"version": 1, "workers": {}}, None, [])
-        fmt.assert_called_once_with("?", "?")
-        self.assertIn("  session   fallback\n", report)
+    def test_partial_report_does_not_offer_placeholder_commands(self):
+        for tmux in ({}, {"socket": "/tmp/server"}, {"session_name": "worker"}):
+            with self.subTest(tmux=tmux), mock.patch.object(sw, "attach_command") as fmt:
+                report = cw.report({"worker_id": "a" * 32, "tmux": tmux},
+                                   {"version": 1, "workers": {}}, None, [])
+            fmt.assert_not_called()
+            self.assertIn("  session   unknown\n", report)
 
 
 class TestUnrosteredRecordsAreReportedNotAdopted(Base):

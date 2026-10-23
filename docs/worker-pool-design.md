@@ -107,10 +107,10 @@ failure while its session is alive or cannot be checked, the retained-worker
 diagnostic prints the same form of command. Both use `spawn_worker.attach_command`:
 
 ```sh
-tmux -S '/path/with spaces/worker.sock' attach -t '=sutando-worker-7c54b230a8d94ea9b86f52d70134ac68'
+'tmux' '-S' '/path/with spaces/worker.sock' 'attach-session' '-t' '=sutando-worker-7c54b230a8d94ea9b86f52d70134ac68'
 ```
 
-Socket paths remain one literal argument, including quotes and shell
+The `-S` server path remains one literal argument, including quotes and shell
 metacharacters. The quoted `=session` target requires an exact tmux session name
 and also prevents Zsh's leading-`=` expansion; the command works in Bash and Zsh.
 If that worker session is absent, it fails instead of attaching to its
@@ -118,7 +118,7 @@ If that worker session is absent, it fails instead of attaching to its
 exists again, the same command can attach. It does not create or recover a
 session or establish conversation continuity.
 
-This formatting is only for human-readable guidance. JSON socket/session
+This formatting is only for human-readable guidance. JSON server/session
 coordinates, worker identities, roster and inboxes, exit statuses, and the
 decision to retain or roll back a failed launch keep their existing contracts.
 
