@@ -82,3 +82,20 @@ State the blocker in one line, name what unblocks it, and stop; no silent retrie
   format is kept under its own extension, never mislabelled. Maximum input image size ~20 MB.
 - Options: `--prompt` (required), `--input` (repeatable), `--output`, `--model`, `--video`,
   `--aspect` (16:9 default, 9:16), `--quality` (jpg/webp, default 90).
+
+## One call: draw, post, write the result
+
+When the picture goes to a named room or DM and the task's result is the only thing left to say,
+`scripts/draw_and_send.py` does all three in one call: generate.py, the ag2space-voice upload script
+with `--post` (`skills/ag2space-voice/scripts/upload-media.ts`, from sonichi/sutando#5773), then
+`results/<task id>.txt` through `src/result_publish.py`. One tool call instead of four with a think
+between each (the 2026-10-22 long-lane worker spent 2 min 15 s on a picture, 13 s of it drawing). It
+prints one JSON line; on any failure nothing is published and the caller decides.
+
+```bash
+python3 skills/image-generation/scripts/draw_and_send.py --prompt "a golden retriever, watercolor" \
+    --room '<room or DM id>' --task-id <task id> [--name dog.jpg] [--say "The dog is in your DM."]
+```
+
+The room id comes from the task (its "known to the voice assistant" block or `channel_id`), never
+from `room_list`. The result carries no `[file:]` marker, since the picture is already posted.

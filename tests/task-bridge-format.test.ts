@@ -244,7 +244,9 @@ describe('buildVoiceTaskHeader (pure) — both header shapes', () => {
 		assert.doesNotMatch(buildVoiceTaskHeader('task-8', TS, 'owner-1', null, 'long', null), /requested_worker/);
 		const routed = laneDirective('long', 'long-lane');
 		assert.match(routed, /^--- lane: long \(the relay's judgement; routed to the long-lane worker\) ---$/m);
-		assert.match(routed, /This task is yours alone: do it here, now/);
+		assert.match(routed, /For the long-lane worker only: do it here, now/);
+		assert.match(routed, /Core: this task is the worker's, not yours\. Do not act on it, spawn nothing for it and write no result for it/);
+		assert.match(routed, /draw_and_send\.py/);
 		assert.doesNotMatch(routed, /Spawn a subagent/);
 		for (const line of routed.split('\n')) assert.doesNotMatch(line, /^[A-Za-z_][A-Za-z0-9_]*:/);
 	});

@@ -376,5 +376,60 @@ class DelegationTest(unittest.TestCase):
                 self.assertIn(line.split()[1].split(".")[0], ("os", "secrets", "sys", "pathlib"), line)
 
 
+class AttributionGuard(unittest.TestCase):
+    """The CLI refuses a result for a task the router attributed to a worker, unless it runs as that worker."""
+
+    WORKER = "163ccc52f8fd4ecd9abf25ab1c4bd4ed"
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp(prefix="result-publish-attr-"))
+        (self.ws / "results").mkdir()
+        (self.ws / "state" / "attribution").mkdir(parents=True)
+        (self.ws / "state" / "attribution" / "task-100").write_text(self.WORKER)
+
+    def publish(self, name, *flags, instance=None):
+        env = {k: v for k, v in os.environ.items() if k != "SUTANDO_INSTANCE_ID"}
+        if instance is not None:
+            env["SUTANDO_INSTANCE_ID"] = instance
+        p = subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py"), *flags, str(self.ws / "results" / name)],
+                           input="the answer\n", capture_output=True, text=True, env=env, timeout=30)
+        return p.returncode, p.stderr
+
+    def test_the_core_cannot_publish_a_worker_attributed_task(self):
+        rc, err = self.publish("task-100.txt")
+        self.assertEqual(rc, result_publish.REFUSED, err)
+        self.assertIn("attributed to worker " + self.WORKER, err)
+        self.assertIn("this session is the core", err)
+        self.assertFalse((self.ws / "results" / "task-100.txt").exists())
+        self.assertEqual([p.name for p in (self.ws / "results").iterdir()], [], "nothing staged either")
+
+    def test_another_worker_cannot_either(self):
+        rc, err = self.publish("task-100.txt", instance="0" * 32)
+        self.assertEqual(rc, result_publish.REFUSED)
+        self.assertIn("this session is worker " + "0" * 32, err)
+
+    def test_the_attributed_worker_publishes(self):
+        rc, err = self.publish("task-100.txt", instance=self.WORKER)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.ws / "results" / "task-100.txt").read_text(), "the answer\n")
+
+    def test_force_overrides(self):
+        rc, _ = self.publish("task-100.txt", "--force")
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.ws / "results" / "task-100.txt").exists())
+
+    def test_unattributed_task_and_other_results_are_untouched(self):
+        self.assertEqual(self.publish("task-200.txt")[0], 0)
+        self.assertEqual(self.publish("proactive-5.txt")[0], 0)
+        (self.ws / "state" / "attribution" / "task-300").write_text("not a worker id")
+        self.assertEqual(self.publish("task-300.txt")[0], 0, "a malformed record is no attribution")
+
+    def test_attributed_worker_reader(self):
+        self.assertEqual(result_publish.attributed_worker(self.ws / "results" / "task-100.txt"), self.WORKER)
+        self.assertIsNone(result_publish.attributed_worker(self.ws / "results" / "task-404.txt"))
+        self.assertIsNone(result_publish.attributed_worker(self.ws / "elsewhere" / "task-100.txt"), "only a results/ path")
+        self.assertIsNone(result_publish.attributed_worker(self.ws / "results" / "proactive-100.txt"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

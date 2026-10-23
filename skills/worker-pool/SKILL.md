@@ -46,6 +46,11 @@ python3 skills/worker-pool/scripts/create_worker.py --folder "$PWD" --label long
 `SUTANDO_VOICE_LONG_LANE_WORKER` names another label, or `none` keeps every task on the core.
 With no such worker the line is absent and the core takes the task, as before.
 
+The routed task's body says so in words, and `src/result_publish.py` refuses to publish a result for a
+task whose attribution (`state/attribution/<task id>`) names a worker unless it runs as that worker
+(`SUTANDO_INSTANCE_ID`), so a core that reads the payload anyway cannot overwrite the worker's answer.
+A picture task is one call for the worker: `skills/image-generation/scripts/draw_and_send.py`.
+
 ## Codex CLI workers
 
 `python3 skills/worker-pool/scripts/create_worker.py --runtime codex --folder

@@ -19,8 +19,8 @@ import secrets
 import sys
 from pathlib import Path
 
-__all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "main"]
+__all__ = ["STAGED_SUFFIX", "REFUSED", "attributed_worker", "stage_text", "is_staged_for", "publish_staged",
+           "publish_text", "main"]
 
 STAGED_SUFFIX = ".tmp"
 
@@ -82,11 +82,54 @@ def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
         raise
 
 
+_HEX = frozenset("0123456789abcdef")
+
+
+def _is_worker_id(value: str) -> bool:
+    """The pool's instance-id grammar (pool_attribution.is_worker_id), kept dependency-light here."""
+    return len(value) == 32 and set(value) <= _HEX
+
+
+def attributed_worker(path: "str | Path") -> "str | None":
+    """The pool worker a `results/task-<id>.txt` path's task is attributed to, or None.
+
+    The router records `state/attribution/<task id>` (one line, the worker id) when it hands a task
+    to a worker. Read beside the results dir, so a result written into another workspace is judged
+    against that workspace. Anything unreadable or malformed reads as "no attribution": the guard
+    is for the case the record is plainly there.
+    """
+    target = Path(path)
+    if target.parent.name != "results" or not target.name.startswith("task-") or not target.name.endswith(".txt"):
+        return None
+    record = target.parent.parent / "state" / "attribution" / target.name[: -len(".txt")]
+    try:
+        value = record.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value if _is_worker_id(value) else None
+
+
+REFUSED = 3
+
+
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1].startswith("-"):
-        print("usage: result_publish.py <path>   (body on stdin)", file=sys.stderr)
+    args = [a for a in argv[1:] if a != "--force"]
+    force = len(args) != len(argv) - 1
+    if len(args) != 1 or args[0].startswith("-"):
+        print("usage: result_publish.py [--force] <path>   (body on stdin)", file=sys.stderr)
         return 2
-    publish_text(argv[1], sys.stdin.read())
+    path = args[0]
+    # A task the router gave to a worker is answered by that worker. On 2026-10-22 the core read a
+    # routed task out of tasks/, did it again, and overwrote the worker's result; the worker's own
+    # session carries its id in SUTANDO_INSTANCE_ID, so only a mismatch is refused.
+    worker = attributed_worker(path)
+    me = os.environ.get("SUTANDO_INSTANCE_ID", "")
+    if worker and worker != me and not force:
+        who = f"worker {me}" if me else "the core"
+        print(f"result_publish: {Path(path).name} is attributed to worker {worker}; this session is {who}, so it is "
+              "not this session's to answer — not publishing. The worker writes it. (--force overrides.)", file=sys.stderr)
+        return REFUSED
+    publish_text(path, sys.stdin.read())
     return 0
 
 

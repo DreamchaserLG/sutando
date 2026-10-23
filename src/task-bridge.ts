@@ -943,9 +943,11 @@ export function buildVoiceTaskHeader(taskId: string, timestamp: string, ownerId:
  *  starts with `---` or a verb, never a header key, so the body guard has nothing to defang. */
 export function laneDirective(lane?: WorkLane, routedTo?: string | null): string {
 	if (lane === 'long' && routedTo) {
-		return '\n\n--- lane: long (the relay\'s judgement; routed to the long-lane worker) ---\n' +
-			'This task is yours alone: do it here, now, and write this task\'s result file, with python3 src/result_publish.py, ' +
-			'the moment the work is done. Nothing waits for a check or for another task.';
+		return `\n\n--- lane: long (the relay\'s judgement; addressed to the ${routedTo} worker) ---\n` +
+			`For the ${routedTo} worker only: do it here, now, and write this task\'s result file with python3 src/result_publish.py ` +
+			'the moment the work is done; for a picture, one call to skills/image-generation/scripts/draw_and_send.py draws it, posts it ' +
+			'and writes the result. Core: this task is the worker\'s, not yours. Do not act on it, spawn nothing for it and write no ' +
+			'result for it (result_publish refuses a result for a task attributed to a worker).';
 	}
 	if (lane === 'long') {
 		return '\n\n--- lane: long (the relay\'s judgement; binding) ---\n' +
