@@ -259,13 +259,16 @@ main session. An item that waits for the owner's go is parked with
 `ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
 line, "Waiting for my owner's go on this.", to the item's room (in its thread
 when it has one), then records a hold marker
-(`RESULT_DIR/.task-holds/<task id>.json`). The line is never queued twice: not
-while it is queued or being sent, and not once the drain's receipt shows it
-delivered. It refuses an item that already has a result or an outbox record,
-a room the proactive drain would not deliver to (including a room on another
-homeserver), and a `.task-holds` that is a symlink. Exit 3 means the line may
-be queued but the hold is not recorded, so the task still reads
-`task-not-picked-up`; running `hold` again records it. The item's result_file
+(`RESULT_DIR/.task-holds/<task id>.json`). The line is never queued twice: a
+durable record (`<task id>.notice` beside the marker) is written before it is
+queued, and once that record exists the line is queued again only if the
+queue entry, a send in progress or the drain's delivery receipt proves
+otherwise; with no readable proof `hold` exits 3 and queues nothing. It
+refuses an item that already has a result or an outbox record, a room the
+proactive drain would not deliver to (including a room on another homeserver,
+judged by the identity the running Sparrow resolves), and a `.task-holds` that
+is a symlink. Exit 3 means the hold is not recorded, so the task still reads
+`task-not-picked-up`; running `hold` again records it when it can. The item's result_file
 stays free for the real answer, and `reply` withdraws a hold line that is
 still queued and ends the hold. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,

@@ -105,22 +105,38 @@ def place(result_dir: Path, tid: str, reason: str = OWNER_GO,
         raise ValueError(f"hold since must be a finite epoch: {since!r}")
     token = secrets.token_hex(16)
     body = json.dumps({"reason": reason, "since": since, "token": token}).encode("utf-8")
-    dfd = _open_dir(result_dir, create=True)
+    return token if _create_at(result_dir, name, body) else None
+
+
+def _held_dir(result_dir: Path, create: bool) -> int:
+    """`_open_dir`, but a dir that is absent (or vanished mid-open) raises: a relative
+    operation never falls back to the process CWD."""
+    dfd = _open_dir(result_dir, create)
+    if dfd is None:
+        raise FileNotFoundError(f"{Path(result_dir) / HOLD_DIR} is absent")
+    return dfd
+
+
+def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
+    """Write `name` whole and exclusively under the held dir fd; False when it exists."""
+    dfd = _held_dir(result_dir, create=True)
     tmp = f".{name}.{secrets.token_hex(8)}.tmp"
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                      dir_fd=dfd)
         try:
-            os.write(fd, body)
+            view = memoryview(body)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
         try:
             os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         except FileExistsError:
-            return None
+            return False
         os.fsync(dfd)
-        return token
+        return True
     finally:
         try:
             os.unlink(tmp, dir_fd=dfd)
@@ -145,18 +161,64 @@ def read(result_dir: Path, tid: str) -> "dict | None":
 
 
 def release(result_dir: Path, tid: str, token: "str | None" = None) -> bool:
-    """Remove the marker; with `token`, only the hold that token placed. True when removed."""
+    """Remove the marker; with `token`, only the hold that token placed. True when removed.
+    The marker is first renamed to a private tombstone, so the check and the removal act
+    on one inode and a successor's marker is never the one deleted."""
     name = _name(tid)
     dfd = _open_dir(result_dir, create=False)
     if dfd is None:
         return False
+    tomb = f".{name}.{secrets.token_hex(8)}.released"
     try:
-        if token is not None and (_read_at(dfd, name) or {}).get("token") != token:
+        try:
+            os.rename(name, tomb, src_dir_fd=dfd, dst_dir_fd=dfd)
+        except FileNotFoundError:
             return False
-        os.unlink(name, dir_fd=dfd)
+        if token is not None and (_read_at(dfd, tomb) or {}).get("token") != token:
+            try:
+                os.link(tomb, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            except FileExistsError:
+                pass  # a newer hold took the name meanwhile; it stands, this one is gone
+            os.unlink(tomb, dir_fd=dfd)
+            return False
+        os.unlink(tomb, dir_fd=dfd)
+        return True
+    finally:
+        os.close(dfd)
+
+
+def mark_notice(result_dir: Path, tid: str) -> bool:
+    """Record, durably and once, that this task's one notice was queued; False when it was."""
+    return _create_at(result_dir, f"{_name(tid)[:-len('.json')]}.notice", b"queued\n")
+
+
+def clear_notice(result_dir: Path, tid: str) -> None:
+    """Forget a notice record whose notice was never queued."""
+    dfd = _held_dir(result_dir, create=False)
+    try:
+        os.unlink(f"{_name(tid)[:-len('.json')]}.notice", dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(dfd)
+
+
+def notice_marked(result_dir: Path, tid: str) -> bool:
+    """Whether a notice was ever queued for this task; an unreadable dir counts as queued."""
+    name = f"{_name(tid)[:-len('.json')]}.notice"
+    try:
+        dfd = _open_dir(result_dir, create=False)
+    except (OSError, ValueError):
+        return True
+    if dfd is None:
+        return False
+    try:
+        os.stat(name, dir_fd=dfd, follow_symlinks=False)
         return True
     except FileNotFoundError:
         return False
+    except OSError:
+        return True
     finally:
         os.close(dfd)
 
@@ -168,7 +230,7 @@ def prune(result_dir: Path, task_dir: Path) -> None:
         return
     try:
         for name in os.listdir(dfd):
-            tid = name[:-len(".json")] if name.endswith(".json") else ""
+            tid = next((name[:-len(x)] for x in (".json", ".notice") if name.endswith(x)), "")
             if valid_tid(tid) and not (Path(task_dir) / f"{tid}.txt").exists():
                 try:
                     os.unlink(name, dir_fd=dfd)

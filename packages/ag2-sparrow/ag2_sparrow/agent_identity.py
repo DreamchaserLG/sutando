@@ -76,6 +76,16 @@ def resolve(state_dir, channel_value, environ=None) -> str:
     return enrolled(state_dir)
 
 
+def lane_identity(state_dir, environ=None, read_file=None) -> str:
+    """The agent id a bridge running with `environ` and `state_dir` resolves at send time:
+    `resolve` over the channel .env files that environment selects."""
+    env = os.environ if environ is None else environ
+    if read_file is None:
+        from .bounded_file_read import read_regular as read_file
+    return resolve(state_dir, lambda key: _sources.config_from_files(
+        _sources.env_files(env, read_file), key), env)
+
+
 def root_segment(agent_id: str) -> str:
     """The one path segment for `agent_id`; ValueError on an empty id."""
     raw = (agent_id or "").strip()

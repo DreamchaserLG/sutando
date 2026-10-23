@@ -313,7 +313,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
-from . import proactive_destination
+from . import delivery_destination as _delivery_destination
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -5420,12 +5420,12 @@ def _gate_failed(name: str, exc: Exception) -> None:
 # matter how often they are retried; they are dead-lettered instead of looping.
 _PROACTIVE_MAX_BODY_B = 48 * 1024
 
-_MATRIX_ROOM_RE = proactive_destination.MATRIX_ROOM_RE
+_MATRIX_ROOM_RE = _delivery_destination.MATRIX_ROOM_RE
 
 
 def _proactive_route(body: str) -> "tuple[str, str | None, str]":
-    """The drain's routing of a proactive body; the policy is proactive_destination's."""
-    return proactive_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
+    """The drain's routing of a proactive body; the policy is delivery_destination's."""
+    return _delivery_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
@@ -5452,11 +5452,11 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
 def _own_homeserver() -> str:
     """The server this lane's agent lives on, from its enrolled identity;
     "" when the identity is unknown (then nothing below can discriminate)."""
-    return proactive_destination.homeserver_of(_reenroll_identity())
+    return _delivery_destination.homeserver_of(_reenroll_identity())
 
 
 def _room_is_deliverable_here(room: str) -> bool:
-    return proactive_destination.deliverable_here(room, _own_homeserver())
+    return _delivery_destination.deliverable_here(room, _own_homeserver())
 
 
 def _record_proactive_receipt(item_id: str, room: str) -> None:
@@ -5464,7 +5464,7 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
     room rotates; this outlives it. Fail-open: a receipt write must never
     unwind a delivery that already happened."""
     try:
-        record_delivered(RESULTS_DIR / proactive_destination.RECEIPT_DIR, item_id,
+        record_delivered(RESULTS_DIR / _delivery_destination.RECEIPT_DIR, item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {e} "

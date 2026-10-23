@@ -28,8 +28,8 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import (_dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox,
-                 proactive_destination, task_hold, workspace_lock)
+from ... import (_dirs, agent_identity, delivery_destination, gateway_credential_io,
+                 gateway_credentials, gateway_instance, outbox, task_hold, workspace_lock)
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
@@ -1071,12 +1071,29 @@ def task_settled(result_dir: Path, tid: str) -> bool:
             or (item is not None and outbox.item_status(root, item) is not None))
 
 
-def _notice_sent(result_dir: Path, tid: str) -> bool:
-    """The hold line is queued, being sent, or the drain's receipt says it was delivered."""
+def _line_state(result_dir: Path, tid: str) -> str:
+    """'queued' while the hold line waits or is being sent, 'delivered' on the drain's
+    receipt, 'new' when it was never queued, else 'unknown' (queued once, no readable proof)."""
     notice = _hold_notice(result_dir, tid)
-    receipts = result_dir / proactive_destination.RECEIPT_DIR
-    return (notice.exists() or any(result_dir.glob(f"{notice.stem}.sending*"))
-            or outbox.item_status(receipts, notice.stem) == "DELIVERED")
+    if notice.exists() or any(result_dir.glob(f"{notice.stem}.sending*")):
+        return "queued"
+    try:
+        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
+    except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
+        return "unknown"
+    if record is not None:
+        return "delivered" if record.get("status") == "DELIVERED" else "unknown"
+    return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
+
+
+def _lane_homeserver(cfg: dict) -> str:
+    """The homeserver the drain resolves at send time: the live Sparrow's environment when
+    readable, else this one, through the bridge's own identity resolver."""
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    pid = live_lock_holder(_lock_record(state, cfg.get("GATEWAY_INSTANCE") or ""))
+    from . import keepalive
+    env = (keepalive.sparrow_env(pid) if pid is not None else None) or os.environ
+    return delivery_destination.homeserver_of(agent_identity.lane_identity(state, env))
 
 
 def hold(args) -> int:
@@ -1105,16 +1122,25 @@ def hold(args) -> int:
         lines.append(f"[thread: {fields['thread_root']}]")
     lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
     body = "\n".join(lines) + "\n"
-    own = proactive_destination.homeserver_of(cfg.get("AGENT_MXID") or "")
-    if not room or proactive_destination.drain_room(body, own) != room:
+    if not room or delivery_destination.drain_room(body, _lane_homeserver(cfg)) != room:
         print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
               file=sys.stderr)
         return 2
     notice = _hold_notice(result_dir, tid)
     # Line first: a crash before the marker leaves the task reading stuck, never silent.
     try:
-        if not _notice_sent(result_dir, tid):
-            _publish_once(notice, body)
+        line = _line_state(result_dir, tid)
+        if line == "unknown":
+            print(f"NOT confirmed: the hold line for {tid} was queued before and nothing proves "
+                  "it was delivered; it is not queued again and the task still reads "
+                  "task-not-picked-up", file=sys.stderr)
+            return REPLY_UNCONFIRMED
+        if line == "new" and task_hold.mark_notice(result_dir, tid):
+            try:
+                _publish_once(notice, body)
+            except OSError:
+                task_hold.clear_notice(result_dir, tid)
+                raise
         token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
     except (OSError, ValueError) as e:
         print(f"NOT confirmed: the hold was not recorded ({e}); the task still reads "
