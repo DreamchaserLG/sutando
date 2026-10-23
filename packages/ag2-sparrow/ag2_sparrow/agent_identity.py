@@ -6,6 +6,9 @@ then the channel .env files (`AGENT_MXID`, `AGENT_ID`, `AG2SPACE_USER_ID`), then
 install derives its root from exactly the identity the bridge will report. A .env file's lines
 are parsed by the credential owner, gateway_credential_sources. Stdlib only.
 
+`publish_lane` is the one writer of `<state>/auth/lane-identity.json`: the id the live drain judges
+rooms by, with a timestamp and pid, never a credential. `published_lane` reads it back.
+
 `root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
 `SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
 character alphanumeric) becomes `local_server`: exactly one `_`, so the id reads back from it. Any
@@ -14,10 +17,12 @@ one (which has no `__`) and two such ids differ by their digest.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 from . import gateway_credential_sources as _sources
@@ -57,6 +62,41 @@ def enrolled(state_dir) -> str:
     try:
         rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
         v = rec.get("agent_id")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
+def _lane_record(state_dir) -> Path:
+    return Path(state_dir) / "auth" / "lane-identity.json"
+
+
+def publish_lane(state_dir, agent_id: str) -> None:
+    """Atomically record the identity the live drain resolved, so a reader that must not open the
+    credential env sees the drain's lane. Holds the id, a timestamp and the pid only; OSError on failure."""
+    path = _lane_record(state_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps({"agent_id": agent_id or "", "ts": time.time(), "pid": os.getpid()}))
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
+def retract_lane(state_dir) -> None:
+    """Remove the published lane record, so readers fall back to the binding; never raises."""
+    with contextlib.suppress(OSError):
+        _lane_record(state_dir).unlink()
+
+
+def published_lane(state_dir) -> str:
+    """The `agent_id` the live drain last published, '' when absent, unreadable or malformed."""
+    if state_dir is None:
+        return ""
+    try:
+        v = json.loads(_lane_record(state_dir).read_text()).get("agent_id")
         return v.strip() if isinstance(v, str) else ""
     except Exception:
         return ""

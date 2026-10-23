@@ -30,7 +30,9 @@ def claim_pid(name: str) -> "int | None":
     parts = name.rsplit(CLAIM_INFIX, 1)
     if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
         return None
-    return int(parts[1])
+    pid = int(parts[1])
+    # Only the spelling claim_path writes: no leading zeros, no zero.
+    return pid if pid > 0 and str(pid) == parts[1] else None
 
 
 def route(body: str, skip_after_channel: bool = True) -> "tuple[str, str | None, str]":

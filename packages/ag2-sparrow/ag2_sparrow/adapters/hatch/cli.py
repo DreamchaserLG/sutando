@@ -1122,12 +1122,11 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
 
 
 def _lane_homeserver(cfg: dict) -> str:
-    """The homeserver of the identity Sparrow enrolled (its durable, non-credential record);
-    "" when missing or unreadable, which `hold` refuses rather than guess."""
-    # Limit: an AGENT_MXID override lives only in the credential env Hatch must not read, so
-    # an enrollment it makes stale still passes here; the drain alone refuses that room.
+    """The homeserver of the identity the live drain published, else the one Sparrow enrolled;
+    "" when neither is readable, which `hold` refuses rather than guess."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    return delivery_destination.homeserver_of(agent_identity.enrolled(state))
+    lane = agent_identity.published_lane(state) or agent_identity.enrolled(state)
+    return delivery_destination.homeserver_of(lane)
 
 
 def hold(args) -> int:

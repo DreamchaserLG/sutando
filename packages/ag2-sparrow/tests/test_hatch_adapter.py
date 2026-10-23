@@ -3598,6 +3598,50 @@ class Hold(Base):
         self.assertEqual(delivery_destination.claim_pid(
             delivery_destination.claim_path(self.notice, 4242).name), 4242)
 
+    def test_a_leading_zero_claim_is_neither_queued_nor_live(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        stray = self.results / f"{self.notice.stem}.sending.0{os.getpid()}"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_pid_alive", wraps=gb._pid_alive) as alive:
+            gb._recover_orphan_proactive()
+        self.assertNotIn(mock.call(os.getpid()), alive.call_args_list,
+                         "recovery never defers a name the drain does not write as a live claim")
+        for suffix in ("0", f"0{os.getpid()}", f"+{os.getpid()}", f" {os.getpid()}", f"{os.getpid()} ", ""):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(delivery_destination.claim_pid(f"{self.notice.stem}.sending.{suffix}"))
+
+    def test_a_drain_identity_that_differs_from_enrollment_decides_the_room(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")  # room !room:ag2.space; enrolled as @watch-agent:ag2.space
+        state = self.home / "state"
+        with mock.patch.object(gb, "_STATE", state), \
+                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@watch-agent:other.space"}):
+            drain_accepts = gb._room_is_deliverable_here("!room:ag2.space")
+        self.assertFalse(drain_accepts, "the live drain refuses the room")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_identity_matching_the_room_still_holds(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.mxid = "@watch-agent:other.space"  # a stale enrollment the live lane overrides
+        with mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            self.assertTrue(gb._room_is_deliverable_here("!room:ag2.space"))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+
     def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
         self.add_task(self.TID, "$ev1")
         with mock.patch.object(task_hold, "place", side_effect=OSError("disk")):
@@ -4086,9 +4130,43 @@ class DeliveryDestination(unittest.TestCase):
         (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
         self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "enrolled.space")
 
+    def test_the_published_lane_record_never_holds_a_token(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        secret = "lane-secret-token-ZZZZ9999"
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "TOKEN", secret), \
+                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@a:lane.space", "REMOTE_TASK_TOKEN": secret}):
+            gb._room_is_deliverable_here("!r:lane.space")
+        raw = (state / "auth" / "lane-identity.json").read_text()
+        self.assertNotIn(secret, raw)
+        rec = json.loads(raw)
+        self.assertEqual(set(rec), {"agent_id", "ts", "pid"})
+        self.assertEqual(rec["agent_id"], "@a:lane.space")
+        self.assertEqual(agent_identity.published_lane(state), "@a:lane.space")
+        self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}), "lane.space")
+        self.assertEqual([p.name for p in (state / "auth").iterdir()], ["lane-identity.json"])
+
+    def test_a_failed_lane_publish_removes_the_stale_record(self):
+        from ag2_sparrow import agent_identity, remote_gateway_bridge as gb
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
+        agent_identity.publish_lane(state, "@old:other.space")
+        with mock.patch.object(gb, "_STATE", state), mock.patch.object(gb, "_log"), \
+                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
+                mock.patch.object(agent_identity, "publish_lane", side_effect=OSError("disk")), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": "@new:ag2.space"}):
+            gb._room_is_deliverable_here("!r:ag2.space")
+        self.assertEqual(agent_identity.published_lane(state), "", "readers fall back to enrollment")
+
     def test_the_drain_delegates_to_it(self):
         from ag2_sparrow import remote_gateway_bridge as gb
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state)
         with mock.patch.object(delivery_destination, "deliverable_here", return_value=False) as d, \
+                mock.patch.object(gb, "_STATE", state), \
+                mock.patch.dict(gb.__dict__, {"_LANE_PUBLISHED": {"id": None}}), \
                 mock.patch.object(gb, "_reenroll_identity", return_value="@a:ag2.space"):
             self.assertFalse(gb._room_is_deliverable_here("!r:ag2.space"))
         d.assert_called_once_with("!r:ag2.space", "ag2.space")

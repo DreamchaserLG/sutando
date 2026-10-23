@@ -5449,10 +5449,27 @@ def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     return None
 
 
+_LANE_PUBLISHED: "dict[str, str | None]" = {"id": None}
+
+
+def _lane_identity() -> str:
+    """The identity the deliverability predicate uses, published to the lane record whenever it
+    changes, so Hatch judges rooms by it without reading the credential env."""
+    identity = _reenroll_identity()
+    if _LANE_PUBLISHED["id"] != identity:
+        try:
+            agent_identity.publish_lane(_STATE, identity)
+            _LANE_PUBLISHED["id"] = identity
+        except OSError as e:
+            agent_identity.retract_lane(_STATE)  # a stale record must not outlive the change
+            _log(f"lane identity record not written ({e}); readers fall back to enrollment")
+    return identity
+
+
 def _own_homeserver() -> str:
-    """The server this lane's agent lives on, from its enrolled identity;
+    """The server this lane's agent lives on, from its live identity;
     "" when the identity is unknown (then nothing below can discriminate)."""
-    return _delivery_destination.homeserver_of(_reenroll_identity())
+    return _delivery_destination.homeserver_of(_lane_identity())
 
 
 def _room_is_deliverable_here(room: str) -> bool:
@@ -5658,6 +5675,7 @@ def _post_proactive() -> None:
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
     noticed: "set[tuple[str, str]]" = set()
+    _lane_identity()  # published each pass, before any file needs it
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —
