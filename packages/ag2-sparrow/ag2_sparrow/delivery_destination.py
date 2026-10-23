@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import re
 
+from pathlib import Path
+
 from .result_markers import parse_markers
 
 # Destination FORMAT validation is the bridge's own job ("the bridge
@@ -13,6 +15,22 @@ from .result_markers import parse_markers
 MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 # Where the drain records a confirmed proactive delivery, keyed by the file's stem.
 RECEIPT_DIR = ".outbox-ag2space-proactive"
+# The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
+CLAIM_INFIX = ".sending."
+
+
+def claim_path(queued: Path, pid: int) -> Path:
+    """The name the drain renames `queued` to while process `pid` sends it."""
+    return queued.with_suffix(f"{CLAIM_INFIX}{pid}")
+
+
+def claim_pid(name: str) -> "int | None":
+    """The pid of a drain claim name; None for any other name, so no reader treats a
+    file the drain neither creates nor recovers as a claim."""
+    parts = name.rsplit(CLAIM_INFIX, 1)
+    if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
+        return None
+    return int(parts[1])
 
 
 def route(body: str, skip_after_channel: bool = True) -> "tuple[str, str | None, str]":

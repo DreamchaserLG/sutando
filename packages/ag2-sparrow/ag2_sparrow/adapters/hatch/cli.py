@@ -1072,30 +1072,60 @@ def task_settled(result_dir: Path, tid: str) -> bool:
             or (item is not None and outbox.item_status(root, item) is not None))
 
 
+# Bounded rescans for a line the drain moves mid-check (claim, hand-back, delivery).
+_LINE_SCANS = 3
+
+
 def _line_state(result_dir: Path, tid: str, body: str) -> str:
     """'queued' while `body` itself waits ready to send or is being sent, 'delivered' on the
     drain's receipt, 'new' when no line was ever queued, else 'unknown' (no proof)."""
     notice = _hold_notice(result_dir, tid)
-    queued = [notice, *result_dir.glob(f"{notice.stem}.sending*")]
-    present = [p for p in queued if p.exists()]
-    if present:
+    for _ in range(_LINE_SCANS):
+        state = _scan_line(result_dir, notice, tid, body.strip())
+        if state is not None:
+            return state
+    return "unknown"
+
+
+def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":
+    """One pass in the order the drain moves a line (queued, claimed, delivered); None when
+    a file vanished under it and nothing later explains where it went."""
+    moved = seen = False
+
+    def matches(path: Path) -> bool:
+        nonlocal moved, seen
         # The drain's own readiness predicate: an empty or partial file is not a line.
-        ready = {result_ready.read_ready_result(p) for p in present}
-        return "queued" if body.strip() in ready else "unknown"
+        text = result_ready.read_ready_result(path)
+        if text is None and not path.exists():
+            moved = True
+        else:
+            seen = True
+        return text == want
+
+    if notice.exists() and matches(notice):
+        return "queued"
+    claims = sorted(p for p in result_dir.glob(f"{notice.stem}.sending.*")
+                    if delivery_destination.claim_pid(p.name) is not None)
+    if any(matches(p) for p in claims):
+        return "queued"
+    if seen and not moved:
+        return "unknown"  # some other or unready file holds the line's name
     try:
         record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
     except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
         return "unknown"
     if record is not None:
         return "delivered" if record.get("status") == "DELIVERED" else "unknown"
+    if moved:
+        return None
     return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
 
 
 def _lane_homeserver(cfg: dict) -> str:
     """The homeserver of the identity Sparrow enrolled (its durable, non-credential record);
-    "" when unknown, so the pre-check passes and the drain decides at send time."""
-    # Limit: the drain's live identity lives in its credential env, which Hatch must not read;
-    # with missing or stale enrollment the pre-check passes and the drain alone can refuse.
+    "" when missing or unreadable, which `hold` refuses rather than guess."""
+    # Limit: an AGENT_MXID override lives only in the credential env Hatch must not read, so
+    # an enrollment it makes stale still passes here; the drain alone refuses that room.
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     return delivery_destination.homeserver_of(agent_identity.enrolled(state))
 
@@ -1126,7 +1156,13 @@ def hold(args) -> int:
         lines.append(f"[thread: {fields['thread_root']}]")
     lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
     body = "\n".join(lines) + "\n"
-    if not room or delivery_destination.drain_room(body, _lane_homeserver(cfg)) != room:
+    lane = _lane_homeserver(cfg)
+    if not lane:
+        print(f"NOT confirmed: can't confirm the room is deliverable, as Sparrow's enrollment "
+              f"is missing or unreadable; no hold recorded and {tid} still reads "
+              "task-not-picked-up", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    if not room or delivery_destination.drain_room(body, lane) != room:
         print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
               file=sys.stderr)
         return 2

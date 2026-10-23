@@ -5482,11 +5482,9 @@ def _recover_orphan_proactive() -> None:
     for f in list(RESULTS_DIR.glob("proactive-*.sending.*")) \
             + list(RESULTS_DIR.glob("proactive-*.sending")):
         name = f.name
-        owner = name.rsplit(".sending.", 1)
-        if len(owner) == 2:  # pid-scoped claim
-            try:
-                pid = int(owner[1])
-            except ValueError:
+        if _delivery_destination.CLAIM_INFIX in name:  # pid-scoped claim
+            pid = _delivery_destination.claim_pid(name)
+            if pid is None:
                 continue  # not ours to interpret
             if _pid_alive(pid):
                 continue  # live worker's in-flight claim (incl. our own
@@ -5692,7 +5690,7 @@ def _post_proactive() -> None:
                     continue
         # pid-scoped claim: recovery can tell a live worker's in-flight claim
         # from a dead one's (review blocker: bare .sending was stealable).
-        claim = f.with_suffix(f".sending.{os.getpid()}")
+        claim = _delivery_destination.claim_path(f, os.getpid())
         try:
             f.rename(claim)  # atomic claim; loser of a race just misses
         except OSError:

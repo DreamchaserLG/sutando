@@ -3403,10 +3403,14 @@ class Hold(Base):
         self.mxid = "@watch-agent:other.space"
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
 
-    def test_an_unknown_identity_posts_as_the_drain_does(self):
+    def test_an_unknown_identity_records_no_hold(self):
         self.room_task("!foreign:other.space")
         self.mxid = ""
-        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIn("can't confirm the room is deliverable", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
 
     def test_the_enrolled_identity_wins_over_snapshot_and_environment(self):
         self.add_task(self.TID, "$ev1")
@@ -3530,16 +3534,69 @@ class Hold(Base):
         self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
         self.assertIsNotNone(task_hold.read(self.results, self.TID))
 
-    def test_missing_enrollment_skips_the_homeserver_check(self):
-        # Pinned limit: with no enrollment the drain is the final authority.
-        self.room_task("!foreign:other.space")
-        env = self.env()
-        (self.home / "state" / "auth" / "ag2space.json").unlink()
-        with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
-            r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
-                         {**env, "AGENT_MXID": "@watch-agent:ag2.space"})
+    def test_missing_or_unreadable_enrollment_records_no_hold(self):
+        # An AGENT_MXID override is not consulted: Hatch never reads the credential env.
+        for enrollment in (None, "{", '{"agent_id": 7}'):
+            with self.subTest(enrollment=enrollment):
+                self.room_task("!foreign:other.space")
+                env = self.env()
+                record = self.home / "state" / "auth" / "ag2space.json"
+                if enrollment is None:
+                    record.unlink()
+                else:
+                    record.write_text(enrollment)
+                with mock.patch.object(hatch_cli, "_installed_config", return_value={}):
+                    r = run_main(hatch_cli.main, ["hold", str(self.result_file)],
+                                 {**env, "AGENT_MXID": "@watch-agent:ag2.space"})
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+                self.assertIn("can't confirm the room is deliverable", r.stderr)
+                self.assertFalse(self.notice.exists())
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_drain_claim_between_listing_and_reading_still_confirms(self):
+        self.add_task(self.TID, "$ev1")
+        real = hatch_cli.result_ready.read_ready_result
+        claimed = []
+
+        def drain_claims_first(path):
+            if Path(path) == self.notice and not claimed:  # listed, then renamed by the drain
+                claimed.append(self.notice.with_suffix(".sending.4242"))
+                os.rename(self.notice, claimed[0])
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_claims_first):
+            r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
-        self.assertTrue(self.notice.exists())
+        self.assertTrue(claimed and claimed[0].exists(), "the line moved to the drain's claim")
+        self.assertIsNotNone(task_hold.read(self.results, self.TID))
+
+    def test_a_claim_handed_back_mid_read_is_found_on_the_rescan(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        claim = self.notice.with_suffix(".sending.4242")
+        claim.write_text(self.line())
+        real = hatch_cli.result_ready.read_ready_result
+
+        def drain_hands_back(path):
+            if Path(path) == claim and claim.exists():  # the drain hands an unready claim back
+                os.rename(claim, self.notice)
+            return real(path)
+        with mock.patch.object(hatch_cli.result_ready, "read_ready_result",
+                               side_effect=drain_hands_back):
+            self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "queued")
+
+    def test_only_a_claim_the_drain_makes_counts_as_queued(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        stray = self.results / f"{self.notice.stem}.sending.x"
+        stray.write_text(self.line())
+        self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(delivery_destination.claim_pid(stray.name), None)
+        self.assertEqual(delivery_destination.claim_pid(
+            delivery_destination.claim_path(self.notice, 4242).name), 4242)
 
     def test_a_failed_marker_reports_not_confirmed_and_a_retry_does_not_requeue(self):
         self.add_task(self.TID, "$ev1")
@@ -3663,6 +3720,24 @@ class TaskHold(unittest.TestCase):
         self.results = self.root / "results"
         self.results.mkdir()
         self.dir = self.results / task_hold.HOLD_DIR
+
+    def test_close_errors_after_the_link_never_undo_a_published_marker(self):
+        real_close, real_link = os.close, os.link
+        linked = []
+
+        def link(*a, **k):
+            real_link(*a, **k)
+            linked.append(True)
+
+        def close_fails_after_link(fd):
+            real_close(fd)
+            if linked:
+                raise OSError("close")
+        with mock.patch.object(task_hold.os, "link", side_effect=link), \
+                mock.patch.object(task_hold.os, "close", side_effect=close_fails_after_link):
+            token = task_hold.place(self.results, "task-1784700000001")
+        self.assertIsNotNone(token)
+        self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
 
     def test_ids_that_could_leave_the_hold_dir_are_refused(self):
         bad = ("../escaped", "task-../../escaped", "../../task-1", "/tmp/task-1", "task-a/b",
@@ -3986,6 +4061,22 @@ class DeliveryDestination(unittest.TestCase):
         with mock.patch.object(gb, "RESULTS_DIR", results):
             gb._record_proactive_receipt("proactive-hold-task-1784700000001", "!r:ag2.space")
         self.assertEqual(hatch_cli._line_state(results, "task-1784700000001", "x"), "delivered")
+
+    def test_the_drain_claims_and_recovers_by_this_grammar(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        results = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, results)
+        (results / "proactive-a.sending.x").write_text("x")
+        (results / "proactive-b.sending.4242").write_text("x")
+        with mock.patch.object(gb, "RESULTS_DIR", results), \
+                mock.patch.object(gb, "_pid_alive", return_value=False), \
+                mock.patch.object(gb, "_log"), \
+                mock.patch.object(delivery_destination, "claim_pid",
+                                  wraps=delivery_destination.claim_pid) as grammar:
+            gb._recover_orphan_proactive()
+        self.assertTrue(grammar.called)
+        self.assertTrue((results / "proactive-a.sending.x").exists(), "never a drain claim")
+        self.assertTrue((results / "proactive-b.txt").exists(), "a dead pid's claim recovers")
 
     def test_hold_reads_the_enrolled_identity_record(self):
         state = Path(tempfile.mkdtemp())

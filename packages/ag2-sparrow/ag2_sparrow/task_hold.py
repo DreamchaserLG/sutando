@@ -122,8 +122,9 @@ def _held_dir(result_dir: Path, create: bool) -> int:
 
 def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
     """Write `name` whole and exclusively under the held dir fd; False when it exists."""
-    dfd = _held_dir(result_dir, create=True)
     tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+    dfd = _held_dir(result_dir, create=True)
+    published = False
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
                      dir_fd=dfd)
@@ -137,20 +138,24 @@ def _create_at(result_dir: Path, name: str, body: bytes) -> bool:
         try:
             with _locked(dfd):
                 os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+                published = True
         except FileExistsError:
             return False
-        try:
-            os.fsync(dfd)
         except OSError:
-            pass  # the link already published the whole record; it stands
+            if not published:
+                raise  # once linked, the whole record stands whatever cleanup does
+        _quietly(os.fsync, dfd)
         return True
     finally:
-        try:
-            os.unlink(tmp, dir_fd=dfd)
-        except OSError:
-            pass  # best-effort: a leftover dot-temp never reads as a record
-        finally:
-            os.close(dfd)
+        _quietly(os.unlink, tmp, dir_fd=dfd)  # a leftover dot-temp never reads as a record
+        _quietly(os.close, dfd)
+
+
+def _quietly(op, *args, **kwargs) -> None:
+    try:
+        op(*args, **kwargs)
+    except OSError:
+        pass
 
 
 def read(result_dir: Path, tid: str) -> "dict | None":
