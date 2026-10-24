@@ -511,8 +511,8 @@ def transition(tasks_dir: Path, results_dir: Path, archive_dir: Path, *,
 def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now: float | None,
                    moves: dict, render: Render, out: dict) -> None:
     for name, generation in moves.items():
-        problem = dirs.problem() or _source_problem(dirs.tasks_fd, name, generation)
-        if problem:  # before the journal is touched: its directory may be the problem
+        problem = dirs.problem()
+        if problem:  # before the journal is touched: it lives in the directory this guards
             out["errors"].append(f"refused to move {name!r}: {problem}")
             continue
         claim = task_archive.claim_name(name)
