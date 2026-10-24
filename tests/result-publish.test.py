@@ -219,6 +219,18 @@ class WitnessedPublish(unittest.TestCase):
                 self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["proactive-a.txt"])
                 target.unlink()
 
+    def test_any_failed_commit_link_removes_the_witness(self):
+        import errno
+        for mod in self.MODULES:
+            for code in (errno.EPERM, errno.EXDEV, errno.ENOSPC, errno.EIO):
+                with self.subTest(mod=mod.__file__, errno=errno.errorcode[code]):
+                    target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                    with mock.patch.object(mod.os, "link", side_effect=OSError(code, os.strerror(code))):
+                        with self.assertRaises(OSError) as raised:
+                            mod.publish_witnessed(target, "body\n", witness)
+                    self.assertEqual(raised.exception.errno, code)
+                    self.assertEqual(list(self.dir.iterdir()), [], "no witness, staging or target left")
+
     def test_a_failed_witness_rename_leaves_no_staging(self):
         for mod in self.MODULES:
             with self.subTest(mod=mod.__file__):

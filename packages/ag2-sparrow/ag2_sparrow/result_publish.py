@@ -97,7 +97,8 @@ def publish_witnessed(path: str | Path, text: str, witness: str | Path) -> Path:
     """Publish `text` at `path` exclusively, keeping `witness` as a second name of the same inode.
 
     While the witness exists, a link count above 1 proves the commit happened even after a
-    consumer renamed the result away. Raises FileExistsError (witness removed) on a taken `path`."""
+    consumer renamed the result away. Raises FileExistsError on a taken `path`; on any failed
+    commit the witness is removed."""
     target, keep = Path(path), Path(witness)
     tmp = stage_text(target, text)
     try:
@@ -107,7 +108,7 @@ def publish_witnessed(path: str | Path, text: str, witness: str | Path) -> Path:
         raise
     try:
         os.link(keep, target)
-    except FileExistsError:
+    except BaseException:  # nothing committed: no witness may outlive the attempt
         keep.unlink(missing_ok=True)
         raise
     if os.name != "nt":
