@@ -30,8 +30,11 @@ since it was last written: that page is kept (action "kept", a line on stderr) a
 With --if-newer it rewrites a complete page only when the list's revision is newer than the page's,
 reusing the prompts and roles the page was last built with, so a pass after an engine update
 refreshes stale pages and leaves current ones alone. A page built before lists had a revision counts
-as older than any list. A rewrite is recorded as `updating` before its first write and finished by
-the next run whatever the revision, so a run cut short never leaves a blank page behind.
+as older than any list. A rewrite is recorded as `updating`, with the target page itself, before
+its first write; the next run finishes that target byte for byte whatever it was asked for (action
+"resumed" when its own inputs differ, which are then not applied), so a run cut short never leaves
+a blank or a different page behind. `publish` refuses to run without an agent identity (--agent-mxid,
+$AGENT_MXID or the channel env file), since a page without the ownership tag cannot be found again.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
 credentials come from the environment, else from the AG2 Space channel env file
@@ -198,9 +201,20 @@ def profile_name(mxid: str, fetch: Optional[Callable[[str], bytes]] = None) -> s
 
 
 def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
-    """This agent's mxid: $AGENT_MXID, else the AG2 Space channel env file's."""
+    """This agent's mxid: $AGENT_MXID, else the AG2 Space channel env file the room tooling
+    resolves, else the launcher-named device file or channels/ag2space/.env read directly (a file
+    that holds the identity but no usable token); '' when none names one."""
     from channel_credentials import channel_value
-    return channel_value("AGENT_MXID", environ)
+    from channel_token import token_from_env_file
+    from util_paths import claude_home_path
+    env = os.environ if environ is None else environ
+    found = channel_value("AGENT_MXID", env)
+    if found:
+        return found
+    files = [Path(p) for p in ((env.get("AG2_DEVICE_ENV") or "").strip(),) if p]
+    with contextlib.suppress(Exception):
+        files.append(claude_home_path("channels") / "ag2space" / ".env")
+    return next((v for v in (token_from_env_file("AGENT_MXID", f) for f in files if f.is_file()) if v), "")
 
 
 def resolve_name(name: str, mxid: Optional[str] = None,
@@ -261,12 +275,14 @@ def list_opener(*handlers) -> urllib.request.OpenerDirector:
 
 def safe_source(source: str) -> str:
     """A list source as it may be printed: a URL keeps scheme, host, port and path only (no
-    userinfo, query or fragment); a file path is returned as given."""
+    userinfo, query or fragment); a file path is returned as given. Never raises, so a malformed
+    URL is still reported and falls back like any other."""
     if "://" not in source:
         return source
-    parts = urllib.parse.urlsplit(source)
-    port = f":{parts.port}" if parts.port else ""
-    return f"{parts.scheme}://{parts.hostname or ''}{port}{parts.path}"
+    scheme, _, rest = source.partition("://")
+    authority, slash, path = rest.partition("/")
+    authority = authority.rsplit("@", 1)[-1]
+    return f"{scheme}://{authority}{slash}{path}".split("?", 1)[0].split("#", 1)[0]
 
 
 def fetch_list(url: str, opener: Optional[urllib.request.OpenerDirector] = None) -> FeatureList:
@@ -542,6 +558,22 @@ def _entry(kind: str, page: str, features: FeatureList, prompts: Dict[str, str],
     return entry
 
 
+def _resume(commons: Commons, kind: str, entry: dict) -> dict:
+    """Finish the rewrite an `updating` entry records: its target page, byte for byte, checked
+    against the entry's hash before and after the write. Returns the complete entry: the recorded
+    one, with the target dropped."""
+    target = entry.get("target")
+    if not isinstance(target, str) or content_hash(target) != entry.get("hash"):
+        raise PublishError(f"{kind} is recorded as updating but its target is missing or does not hash to "
+                           "the entry; it stays recorded as updating")
+    current = commons.read(kind)
+    if current != target:
+        commons.rewrite(kind, current, target)
+        if commons.read(kind) != target:
+            raise PublishError(f"{kind} did not land as its recorded target; it stays recorded as updating")
+    return {**{k: v for k, v in entry.items() if k not in ("target", "updated_at")}, "state": "complete"}
+
+
 def _fill(commons: Commons, kind: str, page: str) -> None:
     """Bring a page the create just wrote (or wrote earlier) to `page`: append the rest after a
     first body that matches, else rewrite whatever is there."""
@@ -600,13 +632,19 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         else:
             if step["action"] == "adopt":
                 _record(marker, rooms, commons.room, {"kind": kind, "state": "pending"})
+            resumed = before == "updating" and step["pending"]
+            if resumed:
+                # A rewrite cut short is finished from its recorded target, not from this run's inputs.
+                _record(marker, rooms, commons.room, _resume(commons, kind, rooms[commons.room]))
+                step["pending"] = False
             current = commons.read(kind)
             was = read_marker(current)
             page_revision = was[1] if was else None
             written = rooms.get(commons.room, {}).get("hash")
-            entry = _entry(kind, page, features, prompts, roles, media)
             if current == page:
-                action = "unchanged"
+                action = "updated" if resumed else "unchanged"  # the resume was this run's update
+            elif resumed:
+                action = "resumed"  # this run asks for a different page: finishing the target is enough
             elif not step["pending"] and written and content_hash(current) != written:
                 action = "kept"  # someone edited the page since this script wrote it: theirs stays
             elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
@@ -614,12 +652,16 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             else:
                 if not step["pending"]:
                     # The rewrite clears, then appends: a run cut short must resume, not read the gap
-                    # as an edit. The entry carries the target so a retry renders the same page.
-                    _record(marker, rooms, commons.room, {**entry, "state": "updating"})
+                    # as an edit, so the entry carries the target page itself.
+                    _record(marker, rooms, commons.room,
+                            {**_entry(kind, page, features, prompts, roles, media), "state": "updating",
+                             "target": page})
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        if action in ("created", "updated") or step["pending"] or step["action"] == "adopt":
-            # An unchanged or kept run records nothing: inputs that were not applied stay out.
+        # A page equal to this run's render records its inputs (a revision-only bump catches up);
+        # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
+        if action in ("created", "updated") or step["pending"] or step["action"] == "adopt" \
+                or action == "unchanged" and current == page:
             _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
               "media": sorted(media)}
@@ -627,6 +669,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         result["adopted"] = True
     if action == "kept":
         result["edited"] = True
+    if step["action"] == "update" and before == "updating":
+        result["resumed"] = True
     # Summoned once: when this page's creation finishes (here, or resumed from our own pending
     # entry). Adopting a page found by its ownership marker is not a creation.
     first = action == "created" or step["action"] == "update" and step["pending"] and before != "updating"
@@ -731,15 +775,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"ok": False, "reason": "room-commons not installed", "path": str(script)}))
         return 3
     env = commons_env(script)
+    agent = args.agent_mxid or agent_mxid()
+    if not agent:
+        # A page without the ownership tag can never be found again: refuse rather than write one.
+        print(json.dumps({"ok": False, "reason": "no agent identity: pass --agent-mxid, or set AGENT_MXID in the "
+                                                 "environment or the AG2 Space channel env file"}))
+        return 4
     try:
         result = publish(Commons(script, args.room, env), marker_path(_workspace()),
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
-                         args.agent_mxid or agent_mxid() or None, prompts, args.roles, features,
-                         args.if_newer, media)
+                         agent, prompts, args.roles, features, args.if_newer, media)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
+    if result["action"] == "resumed":
+        print(f"getting_started: finished the rewrite of {result['kind']} in {args.room} that an earlier run "
+              "left cut short; this run's inputs differ from it and were not applied; run again to apply them",
+              file=sys.stderr)
     if result.get("edited"):
         print(f"getting_started: {result['kind']} in {args.room} was edited since it was last written; "
               "kept as is, not rewritten", file=sys.stderr)

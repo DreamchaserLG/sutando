@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 import unittest
 import urllib.request
@@ -333,6 +334,18 @@ class ListTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, f"over the {tp.LIST_MAX_BYTES}-byte cap"):
                 tp.load_list(big)
             self.assertEqual(gs.LIST_MAX_BYTES, tp.LIST_MAX_BYTES)  # one cap for a file and a URL
+            fifo = Path(tmp) / "list.fifo"  # st_size 0: only a bounded read can hold the cap
+            os.mkfifo(fifo)
+            payload = big.read_bytes()
+
+            def feed():
+                with contextlib.suppress(BrokenPipeError), open(fifo, "wb") as fh:
+                    fh.write(payload)
+            writer = threading.Thread(target=feed, daemon=True)
+            writer.start()
+            with self.assertRaisesRegex(ValueError, f"over the {tp.LIST_MAX_BYTES}-byte cap"):
+                tp.load_list(fifo)
+            writer.join(10)
 
 
 class MediaTest(unittest.TestCase):
@@ -588,6 +601,15 @@ class ListOverrideTest(_Cli):
             self.assertNotIn(leak, err)
         self.assertEqual(gs.safe_source("https://u:p@h.test:8443/x/y?token=1#f"), "https://h.test:8443/x/y")
         self.assertEqual(gs.safe_source("/tmp/list.json"), "/tmp/list.json")
+        self.assertEqual(gs.safe_source("http://user:password@example.test:bad/list?token=x"),
+                         "http://example.test:bad/list")
+        self.assertEqual(gs.safe_source("https://h.test?token=x"), "https://h.test")
+        code, out, err = self.main("render", "--name", "Blue", "--core", "codex",
+                                   "--list", "http://user:password@example.test:bad/list?token=x")
+        self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))  # the fallback, not exit 2
+        self.assertIn("--list http://example.test:bad/list not used", err)
+        for leak in ("password", "token=x", "user:"):
+            self.assertNotIn(leak, err)
 
     def test_a_served_list_that_fails_falls_back(self):
         for url, payload, word in (("http://api.example.test/x", b"{}", "https"),
@@ -842,12 +864,107 @@ class IfNewerTest(_Cli):
                 # The retry passes no prompts or roles: the entry carries the target's.
                 code, out, err = self.publish("--if-newer", "--list", str(newer), "--owner", "@owner:example.test")
                 got = json.loads(out)
-                self.assertEqual((code, got["action"], got["summoned"], got.get("edited"), err),
-                                 (0, "updated", False, None, ""))
+                self.assertEqual((code, got["action"], got["summoned"], got.get("edited"), got["resumed"], err),
+                                 (0, "updated", False, None, True, ""))
                 self.assertEqual(self.page_text(), target)
                 entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
                 self.assertEqual((entry["state"], entry["hash"]), ("complete", gs.content_hash(target)))
                 self.assertNotEqual(mine, target)
+
+    def cut_short(self, newer, prompts):
+        """A created page, then an --if-newer rewrite to `newer` with prompts and roles that fails
+        after both clears (the blank page). Returns the recorded target."""
+        (self.tmp / "room.json").unlink(missing_ok=True)
+        shutil.rmtree(self.tmp / "ws", ignore_errors=True)
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        db = json.loads((self.tmp / "room.json").read_text())
+        db["calls"] = []  # STUB_FAIL_AT counts from here
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        os.environ["STUB_FAIL_AT"] = "append:1"
+        code, _, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        os.environ.pop("STUB_FAIL_AT")
+        self.assertEqual((code, self.page_text()), (4, ""))
+        entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+        self.assertEqual((entry["state"], gs.content_hash(entry["target"])), ("updating", entry["hash"]))
+        return entry["target"]
+
+    def test_a_retry_finishes_the_recorded_target_whatever_this_run_asks_for(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        other = self.write_list("tutorial.2026-12-01.1", name="other.json")
+        base = ["--name", "Blue", "--core", "codex", "--agent-mxid", self.ME]
+        retries = {
+            "plain, bundled list": base,
+            "plain, same list": base + ["--list", str(newer)],
+            "list changed": base + ["--list", str(other), "--if-newer"],
+            "list unavailable": base + ["--list", str(self.tmp / "gone.json"), "--if-newer"],
+            "name changed": ["--name", "Kai", "--core", "codex", "--agent-mxid", self.ME, "--list", str(newer),
+                             "--if-newer"],
+            "core changed": ["--name", "Blue", "--core", "claude", "--agent-mxid", self.ME, "--list", str(newer),
+                             "--if-newer"],
+            "audience changed": base + ["--audience", "room", "--list", str(newer), "--if-newer"],
+            "agent changed": ["--name", "Blue", "--core", "codex", "--agent-mxid", "@other.agent:example.test",
+                              "--list", str(newer), "--if-newer"],
+        }
+        for case, argv in retries.items():
+            with self.subTest(case=case):
+                target = self.cut_short(newer, prompts)
+                code, out, err = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub), *argv)
+                got = json.loads(out)
+                self.assertEqual((code, got["action"], got["resumed"], got["summoned"]), (0, "resumed", True, False))
+                self.assertIn("not applied", err)
+                self.assertEqual(self.page_text(), target)
+                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"], entry["revision"]),
+                                 ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder",
+                                  "tutorial.2026-11-01.1"))
+                self.assertNotIn("target", entry)
+                code, out, err = self.publish("--if-newer", "--list", str(newer))  # the target is current
+                self.assertEqual((code, json.loads(out)["action"], err), (0, "unchanged", ""))
+                self.assertEqual(self.page_text(), target)
+        # A second deliberate run applies different inputs under the usual rules.
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub), *retries["name changed"])
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))  # --if-newer: same revision
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub),
+                                 *retries["name changed"][:-1])
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertIn("Getting started with Kai", self.page_text())
+
+    def test_an_updating_entry_whose_target_does_not_hash_is_refused(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        target = self.cut_short(newer, prompts)
+        self.record(target=target.replace("Draft my update.", "Something else."))
+        code, out, _ = self.publish("--if-newer", "--list", str(newer))
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+        self.assertIn("does not hash", json.loads(out)["reason"])
+        self.assertEqual(self.page_text(), "")  # nothing written
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["state"], "updating")
+
+    def test_a_revision_only_bump_rewrites_once_then_is_a_no_op(self):
+        self.publish()
+        bumped = self.write_list("tutorial.2026-11-01.1")  # the same steps, a newer revision
+        code, out, _ = self.publish("--if-newer", "--list", str(bumped))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-01.1")
+        page = self.page_text()
+        calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
+        code, out, _ = self.publish("--if-newer", "--list", str(bumped))
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "unchanged", page))
+        writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] != "read"]
+        self.assertEqual(writes, [["pages", None]])
+        # An entry whose revision lags the page it describes catches up without a write.
+        self.record(revision="tutorial.2026-10-01.1")
+        calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
+        code, out, _ = self.publish("--if-newer", "--list", str(bumped))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-01.1")
+        writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] not in ("read", "pages")]
+        self.assertEqual(writes, [])
 
     def test_a_pending_page_is_finished_whatever_the_revision(self):
         self.door.fail = "after"
@@ -888,8 +1005,9 @@ class DocTest(unittest.TestCase):
         self.assertIn(str(ASSET_CAP // 1000) + " KB", text)
         self.assertIn(str(PAGE_CAP // 1000) + " KB", text)
         self.assertIn("`updating`", text)
+        self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "mxc://", "1 MiB", "Last verified:"):
+        for word in ("--if-newer", "kept", "updating", "resumed", "mxc://", "1 MiB", "--agent-mxid", "Last verified:"):
             self.assertIn(word, canon)
 
 

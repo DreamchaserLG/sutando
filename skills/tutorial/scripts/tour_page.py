@@ -285,15 +285,14 @@ def load_list(path: Optional[Path] = None) -> FeatureList:
     """The feature list in a JSON file; the skill's own `feature-list.json` by default."""
     path = LIST_PATH if path is None else Path(path)
     try:
-        size = path.stat().st_size
+        with path.open("rb") as fh:  # one bounded read: a FIFO or a growing file cannot bypass the cap
+            raw = fh.read(LIST_MAX_BYTES + 1)
     except OSError as exc:
         raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
-    if size > LIST_MAX_BYTES:
-        raise ValueError(f"the feature list {path} is {size} bytes, over the {LIST_MAX_BYTES}-byte cap")
+    if len(raw) > LIST_MAX_BYTES:
+        raise ValueError(f"the feature list {path} is over the {LIST_MAX_BYTES}-byte cap")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
+        data = json.loads(raw.decode("utf-8"))
     except ValueError as exc:
         raise ValueError(f"the feature list {path} is not JSON: {exc}") from None
     return parse_list(data)

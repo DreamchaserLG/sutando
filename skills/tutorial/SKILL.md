@@ -39,7 +39,9 @@ not retry the page in the same turn.
    - a name made from your mxid's localpart (`@chi-air-blue.agent:…` gives `Chi Air Blue`);
    - `Sutando`.
 
-   Your mxid is `$AGENT_MXID`, else the AG2 Space channel env file's, else `--agent-mxid`.
+   Your mxid is `--agent-mxid`, else `$AGENT_MXID`, else the AG2 Space channel env file's (the
+   launcher-named device file first). `publish` refuses to run without one: a page without the
+   ownership tag could never be found again.
 2. Tailor the prompts when you know the owner's work. You know it when either:
    - the first-contact message has a line `I picked: <labels>.`, for example
      `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
@@ -120,9 +122,12 @@ each room's entry.
   and a `pending` page is finished whatever its revision. A page someone edited since it was last
   written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
   whatever the revision: the result says `"action": "kept"`, stderr names the page, and the entry
-  stands (an `unchanged` or `kept` run records nothing). A rewrite is recorded as `updating` with
-  its target before the first write; a run cut short there is finished by the next run, which
-  renders the same page from the recorded prompts, roles and media. It summons no one. Run it after an engine
+  stands (a gated `unchanged` or `kept` run records nothing; a page equal to the run's own render
+  records its inputs, so a revision-only bump catches the entry up). A rewrite is recorded as
+  `updating`, with the target page itself, before the first write; a run cut short there is
+  finished by the next run from that recorded target, whatever that run was asked for: when its own
+  inputs differ it reports `"action": "resumed"` and applies nothing else, so a second run applies
+  them under the usual rules. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash

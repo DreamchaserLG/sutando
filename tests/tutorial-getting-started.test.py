@@ -862,9 +862,31 @@ class MainTest(unittest.TestCase):
     def test_publish_failure_exits_4(self):
         os.environ["STUB_FAIL"] = "pages"
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
-                                 "--room-commons", str(self.stub))
+                                 "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 4)
         self.assertIn("pages failed", json.loads(out)["reason"])
+
+    def test_publish_refuses_without_an_agent_identity_and_resolves_one_from_the_device_file(self):
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub))
+        self.assertEqual(code, 4)
+        self.assertIn("no agent identity", json.loads(out)["reason"])
+        self.assertFalse((self.tmp / "room.json").exists())  # refused before any Commons call
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=@kai.agent:example.test\n")  # the identity, no usable token
+        with mock.patch.dict(os.environ, {"AG2_DEVICE_ENV": str(device)}):
+            self.assertEqual(gs.agent_mxid(), "@kai.agent:example.test")
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertEqual(gs.read_marker(page), ("@kai.agent:example.test", gs.tour_page.FEATURES.revision))
+        with mock.patch.dict(os.environ, {"AGENT_MXID": "@env.agent:example.test"}):
+            self.assertEqual(gs.agent_mxid(), "@env.agent:example.test")
+        channels = self.tmp / "claude" / "channels" / "ag2space"
+        channels.mkdir(parents=True)
+        (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
+        self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
 
 
     # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.

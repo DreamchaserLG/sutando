@@ -28,15 +28,22 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   whatever the revision (`"action": "kept"`, one stderr line), and its entry is not touched, so a
   later revision does not overwrite the edit either.
 - **A rewrite that is cut short is finished.** A rewrite clears the page and appends the new text
-  in pieces, so the entry is recorded as `updating` (with its target) before the first write; the
-  next run finishes that page whatever the revision, rendering the same target from the recorded
-  inputs, and never reads the half-written page as an owner edit.
+  in pieces, so the entry is recorded as `updating`, with the target page itself, before the first
+  write. The next run finishes that target byte for byte, whatever it was asked for, checks the
+  result against the recorded hash before marking the entry complete, and never reads the
+  half-written page as an owner edit; when that run's own inputs differ from the target it reports
+  `"action": "resumed"` and applies nothing else, so nothing is silently completed as a different
+  page.
+- **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the AG2 Space
+  channel env file) and refuses to run without one: the page's ownership tag is how a later run
+  finds it. A revision-only bump of the list rewrites the page once (its tag records the revision)
+  and the next `--if-newer` is a no-op.
 - **Screenshots.** Each screenshot is a Room Commons asset reference: the page points at the
   room's media (`mxc://`, from `--media` or the room's recorded map) when the room has the asset,
   and inlines the bundled fallback file otherwise, so a room with no uploads gets the same page as
   before. Every page variant stays under 300 KB.
 
-Last verified: 2026-10-23, against `tests/tutorial-feature-list.test.py` and
+Last verified: 2026-10-24, against `tests/tutorial-feature-list.test.py` and
 `tests/tutorial-getting-started.test.py` at the head that introduced the feature list. The live
-Room Commons round trip of `publish --if-newer` and the HTML-surface rendering of `mxc://` media
-were not witnessed at that head.
+Room Commons round trip of `publish --if-newer` was witnessed at the previous head; the
+HTML-surface rendering of `mxc://` media was not.
