@@ -894,6 +894,17 @@ class MainTest(unittest.TestCase):
         (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
         self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
 
+    def test_the_identity_is_resolved_once_for_the_name_and_the_tag(self):
+        with mock.patch.object(gs, "agent_mxid", side_effect=["@alpha.agent:example.test", "@beta.agent:example.test"]) \
+                as resolver, mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
+            code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "auto", "--core", "codex",
+                                     "--room-commons", str(self.stub))
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
+        self.assertEqual(resolver.call_count, 1)
+        page = self.room_state()["pages"]["html-p1"]
+        self.assertIn("<h1>Getting started with Alpha</h1>", page)
+        self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
+
     def test_a_malformed_identity_is_refused_before_any_commons_call(self):
         def attempt(*extra, env=None):
             with mock.patch.dict(os.environ, env or {}):
@@ -1185,9 +1196,10 @@ class PublishTest(unittest.TestCase):
         parts = gs.chunks(self.page())
         self.assertGreater(len(parts), 1)  # the page is over one write's limit
         # The create's own body carries ownership, and the list revision the page was built from.
-        self.assertIn(gs.owner_marker(self.ME, gs.tour_page.FEATURES.revision), parts[0])
+        self.assertEqual(gs.read_marker(parts[0]), (self.ME, gs.tour_page.FEATURES.revision))
+        self.assertTrue(gs.page_digest_ok(self.page()))  # the tag's digest covers the whole page
         self.assertEqual([c[0] for c in room["calls"]],
-                         ["pages", "create", "read", "append", "summon"])
+                         ["pages", "create", "read", "read", "append", "read", "summon"])
         appended = [c for c in room["calls"] if c[0] == "append"]
         self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
         self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
@@ -1213,7 +1225,8 @@ class PublishTest(unittest.TestCase):
         before = len(self.room()["calls"])
         old, new = self.page(), self.page(core="claude")
         self.assertGreater(len(old.encode()), gs.CHUNK_BYTES)
-        out = self.publish(core="claude")
+        with mock.patch.object(gs, "one_call", return_value=False):  # above the one-call budget
+            out = self.publish(core="claude")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
         self.assertEqual([c[0] for c in calls if c[0] == "replace"], ["replace"] * len(gs.chunks(old)))
@@ -1254,7 +1267,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(entry["state"], "creating")
         out = self.publish(owner="@chi:ag2.space")
         # the landed page carries this agent's tag, so the rerun finishes it without a second create
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.door.ops, [entry["operation_id"]])
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
 
@@ -1262,6 +1275,9 @@ class PublishTest(unittest.TestCase):
         self.door.fail = "after"
         with self.assertRaises(gs.PublishError):
             self.publish(name="Old")
+        out = self.publish(name="New")  # finishes the journalled "Old" page first; "New" waits
+        self.assertEqual((out["action"], out["kind"], out["name"]), ("resumed", "html-p1", "Old"))
+        self.assertEqual(self.room()["pages"], {"html-p1": self.page("Old")})
         out = self.publish(name="New")
         self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("New")})
@@ -1317,7 +1333,7 @@ class PublishTest(unittest.TestCase):
                 self.publish()
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "creating")
         out = self.publish()
-        self.assertEqual((out["action"], out["kind"]), ("updated", "html-p1"))
+        self.assertEqual((out["action"], out["kind"]), ("resumed", "html-p1"))  # finished from its journal
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(self.room()["pages"]["html-p1"], self.page())
         self.assertEqual(len(self.door.ops), 1)
@@ -1334,7 +1350,7 @@ class PublishTest(unittest.TestCase):
             with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
                 self.publish()
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("unchanged", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
 
     def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
@@ -1363,7 +1379,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "pending")
         os.environ.pop("STUB_FAIL")
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("updated", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
         self.assertEqual(len(self.door.ops), 1)
 
@@ -1442,7 +1458,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(done.stdout)["reason"], "room-commons not installed")
 
     def test_bad_name_exits_2(self):
-        done = self.run_cli("publish", "--room", "!r:x", "--name", " ")
+        done = self.run_cli("render", "--name", " ")  # publish checks room-commons and the identity first
         self.assertEqual(done.returncode, 2)
 
 

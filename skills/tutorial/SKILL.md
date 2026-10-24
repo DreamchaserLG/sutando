@@ -130,10 +130,16 @@ each room's entry.
   there (`"action": "resumed"`, reporting the journalled name and revision; its own inputs,
   `--summon` included, wait for the next run); a page still as before means the rewrite never ran
   and the run proceeds as usual; any other page is someone's edit, kept with the entry from before
-  the rewrite, whole. Each call of a rewrite first reads the page and runs only when it is exactly
-  what the previous call left (an edit made between two calls stops the rewrite before its next
-  write), and the page is read back against the target before success is recorded. It summons no
-  one. Run it after an engine
+  the rewrite, whole. A rewrite that fits one room-commons call (both texts within this host's
+  argument budget: ARG_MAX less the environment, and 131,072 bytes per argument on Linux) is one
+  `replace` whose needle is the whole page, so a page that changed since it was read is refused as
+  a whole and nothing in between is written; above the budget each call's needle is a whole piece,
+  every call is read back, and an edit between a read and its write is caught by that read-back
+  with at most one piece already cleared (noted in the result, never recorded as written). The
+  page's tag carries a digest of the page, so a page found after the marker is lost is adopted as
+  this script's only when the digest matches; otherwise it is kept as found and never rewritten
+  until a render equals it. Creation goes through the same journal, and a run settles any journal
+  before it reads its own name, list, prompts or media. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash

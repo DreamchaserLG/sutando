@@ -143,6 +143,12 @@ def many_steps(n, shots=0):
     return data
 
 
+def load_media_of(argv):
+    """The --media map an argv names, as render_page takes it; {} without one."""
+    argv = list(argv)
+    return json.loads(Path(argv[argv.index("--media") + 1]).read_text()) if "--media" in argv else {}
+
+
 def served_by(opened):
     """fetch_list's opener replaced by one whose open() is `opened`."""
     return mock.patch.object(gs, "list_opener", return_value=types.SimpleNamespace(open=opened))
@@ -487,6 +493,11 @@ class _Cli(unittest.TestCase):
         rooms[self.ROOM] = {**rooms[self.ROOM], **fields}
         gs.save_marker(marker, rooms)
 
+    def chunked(self):
+        """The rewrite above the one-call budget (every page on a Linux host): cleared and appended
+        in pieces. On this host the default page may fit one call; the tests pin both paths."""
+        return mock.patch.object(gs, "one_call", return_value=False)
+
     def publish(self, *extra):
         return self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                          "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
@@ -721,8 +732,7 @@ class IfNewerTest(_Cli):
     def test_a_page_from_before_lists_had_a_revision_is_rebuilt(self):
         self.publish()
         db = json.loads((self.tmp / "room.json").read_text())
-        db["pages"]["html-p1"] = db["pages"]["html-p1"].replace(
-            tp.owner_marker(self.ME, tp.FEATURES.revision), tp.owner_marker(self.ME))
+        db["pages"]["html-p1"] = tp.MARKER.sub(tp.owner_marker(self.ME), db["pages"]["html-p1"])
         (self.tmp / "room.json").write_text(json.dumps(db))
         self.record(hash=gs.content_hash(db["pages"]["html-p1"]))  # the old script wrote that page
         self.assertEqual(tp.read_marker(self.page_text()), (self.ME, None))
@@ -843,7 +853,8 @@ class IfNewerTest(_Cli):
         mine, db["calls"] = db["pages"]["html-p1"], []  # STUB_FAIL_AT counts from here
         (self.tmp / "room.json").write_text(json.dumps(db))
         os.environ["STUB_FAIL_AT"] = at
-        code, out, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        with self.chunked():
+            code, out, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
         os.environ.pop("STUB_FAIL_AT")
         self.assertEqual((code, json.loads(out)["ok"]), (4, False))
         db = json.loads((self.tmp / "room.json").read_text())
@@ -932,76 +943,142 @@ class IfNewerTest(_Cli):
                     self.assertEqual(entry["hash"], gs.content_hash(mine))
                     self.assertEqual(self.writes_since(n), [])
 
-    def edited_run(self, hook, newer, prompts):
+    def edited_run(self, hook, newer, prompts, chunked=True, extra=()):
         """A created page, then an --if-newer rewrite during which the stub's owner edits the page
         right after call `hook`. Returns (the page before, the target, the owner's text, the stub
         calls, the run's exit code and output)."""
         (self.tmp / "room.json").unlink(missing_ok=True)
         shutil.rmtree(self.tmp / "ws", ignore_errors=True)
-        code, out, _ = self.publish()
+        code, out, _ = self.publish(*extra)
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
         db = json.loads((self.tmp / "room.json").read_text())
         mine, db["calls"] = db["pages"]["html-p1"], []
         (self.tmp / "room.json").write_text(json.dumps(db))
         target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
-                                tp.load_list(newer))
+                                tp.load_list(newer), load_media_of(extra))
         os.environ["STUB_EDIT_AFTER"] = hook
-        code, out, err = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        with self.chunked() if chunked else contextlib.nullcontext():
+            code, out, err = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts),
+                                          "--roles", "Founder", *extra)
         os.environ.pop("STUB_EDIT_AFTER")
         db = json.loads((self.tmp / "room.json").read_text())
-        return mine, target, db["edits"][-1], db["calls"], code, out, err
+        return mine, target, (db.get("edits") or [None])[-1], db["calls"], code, out, err
+
+    def expect_edit(self, mine, target, theirs, calls, code, out, after, steps):
+        """What a run must have done when the owner's edit landed right after write `after` (0:
+        before the first write). A needle the edit broke is refused and nothing is written; a
+        write that landed on a changed page is taken back when both texts fit a call on this host,
+        else the run stops by name. Either way the owner's text is never cut down further."""
+        got = json.loads(out)
+        writes = [c[0] for c in calls if c[0] in ("replace", "append")]
+        if after == 0:
+            pre = mine
+            stale = steps[0][1][0] in theirs if steps[0][0] == "replace" else True
+            left = steps[0][2]  # what the first write leaves when it lands on the owner's page
+            landed = theirs.replace(steps[0][1][0], steps[0][1][1], 1) if steps[0][0] == "replace" else theirs + steps[0][1][0]
+            i = 0
+        else:
+            pre = steps[after - 2][2] if after > 1 else mine
+            stale, left, landed, i = True, steps[after - 1][2], theirs, after - 1
+            pre_calls = [s[0] for s in steps[:after]]
+            self.assertEqual(writes[:after], pre_calls)
+        if not stale:  # the needle itself was edited: Commons refuses, nothing recorded as written
+            self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+            self.assertEqual(self.page_text(), theirs)
+            self.assertEqual(writes[after:], [])
+            done = i
+        elif left in landed and gs.fits_call(left, pre, os.environ):
+            self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+            self.assertEqual(self.page_text(), landed.replace(left, pre, 1))  # the write taken back
+            self.assertEqual(writes[after:], [steps[i][0], "replace"][: 2 if after == 0 else 1] if after == 0 else ["replace"])
+            done = i
+        else:
+            self.assertEqual((code, got["ok"]), (4, False))
+            self.assertIn(f"does not read back as expected after call {i + 1}", got["reason"])
+            self.assertIn(gs.content_hash(landed), got["reason"])
+            self.assertEqual(self.page_text(), landed)
+            journal = self.entry()
+            self.assertEqual((journal["state"], journal["done"], journal["landed"]),
+                             ("updating", i + 1, gs.content_hash(landed)))
+            n = self.calls()
+            code, out, _ = self.publish("--if-newer", "--list", str(self.newer))
+            self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
+            self.assertEqual(self.page_text(), landed)
+            self.assertEqual(self.writes_since(n), [])
+            done = i + 1
+        entry = self.entry()
+        self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
+                         ("complete", gs.content_hash(mine), done))
+        self.assertNotEqual(entry["hash"], gs.content_hash(target))
+        self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
+        page = self.page_text()
+        code, out, _ = self.publish("--if-newer", "--list", str(self.newer))  # still someone's page
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "kept", page))
 
     def test_an_edit_between_any_two_calls_stops_the_rewrite_before_its_next_write(self):
+        """Above the one-call budget. read:1 is the read before the journal, read:2 the check before
+        the first write; the owner's edit lands right after each. An edit inside the piece being
+        replaced makes Commons refuse the needle; an appended tail is caught by the read-back after
+        that one write, which is the window the piecewise path cannot close."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
-        # After the first read: between the journal and the first write. Then after each write but the last.
-        for hook in ("read:1", "replace:1", "replace:2", "append:1"):
-            for mode in ("append", "inplace"):
-                with self.subTest(hook=hook, mode=mode):
-                    mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts)
-                    got = json.loads(out)
-                    self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
-                    self.assertIn("edited", err)
-                    self.assertEqual(self.page_text(), theirs)  # exactly as the owner left it
-                    writes = [c[0] for c in calls if c[0] in ("replace", "append")]
-                    self.assertEqual(writes, self.BOUNDARIES.get(hook, []))  # nothing written after the edit
-                    if hook == "read:1":
-                        self.assertTrue(theirs.startswith(mine) if mode == "append" else theirs.endswith(mine[12:]))
-                    entry = self.entry()
-                    self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
-                                     ("complete", gs.content_hash(mine), len(writes)))
-                    self.assertNotEqual(entry["hash"], gs.content_hash(target))
-                    self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
-                    code, out, _ = self.publish("--if-newer", "--list", str(newer))  # still someone's page
-                    self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
-                    self.assertEqual(self.page_text(), theirs)
+        self.newer = self.write_list("tutorial.2026-11-01.1")
+        for hook, mode in (("read:1", "append"), ("read:1", "inplace"), ("read:2", "inplace"), ("read:2", "append")):
+            with self.subTest(hook=hook, mode=mode):
+                mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", self.newer, prompts)
+                steps = gs.rewrite_steps(mine, target, whole=False)
+                if hook == "read:1":  # before the journal: the check read sees the edit, nothing is written
+                    self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "kept", theirs))
+                    self.assertEqual([c[0] for c in calls if c[0] in ("replace", "append")], [])
+                    self.assertEqual(self.entry()["interrupted"]["done"], 0)
+                else:
+                    self.expect_edit(mine, target, theirs, calls, code, out, 0, steps)
 
-    def test_an_edit_after_the_last_call_fails_the_run_by_hash_and_the_next_run_keeps_the_page(self):
-        prompts = self.tmp / "p.json"
+    def test_a_page_within_one_call_is_replaced_whole_or_not_at_all(self):
+        """Within the one-call budget (every media-mapped page, and every page on a host whose
+        ARG_MAX allows it): one replace whose needle is the whole page. An edit landing between the
+        check read and the write makes Commons refuse the needle; the page is the owner's, whole."""
+        prompts, media = self.tmp / "p.json", self.tmp / "all.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-01.1")
-        for mode in ("append", "inplace"):
-            with self.subTest(mode=mode):
-                mine, target, theirs, calls, code, out, _ = self.edited_run(f"append:2:{mode}", newer, prompts)
+        media.write_text(json.dumps(MXC_OF))  # every screenshot mapped: the page is text, under 40 KB
+        newer = self.newer = self.write_list("tutorial.2026-11-01.1")
+        for hook, mode in (("read:1", "append"), ("read:2", "append"), ("read:2", "inplace")):
+            with self.subTest(hook=hook, mode=mode):
+                mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts,
+                                                                             chunked=False, extra=("--media", str(media)))
+                self.assertTrue(gs.one_call(mine, target, os.environ))
+                steps = gs.rewrite_steps(mine, target, whole=True)
+                self.assertEqual([s[0] for s in steps], ["replace"])
                 got = json.loads(out)
-                self.assertEqual((code, got["ok"]), (4, False))
-                self.assertIn("does not read back as its target", got["reason"])
-                self.assertIn(gs.content_hash(theirs), got["reason"])
-                self.assertEqual(self.page_text(), theirs)
-                journal = self.entry()
-                self.assertEqual((journal["state"], journal["done"], journal["landed"]),
-                                 ("updating", 4, gs.content_hash(theirs)))
-                n = self.calls()
-                code, out, err = self.publish("--if-newer", "--list", str(newer))
-                got = json.loads(out)
-                self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
-                self.assertEqual(self.page_text(), theirs)
-                self.assertEqual(self.writes_since(n), [])
+                self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True), (hook, mode))
+                self.assertEqual(self.page_text(), theirs)  # the owner's page, whole: never a fragment
+                self.assertTrue(theirs.startswith(mine) if mode == "append" else theirs.endswith(mine[12:]))
+                writes = [c for c in calls if c[0] in ("replace", "append")]
+                # inplace: the whole-page needle is refused (and a refused call is not recorded);
+                # append: the needle still matched, the write landed and was taken back.
+                self.assertEqual([c[0] for c in writes],
+                                 ["replace", "replace"] if (hook, mode) == ("read:2", "append") else [])
+                if writes:
+                    self.assertEqual(writes[0][2], len(mine.encode()))  # the needle was the whole page
                 entry = self.entry()
                 self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
-                                 ("complete", gs.content_hash(mine), 4))
-                self.assertNotEqual(entry["hash"], gs.content_hash(target))
+                                 ("complete", gs.content_hash(mine), 0))
+        # No edit: the one replace lands and reads back as the target.
+        mine, target, _, calls, code, out, _ = self.edited_run("read:9:append", newer, prompts, chunked=False,
+                                                              extra=("--media", str(media)))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertEqual(self.page_text(), target)
+        self.assertEqual([c[0] for c in calls if c[0] in ("replace", "append")], ["replace"])
+
+    def test_an_edit_after_any_write_is_taken_back_or_stops_the_run_by_hash(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        self.newer = self.write_list("tutorial.2026-11-01.1")
+        for hook, call in (("replace:1", 1), ("replace:2", 2), ("append:1", 3), ("append:2", 4)):
+            for mode in ("append", "inplace"):
+                with self.subTest(hook=hook, mode=mode):
+                    mine, target, theirs, calls, code, out, _ = self.edited_run(f"{hook}:{mode}", self.newer, prompts)
+                    self.expect_edit(mine, target, theirs, calls, code, out, call, gs.rewrite_steps(mine, target, whole=False))
 
     def test_a_second_failure_mid_resume_on_a_three_piece_page_still_ends_at_the_target(self):
         data = good_list(revision="tutorial.2026-11-01.1")
@@ -1020,7 +1097,8 @@ class IfNewerTest(_Cli):
             db["calls"] = []
             (self.tmp / "room.json").write_text(json.dumps(db))
             os.environ["STUB_FAIL_AT"] = at
-            code, out, _ = self.publish("--if-newer", "--list", str(three))
+            with self.chunked():
+                code, out, _ = self.publish("--if-newer", "--list", str(three))
             os.environ.pop("STUB_FAIL_AT")
             self.assertEqual((code, json.loads(out)["ok"]), (4, False), at)
             journal = self.entry()
@@ -1043,7 +1121,8 @@ class IfNewerTest(_Cli):
         db["calls"] = []  # STUB_FAIL_AT counts from here
         (self.tmp / "room.json").write_text(json.dumps(db))
         os.environ["STUB_FAIL_AT"] = "append:1"
-        code, _, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        with self.chunked():
+            code, _, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
         os.environ.pop("STUB_FAIL_AT")
         self.assertEqual((code, self.page_text()), (4, ""))
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
@@ -1152,12 +1231,106 @@ class IfNewerTest(_Cli):
         writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] not in ("read", "pages")]
         self.assertEqual(writes, [])
 
+    def test_a_create_whose_complete_record_failed_never_replaces_an_edit_made_since(self):
+        real = gs.save_marker
+
+        def flaky(path, rooms):
+            if rooms.get(self.ROOM, {}).get("state") == "complete" and not flaky.done:
+                flaky.done = True
+                raise OSError("disk full")
+            real(path, rooms)
+        flaky.done = False
+        with mock.patch.object(gs, "save_marker", flaky):
+            code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+        self.assertIn("stays recorded as pending", json.loads(out)["reason"])
+        whole = self.page_text()
+        self.assertEqual((self.entry()["state"], gs.content_hash(whole)), ("pending", self.entry()["hash"]))
+        db = json.loads((self.tmp / "room.json").read_text())
+        theirs = whole + "<p>OWNER NOTES</p>"
+        db["pages"]["html-p1"] = theirs
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        n = self.calls()
+        code, out, err = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["edited"], got.get("summoned")), (0, "kept", True, False))
+        self.assertEqual(self.page_text(), theirs)
+        self.assertEqual(self.writes_since(n), [])
+        entry = self.entry()
+        self.assertEqual((entry["state"], entry["foreign"], entry["hash"]), ("complete", True, gs.content_hash(theirs)))
+        code, out, _ = self.publish("--name", "Kai")  # still not a page this script may replace
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "kept", theirs))
+
+    def test_a_page_found_after_marker_loss_is_adopted_only_as_its_digest_says(self):
+        self.publish()
+        page = self.page_text()
+        self.assertTrue(tp.page_digest_ok(page))
+        gs.marker_path(self.tmp / "ws").unlink()
+        code, out, _ = self.publish()  # untouched: ours again, and rewrites go through the journal
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "unchanged", True, False))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        code, out, _ = self.publish("--if-newer", "--list", str(newer))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        # Edited after the marker was lost: adopted as found, never rewritten.
+        db = json.loads((self.tmp / "room.json").read_text())
+        theirs = db["pages"]["html-p1"].replace("</main>", "<p>OWNER NOTES</p></main>")
+        db["pages"]["html-p1"] = theirs
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        self.assertFalse(tp.page_digest_ok(theirs))
+        gs.marker_path(self.tmp / "ws").unlink()
+        n = self.calls()
+        for extra in ((), ("--name", "Kai"), ("--if-newer", "--list", str(self.write_list("tutorial.2026-12-01.1")))):
+            code, out, err = self.publish(*extra)
+            got = json.loads(out)
+            self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True), extra)
+            self.assertEqual(self.page_text(), theirs)
+            self.assertEqual(self.writes_since(n), [])
+        entry = self.entry()
+        self.assertEqual((entry["foreign"], entry["hash"], entry["revision"]),
+                         (True, gs.content_hash(theirs), "tutorial.2026-11-01.1"))
+
+    def test_recovery_needs_nothing_of_this_runs_request(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        # An invalid name: recovered first; the name is refused on the run that would use it.
+        target = self.cut_short(newer, prompts)
+        code, out, err = self.publish("--name", " ")
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "resumed", target))
+        code, out, err = self.publish("--name", " ")
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("1-64 characters", err)
+        # A writer-less FIFO as --prompts: never opened before recovery, refused (ignored) after.
+        fifo = self.tmp / "prompts.fifo"
+        os.mkfifo(fifo)
+        target = self.cut_short(newer, prompts)
+        done = []
+
+        def run(*extra):
+            done.append(self.publish(*extra))
+        for expect in ("resumed", "unchanged"):
+            worker = threading.Thread(target=run, args=("--prompts", str(fifo), "--if-newer", "--list", str(newer)),
+                                      daemon=True)
+            worker.start()
+            worker.join(15)
+            self.assertFalse(worker.is_alive(), "blocked on the FIFO")
+            code, out, _ = done[-1]
+            self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, expect, target))
+        # A list URL: recovered before any fetch.
+        target = self.cut_short(newer, prompts)
+        with mock.patch.object(gs, "list_opener", side_effect=AssertionError("fetched")) as opener:
+            code, out, _ = self.publish("--list", "https://api.example.test/list")
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "resumed", target))
+        opener.assert_not_called()
+
     def test_a_pending_page_is_finished_whatever_the_revision(self):
         self.door.fail = "after"
         code, out, _ = self.publish()
         self.assertEqual(code, 4)
         code, out, _ = self.publish("--if-newer")
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "resumed"))
         self.assertEqual(self.page_text(), tp.render_page("Blue", "codex", "dm", self.ME))
 
     def test_publish_api_takes_the_list_and_the_rule(self):
@@ -1193,8 +1366,8 @@ class DocTest(unittest.TestCase):
         self.assertIn("`updating`", text)
         self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "mxc://", "1 MiB",
-                     "--agent-mxid", "Last verified:"):
+        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "digest", "argument budget",
+                     "mxc://", "1 MiB", "--agent-mxid", "Last verified:"):
             self.assertIn(word, canon)
 
 

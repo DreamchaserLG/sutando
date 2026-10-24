@@ -36,10 +36,21 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   revision; its own request, `--summon` and new prompts or media included, waits for the next
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
-  next run keeps it too. Every call of a rewrite first reads the page and runs only on exactly the
-  page the previous call left, so an edit made between two calls stops the rewrite before its next
-  write; the page is read back against the target before success is recorded, and a run that
+  next run keeps it too. A rewrite that fits one room-commons call (this host's argument budget:
+  ARG_MAX less the environment, 131,072 bytes per argument on Linux) is a single `replace` whose
+  needle is the whole page, so a page that changed since it was read is refused whole and nothing
+  in between is written. Above the budget each call's needle is a whole piece and every call is
+  read back; an edit landing between a read and its write is caught by that read-back with at most
+  one piece already cleared, which the result reports and never records as written. A run that
   resumes continues from the call the journal recorded, never from the page's length.
+- **Pages this script cannot vouch for.** The page's tag carries a digest of the page itself, so a
+  page found after the marker is lost is adopted as this script's only when the digest matches; a
+  page that does not match, or one whose creation never finished as journalled, is kept as found
+  and never rewritten until a render equals it. Creation runs through the same journal as a
+  rewrite.
+- **Recovery comes first.** A run settles any journal in the room before it resolves its name,
+  fetches or opens a list, or opens prompts or media; the identity is resolved and checked once and
+  used for the name, the tag and the journal alike.
 - **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the AG2 Space
   channel env file), resolved and checked once (`@localpart:server`, whitespace trimmed) before any
   Room Commons call, and refuses to run without one: the page's ownership tag is how a later run

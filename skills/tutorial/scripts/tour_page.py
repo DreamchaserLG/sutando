@@ -16,6 +16,7 @@ viewer it uses this browser's localStorage, then memory, and every storage acces
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 import os
@@ -283,25 +284,31 @@ def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
     return FeatureList(revision, steps)
 
 
+def read_regular(path: Path, cap: int, what: str = "file") -> bytes:
+    """At most `cap` bytes of a regular file, from one descriptor opened without blocking (a
+    writer-less FIFO would hang a plain open) and checked before the read, so no special file
+    blocks or gets past the cap. ValueError names what went wrong."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ValueError(f"cannot read the {what} {path}: {exc.strerror or exc}") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"the {what} {path} is not a regular file")
+    with os.fdopen(fd, "rb") as fh:
+        try:
+            raw = fh.read(cap + 1)
+        except OSError as exc:
+            raise ValueError(f"cannot read the {what} {path}: {exc.strerror or exc}") from None
+    if len(raw) > cap:
+        raise ValueError(f"the {what} {path} is over the {cap}-byte cap")
+    return raw
+
+
 def load_list(path: Optional[Path] = None) -> FeatureList:
     """The feature list in a JSON file; the skill's own `feature-list.json` by default."""
     path = LIST_PATH if path is None else Path(path)
-    try:
-        # One descriptor: opened without blocking (a writer-less FIFO would hang a plain open),
-        # checked to be a regular file, then read up to the cap, so no special file gets past it.
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-    except OSError as exc:
-        raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
-        os.close(fd)
-        raise ValueError(f"the feature list {path} is not a regular file")
-    with os.fdopen(fd, "rb") as fh:
-        try:
-            raw = fh.read(LIST_MAX_BYTES + 1)
-        except OSError as exc:
-            raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
-    if len(raw) > LIST_MAX_BYTES:
-        raise ValueError(f"the feature list {path} is over the {LIST_MAX_BYTES}-byte cap")
+    raw = read_regular(path, LIST_MAX_BYTES, "feature list")
     try:
         data = json.loads(raw.decode("utf-8"))
     except ValueError as exc:
@@ -694,14 +701,27 @@ SECTIONS = [s for s in FEATURES.steps if s.runtime is None]
 PROMPT_SLOTS = prompt_slots(FEATURES)
 
 
-MARKER = re.compile(r'<meta name="sutando-tutorial" content="([^"]*)"(?: data-revision="([^"]*)")?>')
+MARKER = re.compile(r'<meta name="sutando-tutorial" content="([^"]*)"(?: data-revision="([^"]*)")?'
+                    r'(?: data-digest="([0-9a-f]{64})")?>')
+DIGEST_SLOT = "f" * 64
 
 
-def owner_marker(agent: str, revision: Optional[str] = None) -> str:
+def owner_marker(agent: str, revision: Optional[str] = None, digest: Optional[str] = None) -> str:
     """The tag that marks a page as this agent's tutorial page, so a later run can recognise it,
-    and records the feature-list revision it was built from."""
+    and records the feature-list revision it was built from and the page's own digest."""
     rev = f' data-revision="{html.escape(revision, quote=True)}"' if revision else ""
-    return f'<meta name="sutando-tutorial" content="{html.escape(agent, quote=True)}"{rev}>'
+    dig = f' data-digest="{digest}"' if digest else ""
+    return f'<meta name="sutando-tutorial" content="{html.escape(agent, quote=True)}"{rev}{dig}>'
+
+
+def page_digest_ok(text: str) -> Optional[bool]:
+    """Whether a page is exactly as this renderer wrote it: its tag's digest is the sha256 of the
+    page with that digest blanked. None when the page carries no digest (an older page)."""
+    m = MARKER.search(text or "")
+    if not m or not m.group(3):
+        return None
+    slotted = text[:m.start(3)] + DIGEST_SLOT + text[m.end(3):]
+    return hashlib.sha256(slotted.encode("utf-8")).hexdigest() == m.group(3)
 
 
 def read_marker(text: str) -> Optional[Tuple[str, Optional[str]]]:
@@ -735,7 +755,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     page = (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"{owner_marker(agent, features.revision) if agent else ''}"
+        f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
@@ -755,6 +775,9 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
         f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
     )
+    if agent:  # the tag's digest covers the whole page with the digest itself blanked
+        page = page.replace(f'data-digest="{DIGEST_SLOT}"',
+                            f'data-digest="{hashlib.sha256(page.encode("utf-8")).hexdigest()}"', 1)
     size = len(page.encode("utf-8"))
     if size > PAGE_MAX_BYTES:
         raise ValueError(f"the page is {size} bytes, over the {PAGE_MAX_BYTES}-byte cap: fewer or smaller "
