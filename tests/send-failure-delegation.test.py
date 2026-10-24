@@ -20,10 +20,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+# Before anything below reads the environment: the park probe imports the gateway bridge.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-sys.path.insert(0, str(REPO / "tests"))
-from _helpers.hermetic_env import hermetic_env  # noqa: E402
 import send_failure_policy as sfp  # noqa: E402
 from proactive_recovery import release_claim  # noqa: E402
 
