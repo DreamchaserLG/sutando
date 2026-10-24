@@ -102,6 +102,20 @@ class DeliveredRetireKeepsTheWitness(unittest.TestCase):
         self.assertEqual(self.drain(archive), [], "nothing more to deliver")
         self.assertEqual(sorted((self.tasks / "archive").glob(".notice-*.json")), [])
 
+    def test_with_no_rename_possible_the_delivered_claim_is_unlinked_not_left_to_resend(self):
+        claim = self.results / f"{PREFIX}1.sending.{os.getpid()}"
+        claim.write_text("delivered\n")
+        original = self.results / f"{PREFIX}1.txt"
+        saved = gb.ARCHIVE_RESULTS_DIR
+        gb.ARCHIVE_RESULTS_DIR = self.results / "archive"
+        try:
+            with mock.patch.object(Path, "rename", side_effect=OSError(5, "Input/output error")):
+                gb._retire_delivered_proactive(claim, original)
+        finally:
+            gb.ARCHIVE_RESULTS_DIR = saved
+        self.assertFalse(claim.exists(), "a claim left in place would be sent again after a restart")
+        self.assertFalse(original.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

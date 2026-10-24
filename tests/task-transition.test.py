@@ -1622,6 +1622,63 @@ class TestRound9(Base):
         self.assertIn(("fsync", tasks_ino), events, "the claim's removal is made durable")
         self.invariants(gen, "task: A", notice_committed=True)
 
+    # coverage of the same contracts' failure branches
+    def test_a_journal_removal_whose_barrier_fails_keeps_the_witness_and_sends_nothing_twice(self):
+        _task(self.tasks, "task-a.txt", "A")
+        self.archive.mkdir()
+        archive_ino, real = os.stat(self.archive).st_ino, tt.task_archive._fsync_dir
+        fired = []
+
+        def sync(fd):
+            if (not fired and os.fstat(fd).st_ino == archive_ino and any(
+                    p.name.endswith(".witness") for p in self.results.iterdir()) and not self.journals()):
+                fired.append(1)
+                raise OSError(5, "Input/output error")
+            real(fd)
+
+        with mock.patch.object(tt.task_archive, "_fsync_dir", side_effect=sync):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertIn("could not be removed durably", out["errors"][0])
+        self.assertEqual(len([p for p in self.results.iterdir() if p.name.endswith(".witness")]), 1)
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertEqual(len(self.notices()), 1, "no second notice")
+        self.assertEqual([p for p in self.results.iterdir() if p.name.endswith(".witness")], [])
+
+    def failed_give_back(self):
+        def link_fails(claim, name, why, dir_fd):
+            raise OSError(5, "Input/output error")
+
+        p, _ = self.refused_after_claim(link_fails)
+        return p, next(x for x in self.tasks.iterdir() if ".claim-" in x.name)
+
+    def test_a_journaled_return_whose_name_was_retaken_quarantines_the_claim(self):
+        p, claim = self.failed_give_back()
+        _task(self.tasks, "task-a.txt", "a new ask")
+        out = self.recover()
+        self.assertIn(f"quarantined as tasks/{claim.name}", out["errors"][0])
+        self.assertIn("task: A", claim.read_text())
+        self.assertIn("a new ask", p.read_text())
+        self.assertTrue((self.tasks / (claim.name + tt.QUARANTINE_SUFFIX)).exists())
+        self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
+
+    def test_a_journaled_return_with_both_names_gone_keeps_the_journal(self):
+        _, claim = self.failed_give_back()
+        claim.unlink()
+        out = self.recover()
+        self.assertIn("lost track of 'task-a.txt': it was refused", out["errors"][0])
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+
+    def test_recovery_effects_reads_unreadable_journals_and_missing_dirs(self):
+        self.assertEqual(tt.recovery_effects(self.ws / "nowhere", self.ws / "nowhere" / "archive"),
+                         {"journals": {}, "sweep": []})
+        self.assertEqual(tt.recovery_effects(self.tasks, self.archive), {"journals": {}, "sweep": []})
+        self.archive.mkdir()
+        (self.archive / f"{tt.JOURNAL_PREFIX}1-2-abc.json").write_text("not json")
+        self.assertEqual(tt.recovery_effects(self.tasks, self.archive),
+                         {"journals": {f"{tt.JOURNAL_PREFIX}1-2-abc.json": "unreadable"}, "sweep": []})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
