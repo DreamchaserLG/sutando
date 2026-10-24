@@ -40,6 +40,11 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "skills" / "task-orphan-check" / "scripts" / "classify.py"
 IMPORT_SCRIPTS = REPO / "skills" / "import-claude-context" / "scripts"
@@ -1444,7 +1449,7 @@ class TestCli(unittest.TestCase):
 
     def run_cli(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
-                              text=True, env={**os.environ, **(env or {})})
+                              text=True, env=isolated_child_env(**(env or {})))
 
     def test_json_on_stdout_with_explicit_workspace(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text())
