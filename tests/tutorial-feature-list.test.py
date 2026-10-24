@@ -473,6 +473,7 @@ class _Cli(unittest.TestCase):
         door = mock.patch.object(gs, "connect_actions", return_value=self.door)
         door.start()
         self.addCleanup(door.stop)
+        base.pin_host_budget(self)
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()

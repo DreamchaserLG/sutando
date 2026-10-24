@@ -32,6 +32,7 @@ SCRIPT = REPO / "skills" / "tutorial" / "scripts" / "getting_started.py"
 spec = importlib.util.spec_from_file_location("getting_started", SCRIPT)
 gs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gs)
+REAL_CALL_BUDGET = gs.call_budget
 
 STUB = textwrap.dedent('''
     import json, os, sys
@@ -1155,6 +1156,16 @@ class FakeActions:
         return {"kind": self.kind or made[operation_id], "surface": "html", "operation_id": operation_id}
 
 
+# A host whose argument budget holds the whole page (macOS); tests of other budgets patch their own.
+WHOLE_PAGE_BUDGET = (1_048_576, 1_000_000)
+
+
+def pin_host_budget(test: unittest.TestCase) -> None:
+    patcher = mock.patch.object(gs, "call_budget", return_value=WHOLE_PAGE_BUDGET)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class PublishTest(unittest.TestCase):
     ROOM = "!dm:ag2.space"
     ME = "@agent:example.test"
@@ -1169,6 +1180,7 @@ class PublishTest(unittest.TestCase):
         self.door = FakeActions(self.state)
         os.environ["STUB_STATE"] = str(self.state)
         os.environ.pop("STUB_FAIL", None)
+        pin_host_budget(self)
 
     def tearDown(self):
         os.environ.pop("STUB_STATE", None)
@@ -1235,6 +1247,10 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(replaces, [["replace", "html-p1", len(old.encode()), len(gs.chunks(new)[0].encode())]])
         self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)) - 1)
         self.assertEqual(self.room()["pages"], {"html-p1": new})
+
+    def test_linux_caps_one_argument(self):
+        with mock.patch.object(gs.sys, "platform", "linux"):
+            self.assertEqual(REAL_CALL_BUDGET({})[0], 131_071)
 
     def test_a_page_no_call_can_hold_is_never_rewritten_in_pieces(self):
         commons = gs.Commons(self.stub, self.ROOM)
