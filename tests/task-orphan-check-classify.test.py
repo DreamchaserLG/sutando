@@ -1003,7 +1003,8 @@ class TestRecoveryPlan(ClassifyBase):
 
 class TestApplyPlan(ClassifyBase):
     """Item 2 (kewei-red, round 4), preferred form: applying the plan has one
-    executable owner, `apply_plan()` (`--apply`), with resolved workspace paths
+    executable owner -- `apply_plan()` (`--apply`), delegating to
+    `src/task_transition.py` since round 5 -- with resolved workspace paths
     and tested failure semantics -- the write through `src/result_publish.py`
     BEFORE any move, and no move at all when the write fails. Every failure
     here is a real filesystem condition, not a mock, except the two guards
@@ -1049,7 +1050,8 @@ class TestApplyPlan(ClassifyBase):
         self.assertIsNone(out["result"])
         self.assertEqual(out["archived"], [])
         self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists(), "untouched for the next pass")
-        self.assertFalse((self.ws.root / "tasks" / "archive").exists())
+        self.assertEqual(list((self.ws.root / "tasks" / "archive").iterdir()), [],
+                         "the archive dir is made before the publish, but nothing moves into it")
 
     def test_done_and_silent_rows_move_without_a_result(self):
         self.ws.task("task-done.txt", chat_task_text("task-done", NOW - 900))
@@ -1064,27 +1066,47 @@ class TestApplyPlan(ClassifyBase):
         for name in ("task-done.txt", "task-voice.txt"):
             self.assertTrue((self.ws.root / "tasks" / "archive" / name).exists(), name)
 
-    def test_an_unwritable_archive_dir_moves_nothing_after_the_publish(self):
+    def test_an_uncreatable_archive_dir_publishes_nothing_and_moves_nothing(self):
         self._orphan()
         (self.ws.root / "tasks" / "archive").write_text("a file where the dir should be")
         out = self.mod.apply_plan(self.ws.root, NOW)
-        self.assertIsNotNone(out["result"], "the DM is still published")
+        self.assertIsNone(out["result"], "no DM for moves that cannot happen")
+        self.assertEqual(self.recovery_files(), [])
         self.assertEqual(out["archived"], [])
         self.assertEqual(len(out["errors"]), 1, out)
         self.assertIn("could not create", out["errors"][0])
         self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
 
+    def test_a_rerun_after_an_archive_dir_failure_sends_exactly_one_recovery_dm(self):
+        """SKILL.md step 4 says 'fix the permission and re-run'. Before the
+        archive dir was made first, the DM went out on the failed pass AND
+        again on the re-run, for the same orphans."""
+        self._orphan()
+        squatter = self.ws.root / "tasks" / "archive"
+        squatter.write_text("a file where the dir should be")
+        for _ in range(2):  # re-run with the fault still present: no DM either time
+            out = self.mod.apply_plan(self.ws.root, NOW)
+            self.assertIn("could not create", out["errors"][0])
+            self.assertEqual(self.recovery_files(), [])
+        squatter.unlink()  # the fix, then the re-run
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["archived"], ["task-a.txt"])
+        self.assertEqual(self.recovery_files(), [Path(out["result"])], "exactly one DM")
+        self.assertIn("recover me", (self.ws.root / "tasks" / "archive" / "task-a.txt").read_text())
+        self.assertFalse((self.ws.root / "tasks" / "task-a.txt").exists())
+
     def test_a_failed_move_is_reported_per_name_and_the_others_proceed(self):
         self._orphan("task-a.txt")
         self._orphan("task-b.txt")
-        real_replace = self.mod.os.replace
+        real_link = os.link
 
-        def flaky(src, dst):
+        def flaky(src, dst, **kw):
             if Path(src).name == "task-a.txt":
                 raise PermissionError("EPERM")
-            return real_replace(src, dst)
+            return real_link(src, dst, **kw)
 
-        with unittest.mock.patch.object(self.mod.os, "replace", side_effect=flaky):
+        with unittest.mock.patch.object(self.mod.task_transition.os, "link", side_effect=flaky):
             out = self.mod.apply_plan(self.ws.root, NOW)
         self.assertEqual(out["archived"], ["task-b.txt"])
         self.assertEqual(len(out["errors"]), 1, out)
@@ -1092,14 +1114,257 @@ class TestApplyPlan(ClassifyBase):
         self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
 
     def test_a_name_that_is_not_a_bare_filename_is_refused(self):
-        (self.ws.root / "notes").mkdir()
-        (self.ws.root / "notes" / "secret.txt").write_text("stay")
-        forged = {"archive": ["../notes/secret.txt", "", ".."], "silent_archive": [], "body": None}
+        """Discriminating fixture (round 5): `../secret.txt` has an existing
+        destination parent (`tasks/`), so without the guard `os.replace` really
+        moves `W/secret.txt` into `tasks/`; an absolute path resolves to itself
+        on both sides, so without the guard it 'succeeds' silently with no error.
+        Each refusal says so, nothing moves, nothing is published."""
+        secret = self.ws.root / "secret.txt"
+        secret.write_text("stay")
+        absolute = self.ws.root / "elsewhere.txt"
+        absolute.write_text("stay too")
+        dotted = self.ws.task("task-x.txt", "task: hi\n")
+        gen = self.mod.task_transition.generation_of
+        # Real generations for every name that resolves: only the bare-name guard refuses them.
+        forged = {"archive": ["../secret.txt", str(absolute), "", ".."],
+                  "silent_archive": ["./task-x.txt"], "body": None, "errors": [],
+                  "generation": {"../secret.txt": gen(secret), str(absolute): gen(absolute),
+                                 "": gen(self.ws.root / "tasks"), "..": gen(self.ws.root),
+                                 "./task-x.txt": gen(dotted)}}
         with unittest.mock.patch.object(self.mod, "recovery_plan", return_value=forged):
             out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual((out["archived"], out["silent_archived"], out["result"]), ([], [], None))
+        self.assertEqual(len(out["errors"]), 5, out)
+        for err in out["errors"]:
+            self.assertIn("refused", err)
+        self.assertEqual(secret.read_text(), "stay")
+        self.assertEqual(absolute.read_text(), "stay too")
+        self.assertFalse((self.ws.root / "tasks" / "secret.txt").exists(),
+                         "without the guard ../secret.txt lands here")
+        self.assertTrue(dotted.exists(), "without the guard ./task-x.txt moves")
+        self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks" / "archive").iterdir()), [])
+        self.assertEqual(self.recovery_files(), [])
+
+
+class TestApplyTransition(ClassifyBase):
+    """Round 5 (kewei-red, item 1): `--apply` is a task/result transaction owned
+    by `src/task_transition.py`. Each case here drives the production
+    operation through `apply_plan()` on a real filesystem: two applies in one
+    frozen second, a task replaced between plan and apply, an archived record
+    already under the name, a symlinked archive dir, a symlinked task."""
+
+    def _orphan(self, name: str, ask: str = "recover me") -> Path:
+        return self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: {ask}\n")
+
+    def recovery_files(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+
+    def test_two_applies_in_one_frozen_second_keep_both_notices_and_both_tasks(self):
+        self._orphan("task-a.txt", "ask A")
+        with unittest.mock.patch.object(self.mod.task_transition.time, "time",
+                                        return_value=1800000000.0):
+            first = self.mod.apply_plan(self.ws.root, NOW)
+            self._orphan("task-b.txt", "ask B")
+            second = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual((first["errors"], second["errors"]), ([], []))
+        self.assertNotEqual(first["result"], second["result"])
+        self.assertEqual(self.recovery_files(), sorted(Path(r["result"]) for r in (first, second)))
+        self.assertIn("ask A", Path(first["result"]).read_text())
+        self.assertIn("ask B", Path(second["result"]).read_text())
+        self.assertNotIn("task-a.txt", Path(second["result"]).read_text(), "no replay of A")
+        for name in ("task-a.txt", "task-b.txt"):
+            self.assertTrue((self.ws.root / "tasks" / "archive" / name).exists(), name)
+        for name in self.recovery_files():
+            self.assertTrue(name.name.startswith("proactive-orphan-recovery-1800000000-"), name)
+
+    def test_a_task_replaced_between_plan_and_publish_is_refused_with_nothing_published(self):
+        self._orphan("task-a.txt", "old ask")
+        real_plan = self.mod.recovery_plan
+
+        def plan_then_replace(*a, **kw):
+            plan = real_plan(*a, **kw)
+            self._replace_live("task-a.txt", "new ask")
+            return plan
+
+        with unittest.mock.patch.object(self.mod, "recovery_plan", side_effect=plan_then_replace):
+            out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("refused to move 'task-a.txt': changed since it was planned", out["errors"][0])
+        self.assertIn("nothing published, nothing moved", out["errors"][0])
+        self.assertIsNone(out["result"])
+        self.assertEqual(self.recovery_files(), [])
         self.assertEqual(out["archived"], [])
-        self.assertEqual(len(out["errors"]), 3, out)
-        self.assertTrue((self.ws.root / "notes" / "secret.txt").exists())
+        self.assertIn("new ask", (self.ws.root / "tasks" / "task-a.txt").read_text())
+        self.assertFalse((self.ws.root / "tasks" / "archive" / "task-a.txt").exists())
+
+    def test_a_task_replaced_after_the_publish_is_refused_and_the_new_generation_stays_live(self):
+        """The reviewer's repro: the publisher wrapped to replace the task the
+        moment the notice is out. The old generation is what the notice
+        describes; the new one is a live task the watcher treats as new."""
+        self._orphan("task-a.txt", "old ask")
+        real_publish = self.mod.task_transition.publish_exclusive
+
+        def publish_then_replace(*a, **kw):
+            target = real_publish(*a, **kw)
+            self._replace_live("task-a.txt", "new ask")
+            return target
+
+        with unittest.mock.patch.object(self.mod.task_transition, "publish_exclusive",
+                                        side_effect=publish_then_replace):
+            out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("refused to move 'task-a.txt': changed since it was planned", out["errors"][0])
+        self.assertEqual(out["archived"], [])
+        self.assertIn("new ask", (self.ws.root / "tasks" / "task-a.txt").read_text())
+        self.assertFalse((self.ws.root / "tasks" / "archive" / "task-a.txt").exists())
+        self.assertIn("old ask", Path(out["result"]).read_text())
+        again = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(again["archived"], ["task-a.txt"], "the new generation is reported on its own pass")
+        self.assertIn("new ask", Path(again["result"]).read_text())
+
+    def test_an_archived_record_under_the_same_name_is_never_overwritten(self):
+        self._orphan("task-a.txt")
+        (self.ws.root / "tasks" / "archive").mkdir()
+        (self.ws.root / "tasks" / "archive" / "task-a.txt").write_text("an earlier record\n")
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["archived"], ["task-a.txt"])
+        self.assertEqual(out["landed"], {"task-a.txt": "task-a.txt.1"})
+        self.assertEqual((self.ws.root / "tasks" / "archive" / "task-a.txt").read_text(),
+                         "an earlier record\n")
+        self.assertIn("recover me", (self.ws.root / "tasks" / "archive" / "task-a.txt.1").read_text())
+        self.assertFalse((self.ws.root / "tasks" / "task-a.txt").exists())
+
+    def test_a_symlinked_archive_dir_is_refused_before_the_publish(self):
+        self._orphan("task-a.txt")
+        outside = Path(self.ws.tmp.name) / "outside"
+        outside.mkdir()
+        (self.ws.root / "tasks" / "archive").symlink_to(outside, target_is_directory=True)
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("is a symlink; nothing published, nothing moved", out["errors"][0])
+        self.assertIsNone(out["result"])
+        self.assertEqual(sorted(outside.iterdir()), [])
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
+
+    def test_a_symlink_where_a_task_should_be_is_refused_and_its_target_untouched(self):
+        real = Path(self.ws.tmp.name) / "real-file.txt"
+        real.write_text(f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: via link\n")
+        (self.ws.root / "tasks" / "task-link.txt").symlink_to(real)
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("refused to move 'task-link.txt': a symlink", out["errors"][0])
+        self.assertIsNone(out["result"])
+        self.assertTrue(real.exists())
+        self.assertTrue((self.ws.root / "tasks" / "task-link.txt").is_symlink())
+
+    def _replace_live(self, name: str, ask: str) -> None:
+        """A writer's atomic rewrite: a new inode under the live name."""
+        live = self.ws.root / "tasks" / name
+        tmp = live.with_name(f".{name}.new")
+        tmp.write_text(f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: {ask}\n")
+        os.replace(tmp, live)
+
+
+class TestMalformedTask(ClassifyBase):
+    """Round 5 (kewei-red, item 2): a file with no `task:` line has no
+    'before the delimiter', so nothing in it is a trusted header. It must
+    surface as an operator-visible orphan (SKILL.md failure modes), never take
+    the voice/phone silent-archive path."""
+
+    FIXTURE = "id: task-bad\ntimestamp: 1970-01-01T00:00:00Z\nsource: voice\nTHIS HAS NO TASK DELIMITER\n"
+
+    def test_reviewer_fixture_is_a_visible_orphan_not_a_silent_archive(self):
+        path = self.ws.task("task-bad.txt", self.FIXTURE)
+        os.utime(path, (NOW - 900, NOW - 900))  # the only age source left once no header is trusted
+        row = self.one()
+        self.assertEqual(row["verdict"], "orphan", row)
+        self.assertFalse(row["well_formed"])
+        self.assertEqual(row["trusted_source"], "")
+        self.assertEqual(row["age_from"], "mtime", "the 1970 timestamp is not trusted either")
+        self.assertIn("malformed", row["reason"])
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual((plan["archive"], plan["silent_archive"]), (["task-bad.txt"], []))
+        self.assertIn("task-bad.txt", plan["body"])
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertIsNotNone(out["result"], "archived WITH a notice")
+
+    def test_control_the_same_headers_with_the_delimiter_are_voice_and_silent(self):
+        self.ws.task("task-bad.txt", self.FIXTURE.replace("THIS HAS NO TASK DELIMITER", "task: hi"))
+        row = self.one()
+        self.assertTrue(row["well_formed"])
+        self.assertEqual(row["trusted_source"], "voice")
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["silent_archive"], ["task-bad.txt"])
+
+    def test_a_malformed_file_cannot_claim_to_be_fresh_forever(self):
+        path = self.ws.task("task-bad.txt", f"timestamp: {iso(NOW + 10 ** 7)}\nsource: chat\nno delimiter\n")
+        os.utime(path, (NOW - 900, NOW - 900))
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+
+class TestRenderedBounds(ClassifyBase):
+    """Round 5 (kewei-red, item 3): every untrusted field a bullet renders is
+    bounded, the channel-count line is capped, and the whole body is held
+    under the delivery adapter's ceiling — or the plan refuses, before any
+    task is archived."""
+
+    BRIDGE = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py"
+
+    def test_ceiling_mirrors_the_production_adapter(self):
+        m = re.search(r"^_PROACTIVE_MAX_BODY_B = (.+)$", self.BRIDGE.read_text(), re.M)
+        self.assertIsNotNone(m, "the adapter's constant moved; re-pin")
+        self.assertEqual(eval(m.group(1), {}), self.mod.task_transition.PROACTIVE_MAX_BODY_B)  # noqa: S307
+
+    def _legacy(self, name: str, trailer: str) -> None:
+        # No header id/tier/room: the lenient parser's body-line fallback supplies them.
+        self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: hi\n{trailer}\n")
+
+    def test_reviewer_repro_49_kib_body_fallback_id_is_bounded_and_delivered(self):
+        self._legacy("task-big.txt", "id: " + "x" * (49 * 1024))
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["errors"], [])
+        self.assertLess(len(plan["body"].encode("utf-8")), self.mod.task_transition.PROACTIVE_MAX_BODY_B)
+        self.assertIn(self.mod.TRUNCATED, plan["body"])
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertLessEqual(Path(out["result"]).stat().st_size, self.mod.task_transition.PROACTIVE_MAX_BODY_B)
+        self.assertEqual(out["archived"], ["task-big.txt"])
+
+    def test_every_rendered_field_is_bounded(self):
+        big = "y" * (49 * 1024)
+        self._legacy("task-tier.txt", f"access_tier: {big}")
+        self._legacy("task-room.txt", f"room_name: {big}\nchannel_id: c1")
+        self.ws.task("task-unbound-import.txt", import_task_text("task-unbound-import", NOW - 379)
+                     .replace("id: task-unbound-import", "id: " + big))
+        self.ws.status("indexed", NOW - 300)  # unbound: its line renders the (bounded) id
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertEqual(plan["errors"], [])
+        self.assertLess(len(plan["body"].encode("utf-8")), self.mod.task_transition.PROACTIVE_MAX_BODY_B)
+        for ln in plan["body"].splitlines():
+            self.assertLess(len(ln), 2000, ln[:80])
+
+    def test_channel_count_line_is_capped(self):
+        for i in range(self.mod.CHANNELS_SHOWN + 30):
+            self.ws.task(f"task-c{i}.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\n"
+                                           f"channel_id: room-{i}\ntask: hi\n")
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        line = next(ln for ln in plan["body"].splitlines() if ln.startswith("By channel: "))
+        self.assertEqual(line.count(" — "), self.mod.CHANNELS_SHOWN)
+        self.assertIn("+30 more channels", line)
+
+    def test_a_body_over_the_ceiling_refuses_before_anything_is_archived(self):
+        self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: hi\n")
+        with unittest.mock.patch.object(self.mod.task_transition, "PROACTIVE_MAX_BODY_B", 64):
+            plan = self.mod.recovery_plan(self.ws.root, NOW)
+            self.assertEqual(len(plan["errors"]), 1, plan)
+            self.assertIn("undeliverable", plan["errors"][0])
+            out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], plan["errors"])
+        self.assertEqual((out["result"], out["archived"]), (None, []))
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
+        self.assertEqual(list((self.ws.root / "results").iterdir()), [])
 
 
 class TestAgeSources(ClassifyBase):
@@ -1209,7 +1474,7 @@ class TestCli(unittest.TestCase):
         res = self.run_cli("--workspace", str(self.ws.root), "--now", str(NOW), "--plan")
         self.assertEqual(res.returncode, 0, res.stderr)
         cli_out = json.loads(res.stdout)
-        self.assertEqual(set(cli_out), {"archive", "silent_archive", "body"})
+        self.assertEqual(set(cli_out), {"archive", "silent_archive", "generation", "body", "errors"})
         direct = _load().recovery_plan(self.ws.root, NOW)
         self.assertEqual(cli_out, direct)
         self.assertEqual(cli_out["archive"], [f"{IMPORT_ID}.txt"])

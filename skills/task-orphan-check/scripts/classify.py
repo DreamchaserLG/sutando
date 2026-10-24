@@ -94,7 +94,7 @@ if str(REPO / "src") not in sys.path:
 
 import local_task_protocol as ltp  # noqa: E402
 import result_markers  # noqa: E402
-import result_publish  # noqa: E402
+import task_transition  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
 # hold a task. Any stat failure but ENOENT propagates — unreadable is not absent.
@@ -232,6 +232,23 @@ def completion_marker(results_dir: Path, task_id: str) -> str:
     return ""
 
 
+# Caps on the untrusted fields a bullet renders; with PREVIEW_SHOWN rows and
+# CHANNELS_SHOWN counts the body stays far under task_transition.PROACTIVE_MAX_BODY_B.
+ID_CHARS = 160
+TIER_CHARS = 32
+LABEL_CHARS = 120
+ERROR_CHARS = 200
+CHANNELS_SHOWN = 20
+TRUNCATED = "…(truncated)"
+
+
+def bounded(text: str, limit: int) -> str:
+    """`text`, or its first `limit` chars plus a visible marker. Runs BEFORE
+    neutralization, which never lengthens a string, so a cut cannot re-open a marker."""
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + TRUNCATED
+
+
 def neutralize(text: str) -> str:
     """Make untrusted text inert before it enters a trusted result body.
     A square bracket is the structural precondition of every result marker, so
@@ -242,7 +259,7 @@ def neutralize(text: str) -> str:
 def channel_label(headers: dict) -> str:
     name = headers.get("room_name") or headers.get("channel_name")
     cid = headers.get("channel_id") or headers.get("chat_id") or ""
-    return neutralize(f"{name} ({cid})" if name else (cid or "DM"))
+    return neutralize(bounded(f"{name} ({cid})" if name else (cid or "DM"), LABEL_CHARS))
 
 
 _KEYWORD_COLON_RE = re.compile(r"(?i)\b(file|send|attach|deduped|channel|reply)(:)")
@@ -297,7 +314,7 @@ def recovery_line(file: str, task_id: str, tier: str, label: str, age_s: int,
         ident = f if tid == stem else f"{f} (claimed id: {tid})"
         return f"- {ident} [{t}, {label}, {age_m}m ago]: {text_preview}"
 
-    return _safe_line(build, file, task_id, tier)
+    return _safe_line(build, file, bounded(task_id, ID_CHARS), bounded(tier, TIER_CHARS))
 
 
 def stalled_line(task_id: str, phase: str, idle_human: str) -> str:
@@ -307,7 +324,7 @@ def stalled_line(task_id: str, phase: str, idle_human: str) -> str:
                         f"({tid}, still in tasks/ — it resumes on the next sweep; say "
                         '"import my Claude history" to resume it now, or '
                         "`/import-claude-context --discard` to drop the run).",
-        task_id, phase)
+        bounded(task_id, ID_CHARS), bounded(phase, TIER_CHARS))
 
 
 def unbound_line(task_id: str, phase: str, idle_human: str) -> str:
@@ -318,7 +335,7 @@ def unbound_line(task_id: str, phase: str, idle_human: str) -> str:
                         'still in tasks/ — its status carries no task id); say "import my '
                         'Claude history" to re-run it, or `/import-claude-context --discard` '
                         "to drop the run.",
-        task_id, phase)
+        bounded(task_id, ID_CHARS), bounded(phase, TIER_CHARS))
 
 
 def unknown_line(task_id: str, error_text: str) -> str:
@@ -329,7 +346,7 @@ def unknown_line(task_id: str, error_text: str) -> str:
                          "worker holds it is unknown — left in tasks/, not archived; if "
                          "it is yours it will be answered by the next sweep, otherwise check "
                          "the host's file permissions (TCC on ~/Documents is the known cause).",
-        task_id, error_text)
+        bounded(task_id, ID_CHARS), bounded(error_text, ERROR_CHARS))
 
 
 def idle_human(idle_s: int) -> str:
@@ -367,9 +384,10 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
     parsed = ltp.parse_task_headers_lenient(text)
     headers = parsed.headers
-    # Headers found strictly before `task:` -- a missing-header task's own
-    # body cannot promote itself into this set the way the union parser does.
-    strict_headers = ltp.parse_task_headers(text).headers
+    # Trusted headers sit strictly before `task:`; a body cannot promote itself into
+    # this set, and a file with no delimiter has no "before", so it trusts nothing.
+    well_formed = any(line.startswith("task:") for line in text.split("\n"))
+    strict_headers = ltp.parse_task_headers(text).headers if well_formed else {}
     task_id = (headers.get("id") or path.stem).strip()
     # Nothing in the task's own content can forge this. Every lookup that can
     # archive, suppress, or bind a task uses it, never the header `task_id`.
@@ -395,6 +413,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         "age_s": age_s,
         "recovery_line": recovery_line(path.name, task_id, tier, label, age_s, task_preview),
         "age_from": age_from,
+        "well_formed": well_formed,
         "import": False,
     }
     marker = completion_marker(workspace / "results", physical_id)
@@ -484,8 +503,9 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     if age_s < FRESH_AGE_S:
         row.update(verdict="fresh", reason=f"arrived {age_s}s ago, watcher will handle")
         return row
+    malformed = "" if well_formed else " (malformed: no `task:` line, so no header is trusted)"
     row.update(verdict="orphan",
-               reason=f"no completion marker, queued {age_s}s ago (>= {FRESH_AGE_S}s)")
+               reason=f"no completion marker, queued {age_s}s ago (>= {FRESH_AGE_S}s){malformed}")
     return row
 
 
@@ -509,6 +529,7 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
             # "owner" matches the documented default for an absent/unknown tier.
             row = {"file": path.name, "id": path.stem, "access_tier": "owner",
                    "source": "", "trusted_source": "", "label": "DM", "age_s": 0,
+                   "well_formed": False,
                    "recovery_line": recovery_line(path.name, path.stem, "owner", "DM", 0,
                                                   neutralize(f"(unreadable: {exc})")),
                    "verdict": "orphan",
@@ -541,8 +562,12 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
     this returns and publishes exactly the body this returns -- nothing derives
     either from `id` or reconstructs the body from individual rows by hand.
 
-    Returns `{"archive": [...], "silent_archive": [...], "body": str|None}`;
-    `archive`/`silent_archive` are bare filenames under `tasks/`.
+    Returns `{"archive": [...], "silent_archive": [...], "generation": {...},
+    "body": str|None, "errors": [...]}`; `archive`/`silent_archive` are bare
+    filenames under `tasks/`, `generation` the identity of each file's bytes
+    when it was planned (`task_transition.generation_of`), which is what
+    `apply_plan()` moves and nothing else. `errors` non-empty means the plan
+    must not be applied (a body the adapter could never deliver).
     """
     now = time.time() if now is None else now
     result = classify_workspace(workspace, now)
@@ -577,8 +602,15 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
     body = None
     if deferred or stalled or unbound or unknown:
         body = _recovery_body(deferred, stalled, unbound, unknown)
-
-    return {"archive": archive, "silent_archive": silent_archive, "body": body}
+    generation = {name: task_transition.generation_of(workspace / "tasks" / name)
+                  for name in (*archive, *silent_archive)}
+    errors = []
+    if body is not None and len(body.encode("utf-8")) > task_transition.PROACTIVE_MAX_BODY_B:
+        errors.append(f"recovery body is {len(body.encode('utf-8'))} bytes "
+                      f"(> {task_transition.PROACTIVE_MAX_BODY_B}): undeliverable, so nothing "
+                      "will be published or moved")
+    return {"archive": archive, "silent_archive": silent_archive, "generation": generation,
+            "body": body, "errors": errors}
 
 
 def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict],
@@ -604,8 +636,10 @@ def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict
             f"{tb} ({tier_counts.get(tb, 0)})" for tb in (*TIER_BUCKETS, "other")
         ) + ".",
         "By channel: " + "; ".join(
-            f"{label} — {count}" for label, count in channel_counts.items()
-        ) + ("." if channel_counts else "(none)."),
+            f"{label} — {count}" for label, count in list(channel_counts.items())[:CHANNELS_SHOWN]
+        ) + (f"; +{len(channel_counts) - CHANNELS_SHOWN} more channels"
+             if len(channel_counts) > CHANNELS_SHOWN else "")
+        + ("." if channel_counts else "(none)."),
         "",
         "Previews (most-recent first, first ~100 chars of task body; in-band system "
         "instructions stripped):",
@@ -645,42 +679,32 @@ RESULT_PREFIX = "proactive-orphan-recovery-"
 
 
 def apply_plan(workspace: Path, now: float | None = None) -> dict:
-    """Step 3, performed: publish `body` whole (the repo's one `results/`
-    publisher), THEN move the plan's files, every path under `workspace`. A
-    failed publish moves nothing, so an orphan is never archived unreported.
+    """Step 3, performed by `src/task_transition.py`, the one owner of the
+    report-then-archive transition: pre-flight every move (archive dir, bare
+    names, each file still the generation the plan captured), publish `body`
+    under an exclusive name, THEN move exactly those generations, never
+    overwriting an archived record. A pre-flight or publish failure changes
+    nothing, so an orphan is never archived unreported and a re-run after the
+    fix reports it once.
 
     Returns the plan plus `result` (the published path or None), `archived`,
-    `silent_archived` (names actually moved) and `errors` (one line each)."""
+    `silent_archived` (names actually moved), `landed` ({name: archive name})
+    and `errors` (one line each)."""
     plan = recovery_plan(workspace, now)
-    out = {**plan, "result": None, "archived": [], "silent_archived": [], "errors": []}
+    out = {**plan, "result": None, "archived": [], "silent_archived": [], "landed": {},
+           "errors": list(plan.get("errors") or [])}
+    if out["errors"]:
+        return out
     tasks_dir = workspace / "tasks"
-    archive_dir = tasks_dir / "archive"
-    if plan["body"] is not None:
-        target = workspace / "results" / f"{RESULT_PREFIX}{int(time.time())}.txt"
-        try:
-            result_publish.publish_text(target, plan["body"])
-        except OSError as exc:
-            out["errors"].append(f"result write failed ({exc}); nothing moved")
-            return out
-        out["result"] = str(target)
-    if plan["archive"] or plan["silent_archive"]:
-        try:
-            archive_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            out["errors"].append(f"could not create {archive_dir}: {exc}; nothing moved")
-            return out
+    moves = {name: (plan.get("generation") or {}).get(name)
+             for name in (*plan["archive"], *plan["silent_archive"])}
+    done = task_transition.transition(tasks_dir, workspace / "results", tasks_dir / "archive",
+                                      moves=moves, body=plan["body"], prefix=RESULT_PREFIX)
+    out["result"] = done["result"]
+    out["landed"] = done["archived"]
+    out["errors"] += done["errors"]
     for key, moved in (("archive", "archived"), ("silent_archive", "silent_archived")):
-        for name in plan[key]:
-            # Belt and braces: the plan only emits bare basenames, so anything else is a bug.
-            if not name or name in (".", "..") or Path(name).name != name:
-                out["errors"].append(f"refused to move {name!r}: not a bare filename")
-                continue
-            try:
-                os.replace(tasks_dir / name, archive_dir / name)
-            except OSError as exc:
-                out["errors"].append(f"move failed for {name}: {exc}")
-            else:
-                out[moved].append(name)
+        out[moved] = [name for name in plan[key] if name in done["archived"]]
     return out
 
 
@@ -702,9 +726,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="print step 3/3b/3c's plan (archive filenames + the complete "
                          "recovery body) instead of the raw per-task classification")
     ap.add_argument("--apply", action="store_true",
-                    help="perform step 3: publish the plan's body through src/result_publish.py, "
-                         "then archive its files under the workspace; a failed publish moves "
-                         "nothing (exit 1 when anything failed)")
+                    help="perform step 3 through src/task_transition.py: publish the plan's "
+                         "body under an exclusive name, then archive exactly the file "
+                         "generations it planned; a failed pre-flight or publish moves nothing "
+                         "(exit 1 when anything failed)")
     args = ap.parse_args(argv)
     ws = Path(args.workspace) if args.workspace else resolve_workspace()
     if ws is None:
