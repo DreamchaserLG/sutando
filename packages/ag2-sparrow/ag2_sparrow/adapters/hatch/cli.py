@@ -1287,16 +1287,18 @@ def hold(args) -> int:
 
 
 def _withdraw_line(result_dir: Path, tid: str) -> None:
-    """Take `tid`'s hold line off the queue; one the drain has claimed but not sent is withdrawn
-    with its sentinel, which the drain checks just before the send."""
+    """Take `tid`'s hold line off the queue; one the drain has claimed is withdrawn with its
+    sentinel under the drain's send lock, so it is either already sent or never sent."""
     notice = _hold_notice(result_dir, tid)
-    notice.unlink(missing_ok=True)
-    if _line_claimed(result_dir, notice):
-        try:
-            delivery_destination.withdrawn_path(notice).touch()
-        except OSError as e:
-            print(f"note: could not withdraw the claimed hold line of {tid} ({diagnostics.describe(e)}); "
-                  "it may still post", file=sys.stderr)
+    try:
+        with delivery_destination.send_lock(result_dir):
+            notice.unlink(missing_ok=True)
+            if _line_claimed(result_dir, notice):
+                delivery_destination.withdrawn_path(notice).touch()
+    except OSError as e:
+        notice.unlink(missing_ok=True)
+        print(f"note: could not withdraw the hold line of {tid} under the send lock "
+              f"({diagnostics.describe(e)}); a claimed one may still post", file=sys.stderr)
 
 
 def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:

@@ -4,9 +4,16 @@ The drain and any adapter that queues a proactive file ask here, so an adapter
 never accepts a destination the drain would skip."""
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
 
 from .outbox import valid_pid
 from .result_markers import parse_markers
@@ -20,9 +27,11 @@ RECEIPT_DIR = ".outbox-ag2space-proactive"
 UNDELIVERED_DIR = "undelivered"
 # The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
 CLAIM_INFIX = ".sending."
-# A producer withdraws a queued or claimed `<stem>.txt` by creating `<stem>.withdrawn`; the drain
-# retires the file unsent when it sees one just before its send.
+# A producer withdraws a queued or claimed `<stem>.txt` by creating `<stem>.withdrawn` under
+# send_lock; the drain checks for it and POSTs under the same lock.
 WITHDRAWN_SUFFIX = ".withdrawn"
+# A directory of its own, so no reader listing the results dir sees a lock file.
+SEND_LOCK_DIR = ".proactive-send-lock"
 
 
 def claim_path(queued: Path, pid: int) -> Path:
@@ -36,6 +45,24 @@ def claim_path(queued: Path, pid: int) -> Path:
 def withdrawn_path(queued: Path) -> Path:
     """The sentinel that withdraws `queued` from the drain before it is sent."""
     return queued.with_name(queued.stem + WITHDRAWN_SUFFIX)
+
+
+@contextlib.contextmanager
+def send_lock(result_dir: Path):
+    """Exclusive lock on `result_dir`/SEND_LOCK_DIR/lock: the drain holds it from its withdrawal check
+    through the POST, and a producer holds it while it withdraws, so one never splits the other.
+    OSError when the lock cannot be taken; a platform without flock (no Hatch there) skips it."""
+    if fcntl is None:
+        yield
+        return
+    lock_dir = Path(result_dir) / SEND_LOCK_DIR
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(lock_dir / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def claim_pid(name: str) -> "int | None":

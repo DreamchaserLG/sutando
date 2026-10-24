@@ -4037,6 +4037,40 @@ class Hold(Base):
         self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
         self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
 
+    def test_an_answer_after_the_drains_withdrawal_check_never_precedes_the_line(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts, answers, workers = [], [], []
+
+        def answer():
+            with mock.patch.object(outbox, "_activity_completed", return_value=None):
+                answers.append(run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                                         "done", "--wait", "0"], self.env()))
+
+        def req(method, path, payload=None, timeout=None):
+            if method == "POST":
+                # The drain has found no withdrawal and is about to send: the worker answers now.
+                worker = threading.Thread(target=answer)
+                worker.start()
+                worker.join(1.0)
+                posts.append((payload["body"], self.result_file.exists()))
+                workers.append(worker)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+            workers[0].join(30)
+        self.assertEqual(posts, [(f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}", False)],
+                         "the answer waited for the send it raced; it never came before the line")
+        self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
+
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")
         self.result_file.write_text("done\n")

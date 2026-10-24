@@ -5751,6 +5751,29 @@ def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
         _log(f"could not record owner-DM upgrade notice state ({diagnostics.describe(e)})")
 
 
+_WITHDRAWN = object()
+
+
+class _SendLockUnavailable(Exception):
+    """The send lock could not be taken, so nothing was sent."""
+
+
+def _send_unless_withdrawn(withdrawn: Path, payload: dict):
+    """POST `payload` unless its producer withdrew it; _WITHDRAWN when it did. The check and the
+    POST share the send lock a withdrawal is written under, so neither splits the other."""
+    try:
+        lock = _delivery_destination.send_lock(RESULTS_DIR)
+        lock.__enter__()
+    except OSError as e:
+        raise _SendLockUnavailable() from e
+    try:
+        if withdrawn.exists():
+            return _WITHDRAWN
+        return _req("POST", "/v1/room", payload, timeout=15)
+    finally:
+        lock.__exit__(None, None, None)
+
+
 def _post_proactive() -> None:
     """Deliver `results/proactive-*.txt` to PROACTIVE_ROOM as room messages.
 
@@ -5880,18 +5903,15 @@ def _post_proactive() -> None:
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         thread_root = _proactive_thread_root(claimed_text, f.name)
         withdrawn = _delivery_destination.withdrawn_path(f)
-        if withdrawn.exists():
-            _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
-            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
-            withdrawn.unlink(missing_ok=True)
-            continue
         try:
-            resp = _req("POST", "/v1/room",
-                        {"op": "message",
-                         "room_id": dest_room,
-                         "body": body,
-                         **({"thread_root": thread_root} if thread_root else {})},
-                        timeout=15)
+            resp = _send_unless_withdrawn(withdrawn, {
+                "op": "message", "room_id": dest_room, "body": body,
+                **({"thread_root": thread_root} if thread_root else {})})
+            if resp is _WITHDRAWN:
+                _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
+                _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+                withdrawn.unlink(missing_ok=True)
+                continue
             # A bare 200 is NOT proof of delivery: the gateway can swallow a
             # room-send failure server-side (bad room id, kicked agent,
             receipt = classify_response(200, resp, id_keys=("event_id",))
@@ -5931,6 +5951,13 @@ def _post_proactive() -> None:
         except (urllib.error.URLError, TimeoutError) as e:
             outcome = _resolve_send_failure(claim, f, e)
             _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
+            continue
+        except _SendLockUnavailable as e:
+            try:
+                claim.rename(f)  # nothing was sent: hand it back for a later pass
+            except OSError:
+                pass
+            _log(f"proactive {f.name} not sent: the send lock could not be taken ({diagnostics.describe(e.__cause__ or e)})")
             continue
         _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
