@@ -57,7 +57,12 @@ SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
 #: Non-blank lines a verdict reads — the same window core-input-watch.py reads.
 TAIL_LINES = 14
 
-_SGR = re.compile(r"\x1b\[[0-9;]*m")
+#: A CSI SGR run (colon or semicolon params, newer tmux emits both) or an OSC
+#: hyperlink (BEL- or ST-terminated) -- anything else is left as real content.
+_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+#: Public alias for strip-to-plain outside this module (core-input-watch.py's
+#: own derivation) -- one pattern, not a second copy that can drift.
+SGR_STRIP = _SGR
 # Dim (SGR 2) or the 256-colour GREYSCALE RAMP (232-255): styled runs are hint/ghost
 # text only. 200-231 are colour-cube entries, so real coloured input must not match.
 _GHOST = re.compile(
@@ -84,7 +89,8 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
     ("fable-limit", re.compile(r"❯\s*Switch to .{1,80}? and continue", re.I)),
     ("fable-limit-unfocused", FABLE_TEXT),
     ("session-limit", re.compile(r"hit your (?:session|usage|weekly) limit", re.I)),
-    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust", re.I)),
+    # Codex 0.160 asks "Trust this folder?"; Claude Code, "Do you trust the files in this folder?".
+    ("folder-trust", re.compile(r"trust the files in this folder|Do you trust|Trust this folder\?", re.I)),
     ("bypass-permissions", re.compile(r"Bypass Permissions mode|Yes, I accept", re.I)),
     ("login", re.compile(r"Select login method|Paste code here|Browser didn'?t open", re.I)),
     ("press-enter", re.compile(r"Press Enter to continue", re.I)),
@@ -95,6 +101,23 @@ CLAUDE_GATE_SIGNATURES: List[Tuple[str, "re.Pattern[str]"]] = [
 AWAIT_HINT = re.compile(
     r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
+# The completed-turn line: "✻ Worked for 0s" / "✻ Cooked for 1s · done 12:32 PM". The spinner
+# reuses the glyph ("✻ Perambulating… (1m 46s · …)") and must not match.
+TURN_DONE = re.compile(
+    r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")
+# A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
+# below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
+_SPINNER_ROW = re.compile(r"^\s*[·✢✳✶✻✽*]\s+[A-Za-z][\w-]*(?:…|\.\.\.)\s*\(")
+_TURN_ROW = re.compile(rf"{_SPINNER_ROW.pattern}|{TURN_DONE.pattern}")
+
+
+def live_tail(lines: List[str]) -> List[str]:
+    """`lines` below the last turn spinner / completion row, else all of them. Tool output
+    above that row may quote a dialog's caret or key hints; only a dialog below it is live."""
+    for i in range(len(lines) - 1, -1, -1):
+        if _TURN_ROW.search(_SGR.sub("", lines[i])):
+            return lines[i + 1:]
+    return lines
 
 
 @dataclass(frozen=True)
@@ -322,6 +345,32 @@ def _tail_lines(capture: str) -> List[str]:
     return [ln for ln in capture.splitlines() if _SGR.sub("", ln).strip()][-TAIL_LINES:]
 
 
+def gate_evidence(tail: str, styled_tail: Optional[str] = None,
+                  adapter: RuntimeAdapter = CLAUDE) -> str:
+    """Exclude idle chrome, verified ghost suggestions and completed conditional recaps."""
+    rows = tail.splitlines()
+    line = prompt_line(styled_tail if styled_tail is not None else tail, adapter)
+    composer_i = next((i for i in range(len(rows) - 1, -1, -1)
+                       if _prompt_glyph(rows[i], adapter) is not None), None)
+    completed = (composer_i is not None and line is not None and not line.text.strip()
+                 and any(row.strip() == "Nothing needs you this round."
+                         for row in rows[:composer_i]))
+    kept = []
+    for i, row in enumerate(rows):
+        signatures = any(rx.search(row) for _, rx in adapter.gate_signatures)
+        if adapter.idle_ready.search(row) and not signatures:
+            continue
+        if i == composer_i and line and line.placeholder and not line.text.strip():
+            continue
+        # A marker alone cannot distinguish a live instruction from completed output.
+        if (completed and i < composer_i and not signatures
+                and re.fullmatch(r"\s*※ recap: if .+, press Enter there to send it\.\s*", row)
+                and len(list(adapter.await_hint.finditer(row))) == 1):
+            continue
+        kept.append(row)
+    return "\n".join(kept)
+
+
 def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeAdapter) -> Optional[str]:
     """The gate kind holding the pane, or None. An empty composer at the bottom means no
     dialog owns the input -- UNLESS a gate has appeared BELOW that composer line since it
@@ -336,6 +385,7 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         footer_hits = list(adapter.idle_ready.finditer(tail))
         beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
         newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        newer = gate_evidence(newer, adapter=adapter)
         if not newer or not adapter.await_hint.search(newer):
             return None
         for kind, rx in adapter.gate_signatures:
@@ -344,6 +394,7 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
         return "unlisted"
+    tail = gate_evidence(tail, "\n".join(_tail_lines(capture)), adapter)
     if not adapter.await_hint.search(tail):
         return None
     for kind, rx in adapter.gate_signatures:
@@ -366,6 +417,16 @@ def automation_leftover(capture: Optional[str], adapter: RuntimeAdapter, workspa
     if not composer_frame_visible(capture, adapter):
         return None  # the box runs off the screen bottom: more text may sit below
     return v.pending if composer_text(capture, adapter) == v.pending else None
+
+
+# Dialogs only a person clears; a headless core shown one stays there, queued work or not.
+# Approvals and pickers are absent: the core's own turn raises and answers those.
+PERSON_ONLY_GATES = ("folder-trust", "bypass-permissions", "login")
+
+
+def waits_for_a_person(verdict: Verdict) -> bool:
+    """True when the pane is held by a dialog that no automation will answer."""
+    return verdict.state == "busy" and verdict.reason in PERSON_ONLY_GATES
 
 
 def blocks_dispatch(verdict: Verdict, adapter: RuntimeAdapter) -> bool:
@@ -421,7 +482,7 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter, workspace=Non
     line = prompt_line(capture, adapter)
     # _gate's after_prompt() must see the same capture line was found in, or
     # it computes "below" from a view that never contained that line at all.
-    gate = _gate(capture, tail, line, adapter)
+    gate = _gate(capture, "\n".join(_SGR.sub("", ln) for ln in live_tail(lines)), line, adapter)
     if gate:
         return Verdict("busy", gate)
     if abn and not _limit_is_stale(abn, workspace, socket, session, probe):

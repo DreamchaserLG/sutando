@@ -15,6 +15,15 @@ Two rules, both about not-knowing:
     ok-with-no-id may already have been delivered, so retrying duplicates
     rather than repairs.
 
+Malformed claims (a complete record with invalid fields) err toward never
+displacing a possibly-live owner: any pid the record plausibly names blocks a
+takeover while that pid reads ALIVE or UNKNOWN, whatever its age. The cost is
+that a corrupt record naming a live pid (e.g. "pid": true, which is pid 1) never
+ages out. No safe manual remedy exists yet: a raw unlink bypasses the item lock and
+instance checks, so it can duplicate a live delivery or remove a successor's claim.
+Clearing one needs every drainer quiesced, no provider call in flight, any
+indeterminate outcome reconciled, then a locked administrative release.
+
 Contracts: tests/sparrow-outbox-claim-protocol.test.py, tests/outbox-race-check.py
 """
 from __future__ import annotations
@@ -29,6 +38,8 @@ import math
 import os
 import threading
 import time
+import unicodedata
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
@@ -58,6 +69,10 @@ class ProcessIdentity:
     pid: int
     state: OwnerState
     start_usec: Optional[int] = None
+
+
+# The largest pid any supported OS hands out; native probes narrow a pid to a C int.
+PID_MAX = 2**31 - 1
 
 
 _PROC_PIDTBSDINFO = 3
@@ -250,7 +265,11 @@ class ClaimRecord:
     pid: int
     start_usec: Optional[int]
     claimed_at: float
-    state: str = "HELD"          # HELD | UNKNOWN (torn)
+    state: str = "HELD"          # HELD | UNKNOWN (torn or malformed)
+    # Malformed = a complete write with invalid fields; it ages by file mtime, never a sweep.
+    malformed: bool = False
+    file_mtime: Optional[float] = None
+    candidate_pid: Optional[int] = None  # lenient: may refuse a takeover, never authorize one
 
 
 def _claims_dir(root: Path) -> Path:
@@ -475,25 +494,101 @@ def _read_claim_at(p: Path, item_id: str) -> Optional[ClaimRecord]:
     if not raw.strip():
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
     try:
-        d = json.loads(raw)
+        d = json.loads(raw, parse_int=_bounded_int)
     except json.JSONDecodeError:
         return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+    except (ValueError, OverflowError):
+        d = None
+    # The writer emits one complete JSON object, so anything that decodes was finished:
+    # invalid fields are malformed, not torn, and must not take the torn-write sweep.
     if not isinstance(d, dict):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
-    # Valid JSON carrying wrong types is still a claim we cannot read. Raising
-    # here would abort a drainer mid-scan; UNKNOWN keeps the item un-stealable.
-    try:
-        pid = int(d.get("pid", -1))
-        claimed_at = float(d.get("claimed_at", 0.0))
-        raw_start = d.get("start_usec")
-        start_usec = None if raw_start is None else int(raw_start)
-    except (TypeError, ValueError):
-        return ClaimRecord(item_id, "", -1, None, 0.0, state="UNKNOWN")
+        return _malformed_claim(p, item_id, {})
+    pid, start_usec, claimed_at = d.get("pid"), d.get("start_usec"), d.get("claimed_at")
+    if not (valid_pid(pid) is not None and (start_usec is None or _valid_start_usec(start_usec))
+            and _valid_claimed_at(claimed_at)):
+        return _malformed_claim(p, item_id, d)
     return ClaimRecord(item_id=str(d.get("item_id", item_id)),
                        drainer_id=str(d.get("drainer_id", "")),
                        pid=pid,
                        start_usec=start_usec,
-                       claimed_at=claimed_at)
+                       claimed_at=float(claimed_at))
+
+
+_OVERSIZE = object()
+
+
+def _bounded_int(text: str) -> object:
+    """An int no claim field could need decodes as a sentinel every validator rejects,
+    so one oversized value spoils only its own field, not the whole record."""
+    return int(text) if len(text.lstrip("-")) <= 20 else _OVERSIZE
+
+
+def _malformed_claim(p: Path, item_id: str, d: dict) -> ClaimRecord:
+    """UNKNOWN, keeping whatever still parses: the item id for terminal retirement,
+    a valid pid and birth token for the liveness rules."""
+    raw_id, raw_drainer, raw_start = d.get("item_id"), d.get("drainer_id"), d.get("start_usec")
+    try:
+        mtime: Optional[float] = os.stat(str(p)).st_mtime
+    except OSError:
+        mtime = None
+    return ClaimRecord(item_id=raw_id if isinstance(raw_id, str) else item_id,
+                       drainer_id=raw_drainer if isinstance(raw_drainer, str) else "",
+                       pid=valid_pid(d.get("pid")) or -1,
+                       start_usec=raw_start if _valid_start_usec(raw_start) else None,
+                       claimed_at=0.0, state="UNKNOWN", malformed=True, file_mtime=mtime,
+                       candidate_pid=_candidate_owner_pid(d.get("pid")))
+
+
+def _candidate_owner_pid(raw: object) -> Optional[int]:
+    """valid_pid(int(raw)) for every JSON value the reader can see, None where int() raises.
+    Only ever evidence AGAINST a takeover; in a PID namespace pid 1 (true) is a drainer."""
+    if type(raw) is bool or (type(raw) is float and math.isfinite(raw)):
+        raw = int(raw)
+    elif type(raw) is str:
+        return _int_string_pid(raw)
+    return valid_pid(raw)
+
+
+# Exactly the characters int() strips: every c with int(c + "1" + c) == 1.
+_INT_WHITESPACE = frozenset(map(chr, (
+    *range(0x09, 0x0E), 0x20, 0x85, 0xA0, 0x1680, *range(0x20_00, 0x20_0B),
+    0x20_28, 0x20_29, 0x20_2F, 0x20_5F, 0x3000)))
+_INT_WHITESPACE_CHARS = "".join(sorted(_INT_WHITESPACE))
+
+
+def _int_string_pid(raw: str) -> Optional[int]:
+    """int()'s string grammar (whitespace, one '+', digit groups joined by '_'), read in
+    linear time: more than 10 significant digits is past PID_MAX at any length."""
+    text = raw.strip(_INT_WHITESPACE_CHARS)
+    if text.startswith("+"):
+        text = text[1:]
+    groups = text.split("_")
+    if not all(g and g.isdecimal() for g in groups):
+        return None
+    digits = "".join(str(unicodedata.decimal(c)) for g in groups for c in g).lstrip("0") or "0"
+    return valid_pid(int(digits)) if len(digits) <= 10 else None
+
+
+_START_USEC_LIMIT = 2**63
+_CLAIMED_AT_BOUND = 2**53
+
+
+def valid_pid(pid) -> Optional[int]:
+    """`pid` when it is an int (never a bool) with 0 < pid <= PID_MAX, else None."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or not 0 < pid <= PID_MAX:
+        return None
+    return pid
+
+
+def _valid_start_usec(value: object) -> bool:
+    return type(value) is int and 0 < value < _START_USEC_LIMIT
+
+
+def _valid_claimed_at(value: object) -> bool:
+    if type(value) is int:
+        return -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND
+    return (type(value) is float and math.isfinite(value)
+            and -_CLAIMED_AT_BOUND <= value <= _CLAIMED_AT_BOUND)
 
 
 def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
@@ -510,13 +605,22 @@ def may_reclaim_delivery(root: Path, item_id: str, ttl_seconds: float) -> bool:
 
 
 def _record_is_reclaimable(rec: ClaimRecord, ttl_seconds: float) -> bool:
-    if rec.state == "UNKNOWN":
+    if rec.state == "UNKNOWN" and not rec.malformed:
         return False                      # torn: we do not know; do not steal
-    owner = process_identity(rec.pid)
-    if owner.state is OwnerState.UNKNOWN:
-        return False
-    if owner.state is OwnerState.ALIVE and not _pid_was_reused(rec, owner):
-        return False
+    # Refusing needs only a plausible owner; proving reuse needs the strict pid and token.
+    owner_pid = rec.candidate_pid if rec.malformed else rec.pid
+    if owner_pid is not None:
+        owner = process_identity(owner_pid)
+        if owner.state is OwnerState.UNKNOWN:
+            return False
+        if owner.state is OwnerState.ALIVE and not (
+                valid_pid(rec.pid) is not None and _pid_was_reused(rec, owner)):
+            return False
+    if rec.malformed:
+        # claimed_at is untrusted here; the filesystem's mtime is not.
+        if rec.file_mtime is None:
+            return False
+        return (time.time() - rec.file_mtime) >= max(ttl_seconds, SWAP_GRACE_S)
     return (time.time() - rec.claimed_at) >= ttl_seconds
 
 
@@ -527,8 +631,8 @@ def _pid_was_reused(rec: ClaimRecord, owner: ProcessIdentity) -> bool:
     liveness check returns early, and the TTL never gets a say — the item stalls
     forever rather than being redelivered.
     """
-    if rec.start_usec is None or owner.start_usec is None:
-        return False                      # cannot tell: treat as the same owner
+    if not (_valid_start_usec(rec.start_usec) and _valid_start_usec(owner.start_usec)):
+        return False                      # cannot tell: an invalid token proves nothing
     return rec.start_usec != owner.start_usec
 
 
@@ -564,7 +668,7 @@ def _reclaim_locked(root: Path, item_id: str, ttl_seconds: float,
     observed = read_delivery_claim(root, item_id)
     if observed is None:
         return _acquire_locked(root, item_id, drainer_id)
-    if observed.state == "UNKNOWN":
+    if observed.state == "UNKNOWN" and not observed.malformed:
         # A torn claim names no owner, so no age of it condemns a live writer —
         # but past the grace period its writer is gone and it would wedge forever.
         if not _sweep_if_abandoned(_claim_path(root, item_id)):
@@ -684,7 +788,8 @@ def _release_own_instance(p: Path, item_id: str, drainer_id: str) -> bool:
     """
     observed = _read_claim_at(p, item_id)
     # A torn claim has no readable owner, so nobody can prove they hold it.
-    if observed is None or observed.state == "UNKNOWN" or observed.drainer_id != drainer_id:
+    if observed is None or (observed.state == "UNKNOWN" and not observed.malformed) \
+            or observed.drainer_id != drainer_id:
         return False
     tomb = p.with_name(f"{p.name}.release-{_claim_stamp(observed)}")
     try:
@@ -890,6 +995,72 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+PROOF_VERSION = 1
+
+
+def new_publication_id() -> str:
+    """A fresh identity for one publish or requeue by this writer (never a clock value)."""
+    return uuid.uuid4().hex
+
+
+def _proof_binding(payload: str, publication_id) -> str:
+    """What a stamped proof vouches for: this version, the stored payload and the
+    publication that wrote them. It only ever decides archive versus quarantine."""
+    return hashlib.sha256(json.dumps([PROOF_VERSION, payload, publication_id]).encode("utf-8")).hexdigest()
+
+
+def source_proof(record: Optional[dict]) -> Optional[str]:
+    """The record's source digest, trusted only from this writer's stamp
+    (`proof_version`) and only while its binding still matches the stored payload
+    and publish; main's records, earlier heads' and unknown shapes have none."""
+    if not record:
+        return None
+    proof, payload = record.get("source_ready_sha256"), record.get("payload")
+    if (record.get("proof_version") != PROOF_VERSION or not proof or not isinstance(payload, str)
+            or not record.get("publication_id")
+            or record.get("source_payload_sha256") != _proof_binding(payload, record.get("publication_id"))):
+        return None
+    return proof
+
+
+def source_proof_fields(source_ready_sha256: Optional[str], payload: str, publication_id: str) -> dict:
+    """Every source-proof field, written atomically with the payload and publication they vouch for."""
+    fields = {"publication_id": publication_id}
+    if source_ready_sha256:
+        fields.update(proof_version=PROOF_VERSION, source_ready_sha256=source_ready_sha256,
+                      source_payload_sha256=_proof_binding(payload, publication_id))
+    return fields
+
+
+def source_digest(ready_body: str) -> str:
+    """The digest an outbox record keeps of the result it was built from: the
+    readiness-normalized body, so surrounding whitespace is the same source."""
+    return hashlib.sha256(ready_body.encode("utf-8")).hexdigest()
+
+
+def delivered_body_differs(root: Path, item_id: str, ready_body: Optional[str]) -> bool:
+    """True when the id is DELIVERED and a live result whose ready body is
+    `ready_body` was never provably what was sent (None: nothing provable).
+    Decided on the record's source proof (`source_proof`), valid only while it
+    describes the stored payload. A record without a valid proof (an earlier
+    `source_sha256`, or a payload replaced without it) proves only a source
+    identical to its stored wire body; any marker a path strips or acts on
+    ([dm-only], [channel:], [file:]...) makes it unprovable."""
+    d = read_item(root, item_id)
+    if not d or d.get("status") != "DELIVERED":
+        return False
+    if ready_body is None:
+        return True
+    proof = source_proof(d)
+    if proof:
+        return proof != source_digest(ready_body)
+    try:
+        stored = json.loads(d.get("payload") or "")
+    except (TypeError, ValueError):
+        return True
+    return not isinstance(stored, dict) or stored.get("body") != ready_body
+
+
 def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     """Every item record, newest id order, optionally filtered by status."""
     d = _items_dir(Path(root))
@@ -918,6 +1089,14 @@ class RequeueOutcome(str, Enum):
 def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
                  operator: Optional[str] = None,
                  reason: Optional[str] = None) -> RequeueOutcome:
+    """Operator recovery: PARKED -> QUEUED. See `requeue_item_with_epoch`."""
+    return requeue_item_with_epoch(root, item_id, reset_attempts=reset_attempts,
+                                   operator=operator, reason=reason)[0]
+
+
+def requeue_item_with_epoch(root: Path, item_id: str, *, reset_attempts: bool = False,
+                            operator: Optional[str] = None,
+                            reason: Optional[str] = None) -> "tuple[RequeueOutcome, Optional[int]]":
     """Operator recovery: PARKED -> QUEUED as ONE atomic transition.
 
     Refuses anything not PARKED, which is what makes it idempotent AND keeps it
@@ -934,14 +1113,18 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
     already at MAX_ATTEMPTS, the next failure re-parks it immediately; that is
     the intended "one more try" semantic, and --reset-attempts is the full
     budget.
+
+    Returns the epoch written under the lock (None unless REQUEUED): a later
+    read can see a peer's re-requeue, and a rollback keyed on it undoes theirs.
+    A requeue never changes the stored payload.
     """
     root = Path(root)
     with _item_lock(root, item_id):
         if not _item_path(root, item_id).exists():
-            return RequeueOutcome.ABSENT
+            return RequeueOutcome.ABSENT, None
         d = _read_item(root, item_id)
         if d.get("status") != "PARKED":
-            return RequeueOutcome.NOT_PARKED
+            return RequeueOutcome.NOT_PARKED, None
         _release_locked(root, item_id, force=True)
         d["resend_epoch"] = int(d.get("resend_epoch", 0) or 0) + 1
         d["status"] = "QUEUED"
@@ -952,5 +1135,9 @@ def requeue_item(root: Path, item_id: str, *, reset_attempts: bool = False,
         d["requeued_at"] = time.time()
         d["requeued_by"] = operator or "unknown"
         d["requeue_reason"] = reason or ""
+        proof = source_proof(d)
+        for field in ("proof_version", "source_ready_sha256", "source_payload_sha256"):
+            d.pop(field, None)
+        d.update(source_proof_fields(proof, d.get("payload") or "", new_publication_id()))
         _write_item(root, item_id, d)
-        return RequeueOutcome.REQUEUED
+        return RequeueOutcome.REQUEUED, d["resend_epoch"]
