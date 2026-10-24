@@ -14,8 +14,10 @@ is archived is a promise. `transition()` keeps it as a staged transaction:
   Journal. A journal in the archive dir (`.notice-<second>-<pid>-<token>.json`,
   beside a flock'd `.lock` the owner holds while alive) records the stage:
   `planned` (moves and the planned notice), then per file its private claim
-  name, then where it landed or that it was quarantined, then `publishing`
-  with the reserved notice name. It is removed when the notice is committed.
+  name BEFORE the rename to it (`claiming`), then where it landed or that it
+  was quarantined, then `publishing` with the reserved notice name. It is
+  removed when the notice is committed. A recorded claim is in progress until
+  the journal says otherwise: never read as "gone".
 
   Per file (`task_archive.claim_generation` / `place_claim`): the live name is
   taken by one atomic rename into `<name>.claim-<pid>-<token>` in the same
@@ -312,12 +314,12 @@ def pending_notices(archive_dir: Path) -> list[str]:
 
 # ── the per-file move ────────────────────────────────────────────────────────
 
-def _claim(dirs: _Dirs, name: str, generation: str | None) -> str:
+def _claim(dirs: _Dirs, name: str, generation: str | None, claim: str | None = None) -> str:
     problem = dirs.problem() or _source_problem(dirs.tasks_fd, name, generation)
     if problem:
         raise TransitionRefused(f"refused to move {name!r}: {problem}")
     try:
-        return task_archive.claim_generation(name, src_dir_fd=dirs.tasks_fd)
+        return task_archive.claim_generation(name, src_dir_fd=dirs.tasks_fd, claim=claim)
     except FileNotFoundError:
         raise TransitionRefused(f"refused to move {name!r}: no longer in tasks/ — another pass "
                                 "archived it and sent its notice") from None
@@ -410,21 +412,23 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
             continue  # placed, quarantined, or never claimed (still live; planned afresh)
         claim = claims[name]
         if _exists(claim, dirs.tasks_fd):
-            got, error, kept = _place(dirs, claim, name, generation)
+            got, error, kept = _place(dirs, claim, name, generation)  # recorded, renamed, unplaced
             if got:
                 landed[name] = got
             else:
                 report["errors"].append(error)
                 if kept:
                     quarantined[name] = claim
+        elif _source_problem(dirs.tasks_fd, name, generation) is None:
+            del claims[name]  # recorded but never renamed: still live under its name, planned afresh
         else:
             found = _find_placed(dirs, name, generation)
             if found:
-                landed[name] = found
+                landed[name] = found  # renamed and placed; the crash hid the record
             else:
                 report["errors"].append(f"lost track of {name!r}: its claim {claim} is gone and no "
                                         "archived copy carries its generation; check tasks/archive/")
-        j.set(landed=landed, quarantined=quarantined)
+        j.set(claims=claims, landed=landed, quarantined=quarantined)
     report["landed"] = landed
     body, name = d.get("body"), d.get("result")
     if body is not None and (landed or name):
@@ -507,12 +511,23 @@ def transition(tasks_dir: Path, results_dir: Path, archive_dir: Path, *,
 def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now: float | None,
                    moves: dict, render: Render, out: dict) -> None:
     for name, generation in moves.items():
+        problem = dirs.problem() or _source_problem(dirs.tasks_fd, name, generation)
+        if problem:  # before the journal is touched: its directory may be the problem
+            out["errors"].append(f"refused to move {name!r}: {problem}")
+            continue
+        claim = task_archive.claim_name(name)
+        j.data["claims"][name] = claim
+        j.set(stage="claiming")  # the name is on disk before anything carries it
         try:
-            claim = _claim(dirs, name, generation)
+            _claim(dirs, name, generation, claim)
         except TransitionRefused as exc:
             out["errors"].append(str(exc))
+            del j.data["claims"][name]  # recovery would read it as never renamed anyway
+            try:
+                j.set(stage="claiming")
+            except OSError:
+                pass
             continue
-        j.data["claims"][name] = claim
         j.set(stage="claimed")
         landed, error, kept = _place(dirs, claim, name, generation or "")
         if landed:

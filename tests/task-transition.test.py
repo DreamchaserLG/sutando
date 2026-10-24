@@ -497,6 +497,95 @@ class TestJournalRecovery(Base):
         self.invariants(gen, "task: A", notice_committed=True)
         self.assertEqual(self.recover()["recovered"], [])
 
+    def test_crash_between_the_claim_record_and_the_rename_leaves_the_task_live(self):
+        """Mini's race (round 6, dev room), first half: the journal names the claim
+        but the rename never happened. Recovery must read the task as still
+        live under its own name — planned afresh — never as gone."""
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=Crash("before rename")), \
+                self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        journal = json.loads(self.journals()[0].read_text())
+        self.assertEqual(journal["stage"], "claiming")
+        self.assertTrue(journal["claims"]["task-a.txt"].startswith("task-a.txt.claim-"))
+        self.assertEqual(self.live_names(), ["archive", "task-a.txt"], "nothing was renamed")
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["recovered"][0]["landed"], {})
+        self.assertEqual(self.notices(), [], "nothing landed, nothing to say")
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(tt.generation_of(p), gen, "still live, untouched")
+        again = self.run_transition(["task-a.txt"], _naming)  # the fresh plan archives it once
+        self.assertEqual(again["archived"], {"task-a.txt": "task-a.txt"})
+        self.invariants(gen, "task: A", notice_committed=True)
+
+    def test_crash_between_the_rename_and_the_claimed_record_is_attributed_by_the_journal(self):
+        """Mini's race, second half: the rename happened to the recorded name but
+        the `claimed` stage was never written. The live name is absent; the
+        recorded claim is present; recovery places it, never reports it gone."""
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        real = tt.task_archive.claim_generation
+
+        def rename_then_crash(*a, **kw):
+            real(*a, **kw)
+            raise Crash("after rename, before the record")
+
+        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=rename_then_crash), \
+                self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        journal = json.loads(self.journals()[0].read_text())
+        self.assertEqual(journal["stage"], "claiming")
+        claim = journal["claims"]["task-a.txt"]
+        self.assertEqual(self.live_names(), ["archive", claim], "renamed to exactly the recorded name")
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["recovered"][0]["landed"], {"task-a.txt": "task-a.txt"})
+        self.assertIn("archived: task-a.txt->task-a.txt", Path(out["recovered"][0]["result"]).read_text())
+        self.invariants(gen, "task: A", notice_committed=True)
+        self.assertEqual(self.recover()["recovered"], [])
+
+    def test_a_recorded_claim_that_no_longer_matches_is_given_back_by_recovery(self):
+        """The recorded claim is present but a writer rewrote it meanwhile (it is
+        not the planned generation): recovery gives it back live, archives nothing."""
+        p = _task(self.tasks, "task-a.txt", "old")
+        real = tt.task_archive.claim_generation
+
+        def rename_then_crash(*a, **kw):
+            real(*a, **kw)
+            raise Crash("after rename")
+
+        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=rename_then_crash), \
+                self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        claim = self.tasks / json.loads(self.journals()[0].read_text())["claims"]["task-a.txt"]
+        _replace(claim, "rewritten while claimed")
+        out = self.recover()
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("changed since it was planned; it is back under its name, live", out["errors"][0])
+        self.assertIn("rewritten while claimed", p.read_text())
+        self.assertEqual(self.live_names(), ["archive", "task-a.txt"])
+        self.assertEqual((self.notices(), self.journals(), self.archive_names()), ([], [], []))
+
+    def test_the_claim_is_recorded_before_the_rename(self):
+        """The order is the guarantee: at the instant of the rename, the journal on
+        disk already names the destination."""
+        _task(self.tasks, "task-a.txt", "A")
+        seen = []
+        real = tt.task_archive.claim_generation
+
+        def peek(name, *, src_dir_fd, claim=None):
+            seen.append((claim, json.loads(self.journals()[0].read_text())))
+            return real(name, src_dir_fd=src_dir_fd, claim=claim)
+
+        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=peek):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(out["errors"], [])
+        (claim, journal), = seen
+        self.assertEqual(journal["stage"], "claiming")
+        self.assertEqual(journal["claims"], {"task-a.txt": claim})
+
     def test_a_finished_pass_leaves_nothing_for_recovery(self):
         p = _task(self.tasks, "task-a.txt", "A")
         gen = tt.generation_of(p)

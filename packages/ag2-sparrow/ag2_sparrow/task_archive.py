@@ -242,14 +242,23 @@ def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChange
     return GenerationChanged(name, why)
 
 
-def claim_generation(name: str, *, src_dir_fd: int) -> str:
-    """Take `name` (a bare name inside `src_dir_fd`) by one atomic rename into a
-    private claim beside it, same directory, same filesystem — never a copy.
-    Returns the claim name; FileNotFoundError when the name is gone. The claim
-    holds whatever occupied the name at that instant: judge it with `place_claim`."""
+def claim_name(name: str) -> str:
+    """A fresh private claim name for `name`: a caller that journals its moves
+    records this BEFORE `claim_generation` renames to it, so a crash in between
+    leaves a claim recovery can attribute."""
     import os
     import secrets
-    claim = f"{name}.claim-{os.getpid()}-{secrets.token_hex(5)}"
+    return f"{name}.claim-{os.getpid()}-{secrets.token_hex(5)}"
+
+
+def claim_generation(name: str, *, src_dir_fd: int, claim: "str | None" = None) -> str:
+    """Take `name` (a bare name inside `src_dir_fd`) by one atomic rename into a
+    private claim beside it, same directory, same filesystem — never a copy.
+    Returns the claim name (`claim` when given, else a fresh `claim_name`);
+    FileNotFoundError when the name is gone. The claim holds whatever occupied
+    the name at that instant: judge it with `place_claim`."""
+    import os
+    claim = claim or claim_name(name)
     os.rename(name, claim, src_dir_fd=src_dir_fd, dst_dir_fd=src_dir_fd)
     return claim
 

@@ -615,6 +615,15 @@ class TestMoveGeneration(unittest.TestCase):
         self.assertEqual(p.read_text(), "newer still")
         self.assertEqual(sorted(self.dst.iterdir()), [])
 
+    def test_a_caller_supplied_claim_name_is_used_verbatim(self):
+        self._file("task-a.txt", "A")
+        name = _task_archive.claim_name("task-a.txt")
+        self.assertTrue(name.startswith("task-a.txt.claim-"))
+        self.assertNotEqual(name, _task_archive.claim_name("task-a.txt"), "fresh per call")
+        got = _task_archive.claim_generation("task-a.txt", src_dir_fd=self.sfd, claim=name)
+        self.assertEqual(got, name)
+        self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", name])
+
     def test_a_gone_name_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
             self.move("task-a.txt", "1:1:1:1")
