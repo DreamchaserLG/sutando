@@ -635,6 +635,19 @@ class TestMoveGeneration(unittest.TestCase):
         self.assertIsNone(_task_archive.find_landed("task-a.txt", "0:0:0:0", dst_dir_fd=self.dfd))
         self.assertIsNone(_task_archive.find_landed("task-b.txt", gen, dst_dir_fd=self.dfd))
 
+    def test_find_landed_reads_past_a_gap_and_ignores_lookalikes(self):
+        p = self._file("task-a.txt", "A")
+        gen = self._gen(p)
+        (self.dst / "task-a.txt").write_text("earlier")
+        (self.dst / "task-a.txt.1").write_text("earlier still")
+        self.assertEqual(self.move("task-a.txt", gen), Path("task-a.txt.2"))
+        (self.dst / "task-a.txt.1").unlink()  # an older record requeued
+        os.link(self.dst / "task-a.txt.2", self.dst / "task-a.txt.02")
+        self.assertEqual(_task_archive.find_landed("task-a.txt", gen, dst_dir_fd=self.dfd), "task-a.txt.2")
+        (self.dst / "task-a.txt.2").unlink()
+        self.assertIsNone(_task_archive.find_landed("task-a.txt", gen, dst_dir_fd=self.dfd),
+                          "only names this module mints count")
+
     def test_a_gone_name_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
             self.move("task-a.txt", "1:1:1:1")

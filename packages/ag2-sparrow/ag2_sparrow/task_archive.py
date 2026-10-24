@@ -205,9 +205,10 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
             finally:
                 os.unlink(str(tmp), dir_fd=dst_dir_fd)
             break
-    os.unlink(str(src), dir_fd=src_dir_fd)
-    if dst_dir_fd is not None:
+    if dst_dir_fd is not None:  # the landing is durable before the source goes
         _fsync_dir(dst_dir_fd)
+    _checkpoint("after_link", str(src))
+    os.unlink(str(src), dir_fd=src_dir_fd)
     if src_dir_fd is not None:
         _fsync_dir(src_dir_fd)
     return candidate
@@ -218,7 +219,7 @@ move_without_clobbering = _move_without_clobbering
 
 
 def _checkpoint(point: str, name: str) -> None:
-    """A named injection point for tests (`before_give_back`); a no-op in production."""
+    """A named injection point for tests (`before_give_back`, `after_link`); a no-op in production."""
 
 
 def _fsync_dir(fd: int) -> None:
@@ -230,20 +231,22 @@ def _fsync_dir(fd: int) -> None:
 
 
 def find_landed(dest: str, generation: str, *, dst_dir_fd: int) -> "str | None":
-    """The name among `dest`, `dest.1`, `dest.2`, ... (the `.N` sequence
-    `move_without_clobbering` mints) that holds `generation`, or None. A link
-    keeps the inode, so a placement whose record was lost is found by identity."""
+    """The name among `dest` and every `dest.N` actually present (the `.N` names
+    `move_without_clobbering` mints) that holds `generation`, or None. Gaps are
+    normal once an older record is requeued, so the whole directory is read."""
     import os
-    n = 0
-    while True:
-        candidate = dest if n == 0 else f"{dest}.{n}"
+    import re
+    tail = re.compile(re.escape(dest) + r"(?:\.([1-9][0-9]*))?")
+    found = sorted((int(m.group(1) or 0), e) for e in os.listdir(dst_dir_fd)
+                   for m in [tail.fullmatch(e)] if m)
+    for _, candidate in found:
         try:
             st = os.lstat(candidate, dir_fd=dst_dir_fd)
         except FileNotFoundError:
-            return None
+            continue
         if file_generation(st) == generation:
             return candidate
-        n += 1
+    return None
 
 
 def file_generation(st) -> str:

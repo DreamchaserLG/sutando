@@ -78,6 +78,7 @@ Exit 0 always on a readable workspace; 2 when the workspace cannot be resolved.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -623,10 +624,35 @@ def _plan(workspace: Path, now: float | None = None) -> tuple[dict, dict]:
     if body is not None and len(body.encode("utf-8")) > limit:
         errors.append(f"recovery body is {len(body.encode('utf-8'))} bytes "
                       f"(> {limit}): undeliverable, so nothing will be published or moved")
+    verdicts = {row["file"]: row.get("verdict") for row in tasks
+                if row["file"] in generation}
     plan = {"archive": archive, "silent_archive": silent_archive, "generation": generation,
-            "body": body, "pending_notices": task_transition.pending_notices(
+            "verdict": verdicts, "body": body, "pending_notices": task_transition.pending_notices(
                 workspace / "tasks" / "archive"), "errors": errors}
+    plan["plan_id"] = plan_id(plan)
     return plan, groups
+
+
+def plan_id(plan: dict) -> str:
+    """What `--apply --plan-id` must match: which files move, as which verdict,
+    at which generation. The body is left out, since its ages change by the minute."""
+    key = {k: plan.get(k) for k in ("archive", "silent_archive", "generation", "verdict")}
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _still_safe(workspace: Path, verdicts: dict, now: float | None):
+    """Asked right before each claim: the file must classify as it did in the
+    approved plan, so a task a worker took, or one answered meanwhile, stays."""
+    def check(name: str) -> str | None:
+        try:
+            row = classify_task(workspace / "tasks" / name, workspace,
+                                time.time() if now is None else now)
+        except OSError as exc:
+            return f"could not be re-classified ({exc})"
+        if row.get("verdict") != verdicts.get(name):
+            return f"now {row.get('verdict')}, not {verdicts.get(name)} as planned: {row.get('reason')}"
+        return None
+    return check
 
 
 def _final_body(groups: dict, landed: dict) -> str | None:
@@ -709,7 +735,7 @@ def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict
 RESULT_PREFIX = "proactive-orphan-recovery-"
 
 
-def apply_plan(workspace: Path, now: float | None = None) -> dict:
+def apply_plan(workspace: Path, now: float | None = None, *, approved: str | None) -> dict:
     """Step 3, performed by `src/task_transition.py`, the one owner of the
     archive-then-report transition: pre-flight every move (pinned directory
     handles, bare names, each file still the generation the plan captured),
@@ -717,6 +743,11 @@ def apply_plan(workspace: Path, now: float | None = None) -> dict:
     record, render the notice from the names they landed under and publish it
     last, journaled so a failed publish is retried by the next pass without
     moving anything again. A pre-flight failure changes nothing.
+
+    `approved` is the `plan_id` of the `--plan` output the caller reviewed:
+    a re-plan that differs (a task arrived, aged in, was answered or taken by a
+    worker) is refused whole, and each file is re-classified right before its
+    claim, so one that turned fresh, held or done meanwhile stays where it is.
 
     Returns the plan plus `result` (the published path or None), `body` (the
     notice as published), `archived`, `silent_archived` (names actually
@@ -728,12 +759,18 @@ def apply_plan(workspace: Path, now: float | None = None) -> dict:
            "quarantined": {}, "recovered": [], "swept": [], "errors": list(plan.get("errors") or [])}
     if out["errors"]:
         return out
+    if not approved or approved != plan["plan_id"]:
+        out["errors"].append(f"refused: the plan to apply is {plan['plan_id']}, approved was "
+                             f"{approved or 'none'}; re-run --plan, review it, and pass its "
+                             "plan_id to --apply --plan-id; nothing published, nothing moved")
+        return out
     tasks_dir = workspace / "tasks"
     moves = {name: (plan.get("generation") or {}).get(name)
              for name in (*plan["archive"], *plan["silent_archive"])}
     done = task_transition.transition(
         tasks_dir, workspace / "results", tasks_dir / "archive", moves=moves, prefix=RESULT_PREFIX,
-        render=lambda landed: _final_body(groups, landed))
+        render=lambda landed: _final_body(groups, landed),
+        still_safe=_still_safe(workspace, plan["verdict"], now))
     out["result"], out["body"], out["landed"] = done["result"], done["body"], done["archived"]
     out["quarantined"], out["recovered"] = done["quarantined"], done["recovered"]
     out["swept"] = done["swept"]
@@ -765,13 +802,15 @@ def main(argv: list[str] | None = None) -> int:
                          "generations the plan captured, then publish the notice naming where "
                          "they landed; a failed pre-flight moves nothing, a failed publish leaves "
                          "a journal the next --apply publishes (exit 1 when anything failed)")
+    ap.add_argument("--plan-id", help="with --apply: the plan_id of the --plan output that was "
+                                      "reviewed; a plan that has changed since is refused whole")
     args = ap.parse_args(argv)
     ws = Path(args.workspace) if args.workspace else resolve_workspace()
     if ws is None:
         print("orphan-check: workspace could not be resolved", file=sys.stderr)
         return 2
     if args.apply:
-        out = apply_plan(ws, args.now)
+        out = apply_plan(ws, args.now, approved=args.plan_id)
     elif args.plan:
         out = recovery_plan(ws, args.now)
     else:

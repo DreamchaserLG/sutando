@@ -968,6 +968,7 @@ class TestRecoveryEdges(Base):
         self.assertIn("lost track of 'task-a.txt'", out["errors"][0])
         self.assertEqual(out["recovered"][0]["landed"], {})
         self.assertEqual(self.notices(), [])
+        self.assertEqual(len(self.journals()), 1, "an unresolved journal is kept for the operator")
 
     def test_a_recovery_whose_publish_fails_keeps_the_journal_and_finishes_later(self):
         p = _task(self.tasks, "task-a.txt", "A")
@@ -1021,6 +1022,229 @@ class TestRecoveryEdges(Base):
             out = self.recover()
         self.assertEqual((out["swept"], out["errors"]), ([], []))
         self.assertTrue(stray.exists())
+
+
+class TestCrashWindows(Base):
+    """Crash windows a later pass must finish without claiming more than
+    durably landed, adopting another notice, or keeping two archive names."""
+
+    crash_after, invariants = TestJournalRecovery.crash_after, TestJournalRecovery.invariants
+    recover = TestJournalRecovery.recover
+
+    def two_tasks(self):
+        return _task(self.tasks, "task-a.txt", "A"), _task(self.tasks, "task-b.txt", "B")
+
+    def all_notice_text(self) -> str:
+        return "".join(p.read_text() for p in self.notices())
+
+    def test_a_crash_after_the_first_of_two_placements_notices_only_what_landed(self):
+        _, b = self.two_tasks()
+        with self.crash_after("placed"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt", "task-b.txt"], _naming)
+        self.assertTrue(b.exists())
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(Path(out["recovered"][0]["result"]).read_text().splitlines()[0],
+                         "archived: task-a.txt->task-a.txt")
+        self.assertNotIn("task-b.txt", self.all_notice_text(), "B is still live")
+        again = self.run_transition(["task-b.txt"], _naming)
+        self.assertEqual(again["errors"], [])
+        self.assertEqual(self.all_notice_text().count("task-b.txt->"), 1, "B is reported once")
+
+    def test_a_crash_after_the_first_claim_of_two_notices_only_the_claimed_one(self):
+        p, b = self.two_tasks()
+        with self.inject("after_claim", p, lambda: (_ for _ in ()).throw(Crash("killed"))), \
+                self.assertRaises(Crash):
+            self.run_transition(["task-a.txt", "task-b.txt"], _naming)
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["recovered"][0]["landed"], {"task-a.txt": "task-a.txt"})
+        self.assertNotIn("task-b.txt", self.all_notice_text())
+        self.assertTrue(b.exists())
+
+    def test_a_crash_after_a_name_collision_never_adopts_the_other_notice(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        foreign = self.results / f"{PREFIX}1-1-foreign.txt"
+        foreign.write_text("FOREIGN NOTICE\n")
+        real_mint, real_publish = tt._mint_name, tt._publish_at
+        names = iter([foreign.name])
+
+        def collide_then_die(*a, **kw):
+            try:
+                return real_publish(*a, **kw)
+            except FileExistsError:
+                raise Crash("killed after the collision") from None
+
+        with mock.patch.object(tt, "_mint_name", side_effect=lambda *a: next(names, None) or real_mint(*a)), \
+                mock.patch.object(tt, "_publish_at", side_effect=collide_then_die), \
+                self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(json.loads(self.journals()[0].read_text())["result"], foreign.name)
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        mine = Path(out["recovered"][0]["result"])
+        self.assertNotEqual(mine.name, foreign.name)
+        self.assertIn("archived: task-a.txt->task-a.txt", mine.read_text())
+        self.assertEqual(foreign.read_text(), "FOREIGN NOTICE\n")
+        self.assertEqual(tt.generation_of(self.archive / "task-a.txt"), gen)
+        self.assertEqual((len(self.notices()), self.journals()), (2, []))
+
+    def test_a_failed_fallback_rewrite_after_every_name_collided_is_still_published(self):
+        _task(self.tasks, "task-a.txt", "A")
+        foreign = self.results / f"{PREFIX}1-1-foreign.txt"
+        foreign.write_text("FOREIGN NOTICE\n")
+        real_set = tt._Journal.set
+
+        def set_failing_the_fallback(self_, **fields):
+            if fields == {"stage": "placed", "result": None}:
+                raise OSError(5, "I/O error")
+            real_set(self_, **fields)
+
+        with mock.patch.object(tt, "_mint_name", return_value=foreign.name), \
+                mock.patch.object(tt._Journal, "set", set_failing_the_fallback):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertIn("could not reserve a result name", out["errors"][0])
+        self.assertEqual(json.loads(self.journals()[0].read_text())["result"], foreign.name)
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn("archived: task-a.txt->task-a.txt", Path(again["recovered"][0]["result"]).read_text())
+        self.assertEqual(foreign.read_text(), "FOREIGN NOTICE\n")
+        self.assertEqual(self.journals(), [])
+
+    def test_a_crash_between_the_archive_link_and_the_claim_unlink_keeps_one_name(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        fired = []
+
+        def at(where, name):
+            if where == "after_link" and not fired:
+                fired.append(name)
+                raise Crash("killed between link and unlink")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertEqual(os.stat(self.archive / "task-a.txt").st_nlink, 2, "claim and landing share it")
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(self.archive_names(), ["task-a.txt"])
+        self.assertEqual(os.stat(self.archive / "task-a.txt").st_nlink, 1)
+        self.assertEqual(out["recovered"][0]["landed"], {"task-a.txt": "task-a.txt"})
+        self.invariants(gen, "task: A", notice_committed=True)
+
+    def test_the_landing_is_fsynced_before_the_claim_is_unlinked(self):
+        _task(self.tasks, "task-a.txt", "A")
+        archive_ino, events = None, []
+        real_sync = tt.task_archive._fsync_dir
+
+        def sync(fd):
+            events.append(("fsync", os.fstat(fd).st_ino))
+            real_sync(fd)
+
+        def at(where, name):
+            if where == "after_link":
+                events.append(("unlink-next", name))
+
+        self.archive.mkdir()
+        archive_ino = os.stat(self.archive).st_ino
+        with mock.patch.object(tt.task_archive, "_fsync_dir", side_effect=sync), \
+                mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(out["errors"], [])
+        i = next(k for k, e in enumerate(events) if e[0] == "unlink-next")
+        self.assertEqual(events[i - 1], ("fsync", archive_ino), events)
+
+    def test_a_placement_past_a_gap_in_the_n_sequence_is_found(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        self.archive.mkdir()
+        (self.archive / "task-a.txt").write_text("older\n")
+        (self.archive / "task-a.txt.1").write_text("older still\n")
+        real_place = tt._place
+
+        def place_then_die(*a, **kw):
+            real_place(*a, **kw)
+            raise Crash("killed before the landing was recorded")
+
+        with mock.patch.object(tt, "_place", side_effect=place_then_die), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        (self.archive / "task-a.txt.1").unlink()  # the older record was requeued meanwhile
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["recovered"][0]["landed"], {"task-a.txt": "task-a.txt.2"})
+        self.assertIn("task-a.txt is archived as tasks/archive/task-a.txt.2",
+                      Path(out["recovered"][0]["result"]).read_text())
+        self.assertEqual(tt.generation_of(self.archive / "task-a.txt.2"), gen)
+        self.assertEqual(self.journals(), [])
+
+    def crash_at_publishing(self, foreign_name: str | None = None) -> Path:
+        """One task archived, the pass killed with its notice reserved and unpublished."""
+        _task(self.tasks, "task-a.txt", "A")
+        with self.crash_after("publishing"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        return self.results / json.loads(self.journals()[0].read_text())["result"]
+
+    def test_a_recovered_pass_with_nothing_to_say_publishes_nothing(self):
+        _task(self.tasks, "task-a.txt", "A")
+        with self.crash_after("placed"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _notice(None))
+        out = self.recover()
+        self.assertEqual((out["errors"], out["recovered"][0]["result"]), ([], None))
+        self.assertEqual((self.notices(), self.journals()), ([], []))
+        self.assertEqual(self.archive_names(), ["task-a.txt"])
+
+    def test_a_name_taken_during_the_recovery_publish_is_judged_by_its_bytes(self):
+        reserved = self.crash_at_publishing()
+        real = tt._publish_at
+        calls = []
+
+        def taken_first(results_dir, name, body):
+            calls.append(name)
+            if len(calls) == 1:
+                (results_dir / name).write_text("FOREIGN NOTICE\n")
+                raise FileExistsError(name)
+            return real(results_dir, name, body)
+
+        with mock.patch.object(tt, "_publish_at", side_effect=taken_first):
+            out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(reserved.read_text(), "FOREIGN NOTICE\n")
+        mine = Path(out["recovered"][0]["result"])
+        self.assertNotEqual(mine, reserved)
+        self.assertEqual(mine.read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(self.journals(), [])
+
+    def test_a_failed_recovery_publish_keeps_the_journal(self):
+        self.crash_at_publishing()
+        with mock.patch.object(tt, "_publish_at", side_effect=OSError(28, "No space left on device")):
+            out = self.recover()
+        self.assertIn("could not publish tasks/archive/.notice-", out["errors"][0])
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+        self.assertEqual(self.recover()["errors"], [])
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_recovery_that_finds_every_name_foreign_keeps_the_journal(self):
+        reserved = self.crash_at_publishing()
+        reserved.write_text("FOREIGN NOTICE\n")
+        with mock.patch.object(tt, "_mint_name", return_value=reserved.name):
+            out = self.recover()
+        self.assertIn("could not reserve a result name", out["errors"][0])
+        self.assertEqual(reserved.read_text(), "FOREIGN NOTICE\n")
+        self.assertEqual(len(self.journals()), 1)
+        again = self.recover()
+        self.assertEqual(again["errors"], [])
+        self.assertEqual(Path(again["recovered"][0]["result"]).read_text(),
+                         "archived: task-a.txt->task-a.txt\n")
+
+    def test_still_safe_refuses_a_file_right_before_its_claim(self):
+        p, b = self.two_tasks()
+        out = self.run_transition(["task-a.txt", "task-b.txt"], _naming,
+                                  still_safe=lambda n: "held by worker w1" if n == "task-b.txt" else None)
+        self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
+        self.assertEqual(out["errors"], ["refused to move 'task-b.txt': held by worker w1"])
+        self.assertTrue(b.exists())
+        self.assertNotIn("task-b.txt", self.all_notice_text())
 
 
 if __name__ == "__main__":
