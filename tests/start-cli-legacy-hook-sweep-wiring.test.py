@@ -9,6 +9,11 @@ LaunchSchedules runs the real launchers end to end with process probes stubbed;
 GatedSweep sources the sweep step from session-launch.sh with a marker installer.
 """
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import io
 import json
@@ -105,11 +110,11 @@ class LaunchSchedules(unittest.TestCase):
         self.sess, self.core, self.pane = self.td / "sess", self.td / "core", self.td / "pane"
         self.delivery = self.td / "pool_delivery.py"
         self.delivery.write_text("# test-only\n")
-        self.env = {"PATH": f"{bind}:{Path(shutil.which('node')).parent}:/usr/bin:/bin", "HOME": str(self.td / "home"),
-                    "SESS_MARK": str(self.sess), "CORE_MARK": str(self.core), "PANE_MARK": str(self.pane),
-                    "SUTANDO_PY": str(bind / "py"),
-                    "REAL_PY": sys.executable, "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
-                    "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1"}
+        self.env = hermetic_env(
+            self.td / "home", PATH=f"{bind}:{Path(shutil.which('node')).parent}:/usr/bin:/bin",
+            SESS_MARK=str(self.sess), CORE_MARK=str(self.core), PANE_MARK=str(self.pane), SUTANDO_PY=str(bind / "py"),
+            REAL_PY=sys.executable, ANTHROPIC_BASE_URL="http://127.0.0.1:9", SUTANDO_TEST_MODE="1",
+            SUTANDO_WORKSPACE=str(self.ws), SUTANDO_RESTART_GRACE_S="1")
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
@@ -259,7 +264,7 @@ class GatedSweep(unittest.TestCase):
         script = ('. "$REPO/src/agent/claude/cli/session-launch.sh"; PY=python3; SETTINGS_ARGS=("$@"); '
                   f'{CALL}; echo "rc=$?"')
         return subprocess.run(["/bin/bash", "-c", script, "x", *settings_args], capture_output=True, text=True,
-                              timeout=30, env={**os.environ, "REPO": str(self.root)})
+                              timeout=30, env=hermetic_env(REPO=str(self.root)))
 
     def test_carried_settings_sweep_once(self):
         r = self._sweep(["--settings", self._built()])
