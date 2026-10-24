@@ -1177,6 +1177,7 @@ class TestApplyPlan(ClassifyBase):
                                  "": gen(self.ws.root / "tasks"), "..": gen(self.ws.root),
                                  "./task-x.txt": gen(dotted)}}
         forged["verdict"] = {n: "orphan" for n in forged["generation"]}
+        forged["recovery"] = {"journals": {}, "sweep": []}
         forged["plan_id"] = self.mod.plan_id(forged)
         groups = {"deferred": [], "stalled": [], "unbound": [], "unknown": []}
         with unittest.mock.patch.object(self.mod, "_plan", return_value=(forged, groups)):
@@ -1190,7 +1191,8 @@ class TestApplyPlan(ClassifyBase):
         self.assertFalse((self.ws.root / "tasks" / "secret.txt").exists(),
                          "without the guard ../secret.txt lands here")
         self.assertTrue(dotted.exists(), "without the guard ./task-x.txt moves")
-        self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks" / "archive").iterdir()), [])
+        self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks" / "archive").iterdir()
+                                if p.name != ".transition.lock"), [])
         self.assertEqual(self.recovery_files(), [])
 
 
@@ -1296,7 +1298,8 @@ class TestApplyTransition(ClassifyBase):
         self.assertIn("new ask", live.read_text(), "the new task survives")
         self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks").iterdir()),
                          ["archive", "task-a.txt"])
-        self.assertEqual(sorted((self.ws.root / "tasks" / "archive").iterdir()), [])
+        self.assertEqual(sorted(p for p in (self.ws.root / "tasks" / "archive").iterdir()
+                                if p.name != ".transition.lock"), [])
 
     def test_an_archived_record_under_the_same_name_is_never_overwritten(self):
         self._orphan("task-a.txt")
@@ -1586,7 +1589,7 @@ class TestCli(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         cli_out = json.loads(res.stdout)
         self.assertEqual(set(cli_out), {"archive", "silent_archive", "generation", "verdict",
-                                        "body", "pending_notices", "errors", "plan_id"})
+                                        "body", "pending_notices", "recovery", "errors", "plan_id"})
         direct = _load().recovery_plan(self.ws.root, NOW)
         self.assertEqual(cli_out, direct)
         self.assertEqual(cli_out["archive"], [f"{IMPORT_ID}.txt"])
@@ -1802,6 +1805,128 @@ class TestApplyOwnsWhatItApproved(ClassifyBase):
         self.assertEqual(journals[0].read_bytes(), before, "recovery did not run")
         self.assertTrue(claims[0].exists())
         self.assertEqual(self.notices(), [])
+
+
+class TestRound9Arbitration(ClassifyBase):
+    """Ninth round (#4399): the approved plan_id is linearized with the recovery it
+    authorizes, and a worker delivery cannot interleave with the claim."""
+
+    def orphan(self, name: str) -> Path:
+        return self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+
+    def notices(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-*.txt"))
+
+    def crashed_transition(self, name: str, transition=None) -> None:
+        """A real interrupted pass over `name`: its journal and claim are left behind."""
+        tt = self.mod.task_transition
+        transition = transition or tt.transition
+        p = self.orphan(name)
+        real_set = tt._Journal.set
+
+        def die_once_claimed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "claimed":
+                raise KeyboardInterrupt("killed")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_claimed), \
+                self.assertRaises(KeyboardInterrupt):
+            transition(self.ws.root / "tasks", self.ws.root / "results",
+                       self.ws.root / "tasks" / "archive", moves={name: tt.generation_of(p)},
+                       render=lambda landed: "late\n" if landed else None, prefix="proactive-late-")
+
+    def test_a_journal_made_after_the_id_check_is_refused_under_the_lock(self):
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        real = self.mod.task_transition.transition
+
+        def interrupted_pass_then(*a, **kw):  # the seam between the ID check and the transition
+            self.crashed_transition("task-late.txt", real)
+            return real(*a, **kw)
+
+        with unittest.mock.patch.object(self.mod.task_transition, "transition",
+                                        side_effect=interrupted_pass_then):
+            out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertTrue(any("recovery state changed" in e for e in out["errors"]), out["errors"])
+        self.assertEqual((out["recovered"], self.notices()), ([], []))
+        self.assertFalse((self.ws.root / "tasks" / "archive" / "task-late.txt").exists())
+        self.assertEqual(len(list((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))), 1)
+
+    def test_a_claim_whose_process_exits_after_approval_is_not_swept(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        stray = self.ws.root / "tasks" / f"task-z.txt.claim-{child.pid}-abcdef0123"
+        stray.write_text("task: Z\n")
+        (self.ws.root / "tasks" / "archive").mkdir(exist_ok=True)
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        child.kill()
+        child.wait()
+        out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertTrue(any("recovery state changed" in e or f"approved was {approved}" in e
+                            for e in out["errors"]), out["errors"])
+        self.assertEqual(out["swept"], [])
+        self.assertTrue(stray.exists())
+        self.assertFalse((self.ws.root / "tasks" / "task-z.txt").exists())
+
+    def test_a_delivery_split_between_its_payload_check_and_sentinel_keeps_its_payload(self):
+        scripts = str(REPO / "skills" / "worker-pool" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import threading
+        import pool_router
+        import resolve_inbox_entry
+        p = self.orphan("task-r.txt")
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        checked, go, outcome, result = threading.Event(), threading.Event(), [], {}
+        real_payload = pool_router.pd.payload_path
+
+        class Paused:  # the payload check returns, then the router stalls before its sentinel
+            def __init__(self, path):
+                self.path = path
+
+            def is_file(self):
+                ok = self.path.is_file()
+                checked.set()
+                go.wait(5)
+                return ok
+
+        def router():  # route()'s shape: the per-task lock around deliver_one
+            with pool_router.task_arbitration(self.ws.root, "task-r"):
+                outcome.append(pool_router.deliver_one(self.ws.root, "w1", "task-r"))
+
+        with unittest.mock.patch.object(pool_router.pd, "payload_path",
+                                        side_effect=lambda ws, tid: Paused(real_payload(ws, tid))):
+            t = threading.Thread(target=router)
+            t.start()
+            self.assertTrue(checked.wait(5))
+            a = threading.Thread(target=lambda: result.update(
+                self.mod.apply_plan(self.ws.root, NOW, approved=approved)))
+            a.start()
+            a.join(0.5)
+            go.set()
+            t.join(10)
+            a.join(15)
+        self.assertEqual(outcome, ["delivered"])
+        self.assertEqual(result["archived"], [], result)
+        sentinel = next((self.ws.root / "deliveries" / "w1").glob("task-r*"))
+        self.assertEqual(resolver_path := resolve_inbox_entry.resolve(str(sentinel), self.ws.root), p)
+        self.assertTrue(resolver_path.exists())
+        self.assertEqual(self.notices(), [])
+
+    def test_a_completion_after_the_last_check_is_archived_as_done_not_reported(self):
+        tt = self.mod.task_transition
+        self.orphan("task-c.txt")
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        real_place = tt.task_archive.place_claim
+
+        def answered_then_placed(*a, **kw):
+            tt.result_publish.publish_text(self.ws.root / "results" / "task-c.txt", "answered\n")
+            return real_place(*a, **kw)
+
+        with unittest.mock.patch.object(tt.task_archive, "place_claim", side_effect=answered_then_placed):
+            out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertEqual(out["archived"], ["task-c.txt"], "done work is archived")
+        self.assertFalse(any("task-c.txt" in p.read_text() for p in self.notices()),
+                         "and not reported as an orphan")
 
 
 class TestWorkerHeld(ClassifyBase):

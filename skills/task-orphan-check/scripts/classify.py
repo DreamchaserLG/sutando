@@ -632,8 +632,10 @@ def _plan(workspace: Path, now: float | None = None) -> tuple[dict, dict]:
     archive_dir = workspace / "tasks" / "archive"
     plan = {"archive": archive, "silent_archive": silent_archive, "generation": generation,
             "verdict": verdicts, "body": body,
-            "pending_notices": task_transition.pending_notices(archive_dir), "errors": errors}
-    plan["plan_id"] = plan_id(plan, _effect_state(workspace, groups))
+            "pending_notices": task_transition.pending_notices(archive_dir),
+            "recovery": task_transition.recovery_effects(workspace / "tasks", archive_dir),
+            "errors": errors}
+    plan["plan_id"] = plan_id(plan, _effect_state(groups))
     return plan, groups
 
 
@@ -641,26 +643,10 @@ def _plan(workspace: Path, now: float | None = None) -> tuple[dict, dict]:
 _VOLATILE = {"age_s", "recovery_line", "stalled_line", "unbound_line", "import_idle_s", "reason"}
 
 
-def _effect_state(workspace: Path, groups: dict) -> dict:
-    """Everything else `--apply` acts on: each reported row, each pending
-    journal's bytes, and each claim in tasks/ a recovery would sweep."""
-    def digest(path: Path) -> str:
-        try:
-            return hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError as exc:
-            return f"unreadable: {exc.__class__.__name__}"
-    tasks_dir = workspace / "tasks"
-    try:
-        claims = sorted(n for n in os.listdir(tasks_dir) if ".claim-" in n)
-    except OSError:
-        claims = []
-    return {
-        "report": {g: [{k: v for k, v in row.items() if k not in _VOLATILE} for row in rows]
-                   for g, rows in groups.items()},
-        "journals": {n: digest(tasks_dir / "archive" / n)
-                     for n in task_transition.pending_notices(tasks_dir / "archive")},
-        "claims": {n: task_transition.generation_of(tasks_dir / n) for n in claims},
-    }
+def _effect_state(groups: dict) -> dict:
+    """The rows the notice reports, without their clock-driven fields."""
+    return {"report": {g: [{k: v for k, v in row.items() if k not in _VOLATILE} for row in rows]
+                       for g, rows in groups.items()}}
 
 
 def plan_id(plan: dict, effects: dict | None = None) -> str:
@@ -668,9 +654,30 @@ def plan_id(plan: dict, effects: dict | None = None) -> str:
     at which generation, and every other effect `--apply` would have (the rows
     the notice reports, the journals it recovers, the claims it sweeps). Clock-
     driven fields are left out, so the id holds while only ages change."""
-    key = {k: plan.get(k) for k in ("archive", "silent_archive", "generation", "verdict")}
+    key = {k: plan.get(k) for k in ("archive", "silent_archive", "generation", "verdict", "recovery")}
     key["effects"] = effects or {}
     return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _unanswered(workspace: Path, landed: dict) -> dict:
+    """The landings to report as orphans: one answered since its claim is done
+    work, archived like any done task and not reported."""
+    results = workspace / "results"
+    return {name: where for name, where in landed.items()
+            if not completion_marker(results, Path(name).stem)}
+
+
+def _arbitration(workspace: Path):
+    """The worker router's per-task lock, held around each claim so a delivery
+    cannot interleave; None when the worker-pool skill is absent."""
+    try:
+        os.stat(_POOL_SCRIPTS / "pool_router.py")
+    except FileNotFoundError:
+        return None
+    if str(_POOL_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(_POOL_SCRIPTS))
+    import pool_router  # noqa: E402
+    return lambda name: pool_router.task_arbitration(workspace, Path(name).stem)
 
 
 def _still_safe(workspace: Path, verdicts: dict, now: float | None):
@@ -802,8 +809,9 @@ def apply_plan(workspace: Path, now: float | None = None, *, approved: str | Non
              for name in (*plan["archive"], *plan["silent_archive"])}
     done = task_transition.transition(
         tasks_dir, workspace / "results", tasks_dir / "archive", moves=moves, prefix=RESULT_PREFIX,
-        render=lambda landed: _final_body(groups, landed),
-        still_safe=_still_safe(workspace, plan["verdict"], now))
+        render=lambda landed: _final_body(groups, _unanswered(workspace, landed)),
+        still_safe=_still_safe(workspace, plan["verdict"], now),
+        arbitrate=_arbitration(workspace), authorized=plan["recovery"])
     out["result"], out["body"], out["landed"] = done["result"], done["body"], done["archived"]
     out["quarantined"], out["recovered"] = done["quarantined"], done["recovered"]
     out["swept"] = done["swept"]

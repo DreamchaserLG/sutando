@@ -143,7 +143,8 @@ class TestExclusivePublication(Base):
         self.assertEqual(sorted(_unref(p.read_text()) for p in self.notices()),
                          ["notice task-a.txt\n", "notice task-b.txt\n"])
         self.assertEqual(self.archive_names(), ["task-a.txt", "task-b.txt"])
-        self.assertEqual(sorted(x.name for x in self.archive.iterdir() if x.name.startswith(".")), [])
+        self.assertEqual(sorted(x.name for x in self.archive.iterdir()
+                                if x.name.startswith(".") and x.name != tt._LOCK_NAME), [])
 
     def test_a_name_collision_in_one_process_is_retried_never_replaced(self):
         _task(self.tasks, "task-a.txt", "A")
@@ -220,7 +221,8 @@ class TestGenerationGuard(Base):
         self.assertEqual((out["archived"], out["quarantined"], out["result"]), ({}, {}, None))
         self.assertIn("new", p.read_text(), "the new task survives under its own name")
         self.assertEqual(self.live_names(), ["archive", "task-a.txt"], "no claim left behind")
-        self.assertEqual(sorted(self.archive.iterdir()), [], "nothing archived, no journal kept")
+        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name != tt._LOCK_NAME), [],
+                         "nothing archived, no journal kept")
 
     def test_a_name_retaken_during_the_give_back_quarantines_the_claim(self):
         p = _task(self.tasks, "task-a.txt", "old")
@@ -394,7 +396,8 @@ class TestNoClobberAndSymlinks(Base):
         out = self.run_transition([], _notice("notice\n"))
         self.assertEqual(out["errors"], [])
         self.assertIsNotNone(out["result"])
-        self.assertEqual(sorted(self.archive.iterdir()), [], "created empty, no journal")
+        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name != tt._LOCK_NAME), [],
+                         "created empty, no journal")
 
 
 class TestJournalRecovery(Base):
@@ -427,7 +430,8 @@ class TestJournalRecovery(Base):
         self.assertIn(ask, copies[0].read_text())
         self.assertEqual(len(self.notices()), 1 if notice_committed else 0)
         self.assertEqual(self.journals(), [])
-        self.assertEqual([x.name for x in self.archive.iterdir() if x.name.startswith(".")], [])
+        self.assertEqual([x.name for x in self.archive.iterdir()
+                          if x.name.startswith(".") and x.name != tt._LOCK_NAME], [])
 
     def recover(self) -> dict:
         return self.run_transition([], _notice(None))
@@ -636,7 +640,8 @@ class TestJournalRecovery(Base):
             seen.append(self.recover()["recovered"])  # another pass runs while this one holds the lock
             return j
 
-        with mock.patch.object(tt._Journal, "create", side_effect=create_then_peek):
+        with mock.patch.object(tt._Journal, "create", side_effect=create_then_peek), \
+                mock.patch.object(tt, "_LOCK_WAIT_S", 0):
             out = self.run_transition(["task-a.txt"], _naming)
         self.assertEqual(out["errors"], [])
         self.assertEqual(seen, [[]])
@@ -902,7 +907,8 @@ class TestRefusalPaths(Base):
         self.assertIn("could not write the journal", out["errors"][0])
         self.assertIn("nothing moved", out["errors"][0])
         self.assertTrue(p.exists())
-        self.assertEqual([x.name for x in self.archive.iterdir()], [], "no lock, tmp or journal left")
+        self.assertEqual([x.name for x in self.archive.iterdir() if x.name != tt._LOCK_NAME], [],
+                         "no journal lock, tmp or journal left")
         self.assertEqual(self.notices(), [])
 
     def test_a_publish_with_nothing_to_move_that_fails_is_reported(self):
@@ -1443,6 +1449,178 @@ class TestCrashWindows(Base):
         self.assertEqual(out["errors"], ["refused to move 'task-b.txt': held by worker w1"])
         self.assertTrue(b.exists())
         self.assertNotIn("task-b.txt", self.all_notice_text())
+
+
+class TestRound9(Base):
+    """Ninth-round blockers (#4399): each drives the production transition on a
+    real filesystem with the fault injected at the named seam."""
+
+    crash_after, invariants = TestJournalRecovery.crash_after, TestJournalRecovery.invariants
+    recover = TestJournalRecovery.recover
+
+    def fsyncs(self):
+        """Record os.fsync by the inode it synced, and os.unlink by name, in order."""
+        events, real_fsync, real_unlink = [], os.fsync, os.unlink
+
+        def fsync(fd):
+            events.append(("fsync", os.fstat(fd).st_ino))
+            return real_fsync(fd)
+
+        def unlink(path, *a, **kw):
+            events.append(("unlink", os.path.basename(str(path))))
+            return real_unlink(path, *a, **kw)
+
+        return events, mock.patch.object(os, "fsync", side_effect=fsync), \
+            mock.patch.object(os, "unlink", side_effect=unlink)
+
+    # 3 — a failed give-back never reverses the refusal
+    def refused_after_claim(self, failing_give_back):
+        p = _task(self.tasks, "task-a.txt", "A")
+        with mock.patch.object(tt.task_archive, "give_back", side_effect=failing_give_back):
+            try:
+                out = self.run_transition(["task-a.txt"], _naming,
+                                          still_safe=lambda n, read: "now done" if read != n else None)
+            except OSError as exc:  # a pass that does not journal its refusal dies here
+                out = {"errors": [str(exc)], "archived": {}}
+        return p, out
+
+    def test_a_give_back_whose_link_fails_is_returned_by_recovery_not_archived(self):
+        def link_fails(claim, name, why, dir_fd):
+            raise OSError(5, "Input/output error")
+
+        p, out = self.refused_after_claim(link_fails)
+        self.assertEqual(out["archived"], {})
+        self.assertFalse(p.exists())
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
+        self.assertEqual([x.name for x in self.tasks.iterdir() if ".claim-" in x.name], [])
+
+    def test_a_give_back_whose_unlink_fails_keeps_one_live_copy_and_no_notice(self):
+        def unlink_fails(claim, name, why, dir_fd):
+            os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            raise OSError(5, "Input/output error")
+
+        p, out = self.refused_after_claim(unlink_fails)
+        self.assertTrue(p.exists())
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
+        self.assertEqual([x.name for x in self.tasks.iterdir() if ".claim-" in x.name], [])
+
+    # 4 — placement moves only the inode it judged
+    def test_a_claim_replaced_between_judgement_and_move_is_never_archived(self):
+        p = _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        real = tt.task_archive.move_without_clobbering
+
+        def replace_then_move(src, dest, **kw):
+            _replace(self.tasks / str(src), "REPLACEMENT BYTES")
+            return real(src, dest, **kw)
+
+        with mock.patch.object(tt.task_archive, "move_without_clobbering", side_effect=replace_then_move):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(out["archived"], {})
+        self.assertIn("was replaced after it was judged", out["errors"][0])
+        self.assertEqual(self.archive_names(), [])
+        kept = [x for x in self.tasks.iterdir() if x.name.endswith(".displaced")]
+        self.assertEqual(len(kept), 1)
+        self.assertIn("ORIGINAL ASK", kept[0].read_text())
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+
+    # 5 — an unreadable witness keeps the journal
+    def retired_notice(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        with self.crash_after("published"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        (live,) = self.notices()
+        claim = live.with_suffix(f".sending.{os.getpid()}")
+        live.rename(claim)
+        (self.results / "archive").mkdir()
+        claim.rename(self.results / "archive" / f"{live.stem}-1800000000.txt")
+        return p, live
+
+    def test_an_unreadable_witness_is_not_read_as_absent(self):
+        _, live = self.retired_notice()
+        real_lstat = os.lstat
+
+        def lstat(path, *a, **kw):
+            if str(path).endswith(".witness"):
+                raise OSError(5, "Input/output error")
+            return real_lstat(path, *a, **kw)
+
+        with mock.patch.object(os, "lstat", side_effect=lstat):
+            out = self.recover()
+        self.assertTrue(out["errors"], out)
+        self.assertEqual(self.notices(), [], "nothing recreated")
+        self.assertEqual(len(self.journals()), 1, "the journal waits for a readable witness")
+        clean = self.recover()
+        self.assertEqual(clean["errors"], [], clean)
+        self.assertEqual((self.notices(), self.journals()), ([], []))
+
+    # 6 — journal removal is durable before the witness goes
+    def test_the_journal_removal_is_fsynced_before_the_witness_is_unlinked(self):
+        _task(self.tasks, "task-a.txt", "A")
+        self.archive.mkdir()
+        archive_ino, results_ino = os.stat(self.archive).st_ino, os.stat(self.results).st_ino
+        events, p_fsync, p_unlink = self.fsyncs()
+        with p_fsync, p_unlink:
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(out["errors"], [])
+        j = next(i for i, e in enumerate(events) if e[0] == "unlink" and e[1].startswith(tt.JOURNAL_PREFIX)
+                 and e[1].endswith(".json"))
+        w = next(i for i, e in enumerate(events) if e[0] == "unlink" and e[1].endswith(".witness"))
+        self.assertIn(("fsync", archive_ino), events[j:w], events)
+        self.assertIn(("fsync", results_ino), events[w:], events)
+
+    # 7 — recovery puts a barrier under a commit whose directory fsync failed
+    def test_a_commit_whose_results_fsync_failed_is_synced_before_recovery_accepts_it(self):
+        _task(self.tasks, "task-a.txt", "A")
+        results_ino, fired, real_fsync = os.stat(self.results).st_ino, [], os.fsync
+
+        def fsync(fd):
+            if not fired and os.fstat(fd).st_ino == results_ino:
+                fired.append(1)
+                raise OSError(5, "Input/output error")
+            return real_fsync(fd)
+
+        with mock.patch.object(os, "fsync", side_effect=fsync):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertIn("result write failed", out["errors"][0])
+        self.assertEqual(len(self.journals()), 1)
+        events, p_fsync, p_unlink = self.fsyncs()
+        with p_fsync, p_unlink:
+            again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        j = next(i for i, e in enumerate(events) if e[0] == "unlink" and e[1].endswith(".json"))
+        self.assertIn(("fsync", results_ino), events[:j], "a barrier before the journal goes")
+        self.assertEqual((len(self.notices()), self.journals()), (1, []))
+
+    # 8 — recovery honours an unsynced placement
+    def test_an_unsynced_claim_removal_is_synced_before_recovery_publishes(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        tasks_ino, fired, real = os.stat(self.tasks).st_ino, [], tt.task_archive._fsync_dir
+
+        def sync(fd):
+            if (not fired and os.fstat(fd).st_ino == tasks_ino and (self.archive / "task-a.txt").exists()
+                    and not any(".claim-" in x.name for x in self.tasks.iterdir())):
+                fired.append(1)
+                raise OSError(5, "Input/output error")
+            real(fd)
+
+        with mock.patch.object(tt.task_archive, "_fsync_dir", side_effect=sync):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertEqual((out["result"], len(self.journals())), (None, 1))
+        events, p_fsync, p_unlink = self.fsyncs()
+        with p_fsync, p_unlink:
+            again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn(("fsync", tasks_ino), events, "the claim's removal is made durable")
+        self.invariants(gen, "task: A", notice_committed=True)
 
 
 if __name__ == "__main__":

@@ -669,7 +669,9 @@ class TestMoveGeneration(unittest.TestCase):
             self.move("task-a.txt", self._gen(p))
         self.assertEqual(m.call_count, 1)
         self.assertTrue(str(m.call_args.args[0]).startswith("task-a.txt.claim-"))
-        self.assertEqual(m.call_args.kwargs, {"src_dir_fd": self.sfd, "dst_dir_fd": self.dfd})
+        st = os.stat(self.dst / "task-a.txt")
+        self.assertEqual(m.call_args.kwargs, {"src_dir_fd": self.sfd, "dst_dir_fd": self.dfd,
+                                              "expect": (st.st_dev, st.st_ino)})
 
     def test_move_without_clobbering_through_handles_never_resolves_a_path(self):
         self._file("task-a.txt", "A")

@@ -5617,6 +5617,24 @@ def _recover_orphan_proactive() -> None:
             pass
 
 
+def _retire_delivered_proactive(claim: Path, original: Path) -> None:
+    """Retire a DELIVERED nudge: into results/archive/, else under a hidden
+    `.<stem>.delivered-<ts>` beside it. Never unlinked while a rename can keep it:
+    a publisher's witness reads a second link of this inode as proof it committed."""
+    stamp = int(time.time())
+    try:
+        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        claim.rename(ARCHIVE_RESULTS_DIR / f"{original.stem}-{stamp}.txt")
+        return
+    except OSError as e:
+        _log(f"could not archive delivered proactive {original.name} ({diagnostics.describe(e)}) "
+             "— keeping it under a hidden delivered name")
+    try:
+        claim.rename(original.with_name(f".{original.stem}.delivered-{stamp}"))
+    except OSError:
+        claim.unlink(missing_ok=True)  # left as a claim it would be sent again after a restart
+
+
 def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
     """Retire a claimed nudge that was NOT delivered, without destroying it.
 
@@ -5933,11 +5951,7 @@ def _post_proactive() -> None:
             _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
             continue
         _record_proactive_receipt(f.stem, dest_room)
-        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
-        except OSError:
-            claim.unlink(missing_ok=True)
+        _retire_delivered_proactive(claim, f)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
         _ENGINE_COUNTS["legacy_sends"] += 1
         _log(f"delivered proactive {f.name} to {dest_room}")

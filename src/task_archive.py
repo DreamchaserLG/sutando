@@ -121,12 +121,14 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
 
 
 def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" = None,
-                             dst_dir_fd: "int | None" = None) -> Path:
+                             dst_dir_fd: "int | None" = None,
+                             expect: "tuple[int, int] | None" = None) -> Path:
     """Move src to dest, or to dest.N if taken. Returns where it landed.
     link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat.
-    With directory handles, src/dest are names inside them and no path is re-resolved."""
+    With directory handles, src/dest are names inside them and no path is re-resolved;
+    `expect` (st_dev, st_ino) refuses to move anything but that inode (PlacementMismatch)."""
     if src_dir_fd is not None or dst_dir_fd is not None:
-        return _move_relative(src, dest, src_dir_fd, dst_dir_fd)
+        return _move_relative(src, dest, src_dir_fd, dst_dir_fd, expect)
     import os
     import shutil
     base, candidate, n = dest, dest, 0
@@ -163,7 +165,8 @@ def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" 
     return candidate
 
 
-def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: "int | None") -> Path:
+def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: "int | None",
+                   expect: "tuple[int, int] | None" = None) -> Path:
     """The handle form of `_move_without_clobbering`: same policy, every call
     relative to the directories, unlink of the (private) source by name in its handle."""
     import os
@@ -174,13 +177,24 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
     while True:
         try:
             os.link(str(src), str(candidate), src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+            if expect is not None:
+                got = os.lstat(str(candidate), dir_fd=dst_dir_fd)
+                if (got.st_dev, got.st_ino) != expect:  # src was replaced after it was judged
+                    os.unlink(str(candidate), dir_fd=dst_dir_fd)
+                    raise PlacementMismatch(str(src))
             break
         except FileExistsError:
             n += 1
             candidate = base.with_name(f"{base.name}.{n}")
+        except PlacementMismatch:
+            raise
         except OSError:
             tmp = base.with_name(f".{base.name}.{uuid.uuid4().hex[:12]}.part")
             fd_in = os.open(str(src), os.O_RDONLY, dir_fd=src_dir_fd)
+            got = os.fstat(fd_in)
+            if expect is not None and (got.st_dev, got.st_ino) != expect:
+                os.close(fd_in)
+                raise PlacementMismatch(str(src))
             try:
                 fd_out = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
                                  dir_fd=dst_dir_fd)
@@ -259,6 +273,14 @@ def file_generation(st) -> str:
     return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
+class PlacementMismatch(Exception):
+    """The name to move no longer holds the inode that was judged; nothing was placed."""
+
+    def __init__(self, name: str):
+        super().__init__(f"{name} was replaced after it was judged")
+        self.name = name
+
+
 class PlacementUnsynced(Exception):
     """The file is linked at `landed` in the archive, but making that durable or
     removing the source failed: it is placed, not given back, and must be finished."""
@@ -293,6 +315,26 @@ def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChange
 
 
 give_back = _give_back
+
+
+def _keep_displaced(fd: int, claim: str, dir_fd: int) -> "str | None":
+    """The judged bytes, whose name was taken from under the move, copied to a
+    fresh `<claim>.displaced` from the descriptor still holding them."""
+    import os
+    keep = f"{claim}.displaced"
+    try:
+        out = os.open(keep, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return None
+    with os.fdopen(out, "wb") as fh:
+        offset = 0
+        while chunk := os.pread(fd, 1 << 16, offset):
+            fh.write(chunk)
+            offset += len(chunk)
+        fh.flush()
+        os.fsync(fh.fileno())
+    _fsync_dir(dir_fd)
+    return keep
 
 
 def claim_name(name: str) -> str:
@@ -333,11 +375,15 @@ def place_claim(claim: str, name: str, generation: str, dest: str, *, src_dir_fd
     except OSError as exc:
         raise _give_back(claim, name, f"cannot be opened as a regular file ({exc})", src_dir_fd) from None
     try:
-        if file_generation(os.fstat(fd)) != generation:
+        held = os.fstat(fd)
+        if file_generation(held) != generation:
             raise _give_back(claim, name, "changed since it was planned", src_dir_fd)
         try:
             return move_without_clobbering(Path(claim), Path(dest), src_dir_fd=src_dir_fd,
-                                           dst_dir_fd=dst_dir_fd)
+                                           dst_dir_fd=dst_dir_fd, expect=(held.st_dev, held.st_ino))
+        except PlacementMismatch as exc:
+            exc.kept_as = _keep_displaced(fd, claim, src_dir_fd)
+            raise
         except OSError as exc:
             raise _give_back(claim, name, f"the archive move failed ({exc})", src_dir_fd) from exc
     finally:
