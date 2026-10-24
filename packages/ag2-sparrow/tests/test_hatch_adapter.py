@@ -3941,6 +3941,42 @@ class Hold(Base):
         self.assertIsNone(runtime_text.held_line(cache(self.SERVED, text_schema_version=2)))
         self.assertIsNone(runtime_text.held_line(None))
 
+    def test_an_answer_between_the_drains_claim_and_its_send_posts_no_line(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts, answers = [], []
+        ready = gb.read_ready_result
+
+        def claimed(path):
+            # The drain has renamed the line to its claim: the worker answers right now.
+            if path.name.startswith(self.notice.stem + delivery_destination.CLAIM_INFIX) and not answers:
+                with mock.patch.object(outbox, "_activity_completed", return_value=None):
+                    answers.append(run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
+                                                             "done", "--wait", "0"], self.env()))
+            return ready(path)
+
+        def req(method, path, payload=None, timeout=None):
+            if method == "POST":
+                posts.append(payload)
+            return {"ok": True, "event_id": "$evt"}
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.object(gb, "read_ready_result", claimed), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+        self.assertEqual(len(answers), 1, "the answer landed while the line was claimed")
+        self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
+        self.assertEqual(posts, [], "the claimed line was withdrawn, never posted")
+        self.assertFalse(list(self.results.glob(f"{self.notice.stem}.sending.*")))
+        self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
+        self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")
         self.result_file.write_text("done\n")

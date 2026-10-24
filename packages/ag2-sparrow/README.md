@@ -278,7 +278,9 @@ lock's holder, when a lock is held), and its timestamp is under 30 seconds old (
 cannot write its state directory) `hold` exits 3: "can't confirm the room is deliverable yet". Exit 3 means the hold is not recorded, so the task still reads
 `task-not-picked-up`; running `hold` again records it when it can. The item's result_file
 stays free for the real answer, and `reply` withdraws a hold line that is
-still queued and ends the hold. For a sender who is not the owner, the
+still queued and ends the hold. A line the drain has already claimed is withdrawn
+with a `<stem>.withdrawn` sentinel, which the drain checks just before it sends;
+only a send already under way when the answer lands can still post the line. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker

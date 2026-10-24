@@ -5879,6 +5879,12 @@ def _post_proactive() -> None:
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         thread_root = _proactive_thread_root(claimed_text, f.name)
+        withdrawn = _delivery_destination.withdrawn_path(f)
+        if withdrawn.exists():
+            _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
+            _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+            withdrawn.unlink(missing_ok=True)
+            continue
         try:
             resp = _req("POST", "/v1/room",
                         {"op": "message",
@@ -5933,6 +5939,7 @@ def _post_proactive() -> None:
         except OSError:
             claim.unlink(missing_ok=True)
         _PROACTIVE_ATTEMPTS.pop(f.name, None)
+        withdrawn.unlink(missing_ok=True)  # a withdrawal that came after the send
         _ENGINE_COUNTS["legacy_sends"] += 1
         _log(f"delivered proactive {f.name} to {dest_room}")
 

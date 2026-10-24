@@ -1278,12 +1278,25 @@ def hold(args) -> int:
               "still reads task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if task_settled(result_dir, tid):
-        notice.unlink(missing_ok=True)
+        _withdraw_line(result_dir, tid)
         _release_quietly(result_dir, tid, token)
         print(f"NOT held: {tid} was answered meanwhile; notice withdrawn", file=sys.stderr)
         return REPLY_NOT_POSTED
     print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
     return REPLY_POSTED
+
+
+def _withdraw_line(result_dir: Path, tid: str) -> None:
+    """Take `tid`'s hold line off the queue; one the drain has claimed but not sent is withdrawn
+    with its sentinel, which the drain checks just before the send."""
+    notice = _hold_notice(result_dir, tid)
+    notice.unlink(missing_ok=True)
+    if _line_claimed(result_dir, notice):
+        try:
+            delivery_destination.withdrawn_path(notice).touch()
+        except OSError as e:
+            print(f"note: could not withdraw the claimed hold line of {tid} ({diagnostics.describe(e)}); "
+                  "it may still post", file=sys.stderr)
 
 
 def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:
@@ -1311,8 +1324,8 @@ def reply(args) -> int:
         print(f"error: {why}", file=sys.stderr)
         return 2
     root = gateway_instance.outbox_root(result_dir, instance)
-    # The answer supersedes a hold notice still queued; one already claimed cannot be recalled.
-    _hold_notice(result_dir, tid).unlink(missing_ok=True)
+    # The answer supersedes its hold line, before the answer itself is queued.
+    _withdraw_line(result_dir, tid)
     _prune_claims(result_dir, task_dir)
     if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
             or not _publish_once(result_file, body)):

@@ -20,6 +20,9 @@ RECEIPT_DIR = ".outbox-ag2space-proactive"
 UNDELIVERED_DIR = "undelivered"
 # The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
 CLAIM_INFIX = ".sending."
+# A producer withdraws a queued or claimed `<stem>.txt` by creating `<stem>.withdrawn`; the drain
+# retires the file unsent when it sees one just before its send.
+WITHDRAWN_SUFFIX = ".withdrawn"
 
 
 def claim_path(queued: Path, pid: int) -> Path:
@@ -28,6 +31,11 @@ def claim_path(queued: Path, pid: int) -> Path:
     if valid_pid(pid) is None:
         raise ValueError(f"pid {pid!r} is outside the pid domain")
     return queued.with_suffix(f"{CLAIM_INFIX}{pid}")
+
+
+def withdrawn_path(queued: Path) -> Path:
+    """The sentinel that withdraws `queued` from the drain before it is sent."""
+    return queued.with_name(queued.stem + WITHDRAWN_SUFFIX)
 
 
 def claim_pid(name: str) -> "int | None":
