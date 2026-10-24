@@ -299,6 +299,30 @@ class LaunchCheck(Fixture):
                 self.assertEqual(chs.main(["launch-check", "--repo", str(self.repo)]), rc, text[:20])
 
 
+class Shapes(Fixture):
+    def test_malformed_groups_are_skipped_not_raised(self):
+        settings = {"hooks": {"Stop": ["not a group", {"hooks": "not a list"}, {"matcher": "", "hooks": [
+            "not a hook", {"type": "command", "command": 7}, {"type": "command", "command": "echo ok"}]}],
+            "PreToolUse": "not a list"}}
+        self.assertEqual(chs.records_in(settings), {("Stop", "", "echo ok")})
+        self.assertEqual(chs.records_in({"hooks": 3}), set())
+        self.assertEqual(chs.records_in("nope"), set())
+
+    def test_a_write_that_fails_leaves_the_file_and_no_temp_behind(self):
+        path = self.repo / "settings.json"
+        path.write_text("{\"keep\": true}\n")
+        with self.assertRaises(TypeError):
+            chs.write_json_keeping_mode(path, {"bad": object()})
+        self.assertEqual(path.read_text(), "{\"keep\": true}\n")
+        self.assertEqual([p.name for p in self.repo.iterdir() if p.name.startswith(".settings.json.")], [])
+
+    def test_launch_settings_that_are_not_an_object_raise(self):
+        with self.assertRaises(ValueError):
+            chs.launch_check(self.repo, "[]")
+        with self.assertRaises(json.JSONDecodeError):
+            chs.launch_check(self.repo, "not json")
+
+
 class ScriptPathOf(unittest.TestCase):
     def test_cases(self):
         self.assertEqual(chs.script_path_of("bash /x/y.sh"), "/x/y.sh")

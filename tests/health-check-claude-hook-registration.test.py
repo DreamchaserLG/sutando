@@ -15,6 +15,8 @@ from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -278,6 +280,56 @@ class Probe(unittest.TestCase):
             self.assertIn("is not in a pane of session", self._bound_record_fails(launch="tmux", socket=self.sock))
         # Without any tmux on PATH a tmux record is not proof either.
         self.assertIn("the record is", self._bound_record_fails(launch="tmux", socket=self.sock))
+
+    def test_the_shared_name_reader_cli_and_its_malformed_quote_fallback(self):
+        cli = [sys.executable, str(REPO / "src" / "claude_argv.py")]
+        env = hermetic_env(PATH="/usr/bin:/bin")
+        run = lambda *a: subprocess.run([*cli, *a], env=env, capture_output=True, text=True, timeout=30)  # noqa: E731
+        self.assertEqual(run("names-session", "claude --name sutando-core --x", "sutando-core").returncode, 0)
+        self.assertEqual(run("names-session", "claude --name sutando-core-2", "sutando-core").returncode, 1)
+        # An apostrophe in the argv (a boot prompt's) breaks shlex; the whitespace fallback still reads the name.
+        malformed = "claude --name sutando-core -- don't stop"
+        self.assertEqual(run("names-session", malformed, "sutando-core").returncode, 0)
+        self.assertEqual(claude_argv.session_name(malformed), "sutando-core")
+        self.assertEqual(run("session-name", "claude --name=sutando-core").stdout.strip(), "sutando-core")
+        self.assertEqual(run("session-name").returncode, 2)
+        # The same entry points in-process, where coverage measures them.
+        self.assertEqual(claude_argv.main(["names-session", "claude --name sutando-core", "sutando-core"]), 0)
+        self.assertEqual(claude_argv.main(["names-session", "claude --name sutando-core-2", "sutando-core"]), 1)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(claude_argv.main(["session-name", "claude --name=sutando-core"]), 0)
+        self.assertEqual(buf.getvalue().strip(), "sutando-core")
+        self.assertEqual(claude_argv.main(["bogus"]), 2)
+        self.assertFalse(claude_argv.names_session("claude --name sutando-core", ""))
+
+    def test_a_tmux_that_cannot_run_or_a_ps_that_fails_mid_walk_is_not_proof(self):
+        settings, _ = hc._core_launch_settings(self.repo)
+        self.record(settings, launch="tmux", socket=self.sock)
+        rec = json.loads((self.ws / "state" / "core-launch-settings.json").read_text())
+        real_run = hc.subprocess.run
+
+        def tmux_cannot_run(argv, **kw):
+            if argv[0] == "tmux":
+                raise OSError("tmux cannot run")
+            return real_run(argv, **kw)
+
+        def ps_walk_fails(argv, **kw):
+            if argv[:3] == ["ps", "-o", "ppid="]:
+                raise OSError("ps is gone")
+            return real_run(argv, **kw)
+        with self.tmux_probe_env(), mock.patch.object(hc.subprocess, "run", side_effect=tmux_cannot_run):
+            self.assertIn("cannot list the panes", hc._launch_record_binds_live_core(rec))
+            self.assertEqual(self.probe()["status"], "warn")
+        with self.tmux_probe_env(pane_pid=os.getpid()), mock.patch.object(hc.subprocess, "run", side_effect=ps_walk_fails):
+            self.assertIn("is not in a pane of session", hc._pid_outside_session_pane(self.core.pid, self.sock, "sutando-core"))
+
+    def test_an_unreadable_owned_hooks_table_warns(self):
+        import claude_hooks_settings as chs
+        with mock.patch.object(chs, "owned_launch_records", side_effect=RuntimeError("table gone")):
+            out = self.probe()
+        self.assertEqual(out["status"], "warn")
+        self.assertIn("owned-hooks table unreadable (table gone)", out["detail"])
 
     def test_a_bare_record_needs_no_tmux_and_still_needs_the_exact_start(self):
         self.assertEqual(self.probe()["status"], "ok")
