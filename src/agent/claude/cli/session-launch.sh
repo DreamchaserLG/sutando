@@ -63,10 +63,28 @@ claude_named_pids() {
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
     args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
-    case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
-    esac
+    [ -n "$args" ] && claude_argv_names_session "$args" && echo "$pid"
   done
+  return 0
+}
+
+# Exact `--name $SESSION` (never `$SESSION-2`), read by the shared owner src/claude_argv.py;
+# a host with no Python (a fresh Mac) gets the same token rule in bash.
+claude_argv_names_session() {
+  local args="$1" rc prev w
+  if [ -n "${PY:-}" ]; then
+    "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION" 2>/dev/null
+    rc=$?
+    [ "$rc" -le 1 ] && return "$rc"
+  fi
+  prev=""
+  set -f
+  for w in $args; do
+    if { [ "$prev" = "--name" ] && [ "$w" = "$SESSION" ]; } || [ "$w" = "--name=$SESSION" ]; then set +f; return 0; fi
+    prev="$w"
+  done
+  set +f
+  return 1
 }
 
 claude_named_process_running() {

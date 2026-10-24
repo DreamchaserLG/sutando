@@ -345,5 +345,35 @@ class GatedSweep(unittest.TestCase):
         self.assertIn("legacy hook sweep failed", r.stderr)
 
 
+class NamedPids(unittest.TestCase):
+    """`claude_named_pids` (session-launch.sh) names the session token-wise through claude_argv,
+    with and without a Python on the host."""
+
+    def _pids(self, args_line, py):
+        td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, td, True)
+        bind = td / "bin"
+        bind.mkdir()
+        (bind / "pgrep").write_text("#!/bin/bash\necho 4242\n")
+        (bind / "ps").write_text(f"#!/bin/bash\ncat '{td}/args'\n")
+        for f in ("pgrep", "ps"):
+            (bind / f).chmod(0o755)
+        (td / "args").write_text(args_line + "\n")
+        script = 'REPO="$1"; SESSION=sutando-core; PY="$2"; . "$REPO/src/agent/claude/cli/session-launch.sh"; claude_named_pids'
+        run = subprocess.run(["/bin/bash", "-c", script, "_", str(REPO), py],
+                             env=hermetic_env(PATH=f"{bind}:/usr/bin:/bin"), capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.split()
+
+    def test_the_session_name_is_matched_token_wise_with_and_without_python(self):
+        for py in (sys.executable, ""):
+            with self.subTest(python=bool(py)):
+                self.assertEqual(self._pids("claude --name sutando-core --x", py), ["4242"])
+                self.assertEqual(self._pids("claude --name=sutando-core", py), ["4242"])
+                self.assertEqual(self._pids("claude --name sutando-core-2", py), [])
+                self.assertEqual(self._pids("claude --name sutando-core-watcher", py), [])
+                self.assertEqual(self._pids("claude --resume", py), [])
+
+
 if __name__ == "__main__":
     unittest.main()
