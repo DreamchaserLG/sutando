@@ -19,6 +19,7 @@ import base64
 import html
 import json
 import re
+import string
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -40,6 +41,9 @@ RELEASE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 SURFACES = ("dm", "room", "mobile")
 RUNTIMES = ("claude", "codex")
 BODY_PARTS = 2
+STEPS_MAX = 24
+# A fallback-mode page inlines every screenshot; Room Commons refuses a page much larger.
+PAGE_MAX_BYTES = 300_000
 
 
 class Shot(NamedTuple):
@@ -168,6 +172,13 @@ def newer(revision: str, than: Optional[str]) -> bool:
     return mine is not None and (revision_key(than) is None or mine > revision_key(than))
 
 
+def _no_tags(text: str, where: str) -> str:
+    # The page interpolates these as markup; entities (&rarr;) say everything a list needs.
+    if "<" in text or ">" in text:
+        raise ValueError(f"{where}: '<' and '>' are not allowed; write entities such as &rarr;")
+    return text
+
+
 def _text(part: object, where: str) -> str:
     if isinstance(part, dict) and "href" not in part:
         part = part.get("text")
@@ -175,6 +186,14 @@ def _text(part: object, where: str) -> str:
         raise ValueError(f"{where}: a link is not allowed; the page carries no external URL")
     if not isinstance(part, str) or not part.strip():
         raise ValueError(f"{where}: a body part must be a non-empty string")
+    _no_tags(part, where)
+    try:
+        fields = [(f, spec, conv) for _, f, spec, conv in string.Formatter().parse(part)]
+    except ValueError as exc:
+        raise ValueError(f"{where}: {exc}; a literal brace is written {{{{ or }}}}") from None
+    for field, spec, conv in fields:
+        if field is not None and (field != "name" or spec or conv):
+            raise ValueError(f"{where}: {{name}} is the only placeholder allowed, got {{{field}}}")
     return part
 
 
@@ -189,6 +208,7 @@ def _step(raw: object, n: int, assets: Path) -> Section:
     title = raw.get("title")
     if not isinstance(title, str) or not title.strip():
         raise ValueError(f"{where}: title must be a non-empty string")
+    _no_tags(title, f"{where} title")
     body = raw.get("body")
     if not isinstance(body, list) or len(body) != BODY_PARTS:
         raise ValueError(f"{where}: body must list {BODY_PARTS} parts (what it is, what to try)")
@@ -242,6 +262,8 @@ def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
     raw_steps = data.get("steps")
     if not isinstance(raw_steps, list) or not raw_steps:
         raise ValueError("steps must be a non-empty list")
+    if len(raw_steps) > STEPS_MAX:
+        raise ValueError(f"steps must list at most {STEPS_MAX} steps, got {len(raw_steps)}")
     steps = tuple(_step(raw, n, assets) for n, raw in enumerate(raw_steps))
     ids = [s.id for s in steps]
     dup = sorted({i for i in ids if ids.count(i) > 1})
@@ -693,7 +715,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     secs = sections_for(core, features)
     body = "".join(_section(s, i == 0, who, prompts, media) for i, s in enumerate(secs))
     light, dark = _palette(tuple(s.id for s in features.steps if s.id not in ACCENTS))
-    return (
+    page = (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         f"{owner_marker(agent, features.revision) if agent else ''}"
@@ -716,3 +738,8 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
         f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
     )
+    size = len(page.encode("utf-8"))
+    if size > PAGE_MAX_BYTES:
+        raise ValueError(f"the page is {size} bytes, over the {PAGE_MAX_BYTES}-byte cap: fewer or smaller "
+                         "inlined screenshots, or map them to room media")
+    return page

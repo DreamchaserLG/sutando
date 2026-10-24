@@ -115,9 +115,11 @@ each room's entry.
   (`data-revision="tutorial.2026-10-23.1"`). **Rebuild rule:** a page is rebuilt in place when the
   engine's list revision is newer than the page's. `publish --if-newer` applies exactly that rule
   and nothing else: a complete page whose revision is current is left alone even when a rebuild
-  would differ (another name or core), a stale page is rewritten with the prompts it was last
-  built with (recorded in the entry), a page from before lists had a revision counts as stale, and
-  a `pending` page is finished whatever its revision. It summons no one. Run it after an engine
+  would differ (another name or core), a stale page is rewritten with the prompts and roles it was
+  last built with (recorded in the entry), a page from before lists had a revision counts as stale,
+  and a `pending` page is finished whatever its revision. A page someone edited since it was last
+  written (its text no longer hashes to the entry) is kept, with or without `--if-newer`: the
+  result says `"action": "kept"` and stderr names the page. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash
@@ -172,6 +174,8 @@ so one validated format can serve both:
   single asset name is a list here because a step carries up to three crops.
 - `since_release`: the release date (`YYYY-MM-DD`) that introduced the feature.
 - `runtime` (optional): `claude` or `codex`; the step appears on that core only.
+- `title` and both `body` parts are plain text: no `<` or `>` (write entities such as `&rarr;`),
+  and `{name}` is the only placeholder (a literal brace is `{{` or `}}`).
 - `revision`: `tutorial.YYYY-MM-DD.N`. Any change to the list bumps it; two revisions order by
   date, then N.
 
@@ -197,9 +201,11 @@ drops names the list does not use and anything that is not a well-formed `mxc://
 with no mapping is inlined from its `fallback_file` as a `data:` URI, so a room with no uploads
 gets today's page byte for byte. `assets/*.jpg` are real UI crops, adapted from Zerlinda's
 Sutando's "Getting started with AG2 Space" page, each cropped so that no person's name, room or
-account shows. Two caps, enforced by the tests: each fallback file is at most 60 KB, and every
-rendered page variant in fallback mode is at most 300 KB, so publishing a page publicly stays well
-under the 413 that an image-heavy page met (#5318). Fully mapped, the page shrinks to text (under
+account shows. Three caps: a list has at most 24 steps (`STEPS_MAX`, refused by `parse_list`), a
+rendered page is at most 300 KB (`PAGE_MAX_BYTES`; `render` and `publish` refuse a larger one, and
+asset names that share one fallback file inline it once each), and the tests hold each fallback
+file to 60 KB, so publishing a page publicly stays well under the 413 that an image-heavy page met
+(#5318). Fully mapped, the page shrinks to text (under
 40 KB). Room media does not load on a public copy of a page (`page-publish`), so a copy meant for
 the public is rendered without `--media`.
 

@@ -25,10 +25,11 @@ room's media for those assets; the map is recorded in the room's entry and reuse
 there, and an asset with no mapping is inlined from its fallback file, as every one is today.
 
 The page records the list's revision in its ownership tag. `publish` rewrites a page whose text
-differs from what it would write (a new name, core, list or prompts); with --if-newer it rewrites a
-complete page only when the list's revision is newer than the page's, reusing the prompts the page
-was last built with, so a pass after an engine update refreshes stale pages and leaves current ones
-alone. A page built before lists had a revision counts as older than any list.
+differs from what it would write (a new name, core, list or prompts), unless someone edited the page
+since it was last written: that page is kept (action "kept", a line on stderr). With --if-newer it
+rewrites a complete page only when the list's revision is newer than the page's, reusing the prompts
+and roles the page was last built with, so a pass after an engine update refreshes stale pages and
+leaves current ones alone. A page built before lists had a revision counts as older than any list.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
 credentials come from the environment, else from the AG2 Space channel env file
@@ -79,6 +80,7 @@ import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
     AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
+    role_labels,
 )
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
@@ -513,6 +515,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         if if_newer and not clean_prompts(prompts):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
+        if if_newer and not role_labels(roles):
+            roles = rooms.get(commons.room, {}).get("roles")
         prompts = clean_prompts(prompts, tour_page.prompt_slots(features))
         recorded = rooms.get(commons.room, {}).get("media")
         media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
@@ -549,18 +553,26 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             current = commons.read(kind)
             was = read_marker(current)
             page_revision = was[1] if was else None
+            written = rooms.get(commons.room, {}).get("hash")
             if current == page:
                 action = "unchanged"
             elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
                 action = "unchanged"
                 page = current
+            elif not step["pending"] and written and content_hash(current) != written:
+                # Someone edited the page since this script wrote it: theirs stays, hash and all.
+                action = "kept"
+                page = current
             else:
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        entry = {"kind": kind, "state": "complete", "hash": content_hash(page),
+        entry = {"kind": kind, "state": "complete",
+                 "hash": written if action == "kept" else content_hash(page),
                  "revision": (read_marker(page) or (None, features.revision))[1]}
         if prompts:
             entry["prompts"] = prompts
+        if role_labels(roles):
+            entry["roles"] = ", ".join(role_labels(roles))
         if media:
             entry["media"] = media
         _record(marker, rooms, commons.room, entry)
@@ -568,6 +580,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
               "media": sorted(media)}
     if step["action"] == "adopt":
         result["adopted"] = True
+    if action == "kept":
+        result["edited"] = True
     # Summoned once: when this page's creation finishes (here, or resumed from our own pending
     # entry). Adopting a page found by its ownership marker is not a creation.
     first = action == "created" or step["action"] == "update" and step["pending"]
@@ -681,6 +695,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
+    if result.get("edited"):
+        print(f"getting_started: {result['kind']} in {args.room} was edited since it was last written; "
+              "kept as is, not rewritten", file=sys.stderr)
     print(json.dumps({**result, "name": name, "list": listed}))
     return 0
 

@@ -125,6 +125,19 @@ def with_step(**fields):
     return data
 
 
+def many_steps(n, shots=0):
+    """A list of `n` text-only steps; with `shots`, each step inlines the biggest fallback file that
+    many times under distinct asset names (the duplicate-asset rule is per name, not per file)."""
+    biggest = max(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
+    data = good_list()
+    data["steps"] = [{"id": f"step-{i}", "title": f"Step {i}", "surface": "dm", "since_release": "2026-10-23",
+                      "body": [f"What step {i} is for {{name}}.", "Ask {name}:"],
+                      "screenshot": [{"asset": f"shot-{i}-{j}", "fallback_file": f"assets/{biggest}", "alt": "a"}
+                                     for j in range(shots)]}
+                     for i in range(n)]
+    return data
+
+
 class LosslessTest(unittest.TestCase):
     def test_the_list_renders_the_same_html_as_the_hard_coded_sections(self):
         cases = 0
@@ -214,6 +227,24 @@ class ListTest(unittest.TestCase):
         for s in data["steps"]:
             s["runtime"] = "claude"
         self.refuse(data, "every core")
+        self.assertLessEqual(len(good_list()["steps"]), tp.STEPS_MAX // 2)
+        self.refuse(many_steps(40), "steps", "at most 24", "got 40")
+        self.assertEqual(len(tp.parse_list(many_steps(tp.STEPS_MAX)).steps), tp.STEPS_MAX)
+
+    def test_markup_and_stray_placeholders_are_refused_in_the_title_and_both_body_parts(self):
+        tag = "<script>fetch('https://x.test')</script>"
+        self.refuse(with_step(title=f"Your DM {tag}"), "step dm title", "'<'")
+        self.refuse(with_step(body=[tag, "Ask {name}:"]), "body[0]", "'<'")
+        self.refuse(with_step(body=["What.", {"text": "a > b"}]), "body[1]", "'>'")
+        self.refuse(with_step(body=["Costs {0} dollars", "How."]), "body[0]", "{name}", "{0}")
+        self.refuse(with_step(body=["What.", "Ask {x}:"]), "body[1]", "{name}", "{x}")
+        self.refuse(with_step(body=["What {}.", "How."]), "body[0]", "{name}")
+        self.refuse(with_step(body=["{name!r}", "How."]), "body[0]", "{name}")
+        self.refuse(with_step(body=["Unbalanced {", "How."]), "body[0]", "literal brace")
+        data = with_step(body=["Braces {{like these}} stay literal for {name}.", "Ask {name}:"])
+        page = tp.render_page("Blue", "codex", features=tp.parse_list(data))
+        self.assertIn("Braces {like these} stay literal for Blue.", page)
+        self.assertNotIn("{name}", page)
 
     def test_body_parts_may_be_text_objects_and_the_revision_orders_by_date_then_number(self):
         data = with_step(body=[{"text": "What."}, {"text": "How."}])
@@ -339,6 +370,16 @@ class SizeTest(unittest.TestCase):
                 self.assertLessEqual(len(page.encode("utf-8")), PAGE_CAP, (core, audience))
 
 
+    def test_render_refuses_a_page_over_the_cap_however_the_list_reaches_it(self):
+        self.assertEqual(tp.PAGE_MAX_BYTES, PAGE_CAP)
+        heavy = tp.parse_list(many_steps(tp.STEPS_MAX, shots=3))  # within the step bound, over the cap
+        with self.assertRaisesRegex(ValueError, f"over the {PAGE_CAP}-byte cap") as caught:
+            tp.render_page("Blue", "codex", features=heavy)
+        self.assertIn("room media", str(caught.exception))
+        light = tp.parse_list(many_steps(tp.STEPS_MAX))
+        self.assertLess(len(tp.render_page("Blue", "codex", features=light).encode("utf-8")), PAGE_CAP)
+
+
 class _Cli(unittest.TestCase):
     """main() in-process against a stub room_commons.py, like the base MainTest."""
 
@@ -378,6 +419,12 @@ class _Cli(unittest.TestCase):
     def page_text(self, kind="html-p1"):
         return json.loads((self.tmp / "room.json").read_text())["pages"][kind]
 
+    def record(self, **fields):
+        marker = gs.marker_path(self.tmp / "ws")
+        rooms = gs.load_marker(marker)
+        rooms[self.ROOM] = {**rooms[self.ROOM], **fields}
+        gs.save_marker(marker, rooms)
+
     def publish(self, *extra):
         return self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                          "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
@@ -402,6 +449,32 @@ class ListOverrideTest(_Cli):
         code, out, err = self.main("render", "--name", "Blue", "--list", str(self.tmp / "missing.json"))
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
         self.assertIn("cannot read", err)
+
+    def test_a_list_with_markup_or_a_stray_placeholder_falls_back_to_the_file_and_says_so(self):
+        for field, bad, said in (("title", "Your DM <script>x</script>", "title"),
+                                 ("body", ["<a href='https://x.test'>x</a>", "How."], "body[0]"),
+                                 ("body", ["Costs {0} dollars", "How."], "{0}"),
+                                 ("body", ["What.", "Ask {x}:"], "{x}")):
+            broken = self.tmp / "broken.json"
+            broken.write_text(json.dumps(with_step(**{field: bad})))
+            code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", str(broken))
+            self.assertEqual(code, 0, (bad, err))
+            self.assertEqual(out, tp.render_page("Blue", "codex"))
+            self.assertNotIn("x.test", out)
+            for w in ("--list", said, "skill's own list"):
+                self.assertIn(w, err, bad)
+
+    def test_a_page_over_the_cap_is_refused_by_render_and_publish(self):
+        heavy = self.tmp / "heavy.json"
+        heavy.write_text(json.dumps(many_steps(tp.STEPS_MAX, shots=3)))
+        code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", str(heavy))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn(f"over the {PAGE_CAP}-byte cap", err)
+        code, out, _ = self.publish("--list", str(heavy))
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+        self.assertIn(f"over the {PAGE_CAP}-byte cap", json.loads(out)["reason"])
+        state = self.tmp / "room.json"
+        self.assertFalse(state.exists() and json.loads(state.read_text()).get("pages"))  # nothing was written
 
     def test_no_network_call_without_a_list_url(self):
         with mock.patch.object(gs.urllib.request, "urlopen", side_effect=AssertionError("network")) as net:
@@ -521,6 +594,7 @@ class IfNewerTest(_Cli):
         db["pages"]["html-p1"] = db["pages"]["html-p1"].replace(
             tp.owner_marker(self.ME, tp.FEATURES.revision), tp.owner_marker(self.ME))
         (self.tmp / "room.json").write_text(json.dumps(db))
+        self.record(hash=gs.content_hash(db["pages"]["html-p1"]))  # the old script wrote that page
         self.assertEqual(tp.read_marker(self.page_text()), (self.ME, None))
         code, out, _ = self.publish("--if-newer")
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
@@ -544,6 +618,47 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         self.assertNotIn("Draft my weekly update.", self.page_text())
         self.assertNotIn("prompts", gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM])
+
+    def test_the_refresh_keeps_the_roles_line_without_being_told_again(self):
+        self.publish("--roles", "I picked: Founder, Sales.")
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["roles"], "Founder, Sales")
+        newer = self.write_list("tutorial.2026-11-01.1")
+        code, out, _ = self.publish("--if-newer", "--list", str(newer))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertIn('<p class="roles">Picked for: Founder, Sales</p>', self.page_text())
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-02.1")),
+                                    "--roles", "Engineer")  # roles given again win
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertIn("Picked for: Engineer</p>", self.page_text())
+        code, out, _ = self.publish("--list", str(newer))  # a plain publish resets, like the prompts
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertNotIn('class="roles"', self.page_text())
+        self.assertNotIn("roles", gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM])
+
+    def test_a_page_someone_edited_is_kept_until_it_hashes_to_the_entry_again(self):
+        self.publish()
+        written = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"]
+        db = json.loads((self.tmp / "room.json").read_text())
+        mine, theirs = db["pages"]["html-p1"], db["pages"]["html-p1"].replace("</main>", "<p>Our notes.</p></main>")
+        db["pages"]["html-p1"] = theirs
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        for extra in (("--if-newer", "--list", str(newer)), ("--name", "Kai")):
+            code, out, err = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                       "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
+            got = json.loads(out)
+            self.assertEqual((code, got["action"], got.get("edited")), (0, "kept", True), extra)
+            self.assertEqual(self.page_text(), theirs)
+            self.assertIn("html-p1", err)
+            self.assertIn("edited", err)
+            entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+            self.assertEqual((entry["hash"], entry["revision"]), (written, tp.FEATURES.revision))
+        db["pages"]["html-p1"] = mine  # put back as written: the next newer list rebuilds it
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        code, out, err = self.publish("--if-newer", "--list", str(newer))
+        self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
 
     def test_a_pending_page_is_finished_whatever_the_revision(self):
         self.door.fail = "after"
