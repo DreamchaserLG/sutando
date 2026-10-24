@@ -545,6 +545,19 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
                 orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
                 ["packages/x/test_dead.py"], redirect)
 
+    def test_an_empty_or_expandable_here_string_does_not_false_green_a_dead_test(self):
+        """qingyun-wu's core, round 3: `set <<<"" -o pipefail` was read as an
+        aborted command (empty file target), losing pipefail and crediting
+        the dead test; a here-string's word is data and never fails to open."""
+        for redirect in ('<<<""', '<<<"$E"', '<<< ""'):
+            wf = ("steps:\n  - run: |\n"
+                  f"      set {redirect} -o pipefail\n"
+                  "      false | true && python3 packages/x/test_dead.py\n")
+            self.assertEqual(_named_in(wf), set(), redirect)
+            self.assertEqual(
+                orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+                ["packages/x/test_dead.py"], redirect)
+
     def test_a_leading_o_cluster_form_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 12: `set -oe pipefail` (o first, not last)."""
         wf = ("steps:\n  - run: |\n"

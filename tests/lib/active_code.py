@@ -1258,7 +1258,9 @@ def _shell_words(text: str):
             else:
                 val, qmask = [], []  # bare fd-prefix digits (or nothing) -- part of the redirect
             i += len(op)
-            is_heredoc = op in ("<<", "<<-")  # `<<<` is a here-string: its word is the target
+            # A heredoc delimiter or here-string word is DATA, never a file to
+            # open: empty or expandable is fine, missing is a syntax error.
+            is_heredoc = op in ("<<", "<<-", "<<<")
             while i < n and text[i] in " \t":
                 i += 1
             target, target_expandable, target_start = [], False, i

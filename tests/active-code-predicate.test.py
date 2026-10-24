@@ -1342,6 +1342,24 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 program_python_args(f"set -o pipefail\nset {redirect} +o pipefail{tail}"),
                 ["packages/x/live.py"], redirect)
 
+    def test_a_here_string_word_is_data_never_a_file_that_can_fail_to_open(self):
+        """qingyun-wu's core, round 3 at 6822d2ad5: `<<<` went down the
+        file-target path, so an empty word aborted the command (None) and
+        an expandable one made it "unknown" -- but a here-string opens no
+        file. Bash enables pipefail in all three (confirmed by direct
+        execution); `set <<<` with no word at all stays a syntax error."""
+        tail = "\nfalse | true && python3 packages/x/dead.py"
+        for redirect in ('<<<""', '<<<"$E"', '<<< ""', "<<<''", '<<< "$E"'):
+            self.assertEqual(
+                program_python_args(f"set {redirect} -o pipefail{tail}"), [], redirect)
+        self.assertEqual(
+            program_python_args('set -o pipefail\nset <<<"" +o pipefail\n'
+                                "false | true && python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+        self.assertEqual(program_python_args("set <<<" + tail), [])
+        self.assertEqual(
+            program_python_args('set <"" -o pipefail' + tail), ["packages/x/dead.py"])
+
     def test_a_here_string_word_is_the_target_not_an_option(self):
         """`set <<< -o pipefail`: `-o` is the here-string's word, so
         `pipefail` is a positional and pipefail stays OFF (Bash: live.py runs)."""
