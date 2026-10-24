@@ -71,6 +71,12 @@ STUB = textwrap.dedent('''
         pass
     else:
         sys.exit(9)
+    edit = os.environ.get("STUB_EDIT_AFTER", "")  # "<cmd>:<n>:<append|inplace>": the owner edits right after that call
+    if edit and kind and cmd == edit.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(edit.split(":")[1]):
+        cur = db["pages"][kind]
+        db["pages"][kind] = (cur + "<p>OWNER NOTES</p>" if edit.endswith("append")
+                             else "<!--OWNER-->" + cur[12:] if cur else "<p>OWNER</p>")
+        db.setdefault("edits", []).append(db["pages"][kind])
     save()
 ''')
 

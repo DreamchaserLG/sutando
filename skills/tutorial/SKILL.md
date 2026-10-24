@@ -130,7 +130,10 @@ each room's entry.
   there (`"action": "resumed"`, reporting the journalled name and revision; its own inputs,
   `--summon` included, wait for the next run); a page still as before means the rewrite never ran
   and the run proceeds as usual; any other page is someone's edit, kept with the entry from before
-  the rewrite, whole. It summons no one. Run it after an engine
+  the rewrite, whole. Each call of a rewrite first reads the page and runs only when it is exactly
+  what the previous call left (an edit made between two calls stops the rewrite before its next
+  write), and the page is read back against the target before success is recorded. It summons no
+  one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash

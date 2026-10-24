@@ -36,7 +36,10 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   revision; its own request, `--summon` and new prompts or media included, waits for the next
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
-  next run keeps it too.
+  next run keeps it too. Every call of a rewrite first reads the page and runs only on exactly the
+  page the previous call left, so an edit made between two calls stops the rewrite before its next
+  write; the page is read back against the target before success is recorded, and a run that
+  resumes continues from the call the journal recorded, never from the page's length.
 - **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the AG2 Space
   channel env file), resolved and checked once (`@localpart:server`, whitespace trimmed) before any
   Room Commons call, and refuses to run without one: the page's ownership tag is how a later run

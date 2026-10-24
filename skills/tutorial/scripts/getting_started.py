@@ -35,7 +35,9 @@ page, the page before it, the page after each call, and the entry before it. The
 it from that journal before rendering anything: a page the rewrite left behind is finished to the
 target byte for byte (action "resumed", reporting the journalled name and revision; the run's own
 inputs, --summon included, wait for the next run), a page still as before means the rewrite never
-ran, and any other page is someone's edit, kept with the entry from before the rewrite. `publish`
+ran, and any other page is someone's edit, kept with the entry from before the rewrite. Every call
+of a rewrite first reads the page and runs only on the page the previous call leaves; the page is
+read back against the target before success is recorded. `publish`
 refuses to run without a well-formed agent identity (--agent-mxid, $AGENT_MXID or the channel env
 file), since a page without the ownership tag cannot be found again.
 
@@ -571,40 +573,85 @@ def _entry(kind: str, page: str, features: FeatureList, prompts: Dict[str, str],
     return entry
 
 
-# What an `updating` entry carries beyond the complete entry it becomes: the target page, the hash
-# of the page before the rewrite, the hash after each call, the entry before it, and who asked.
-JOURNAL_KEYS = ("target", "source", "steps", "previous", "name", "core", "audience", "agent")
+# What an `updating` journal carries beyond the complete entry it becomes; `done` is the number of
+# calls that ran, `landed` what the page read back as when that was not the target.
+JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "landed", "previous", "name", "core", "audience",
+                "agent")
 
 
 def _journal(entry: dict, current: str, page: str, previous: dict, name: str, core: str, audience: str,
              agent: Optional[str]) -> dict:
-    return {**entry, "state": "updating", "target": page, "source": content_hash(current),
-            "steps": [content_hash(text) for _, _, text in rewrite_steps(current, page)],
+    return {**entry, "state": "updating", "target": page, "before": current, "source": content_hash(current),
+            "steps": [content_hash(text) for _, _, text in rewrite_steps(current, page)], "done": 0,
             "previous": {k: v for k, v in previous.items() if k != "updated_at"},
             "name": name, "core": core, "audience": audience, "agent": agent}
 
 
-def _settle(commons: Commons, kind: str, entry: dict) -> str:
-    """What the page of an `updating` entry holds now, from the journal alone: `finished` once it
-    is the recorded target (written here when the page was in a state the rewrite itself leaves),
-    `untouched` when it is still the page before the rewrite, `edited` when it is none of those,
-    which only someone else can have written."""
-    target = entry.get("target")
-    if not isinstance(target, str) or content_hash(target) != entry.get("hash"):
-        raise PublishError(f"{kind} is recorded as updating but its target is missing or does not hash to "
-                           "the entry; it stays recorded as updating")
-    current = commons.read(kind)
-    if current == target:
-        return "finished"
-    now = content_hash(current)
-    if now == entry.get("source"):
-        return "untouched"
-    if now not in (entry.get("steps") or []):
+def _complete(journal: dict) -> dict:
+    return {**{k: v for k, v in journal.items() if k not in JOURNAL_KEYS + ("updated_at",)}, "state": "complete"}
+
+
+def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict) -> None:
+    """The page is someone else's now: the entry from before the rewrite stands, whole, with a note
+    of how far the rewrite got; nothing of the target is recorded as written."""
+    previous = journal.get("previous") or {"kind": journal["kind"], "state": "complete", "hash": journal.get("source")}
+    _record(marker, rooms, room, {**previous, "interrupted": {"done": journal.get("done", 0),
+                                                              "target": journal.get("hash")}})
+
+
+def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str, fresh: bool) -> str:
+    """Run the journalled rewrite from the step it records, each call only on the page the previous
+    call leaves (or the one this call leaves, when it applied without an answer), recording each
+    step as it lands. `finished` once the page reads back as the target; `edited` when the page is
+    in no state of the rewrite, which stops it before any write. A page that reads back as something
+    other than the target fails the run by name the first time, and is someone's the next."""
+    journal = rooms[room]
+    kind, steps = journal["kind"], rewrite_steps(journal["before"], journal["target"])
+    expected = [journal["source"], *journal["steps"]]  # expected[i]: the page's hash before step i
+    i = journal.get("done", 0)
+    while i < len(steps):
+        now = content_hash(commons.read(kind))
+        if now == expected[i + 1]:
+            i += 1  # the call applied and the run died before recording it
+        elif now != expected[i]:
+            _stand_aside(marker, rooms, room, journal)
+            return "edited"
+        else:
+            cmd, args, _ = steps[i]
+            commons.run(cmd, commons.room, *args, kind=kind)
+            i += 1
+        journal = {**journal, "done": i}
+        _record(marker, rooms, room, journal)
+    after = commons.read(kind)
+    if after != journal["target"]:
+        landed = content_hash(after)
+        if fresh or landed != journal.get("landed"):
+            _record(marker, rooms, room, {**journal, "landed": landed})
+            raise PublishError(f"{kind} does not read back as its target after the rewrite (sha256 {landed}); "
+                               "it stays recorded as updating")
+        _stand_aside(marker, rooms, room, journal)  # the same foreign text twice: it is someone's page
         return "edited"
-    commons.rewrite(kind, current, target)
-    if commons.read(kind) != target:
-        raise PublishError(f"{kind} did not land as its recorded target; it stays recorded as updating")
+    _record(marker, rooms, room, _complete(journal))
     return "finished"
+
+
+def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -> str:
+    """What the page of an `updating` journal holds now, from the journal alone: `finished` once it
+    is the target (written here, step by step, when the page is where the rewrite left it),
+    `untouched` when the rewrite never ran, `edited` when the page is in no state of the rewrite."""
+    journal = rooms[room]
+    kind, target, before = journal["kind"], journal.get("target"), journal.get("before")
+    if not isinstance(target, str) or content_hash(target) != journal.get("hash") \
+            or not isinstance(before, str) or content_hash(before) != journal.get("source"):
+        raise PublishError(f"{kind} is recorded as updating but its journal does not hash to itself; "
+                           "it stays recorded as updating")
+    now = content_hash(commons.read(kind))
+    if now == journal["hash"]:
+        _record(marker, rooms, room, _complete(journal))
+        return "finished"
+    if now == journal["source"] and not journal.get("done"):
+        return "untouched"
+    return _advance(commons, marker, rooms, room, fresh=False)
 
 
 def _fill(commons: Commons, kind: str, page: str) -> None:
@@ -631,16 +678,18 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             # A rewrite cut short is settled from its journal before this run's inputs are even
             # rendered; finishing it is this run's whole work, its own request waits for the next.
             pages = commons.listed_pages()
-            if journal["kind"] in [p.get("kind") for p in pages] and \
-                    _settle(commons, journal["kind"], journal) == "finished":
-                _record(marker, rooms, commons.room,
-                        {**{k: v for k, v in journal.items() if k not in JOURNAL_KEYS + ("updated_at",)},
-                         "state": "complete"})
+            settled = _settle(commons, marker, rooms, commons.room) \
+                if journal["kind"] in [p.get("kind") for p in pages] else "gone"
+            if settled == "finished":
                 return {"ok": True, "action": "resumed", "resumed": True, "kind": journal["kind"], "summoned": False,
                         "revision": journal.get("revision"), "media": sorted(journal.get("media") or {}),
                         **{k: journal.get(k) for k in ("name", "core", "audience", "agent")}}
-            # Untouched (the rewrite never ran), edited (someone wrote meanwhile) or the page is gone:
-            # the entry from before the rewrite stands and this run proceeds like any other.
+            if settled == "edited":  # someone's page now; the entry from before the rewrite stands
+                kept = rooms[commons.room]
+                return {"ok": True, "action": "kept", "edited": True, "kind": journal["kind"], "summoned": False,
+                        "revision": kept.get("revision"), "media": sorted(kept.get("media") or {})}
+            # Untouched (the rewrite never ran) or the page is gone: the entry from before the
+            # rewrite stands and this run proceeds like any other.
             _record(marker, rooms, commons.room, journal.get("previous")
                     or {"kind": journal["kind"], "state": "complete", "hash": journal.get("source")})
         if if_newer and not clean_prompts(prompts, slots):
@@ -692,14 +741,17 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
                 action = "unchanged"
             else:
-                if not step["pending"]:
-                    # The rewrite clears, then appends: the journal lets a run cut short tell its own
-                    # states from the page before it and from an edit, and finish or stand aside.
+                if step["pending"]:
+                    commons.rewrite(kind, current, page)
+                    action = "updated"
+                else:
+                    # The rewrite clears, then appends: the journal lets each call check the page it
+                    # expects, and a run cut short finish or stand aside, from the step it recorded.
                     _record(marker, rooms, commons.room,
                             _journal(_entry(kind, page, features, prompts, roles, media), current, page,
                                      rooms.get(commons.room, {}), name, core, audience, agent))
-                commons.rewrite(kind, current, page)
-                action = "updated"
+                    action = "updated" if _advance(commons, marker, rooms, commons.room, fresh=True) == "finished" \
+                        else "kept"
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
         # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
         if action in ("created", "updated") or step["pending"] or step["action"] == "adopt" \

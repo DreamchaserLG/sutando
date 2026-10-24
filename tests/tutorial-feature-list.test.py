@@ -853,6 +853,7 @@ class IfNewerTest(_Cli):
                          ("updating", journal["hash"], gs.content_hash(mine)))
         self.assertEqual((journal["name"], journal["core"], journal["agent"], journal["previous"]["hash"]),
                          ("Blue", "codex", self.ME, gs.content_hash(mine)))
+        self.assertEqual((journal["done"], journal["before"]), (len(self.BOUNDARIES[at]) - 1, mine))
         return mine, journal["target"], self.page_text()
 
     def entry(self):
@@ -926,9 +927,110 @@ class IfNewerTest(_Cli):
                     self.assertIn("edited", err)
                     self.assertEqual(self.page_text(), theirs)
                     entry = {k: v for k, v in self.entry().items() if k != "updated_at"}
+                    self.assertEqual(entry.pop("interrupted")["target"], gs.content_hash(target))
                     self.assertEqual(entry, previous)  # the entry from before the rewrite, whole
                     self.assertEqual(entry["hash"], gs.content_hash(mine))
                     self.assertEqual(self.writes_since(n), [])
+
+    def edited_run(self, hook, newer, prompts):
+        """A created page, then an --if-newer rewrite during which the stub's owner edits the page
+        right after call `hook`. Returns (the page before, the target, the owner's text, the stub
+        calls, the run's exit code and output)."""
+        (self.tmp / "room.json").unlink(missing_ok=True)
+        shutil.rmtree(self.tmp / "ws", ignore_errors=True)
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        db = json.loads((self.tmp / "room.json").read_text())
+        mine, db["calls"] = db["pages"]["html-p1"], []
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
+                                tp.load_list(newer))
+        os.environ["STUB_EDIT_AFTER"] = hook
+        code, out, err = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        os.environ.pop("STUB_EDIT_AFTER")
+        db = json.loads((self.tmp / "room.json").read_text())
+        return mine, target, db["edits"][-1], db["calls"], code, out, err
+
+    def test_an_edit_between_any_two_calls_stops_the_rewrite_before_its_next_write(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        # After the first read: between the journal and the first write. Then after each write but the last.
+        for hook in ("read:1", "replace:1", "replace:2", "append:1"):
+            for mode in ("append", "inplace"):
+                with self.subTest(hook=hook, mode=mode):
+                    mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts)
+                    got = json.loads(out)
+                    self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+                    self.assertIn("edited", err)
+                    self.assertEqual(self.page_text(), theirs)  # exactly as the owner left it
+                    writes = [c[0] for c in calls if c[0] in ("replace", "append")]
+                    self.assertEqual(writes, self.BOUNDARIES.get(hook, []))  # nothing written after the edit
+                    if hook == "read:1":
+                        self.assertTrue(theirs.startswith(mine) if mode == "append" else theirs.endswith(mine[12:]))
+                    entry = self.entry()
+                    self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
+                                     ("complete", gs.content_hash(mine), len(writes)))
+                    self.assertNotEqual(entry["hash"], gs.content_hash(target))
+                    self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
+                    code, out, _ = self.publish("--if-newer", "--list", str(newer))  # still someone's page
+                    self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
+                    self.assertEqual(self.page_text(), theirs)
+
+    def test_an_edit_after_the_last_call_fails_the_run_by_hash_and_the_next_run_keeps_the_page(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        for mode in ("append", "inplace"):
+            with self.subTest(mode=mode):
+                mine, target, theirs, calls, code, out, _ = self.edited_run(f"append:2:{mode}", newer, prompts)
+                got = json.loads(out)
+                self.assertEqual((code, got["ok"]), (4, False))
+                self.assertIn("does not read back as its target", got["reason"])
+                self.assertIn(gs.content_hash(theirs), got["reason"])
+                self.assertEqual(self.page_text(), theirs)
+                journal = self.entry()
+                self.assertEqual((journal["state"], journal["done"], journal["landed"]),
+                                 ("updating", 4, gs.content_hash(theirs)))
+                n = self.calls()
+                code, out, err = self.publish("--if-newer", "--list", str(newer))
+                got = json.loads(out)
+                self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+                self.assertEqual(self.page_text(), theirs)
+                self.assertEqual(self.writes_since(n), [])
+                entry = self.entry()
+                self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
+                                 ("complete", gs.content_hash(mine), 4))
+                self.assertNotEqual(entry["hash"], gs.content_hash(target))
+
+    def test_a_second_failure_mid_resume_on_a_three_piece_page_still_ends_at_the_target(self):
+        data = good_list(revision="tutorial.2026-11-01.1")
+        biggest = max(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
+        data["steps"].append({"id": "extra", "title": "Extra", "surface": "dm", "since_release": "2026-11-01",
+                              "body": ["One more step for {name}.", "Ask {name}:"],
+                              "screenshot": [{"asset": "extra-shot", "fallback_file": f"assets/{biggest}", "alt": "a"}]})
+        three = self.tmp / "three.json"
+        three.write_text(json.dumps(data))
+        target = tp.render_page("Blue", "codex", "dm", self.ME, None, None, tp.load_list(three))
+        self.assertEqual(len(gs.chunks(target)), 3)  # three clears of the old page, three appends
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        for at, done_after, left_pieces in (("replace:2", 1, 1), ("append:1", 2, 0)):
+            db = json.loads((self.tmp / "room.json").read_text())
+            db["calls"] = []
+            (self.tmp / "room.json").write_text(json.dumps(db))
+            os.environ["STUB_FAIL_AT"] = at
+            code, out, _ = self.publish("--if-newer", "--list", str(three))
+            os.environ.pop("STUB_FAIL_AT")
+            self.assertEqual((code, json.loads(out)["ok"]), (4, False), at)
+            journal = self.entry()
+            self.assertEqual((journal["state"], journal["done"]), ("updating", done_after), at)
+            self.assertEqual(len(gs.chunks(self.page_text())), left_pieces, at)
+        code, out, _ = self.publish("--if-newer", "--list", str(three))
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["resumed"]), (0, "resumed", True))
+        self.assertEqual(self.page_text(), target)
+        self.assertEqual((self.entry()["state"], self.entry()["hash"]), ("complete", gs.content_hash(target)))
 
     def cut_short(self, newer, prompts):
         """A created page, then an --if-newer rewrite to `newer` with prompts and roles that fails
@@ -1091,8 +1193,8 @@ class DocTest(unittest.TestCase):
         self.assertIn("`updating`", text)
         self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "mxc://", "1 MiB", "--agent-mxid",
-                     "Last verified:"):
+        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "mxc://", "1 MiB",
+                     "--agent-mxid", "Last verified:"):
             self.assertIn(word, canon)
 
 
