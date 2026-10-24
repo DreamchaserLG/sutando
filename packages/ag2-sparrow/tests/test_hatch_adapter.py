@@ -4,7 +4,6 @@ The hook script runs against a stub hook runtime (log/silent/wake/state) and the
 real task-field helper; `flock` and `timeout` are stubbed. Run:
     python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -4089,6 +4088,7 @@ class Hold(Base):
             gb._post_proactive()
 
     def lock_is_free(self):
+        import fcntl  # POSIX only, like the lock under test
         lock = self.results / delivery_destination.SEND_LOCK_DIR / "lock"
         fd = os.open(lock, os.O_RDWR)
         try:
