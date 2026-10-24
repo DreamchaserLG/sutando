@@ -133,9 +133,11 @@ each room's entry.
   the rewrite, whole. A rewrite that fits one room-commons call (both texts within this host's
   argument budget: ARG_MAX less the environment, and 131,072 bytes per argument on Linux) is one
   `replace` whose needle is the whole page, so a page that changed since it was read is refused as
-  a whole and nothing in between is written; above the budget each call's needle is a whole piece,
-  every call is read back, and an edit between a read and its write is caught by that read-back
-  with at most one piece already cleared (noted in the result, never recorded as written). The
+  a whole and nothing in between is written. When the old page fits a call but not beside the new
+  one, the first call replaces the whole page by the new page's first piece and the rest is
+  appended, each call read back. A page no call can hold (the default page on Linux) is never
+  rewritten in pieces: the run exits 4 and leaves it as is, since a page cut away piece by piece
+  cannot be put back where an edit made meanwhile left it. The
   page's tag carries a digest of the page, so a page found after the marker is lost is adopted as
   this script's only when the digest matches; otherwise it is kept as found and never rewritten
   until a render equals it. A page from before tags carried a digest (our tag with a
@@ -144,9 +146,8 @@ each room's entry.
   tutorial page and shaped exactly as one is written (our head, one tag, our tail); any other such
   page is kept as found. The shape rule cannot tell an edit inside the body of such a page from an
   older render, so a pre-digest page the owner edited inside is upgraded with the rest. A write that landed on a page someone edited meanwhile is taken back the
-  way it was made (a whole page replaced back, an appended piece removed, a cleared piece put back
-  at the front in pieces that fit a call); when a piece cannot fit, nothing more is written and the
-  result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
+  way it was made, in place (the replaced page replaced back, an appended piece removed); when that
+  call cannot fit, nothing more is written and the result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
   before it reads its own name, list, prompts or media. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
@@ -272,8 +273,9 @@ page's, while every fallback file stays under the caps above.
 **Size.** With its screenshots the page is about 215 KB (capped at 300 KB), over the 196,608
 bytes Room Commons takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
 of at most 120,000 bytes (`CHUNK_BYTES`). Each piece is passed to `room_commons.py` as one argument,
-and Linux caps a single argument at 131,072 bytes. A refresh is one `replace` when both the old and
-new text fit one piece; otherwise it clears the old text in pieces and appends the new.
+and Linux caps a single argument at 131,072 bytes. A refresh is one `replace` when the old and new
+text fit one call; else one `replace` of the whole old page by the new page's first piece, then
+appends; a page no call can hold is left as is (exit 4).
 
 **The prompts.** Each card's Copy button puts its prompt on the clipboard; where the page's sandbox
 refuses the clipboard, the prompt is selected instead and the button says to press ⌘C. The page

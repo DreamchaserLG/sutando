@@ -60,7 +60,8 @@ DM. `owner` and `roles` apply only in that file's own room; a missing, unreadabl
 or a field of the wrong shape, is ignored. `--name` defaults to auto.
 
 Exit codes: 0 done, 2 bad arguments, 3 the room-commons skill is not installed, 4 a room-commons
-call failed or ownership was unclear (the marker keeps what is known, so the next run resumes).
+call failed, ownership was unclear, or the page is too large for one call on this host (the marker
+keeps what is known, so the next run resumes).
 """
 from __future__ import annotations
 
@@ -527,7 +528,10 @@ class Commons:
             self.run("append", self.room, part, kind=kind)
 
     def rewrite(self, kind: str, old: str, new: str) -> None:
-        """Replace the page's text with the calls `rewrite_steps` lists, in that order."""
+        """Replace the page's text with the calls `rewrite_steps` lists, in that order; refused,
+        with nothing written, when `rewritable` says no call can hold the whole page."""
+        if not rewritable(old, new, self.env):
+            raise PublishError(too_large(kind, old, self.env))
         for cmd, args, _ in rewrite_steps(old, new, env=self.env):
             self.run(cmd, self.room, *args, kind=kind)
 
@@ -561,21 +565,34 @@ def piece_limit(env: Optional[Mapping[str, str]] = None) -> int:
     return max(1, min(CHUNK_BYTES, call_budget(env)[0]))
 
 
+def rewritable(old: str, new: str, env: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether one call can take the whole of `old` as its needle, beside `new` or its first piece.
+    A page cut away in pieces cannot be put back where an edit made meanwhile left it, so a page
+    no call can hold is not rewritten at all."""
+    return not old or one_call(old, new, env) or fits_call(old, (chunks(new, piece_limit(env)) or [""])[0], env)
+
+
+def too_large(kind: str, page: str, env: Optional[Mapping[str, str]] = None) -> str:
+    return (f"{kind} is {len(page.encode('utf-8'))} bytes, more than one room-commons call can carry on this "
+            f"host ({call_budget(env)[0]} bytes an argument); it is left as is, not rewritten in pieces")
+
+
 def rewrite_steps(old: str, new: str, whole: Optional[bool] = None,
                   env: Optional[Mapping[str, str]] = None, piece: int = 0) -> List[tuple]:
     """The room-commons calls that take a page from `old` to `new`, each with the text the page
     holds once it has run: one `replace` of the whole page when it fits a call (`one_call`), else
-    `old` cleared piece by piece (each needle a whole piece), then `new` appended in pieces.
+    one `replace` of the whole page by the first piece of `new` and the rest appended in pieces,
+    so every needle that removes text is the whole page (callers check `rewritable` first).
     `Commons.rewrite` runs exactly this list, so a journal knows every state a run can leave."""
     whole = one_call(old, new, env) if whole is None else whole
     if whole and old:
         return [("replace", (old, new), new)]
-    piece = piece or piece_limit(env)
-    steps, text = [], old
-    for part in chunks(old, piece):
-        text = text.replace(part, "", 1)
-        steps.append(("replace", (part, ""), text))
-    for part in chunks(new, piece):
+    parts = chunks(new, piece or piece_limit(env))
+    steps, text = [], ""
+    if old:
+        text = parts.pop(0) if parts else ""
+        steps.append(("replace", (old, text), text))
+    for part in parts:
         text += part
         steps.append(("append", (part,), text))
     return steps
@@ -618,7 +635,6 @@ def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[
 # complete entry it becomes; `done` is the number of calls that ran, `mode` fill or rewrite.
 JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "previous", "mode", "whole", "piece", "name", "core",
                 "audience", "agent")
-HEAD_CHARS = 64  # the page's opening characters: the needle when text is put back at its front
 
 
 def _steps(journal: dict) -> List[tuple]:
@@ -668,37 +684,19 @@ def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict,
                                       **note})
 
 
-def _undo(commons: Commons, kind: str, step: tuple, found: str) -> str:
-    """Take back one call whose page read back wrong, so the page is again what the other writer
-    had, their edit included: a whole-page replace is replaced back; an appended piece is removed;
-    a cleared piece is put back at the front, in pieces each fitting a call, before the page's
-    first characters. `undone`, `unfit` (no write: a piece cannot fit this host's call budget) or
-    `failed` (a needle was gone by the time it was tried)."""
-    cmd, args, left = step
-    if cmd == "append" or args[1]:  # an appended piece, or the whole new page
-        needle, back = (args[0], "") if cmd == "append" else (args[1], args[0])
-        if not fits_call(needle, back, commons.env):
-            return "unfit"
-        try:
-            commons.run("replace", commons.room, needle, back, kind=kind)
-        except PublishError:
-            return "failed"
-        return "undone"
-    per_arg, total = call_budget(commons.env)
-    head = found[:HEAD_CHARS].encode("utf-8")
-    room = min(per_arg, total - 2 * len(head)) - len(head)
-    if room <= 0:
+def _undo(commons: Commons, kind: str, step: tuple) -> str:
+    """Take back one call whose page read back wrong, in place, so the page is again what the other
+    writer had, their edit included: a replace is replaced back, an appended piece is removed.
+    `undone`, `unfit` (no write: no needle to find, or the call does not fit this host's budget) or
+    `failed` (the needle was gone by the time it was tried)."""
+    cmd, args, _ = step
+    needle, back = (args[0], "") if cmd == "append" else (args[1], args[0])
+    if not needle or not fits_call(needle, back, commons.env):
         return "unfit"
-    for piece in reversed(chunks(args[0], room)):
-        current = commons.read(kind)
-        head = current[:HEAD_CHARS]
-        try:
-            if head:
-                commons.run("replace", commons.room, head, piece + head, kind=kind)
-            else:
-                commons.run("append", commons.room, piece, kind=kind)
-        except PublishError:
-            return "failed"
+    try:
+        commons.run("replace", commons.room, needle, back, kind=kind)
+    except PublishError:
+        return "failed"
     return "undone"
 
 
@@ -734,7 +732,7 @@ def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) 
                 if now != expected[i + 1]:
                     # Someone wrote outside the needle meanwhile: this call is taken back when it can
                     # be, and the page is theirs, as it stands, with how far the undo got noted.
-                    undo = _undo(commons, kind, steps[i], steps[i - 1][2] if i else journal["before"])
+                    undo = _undo(commons, kind, steps[i])
                     _stand_aside(marker, rooms, room, journal,
                                  now if undo == "unfit" else content_hash(commons.read(kind)), undo)
                     return "edited"
@@ -758,6 +756,9 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
             or not isinstance(before, str) or content_hash(before) != journal.get("source"):
         raise PublishError(f"{kind} is recorded as {journal.get('state')} but its journal does not hash to itself; "
                            "it stays recorded")
+    if [content_hash(text) for _, _, text in _steps(journal)] != journal.get("steps"):
+        raise PublishError(f"{kind} is recorded as {journal.get('state')} with calls this script no longer makes; "
+                           "it stays recorded and the page is left as is")
     now = content_hash(commons.read(kind))
     if now == journal["hash"]:
         _record(marker, rooms, room, _complete(journal))
@@ -876,6 +877,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 # The same operation id answered an earlier attempt's page: its first piece is known
                 # from that journal and rewritten from there; any other text is not ours to replace.
                 if live == earlier:
+                    if not rewritable(live, page, commons.env):
+                        raise PublishError(too_large(kind, live, commons.env))
                     journal = _journal(entry, live, page, None, name, core, audience, agent, env=commons.env)
                 else:
                     _record(marker, rooms, commons.room, {"kind": kind, "state": "complete", "hash": content_hash(live),
@@ -902,6 +905,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 action = "kept"  # a page this script cannot vouch for, or edited since: theirs stays
             elif if_newer and not upgrade and not newer(features.revision, page_revision):
                 action = "unchanged"
+            elif not rewritable(current, page, commons.env):
+                raise PublishError(too_large(kind, current, commons.env))
             else:
                 # Every call of the rewrite checks the page it expects and is read back; a run cut
                 # short finishes or stands aside from the call the journal recorded.

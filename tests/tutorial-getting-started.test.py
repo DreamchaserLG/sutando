@@ -50,8 +50,9 @@ STUB = textwrap.dedent('''
                                       if sized else rest[:1]))
     def save():
         state.write_text(json.dumps(db))
-    fail_at = os.environ.get("STUB_FAIL_AT", "")  # "<cmd>:<n>": the n-th call of cmd fails
-    nth = fail_at and cmd == fail_at.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(fail_at.split(":")[1])
+    fail_at = os.environ.get("STUB_FAIL_AT", "")  # "<cmd>:<n>": the n-th call of cmd fails; "write" counts both writes
+    of = ("replace", "append") if fail_at.startswith("write:") else (fail_at.split(":")[0],)
+    nth = fail_at and cmd in of and sum(c[0] in of for c in db["calls"]) == int(fail_at.split(":")[1])
     if cmd in os.environ.get("STUB_FAIL", "").split(",") or nth:
         save(); print("boom", file=sys.stderr); sys.exit(1)
     if cmd == "pages":
@@ -71,10 +72,11 @@ STUB = textwrap.dedent('''
         pass
     else:
         sys.exit(9)
-    edit = os.environ.get("STUB_EDIT_AFTER", "")  # "<cmd>:<n>:<append|inplace>": the owner edits right after that call
+    edit = os.environ.get("STUB_EDIT_AFTER", "")  # "<cmd>:<n>:<append|prepend|inplace>": the owner edits right after that call
     if edit and kind and cmd == edit.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(edit.split(":")[1]):
         cur = db["pages"][kind]
         db["pages"][kind] = (cur + "<p>OWNER NOTES</p>" if edit.endswith("append")
+                             else "<p>OWNER FIRST</p>" + cur if edit.endswith("prepend")
                              else "<!--OWNER-->" + cur[12:] if cur else "<p>OWNER</p>")
         db.setdefault("edits", []).append(db["pages"][kind])
     save()
@@ -1220,7 +1222,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(out["action"], "updated")
         self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
 
-    def test_a_large_change_clears_in_pieces_then_appends_in_pieces(self):
+    def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
         old, new = self.page(), self.page(core="claude")
@@ -1229,10 +1231,20 @@ class PublishTest(unittest.TestCase):
             out = self.publish(core="claude")
         self.assertEqual(out["action"], "updated")
         calls = self.room()["calls"][before:]
-        self.assertEqual([c[0] for c in calls if c[0] == "replace"], ["replace"] * len(gs.chunks(old)))
-        self.assertTrue(all(c[3] == 0 and c[2] <= gs.CHUNK_BYTES for c in calls if c[0] == "replace"))
-        self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)))
+        replaces = [c for c in calls if c[0] == "replace"]
+        self.assertEqual(replaces, [["replace", "html-p1", len(old.encode()), len(gs.chunks(new)[0].encode())]])
+        self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)) - 1)
         self.assertEqual(self.room()["pages"], {"html-p1": new})
+
+    def test_a_page_no_call_can_hold_is_never_rewritten_in_pieces(self):
+        commons = gs.Commons(self.stub, self.ROOM)
+        old, new = self.page(), self.page(core="claude")
+        self.state.write_text(json.dumps({"pages": {"html-p1": old}, "calls": [], "next": 2}))
+        with mock.patch.object(gs, "call_budget", return_value=(131_071, 2_000_000)):  # Linux's per-argument cap
+            self.assertFalse(gs.rewritable(old, new))
+            with self.assertRaisesRegex(gs.PublishError, "left as is, not rewritten in pieces"):
+                commons.rewrite("html-p1", old, new)
+        self.assertEqual((self.room()["pages"]["html-p1"], self.room()["calls"]), (old, []))
 
     def test_a_small_change_is_one_replace(self):
         commons = gs.Commons(self.stub, self.ROOM)
