@@ -618,7 +618,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                     _record(marker, rooms, commons.room, {**entry, "state": "updating"})
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        if action == "updated" or step["pending"] or step["action"] == "adopt":
+        if action in ("created", "updated") or step["pending"] or step["action"] == "adopt":
             # An unchanged or kept run records nothing: inputs that were not applied stay out.
             _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
