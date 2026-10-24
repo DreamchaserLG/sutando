@@ -888,6 +888,26 @@ class MainTest(unittest.TestCase):
         (channels / ".env").write_text("AGENT_MXID=@file.agent:example.test\n")
         self.assertEqual(gs.agent_mxid(), "@file.agent:example.test")
 
+    def test_a_malformed_identity_is_refused_before_any_commons_call(self):
+        def attempt(*extra, env=None):
+            with mock.patch.dict(os.environ, env or {}):
+                return self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                 "--room-commons", str(self.stub), *extra)
+        device = self.tmp / "device.env"
+        device.write_text("AGENT_MXID=kai.agent\n")
+        for case in (("--agent-mxid", "   "), ("--agent-mxid", "kai"), ("--agent-mxid", "!kai:example.test"),
+                     ("--agent-mxid", "@kai example.test"), ("--agent-mxid", "@kai:"),
+                     (("env",), {"AGENT_MXID": "not-an-mxid"}), (("env",), {"AGENT_MXID": " \t "}),
+                     (("env",), {"AG2_DEVICE_ENV": str(device)})):
+            extra, env = (case, None) if case[0] != ("env",) else ((), case[1])
+            code, out, _ = attempt(*extra, env=env)
+            self.assertEqual(code, 4, case)
+            self.assertIn("identity", json.loads(out)["reason"])
+            self.assertFalse((self.tmp / "room.json").exists(), case)
+        code, out, _ = attempt("--agent-mxid", "  @kai.agent:example.test\n")  # whitespace is cleaned, once
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        self.assertEqual(gs.read_marker(self.room_state()["pages"]["html-p1"])[0], "@kai.agent:example.test")
+
 
     # The setup app's saved inputs: <workspace>/state/onboarding/tutorial-inputs.json.
     def save_inputs(self, data):

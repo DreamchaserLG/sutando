@@ -18,7 +18,9 @@ from __future__ import annotations
 import base64
 import html
 import json
+import os
 import re
+import stat
 import string
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -285,10 +287,19 @@ def load_list(path: Optional[Path] = None) -> FeatureList:
     """The feature list in a JSON file; the skill's own `feature-list.json` by default."""
     path = LIST_PATH if path is None else Path(path)
     try:
-        with path.open("rb") as fh:  # one bounded read: a FIFO or a growing file cannot bypass the cap
-            raw = fh.read(LIST_MAX_BYTES + 1)
+        # One descriptor: opened without blocking (a writer-less FIFO would hang a plain open),
+        # checked to be a regular file, then read up to the cap, so no special file gets past it.
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as exc:
         raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ValueError(f"the feature list {path} is not a regular file")
+    with os.fdopen(fd, "rb") as fh:
+        try:
+            raw = fh.read(LIST_MAX_BYTES + 1)
+        except OSError as exc:
+            raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
     if len(raw) > LIST_MAX_BYTES:
         raise ValueError(f"the feature list {path} is over the {LIST_MAX_BYTES}-byte cap")
     try:

@@ -27,15 +27,19 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   when the skill last wrote it. A page edited since is kept, with or without `--if-newer` and
   whatever the revision (`"action": "kept"`, one stderr line), and its entry is not touched, so a
   later revision does not overwrite the edit either.
-- **A rewrite that is cut short is finished.** A rewrite clears the page and appends the new text
-  in pieces, so the entry is recorded as `updating`, with the target page itself, before the first
-  write. The next run finishes that target byte for byte, whatever it was asked for, checks the
-  result against the recorded hash before marking the entry complete, and never reads the
-  half-written page as an owner edit; when that run's own inputs differ from the target it reports
-  `"action": "resumed"` and applies nothing else, so nothing is silently completed as a different
-  page.
+- **A rewrite that is cut short is finished, and an edit made meanwhile is kept.** A rewrite clears
+  the page and appends the new text in pieces, so before the first write the entry becomes an
+  `updating` journal: the target page, the hash of the page before, the hash after each call, and
+  the entry before. The next run settles the journal before rendering anything of its own. A page
+  in a state the rewrite itself leaves is finished to the target byte for byte, checked against the
+  recorded hash, and the run stops there (`"action": "resumed"`, reporting the journalled name and
+  revision; its own request, `--summon` and new prompts or media included, waits for the next
+  run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
+  page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
+  next run keeps it too.
 - **Identity.** `publish` needs the agent's mxid (`--agent-mxid`, `$AGENT_MXID` or the AG2 Space
-  channel env file) and refuses to run without one: the page's ownership tag is how a later run
+  channel env file), resolved and checked once (`@localpart:server`, whitespace trimmed) before any
+  Room Commons call, and refuses to run without one: the page's ownership tag is how a later run
   finds it. A revision-only bump of the list rewrites the page once (its tag records the revision)
   and the next `--if-newer` is a no-op.
 - **Screenshots.** Each screenshot is a Room Commons asset reference: the page points at the

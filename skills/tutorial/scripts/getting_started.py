@@ -30,11 +30,14 @@ since it was last written: that page is kept (action "kept", a line on stderr) a
 With --if-newer it rewrites a complete page only when the list's revision is newer than the page's,
 reusing the prompts and roles the page was last built with, so a pass after an engine update
 refreshes stale pages and leaves current ones alone. A page built before lists had a revision counts
-as older than any list. A rewrite is recorded as `updating`, with the target page itself, before
-its first write; the next run finishes that target byte for byte whatever it was asked for (action
-"resumed" when its own inputs differ, which are then not applied), so a run cut short never leaves
-a blank or a different page behind. `publish` refuses to run without an agent identity (--agent-mxid,
-$AGENT_MXID or the channel env file), since a page without the ownership tag cannot be found again.
+as older than any list. A rewrite is journalled as `updating` before its first write: the target
+page, the page before it, the page after each call, and the entry before it. The next run settles
+it from that journal before rendering anything: a page the rewrite left behind is finished to the
+target byte for byte (action "resumed", reporting the journalled name and revision; the run's own
+inputs, --summon included, wait for the next run), a page still as before means the rewrite never
+ran, and any other page is someone's edit, kept with the entry from before the rewrite. `publish`
+refuses to run without a well-formed agent identity (--agent-mxid, $AGENT_MXID or the channel env
+file), since a page without the ownership tag cannot be found again.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
 credentials come from the environment, else from the AG2 Space channel env file
@@ -522,16 +525,26 @@ class Commons:
             self.run("append", self.room, part, kind=kind)
 
     def rewrite(self, kind: str, old: str, new: str) -> None:
-        """Replace the page's text: one edit when both texts fit one argument, else clear the page
-        piece by piece and append the new text in pieces."""
-        if not old:
-            self.append(kind, new)
-        elif len(old.encode("utf-8")) <= CHUNK_BYTES and len(new.encode("utf-8")) <= CHUNK_BYTES:
-            self.run("replace", self.room, old, new, kind=kind)
-        else:
-            for part in chunks(old):
-                self.run("replace", self.room, part, "", kind=kind)
-            self.append(kind, new)
+        """Replace the page's text with the calls `rewrite_steps` lists, in that order."""
+        for cmd, args, _ in rewrite_steps(old, new):
+            self.run(cmd, self.room, *args, kind=kind)
+
+
+def rewrite_steps(old: str, new: str) -> List[tuple]:
+    """The room-commons calls that take a page from `old` to `new`, each with the text the page
+    holds once it has run: one `replace` when both texts fit one argument, else `old` cleared piece
+    by piece, then `new` appended in pieces. `Commons.rewrite` runs exactly this list, so the
+    journal of a rewrite knows every state a run cut short can leave behind."""
+    if old and len(old.encode("utf-8")) <= CHUNK_BYTES and len(new.encode("utf-8")) <= CHUNK_BYTES:
+        return [("replace", (old, new), new)]
+    steps, text = [], old
+    for part in chunks(old):
+        text = text.replace(part, "", 1)
+        steps.append(("replace", (part, ""), text))
+    for part in chunks(new):
+        text += part
+        steps.append(("append", (part,), text))
+    return steps
 
 
 def _record(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> None:
@@ -558,20 +571,40 @@ def _entry(kind: str, page: str, features: FeatureList, prompts: Dict[str, str],
     return entry
 
 
-def _resume(commons: Commons, kind: str, entry: dict) -> dict:
-    """Finish the rewrite an `updating` entry records: its target page, byte for byte, checked
-    against the entry's hash before and after the write. Returns the complete entry: the recorded
-    one, with the target dropped."""
+# What an `updating` entry carries beyond the complete entry it becomes: the target page, the hash
+# of the page before the rewrite, the hash after each call, the entry before it, and who asked.
+JOURNAL_KEYS = ("target", "source", "steps", "previous", "name", "core", "audience", "agent")
+
+
+def _journal(entry: dict, current: str, page: str, previous: dict, name: str, core: str, audience: str,
+             agent: Optional[str]) -> dict:
+    return {**entry, "state": "updating", "target": page, "source": content_hash(current),
+            "steps": [content_hash(text) for _, _, text in rewrite_steps(current, page)],
+            "previous": {k: v for k, v in previous.items() if k != "updated_at"},
+            "name": name, "core": core, "audience": audience, "agent": agent}
+
+
+def _settle(commons: Commons, kind: str, entry: dict) -> str:
+    """What the page of an `updating` entry holds now, from the journal alone: `finished` once it
+    is the recorded target (written here when the page was in a state the rewrite itself leaves),
+    `untouched` when it is still the page before the rewrite, `edited` when it is none of those,
+    which only someone else can have written."""
     target = entry.get("target")
     if not isinstance(target, str) or content_hash(target) != entry.get("hash"):
         raise PublishError(f"{kind} is recorded as updating but its target is missing or does not hash to "
                            "the entry; it stays recorded as updating")
     current = commons.read(kind)
-    if current != target:
-        commons.rewrite(kind, current, target)
-        if commons.read(kind) != target:
-            raise PublishError(f"{kind} did not land as its recorded target; it stays recorded as updating")
-    return {**{k: v for k, v in entry.items() if k not in ("target", "updated_at")}, "state": "complete"}
+    if current == target:
+        return "finished"
+    now = content_hash(current)
+    if now == entry.get("source"):
+        return "untouched"
+    if now not in (entry.get("steps") or []):
+        return "edited"
+    commons.rewrite(kind, current, target)
+    if commons.read(kind) != target:
+        raise PublishError(f"{kind} did not land as its recorded target; it stays recorded as updating")
+    return "finished"
 
 
 def _fill(commons: Commons, kind: str, page: str) -> None:
@@ -593,7 +626,23 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
     slots = tour_page.prompt_slots(features)
     with _locked(marker):
         rooms = load_marker(marker)
-        before = rooms.get(commons.room, {}).get("state")
+        journal, pages = rooms.get(commons.room, {}), None
+        if journal.get("state") == "updating":
+            # A rewrite cut short is settled from its journal before this run's inputs are even
+            # rendered; finishing it is this run's whole work, its own request waits for the next.
+            pages = commons.listed_pages()
+            if journal["kind"] in [p.get("kind") for p in pages] and \
+                    _settle(commons, journal["kind"], journal) == "finished":
+                _record(marker, rooms, commons.room,
+                        {**{k: v for k, v in journal.items() if k not in JOURNAL_KEYS + ("updated_at",)},
+                         "state": "complete"})
+                return {"ok": True, "action": "resumed", "resumed": True, "kind": journal["kind"], "summoned": False,
+                        "revision": journal.get("revision"), "media": sorted(journal.get("media") or {}),
+                        **{k: journal.get(k) for k in ("name", "core", "audience", "agent")}}
+            # Untouched (the rewrite never ran), edited (someone wrote meanwhile) or the page is gone:
+            # the entry from before the rewrite stands and this run proceeds like any other.
+            _record(marker, rooms, commons.room, journal.get("previous")
+                    or {"kind": journal["kind"], "state": "complete", "hash": journal.get("source")})
         if if_newer and not clean_prompts(prompts, slots):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
@@ -604,7 +653,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
                              **(media if isinstance(media, dict) else {})}, features)
         page = render_page(name, core, audience, agent, prompts, roles, features, media)
-        pages = commons.listed_pages()
+        pages = commons.listed_pages() if pages is None else pages
         step = plan(rooms, commons.room, pages)
         if step["action"] == "reconcile":
             found = commons.reconcile(pages, agent)
@@ -632,30 +681,23 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         else:
             if step["action"] == "adopt":
                 _record(marker, rooms, commons.room, {"kind": kind, "state": "pending"})
-            resumed = before == "updating" and step["pending"]
-            if resumed:
-                # A rewrite cut short is finished from its recorded target, not from this run's inputs.
-                _record(marker, rooms, commons.room, _resume(commons, kind, rooms[commons.room]))
-                step["pending"] = False
             current = commons.read(kind)
             was = read_marker(current)
             page_revision = was[1] if was else None
             written = rooms.get(commons.room, {}).get("hash")
             if current == page:
-                action = "updated" if resumed else "unchanged"  # the resume was this run's update
-            elif resumed:
-                action = "resumed"  # this run asks for a different page: finishing the target is enough
+                action = "unchanged"
             elif not step["pending"] and written and content_hash(current) != written:
                 action = "kept"  # someone edited the page since this script wrote it: theirs stays
             elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
                 action = "unchanged"
             else:
                 if not step["pending"]:
-                    # The rewrite clears, then appends: a run cut short must resume, not read the gap
-                    # as an edit, so the entry carries the target page itself.
+                    # The rewrite clears, then appends: the journal lets a run cut short tell its own
+                    # states from the page before it and from an edit, and finish or stand aside.
                     _record(marker, rooms, commons.room,
-                            {**_entry(kind, page, features, prompts, roles, media), "state": "updating",
-                             "target": page})
+                            _journal(_entry(kind, page, features, prompts, roles, media), current, page,
+                                     rooms.get(commons.room, {}), name, core, audience, agent))
                 commons.rewrite(kind, current, page)
                 action = "updated"
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
@@ -669,11 +711,9 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         result["adopted"] = True
     if action == "kept":
         result["edited"] = True
-    if step["action"] == "update" and before == "updating":
-        result["resumed"] = True
     # Summoned once: when this page's creation finishes (here, or resumed from our own pending
     # entry). Adopting a page found by its ownership marker is not a creation.
-    first = action == "created" or step["action"] == "update" and step["pending"] and before != "updating"
+    first = action == "created" or step["action"] == "update" and step["pending"]
     if owner and (summon or first):
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT,
@@ -775,11 +815,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"ok": False, "reason": "room-commons not installed", "path": str(script)}))
         return 3
     env = commons_env(script)
-    agent = args.agent_mxid or agent_mxid()
+    agent = (args.agent_mxid or agent_mxid() or "").strip()
     if not agent:
         # A page without the ownership tag can never be found again: refuse rather than write one.
         print(json.dumps({"ok": False, "reason": "no agent identity: pass --agent-mxid, or set AGENT_MXID in the "
                                                  "environment or the AG2 Space channel env file"}))
+        return 4
+    if not MXID.fullmatch(agent):
+        print(json.dumps({"ok": False, "reason": f"the agent identity {agent[:80]!r} is not an mxid "
+                                                 "(@localpart:server); nothing was published"}))
         return 4
     try:
         result = publish(Commons(script, args.room, env), marker_path(_workspace()),
@@ -791,8 +835,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 4
     if result["action"] == "resumed":
         print(f"getting_started: finished the rewrite of {result['kind']} in {args.room} that an earlier run "
-              "left cut short; this run's inputs differ from it and were not applied; run again to apply them",
+              "left cut short, from its record; this run's own inputs were not applied; run again to apply them",
               file=sys.stderr)
+        print(json.dumps({**result, "list": "journal"}))
+        return 0
     if result.get("edited"):
         print(f"getting_started: {result['kind']} in {args.room} was edited since it was last written; "
               "kept as is, not rewritten", file=sys.stderr)

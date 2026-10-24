@@ -334,18 +334,20 @@ class ListTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, f"over the {tp.LIST_MAX_BYTES}-byte cap"):
                 tp.load_list(big)
             self.assertEqual(gs.LIST_MAX_BYTES, tp.LIST_MAX_BYTES)  # one cap for a file and a URL
-            fifo = Path(tmp) / "list.fifo"  # st_size 0: only a bounded read can hold the cap
+            fifo = Path(tmp) / "list.fifo"  # no writer: a plain open would block for ever
             os.mkfifo(fifo)
-            payload = big.read_bytes()
+            done = []
 
-            def feed():
-                with contextlib.suppress(BrokenPipeError), open(fifo, "wb") as fh:
-                    fh.write(payload)
-            writer = threading.Thread(target=feed, daemon=True)
-            writer.start()
-            with self.assertRaisesRegex(ValueError, f"over the {tp.LIST_MAX_BYTES}-byte cap"):
-                tp.load_list(fifo)
-            writer.join(10)
+            def attempt():
+                with self.assertRaisesRegex(ValueError, "not a regular file"):
+                    tp.load_list(fifo)
+                done.append(True)
+            reader = threading.Thread(target=attempt, daemon=True)
+            reader.start()
+            reader.join(10)
+            self.assertEqual(done, [True])
+            with self.assertRaisesRegex(ValueError, "not a regular file"):
+                tp.load_list(Path(tmp))
 
 
 class MediaTest(unittest.TestCase):
@@ -826,6 +828,43 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
         self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM], before)
 
+    BOUNDARIES = {"replace:1": ["replace"], "replace:2": ["replace", "replace"],
+                  "append:1": ["replace", "replace", "append"],
+                  "append:2": ["replace", "replace", "append", "append"]}
+
+    def fail_at(self, at, newer, prompts):
+        """A created page, then an --if-newer rewrite to `newer` with prompts and roles that the
+        stub fails at call `at`. Returns (the page before, the target, what the page holds now)."""
+        (self.tmp / "room.json").unlink(missing_ok=True)
+        shutil.rmtree(self.tmp / "ws", ignore_errors=True)
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        db = json.loads((self.tmp / "room.json").read_text())
+        mine, db["calls"] = db["pages"]["html-p1"], []  # STUB_FAIL_AT counts from here
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        os.environ["STUB_FAIL_AT"] = at
+        code, out, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder")
+        os.environ.pop("STUB_FAIL_AT")
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+        db = json.loads((self.tmp / "room.json").read_text())
+        self.assertEqual([c[0] for c in db["calls"] if c[0] in ("replace", "append")], self.BOUNDARIES[at])
+        journal = self.entry()
+        self.assertEqual((journal["state"], gs.content_hash(journal["target"]), journal["source"]),
+                         ("updating", journal["hash"], gs.content_hash(mine)))
+        self.assertEqual((journal["name"], journal["core"], journal["agent"], journal["previous"]["hash"]),
+                         ("Blue", "codex", self.ME, gs.content_hash(mine)))
+        return mine, journal["target"], self.page_text()
+
+    def entry(self):
+        return gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+
+    def writes_since(self, n):
+        return [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][n:]
+                if c[0] not in ("pages", "read")]
+
+    def calls(self):
+        return len(json.loads((self.tmp / "room.json").read_text())["calls"])
+
     def test_a_rewrite_cut_short_is_finished_by_the_next_run_at_the_exact_target(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
@@ -833,43 +872,63 @@ class IfNewerTest(_Cli):
         target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
                                 tp.load_list(newer))
         self.assertEqual(len(gs.chunks(target)), 2)  # the default-size page: two clears, two appends
-        boundaries = {"replace:1": ["replace"], "replace:2": ["replace", "replace"],
-                      "append:1": ["replace", "replace", "append"],
-                      "append:2": ["replace", "replace", "append", "append"]}
-        for at, calls in boundaries.items():
+        for at in self.BOUNDARIES:
             with self.subTest(at=at):
-                (self.tmp / "room.json").unlink(missing_ok=True)
-                shutil.rmtree(self.tmp / "ws", ignore_errors=True)
-                code, out, _ = self.publish()
-                self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
-                db = json.loads((self.tmp / "room.json").read_text())
-                mine = db["pages"]["html-p1"]
-                db["calls"] = []
-                (self.tmp / "room.json").write_text(json.dumps(db))
-                os.environ["STUB_FAIL_AT"] = at
-                code, out, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts),
-                                            "--roles", "Founder")
-                os.environ.pop("STUB_FAIL_AT")
-                self.assertEqual((code, json.loads(out)["ok"]), (4, False))
-                db = json.loads((self.tmp / "room.json").read_text())
-                self.assertEqual([c[0] for c in db["calls"] if c[0] in ("replace", "append")], calls)
-                left = self.page_text()
-                self.assertNotEqual(left, target)
+                mine, journaled, left = self.fail_at(at, newer, prompts)
+                self.assertEqual(journaled, target)
+                journal = self.entry()
+                if at == "replace:1":
+                    self.assertEqual(left, mine)  # the rewrite never started
+                else:
+                    self.assertNotEqual(left, target)
+                    self.assertIn(gs.content_hash(left), journal["steps"])  # a state the rewrite itself leaves
                 if at == "append:1":
                     self.assertEqual(left, "")  # the blank page a retry must not read as an edit
-                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"]),
-                                 ("updating", gs.content_hash(target), {"dm": "Draft my update."}, "Founder"))
                 self.assertEqual(json.loads(self.main("plan", "--room", self.ROOM)[1])["pending"], True)
-                # The retry passes no prompts or roles: the entry carries the target's.
-                code, out, err = self.publish("--if-newer", "--list", str(newer), "--owner", "@owner:example.test")
+                # The same request again: finished from the journal, or run afresh when nothing ran.
+                code, out, err = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts),
+                                              "--roles", "Founder", "--owner", "@owner:example.test", "--summon")
                 got = json.loads(out)
-                self.assertEqual((code, got["action"], got["summoned"], got.get("edited"), got["resumed"], err),
-                                 (0, "updated", False, None, True, ""))
+                if at == "replace:1":
+                    self.assertEqual((code, got["action"], got.get("resumed"), got["summoned"], err),
+                                     (0, "updated", None, True, ""))  # --summon honoured: nothing was resumed
+                else:
+                    self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"],
+                                      got["revision"], got["list"]),
+                                     (0, "resumed", True, False, "Blue", "tutorial.2026-11-01.1", "journal"))
+                    self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
-                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-                self.assertEqual((entry["state"], entry["hash"]), ("complete", gs.content_hash(target)))
-                self.assertNotEqual(mine, target)
+                entry = self.entry()
+                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"]),
+                                 ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder"))
+                self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
+                code, out, _ = self.publish("--if-newer", "--list", str(newer))
+                self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+
+    def test_an_edit_made_while_a_rewrite_was_cut_short_is_kept_at_every_boundary(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        for at in self.BOUNDARIES:
+            with self.subTest(at=at):
+                mine, target, left = self.fail_at(at, newer, prompts)
+                previous = {k: v for k, v in self.entry()["previous"].items() if k != "updated_at"}
+                db = json.loads((self.tmp / "room.json").read_text())
+                theirs = left + "<p>OWNER NOTES</p>"
+                db["pages"]["html-p1"] = theirs
+                (self.tmp / "room.json").write_text(json.dumps(db))
+                n = self.calls()
+                for extra in (("--if-newer", "--list", str(newer), "--prompts", str(prompts), "--roles", "Founder"),
+                              ("--name", "Kai")):  # the next ordinary run still sees an owner's page
+                    code, out, err = self.publish(*extra)
+                    got = json.loads(out)
+                    self.assertEqual((code, got["action"], got["edited"], got.get("resumed")), (0, "kept", True, None), extra)
+                    self.assertIn("edited", err)
+                    self.assertEqual(self.page_text(), theirs)
+                    entry = {k: v for k, v in self.entry().items() if k != "updated_at"}
+                    self.assertEqual(entry, previous)  # the entry from before the rewrite, whole
+                    self.assertEqual(entry["hash"], gs.content_hash(mine))
+                    self.assertEqual(self.writes_since(n), [])
 
     def cut_short(self, newer, prompts):
         """A created page, then an --if-newer rewrite to `newer` with prompts and roles that fails
@@ -894,43 +953,68 @@ class IfNewerTest(_Cli):
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         newer = self.write_list("tutorial.2026-11-01.1")
         other = self.write_list("tutorial.2026-12-01.1", name="other.json")
+        media = self.tmp / "media.json"
+        media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
         base = ["--name", "Blue", "--core", "codex", "--agent-mxid", self.ME]
         retries = {
             "plain, bundled list": base,
             "plain, same list": base + ["--list", str(newer)],
             "list changed": base + ["--list", str(other), "--if-newer"],
             "list unavailable": base + ["--list", str(self.tmp / "gone.json"), "--if-newer"],
-            "name changed": ["--name", "Kai", "--core", "codex", "--agent-mxid", self.ME, "--list", str(newer),
-                             "--if-newer"],
+            "name changed, summon asked": ["--name", "Kai", "--core", "codex", "--agent-mxid", self.ME, "--list",
+                                           str(newer), "--if-newer", "--owner", "@other:example.test", "--summon"],
             "core changed": ["--name", "Blue", "--core", "claude", "--agent-mxid", self.ME, "--list", str(newer),
                              "--if-newer"],
             "audience changed": base + ["--audience", "room", "--list", str(newer), "--if-newer"],
             "agent changed": ["--name", "Blue", "--core", "codex", "--agent-mxid", "@other.agent:example.test",
                               "--list", str(newer), "--if-newer"],
+            "new prompts and media": base + ["--list", str(newer), "--prompts", str(prompts), "--media", str(media)],
         }
         for case, argv in retries.items():
             with self.subTest(case=case):
                 target = self.cut_short(newer, prompts)
+                n = self.calls()
                 code, out, err = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub), *argv)
                 got = json.loads(out)
-                self.assertEqual((code, got["action"], got["resumed"], got["summoned"]), (0, "resumed", True, False))
-                self.assertIn("not applied", err)
+                self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"], got["core"],
+                                  got["agent"], got["revision"], got["media"], got["list"]),
+                                 (0, "resumed", True, False, "Blue", "codex", self.ME, "tutorial.2026-11-01.1", [],
+                                  "journal"))
+                self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
-                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"], entry["revision"]),
+                self.assertNotIn("summon", [c[0] for c in self.writes_since(n)])
+                entry = self.entry()
+                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"], entry["revision"],
+                                  entry.get("media")),
                                  ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder",
-                                  "tutorial.2026-11-01.1"))
-                self.assertNotIn("target", entry)
+                                  "tutorial.2026-11-01.1", None))
+                self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
                 code, out, err = self.publish("--if-newer", "--list", str(newer))  # the target is current
                 self.assertEqual((code, json.loads(out)["action"], err), (0, "unchanged", ""))
                 self.assertEqual(self.page_text(), target)
         # A second deliberate run applies different inputs under the usual rules.
-        code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub), *retries["name changed"])
+        argv = retries["name changed, summon asked"]
+        code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub), *argv)
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))  # --if-newer: same revision
         code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub),
-                                 *retries["name changed"][:-1])
-        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+                                 *[a for a in argv if a != "--if-newer"])
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "updated", True))
         self.assertIn("Getting started with Kai", self.page_text())
+
+    def test_recovery_runs_before_this_runs_inputs_are_rendered(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        heavy = self.tmp / "heavy.json"
+        heavy.write_text(json.dumps(many_steps(tp.STEPS_MAX, shots=3)))  # valid, over the page cap once rendered
+        target = self.cut_short(newer, prompts)
+        code, out, _ = self.publish("--list", str(heavy))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "resumed"))
+        self.assertEqual(self.page_text(), target)  # recovered before the oversized render could fail
+        code, out, _ = self.publish("--list", str(heavy))
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+        self.assertIn(f"over the {PAGE_CAP}-byte cap", json.loads(out)["reason"])
+        self.assertEqual(self.page_text(), target)
 
     def test_an_updating_entry_whose_target_does_not_hash_is_refused(self):
         prompts = self.tmp / "p.json"
@@ -1007,7 +1091,8 @@ class DocTest(unittest.TestCase):
         self.assertIn("`updating`", text)
         self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "resumed", "mxc://", "1 MiB", "--agent-mxid", "Last verified:"):
+        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "mxc://", "1 MiB", "--agent-mxid",
+                     "Last verified:"):
             self.assertIn(word, canon)
 
 

@@ -123,11 +123,14 @@ each room's entry.
   written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
   whatever the revision: the result says `"action": "kept"`, stderr names the page, and the entry
   stands (a gated `unchanged` or `kept` run records nothing; a page equal to the run's own render
-  records its inputs, so a revision-only bump catches the entry up). A rewrite is recorded as
-  `updating`, with the target page itself, before the first write; a run cut short there is
-  finished by the next run from that recorded target, whatever that run was asked for: when its own
-  inputs differ it reports `"action": "resumed"` and applies nothing else, so a second run applies
-  them under the usual rules. It summons no one. Run it after an engine
+  records its inputs, so a revision-only bump catches the entry up). A rewrite is journalled as
+  `updating` before its first write: the target page, the page before it, the page after each
+  call and the entry before it. The next run settles that journal before rendering anything: a page
+  in a state the rewrite itself leaves is finished to the target byte for byte and the run stops
+  there (`"action": "resumed"`, reporting the journalled name and revision; its own inputs,
+  `--summon` included, wait for the next run); a page still as before means the rewrite never ran
+  and the run proceeds as usual; any other page is someone's edit, kept with the entry from before
+  the rewrite, whole. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash
