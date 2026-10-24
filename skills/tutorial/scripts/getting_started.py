@@ -101,12 +101,13 @@ SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
 SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
 # A piece of a create or an append: under Room Commons' 196,608-byte write.
 CHUNK_BYTES = 120_000
-# room_commons.py runs with its argv read from stdin: a page can exceed what an OS lets one exec carry.
-ARGV_FROM_STDIN = ("import json, os, runpy, sys\n"
-                   "sys.argv = json.load(sys.stdin)\n"
-                   "sys.stdin = open(os.devnull)\n"
-                   "sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))\n"
-                   "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+# room_commons.py runs with its argv read from a 0600 file named on the command line: a page can exceed
+# what one exec argument carries, and its re-exec under another python reads the same file again.
+ARGV_FROM_FILE = ("import json, os, runpy, sys\n"
+                  "with open(sys.argv[1], encoding='utf-8') as f:\n"
+                  "    sys.argv = json.load(f)\n"
+                  "sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))\n"
+                  "runpy.run_path(sys.argv[0], run_name='__main__')\n")
 CALL_BYTES = 1_048_576  # what one call may carry: well above the page cap, so a page is one replace
 USER_AGENT = "sutando-tutorial/1"
 LIST_TIMEOUT = 10
@@ -499,11 +500,17 @@ class Commons:
         if kind:
             argv += ["--kind", kind]
         argv += list(args)
+        fd, path = tempfile.mkstemp(prefix="tutorial-argv-", suffix=".json")
         try:
-            done = subprocess.run([sys.executable, "-c", ARGV_FROM_STDIN], input=json.dumps(argv), capture_output=True,
-                                  text=True, timeout=120, env=self.env)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(argv, fh)
+            done = subprocess.run([sys.executable, "-c", ARGV_FROM_FILE, path], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=120, env=self.env)
         except subprocess.TimeoutExpired:
             raise PublishError(f"room-commons {args[0]} timed out") from None
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
         if done.returncode != 0:
             said = redact((done.stderr or done.stdout).strip(), self.env)
             raise PublishError(f"room-commons {args[0]} failed ({done.returncode}): {said[:400]}")
@@ -545,7 +552,7 @@ class Commons:
 
 def call_budget(env: Optional[Mapping[str, str]] = None) -> tuple:
     """(bytes one text may hold, bytes the two texts of one call may hold together). Arguments go
-    over stdin (`Commons.run`), so no exec limit applies; CALL_BYTES bounds a call instead."""
+    in a file (`Commons.run`), so no exec limit applies; CALL_BYTES bounds a call instead."""
     return CALL_BYTES, 2 * CALL_BYTES
 
 

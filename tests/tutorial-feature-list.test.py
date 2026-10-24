@@ -1561,7 +1561,7 @@ class DocTest(unittest.TestCase):
         self.assertIn("`updating`", text)
         self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "digest", "over stdin",
+        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "digest", "0600 file",
                      "mxc://", "1 MiB", "--agent-mxid", "Last verified:"):
             self.assertIn(word, canon)
 

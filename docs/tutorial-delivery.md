@@ -37,7 +37,7 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
   next run keeps it too. A rewrite that fits one room-commons call (1 MiB a text; arguments travel
-  over stdin, so no exec limit applies) is a single `replace` whose
+  in a 0600 file, never argv, so no exec limit applies) is a single `replace` whose
   needle is the whole page, so a page that changed since it was read is refused whole and nothing
   in between is written. When only the old page fits a call, the first call replaces the whole page
   by the new page's first piece and the rest is appended, every call read back. A page no call can

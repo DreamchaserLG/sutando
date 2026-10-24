@@ -36,6 +36,9 @@ spec.loader.exec_module(gs)
 STUB = textwrap.dedent('''
     import json, os, sys
     from pathlib import Path
+    if os.environ.get("STUB_REEXEC") and not os.environ.get("STUB_REEXECED"):
+        # Room Commons' handoff to a python that has its deps: the same command line, run again.
+        os.execve(sys.executable, [sys.executable, *sys.orig_argv[1:]], {**os.environ, "STUB_REEXECED": "1"})
     state = Path(os.environ["STUB_STATE"])
     db = json.loads(state.read_text()) if state.exists() else {"pages": {}, "calls": [], "next": 1}
     argv = sys.argv[1:]
@@ -1251,20 +1254,34 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)) - 1)
         self.assertEqual(self.room()["pages"], {"html-p1": new})
 
-    def test_arguments_travel_over_stdin_whatever_their_size(self):
+    def test_arguments_travel_in_a_private_file_whatever_their_size(self):
         big = "x" * 300_000  # over Linux's 131,072-byte cap on one exec argument
         self.state.write_text(json.dumps({"pages": {"html-p1": ""}, "calls": [], "next": 2}))
         real, seen = subprocess.run, []  # the exec-limit guard: a payload in argv would fail here
 
         def spy(argv, **kw):
-            seen.append((argv, kw.get("input") or ""))
+            path = Path(argv[-1])
+            seen.append((argv, path, path.stat().st_mode & 0o777, json.loads(path.read_text())))
             return real(argv, **kw)
         with mock.patch.object(gs.subprocess, "run", spy):
             gs.Commons(self.stub, self.ROOM).run("append", self.ROOM, big, kind="html-p1")
+        argv, path, mode, carried = seen[0]
         self.assertEqual(self.room()["pages"]["html-p1"], big)
-        self.assertTrue(all(len(a) < 1000 for a in seen[0][0]))
-        self.assertIn(big, seen[0][1])
+        self.assertTrue(all(len(a) < 1000 for a in argv))
+        self.assertEqual((mode, carried[-1]), (0o600, big))
+        self.assertFalse(path.exists())  # removed once the call returns
         self.assertGreater(gs.call_budget()[0], gs.tour_page.PAGE_MAX_BYTES)  # every page is one replace
+
+    def test_the_arguments_survive_room_commons_re_running_itself_under_another_python(self):
+        os.environ["STUB_REEXEC"] = "1"
+        try:
+            out = self.publish(owner="@chi:ag2.space")
+            self.assertEqual((out["action"], out["summoned"]), ("created", True))
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
+            self.assertEqual(self.publish(name="Kai")["action"], "updated")  # a whole-page replace, re-run too
+            self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
+        finally:
+            os.environ.pop("STUB_REEXEC")
 
     def test_a_page_no_call_can_hold_is_never_rewritten_in_pieces(self):
         commons = gs.Commons(self.stub, self.ROOM)
