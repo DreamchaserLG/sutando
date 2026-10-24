@@ -1314,6 +1314,42 @@ class PipefailIsNotABareRegex(unittest.TestCase):
                 "set -o >/dev/null pipefail\n"
                 "false | true && python3 packages/x/dead.py"), [])
 
+    def test_every_redirect_operator_is_consumed_before_set_sees_its_options(self):
+        """liususan091219's review at 996506045: `_shell_words()` kept its
+        own redirect grammar (`>`, `>>`, `<<`, `[n]>&` only), so `set >|
+        /dev/null -o pipefail` handed `/dev/null` to `set` as a positional,
+        ended option scanning and LOST pipefail -- the later pipe read as
+        reachable and a dead test was credited (fail-open). One grammar now
+        (`_REDIR_OPS`); every form below really enables pipefail in Bash
+        (confirmed by direct execution, `&>>` on Bash 4+ only)."""
+        tail = "\nfalse | true && python3 packages/x/dead.py"
+        for redirect in (">|/dev/null", ">| /dev/null", "&>/dev/null", "&> /dev/null",
+                         "&>>/dev/null", "&>> /dev/null", "<<<x", "<<< x",
+                         "2>&1", "2>& 1", "1>&2", "3<&0", "<> /dev/null"):
+            self.assertEqual(
+                program_python_args(f"set {redirect} -o pipefail{tail}"), [], redirect)
+        for heredoc in ("<<-EOF", "<<- EOF", "<<EOF"):
+            self.assertEqual(
+                program_python_args(f"set {heredoc} -o pipefail\nEOF{tail}"), [], heredoc)
+
+    def test_a_redirected_set_can_turn_pipefail_back_off(self):
+        """Mirror direction: `set >| /dev/null +o pipefail` after `set -o
+        pipefail` -- a scanner that stops at the misread target keeps
+        pipefail ON and hides a live test (confirmed by direct execution)."""
+        tail = "\nfalse | true && python3 packages/x/live.py"
+        for redirect in (">| /dev/null", "&>/dev/null", "<<< x", "2>&1"):
+            self.assertEqual(
+                program_python_args(f"set -o pipefail\nset {redirect} +o pipefail{tail}"),
+                ["packages/x/live.py"], redirect)
+
+    def test_a_here_string_word_is_the_target_not_an_option(self):
+        """`set <<< -o pipefail`: `-o` is the here-string's word, so
+        `pipefail` is a positional and pipefail stays OFF (Bash: live.py runs)."""
+        self.assertEqual(
+            program_python_args(
+                "set <<< -o pipefail\nfalse | true && python3 packages/x/live.py"),
+            ["packages/x/live.py"])
+
     def test_a_redirect_to_an_empty_target_aborts_the_whole_command(self):
         """`set +o >"" pipefail`: Bash rejects an empty redirect target
         before the command ever runs -- confirmed by direct execution:

@@ -73,9 +73,12 @@ def active_text(text: str) -> str:
 import re
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# A whole redirect operator with its optional fd (`2>>`, `>|`, `2>&`, `<<<`,
-# `&>`): matched as one unit, so what follows is its target, glued or not.
-_REDIR_TOKEN_RE = re.compile(r"^(?:[0-9]*(?:>>|>\||>&|<<<|<<-|<<|<&|<>|<|>)|&>>|&>)")
+# The one redirect-operator grammar: `_command_tokens` peels a whole token
+# (optional fd + operator) with it; `_shell_words` scans the operator in place.
+_REDIR_OPS = r">>|>\||>&|<<<|<<-|<<|<&|<>|<|>"
+_REDIR_AMP_OPS = r"&>>|&>"
+_REDIR_TOKEN_RE = re.compile(rf"^(?:[0-9]*(?:{_REDIR_OPS})|{_REDIR_AMP_OPS})")
+_REDIR_OP_RE = re.compile(rf"(?:{_REDIR_OPS}|{_REDIR_AMP_OPS})")
 
 
 def _command_tokens(seg: str) -> list[str]:
@@ -1244,23 +1247,18 @@ def _shell_words(text: str):
                     depth -= 1
                 i += 1
             val.extend(text[start:i]); qmask.extend([True] * (i - start))
-        elif ch in "<>":
+        elif ch in "<>" or (ch == "&" and text[i + 1:i + 2] == ">"):
+            op = _REDIR_OP_RE.match(text, i).group()
             # An fd prefix must be BARE -- an escaped/quoted digit is a real
-            # argv word instead (see docstring).
+            # argv word instead (see docstring); `&>` takes no fd at all.
             is_bare_fd_or_nothing = (not val) or (
-                all(c.isdigit() for c in val) and not any(qmask))
+                ch != "&" and all(c.isdigit() for c in val) and not any(qmask))
             if not is_bare_fd_or_nothing:
                 flush()  # real word before the operator -- its own argv word
             else:
                 val, qmask = [], []  # bare fd-prefix digits (or nothing) -- part of the redirect
-            i += 1
-            is_heredoc = False
-            if i < n and text[i] == ch:
-                is_heredoc = ch == "<"; i += 1
-            elif i < n and text[i] == "&":
-                i += 1
-            if is_heredoc and i < n and text[i] == "-":
-                i += 1  # `<<-` strips leading tabs from the body; irrelevant to the delimiter itself
+            i += len(op)
+            is_heredoc = op in ("<<", "<<-")  # `<<<` is a here-string: its word is the target
             while i < n and text[i] in " \t":
                 i += 1
             target, target_expandable, target_start = [], False, i

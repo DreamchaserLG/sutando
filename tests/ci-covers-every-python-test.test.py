@@ -532,6 +532,19 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
             ["packages/x/test_dead.py"])
 
+    def test_a_redirect_ahead_of_set_options_does_not_false_green_a_dead_test(self):
+        """liususan091219 (review at 996506045): `set >| /dev/null -o pipefail`
+        handed `/dev/null` to `set` as a positional and lost pipefail, so the
+        dead test below was credited -- fail-open, pinned through the consumer."""
+        for redirect in (">| /dev/null", "&>/dev/null", "&> /dev/null", "<<< x", "2>&1"):
+            wf = ("steps:\n  - run: |\n"
+                  f"      set {redirect} -o pipefail\n"
+                  "      false | true && python3 packages/x/test_dead.py\n")
+            self.assertEqual(_named_in(wf), set(), redirect)
+            self.assertEqual(
+                orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+                ["packages/x/test_dead.py"], redirect)
+
     def test_a_leading_o_cluster_form_does_not_false_orphan_through_the_consumer_path(self):
         """keweichen round 12: `set -oe pipefail` (o first, not last)."""
         wf = ("steps:\n  - run: |\n"
