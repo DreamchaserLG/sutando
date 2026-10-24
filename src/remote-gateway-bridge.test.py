@@ -632,6 +632,8 @@ def main() -> int:
     spec = importlib.util.spec_from_file_location("rtc", Path(__file__).resolve().parent / "remote-gateway-bridge.py")
     rtc = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rtc)
+    # The binding key lives under the passwd home: every load shares this module, never the real one.
+    rtc.gateway_instance.binding_key_path = lambda: Path(tmp, "config", "binding.key")
 
     # 1. pull a task and write it locally
     resp = rtc._req("GET", "/v1/tasks?wait=0")
@@ -1614,7 +1616,10 @@ def main() -> int:
     rtc._post_proactive()
     check(STATE["room_posts"][-1]["room_id"] == "!dm:example.org",
           "proactive delivery goes to the gateway's owner_dm_room, not the pinned room")
-    check(json.loads(rtc._routing_file().read_text()) == {"identity": "@agent-t:example.org", "gateway": rtc.URL, "owner_dm": "!dm:example.org"},
+    _rec = json.loads(rtc._routing_file().read_text())
+    check(_rec == {"identity": "@agent-t:example.org", "gateway": rtc._redact_url(rtc.URL),
+                   "binding": rtc.gateway_instance.binding_digest("@agent-t:example.org", rtc.URL),
+                   "owner_dm": "!dm:example.org"} and len(_rec["binding"]) == 64,
           "the reading is persisted under the state dir, bound to this identity and this gateway")
     _real_replace = rtc.os.replace; _faults = []
     def _fail_routing_once(src, dst):

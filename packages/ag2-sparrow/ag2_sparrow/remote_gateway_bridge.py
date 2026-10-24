@@ -60,6 +60,7 @@ import glob
 import base64
 import contextlib
 import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -304,7 +305,8 @@ from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir a
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
-from . import agent_identity, gateway_credential_io, gateway_credential_sources, gateway_credentials, gateway_instance, local_task_protocol
+from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
+               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations)
 from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
@@ -313,6 +315,7 @@ from .proactive_routing import proactive_filename
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
+from . import __version__ as _PACKAGE_VERSION
 from .outbox import DeliveryOutcome, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
@@ -463,6 +466,10 @@ _RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+# The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
+SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
+SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
+SETUP_REVISION_WITHHELD = "setup_revision_withheld"  # read by adapters/hatch/runtime_text.py
 
 # Launch provenance + in-bridge file log. A supervisor that persists stdout
 # (sutando's startup.sh redirects it to logs/remote-gateway-bridge.log) exports
@@ -609,7 +616,7 @@ def _stage_durable(path: Path, text: str) -> "Path | None":
     try:
         return _stage_text(path, text)
     except Exception as exc:  # noqa: BLE001
-        _log(f"durable stage failed for {path.name} ({exc})")
+        _log(f"durable stage failed for {path.name} ({diagnostics.describe(exc)})")
         return None
 
 
@@ -619,7 +626,7 @@ def _publish_staged(tmp: Path, path: Path) -> bool:
         _publish_staged_whole(tmp, path)
         return True
     except Exception as exc:  # noqa: BLE001
-        _log(f"durable publish failed for {path.name} ({exc})")
+        _log(f"durable publish failed for {path.name} ({diagnostics.describe(exc)})")
         return False
 
 
@@ -664,8 +671,8 @@ def _gateway_owner() -> str:
                 if isinstance(row, dict) and row.get("id") == identity), None)
     owner = str((row or {}).get("owner") or "")
     hint = str((row or {}).get("owner_dm_room") or "")
-    _GATEWAY_OWNER_DM_HINT = hint if hint.startswith("!") else ""
-    return owner if owner.startswith("@") and ":" in owner else ""
+    _GATEWAY_OWNER_DM_HINT = gateway_instance.owner_room(hint, identity)
+    return gateway_instance.owner_mxid(owner, identity)
 
 
 def _owner_review_dm(owner: str) -> str:
@@ -674,16 +681,16 @@ def _owner_review_dm(owner: str) -> str:
                              {"owner": owner, "room_id": _GATEWAY_OWNER_DM_HINT})
         return _GATEWAY_OWNER_DM_HINT
     cached = _read_private_json(_WITHHELD_DM_CACHE) or {}
-    room = str(cached.get("room_id") or "")
-    if cached.get("owner") == owner and room.startswith("!"):
+    room = gateway_instance.owner_room(cached.get("room_id"), _reenroll_identity())
+    if cached.get("owner") == owner and room:
         return room
     answer = _req("POST", "/v1/room", {
         "op": "create", "invite": [owner], "is_direct": True,
         "name": "Private result reviews",
         "topic": "Owner-only review of results withheld from shared rooms.",
     }, timeout=20)
-    room = str((answer or {}).get("room_id") or "")
-    if not room.startswith("!"):
+    room = gateway_instance.owner_room((answer or {}).get("room_id"), _reenroll_identity())
+    if not room:
         raise RuntimeError("gateway did not return a private review room")
     _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room})
     return room
@@ -1056,7 +1063,7 @@ def _settle_landed_releases() -> None:
                 _log(f"withheld review {review_id}: published; its outbox item is still claimed "
                      "and is settled once that claim can be taken")
         except Exception as exc:  # noqa: BLE001 — next beat retries
-            _log(f"withheld review {review_id}: outbox settlement deferred ({exc})")
+            _log(f"withheld review {review_id}: outbox settlement deferred ({diagnostics.describe(exc)})")
 
 
 def _settlement_record(directory: Path, review_id: str) -> "dict | None":
@@ -1161,7 +1168,7 @@ def _defers_to_archive(path: Path) -> bool:
         note = ("its archived decision stands" if outcome is not None else
                 "its archived decision is not a recognised outcome; left for the owner")
     except Exception as exc:  # noqa: BLE001 — one record's fault must never stop the beat
-        note = f"archive reconcile failed ({exc}); left for the owner"
+        note = f"archive reconcile failed ({diagnostics.describe(exc)}); left for the owner"
         failures = _RECONCILE_FAILURES[str(path)] = _RECONCILE_FAILURES.get(str(path), 0) + 1
         if failures == _RECONCILE_GIVE_UP_AFTER:
             _log(f"withheld review {path.stem}: archive reconcile failed {failures} times; "
@@ -1211,7 +1218,7 @@ def _handle_hitl_action(task: dict):
     try:
         out = handler.offer_task(task)
     except Exception as e:  # noqa: BLE001 — a broken click must not stall the poll loop
-        _log(f"hitl: task-relay click {task_id} not applied: {e}")
+        _log(f"hitl: task-relay click {task_id} not applied: {diagnostics.describe(e)}")
         return False
     if out == "rejected":
         return "rejected:" + (getattr(handler, "last_reason", "") or "stale or malformed")
@@ -1236,7 +1243,7 @@ def _claim_review_decision(task: dict, path: Path, updates: dict) -> "dict | Non
         if claimed is None:
             _explain_unclaimed(task, path)
     except Exception as exc:  # noqa: BLE001 — a failed claim is answered, never escapes the beat
-        _log(f"withheld review {path.stem}: reply {task.get('id')} could not be processed ({exc})")
+        _log(f"withheld review {path.stem}: reply {task.get('id')} could not be processed ({diagnostics.describe(exc)})")
         _queue_review_control_result(task, body=(
             f"Your decision on review `{path.stem}` could not be processed right now. Nothing "
             "changed; please reply again."))
@@ -1293,7 +1300,7 @@ def _handle_review_decision(task: dict) -> bool:
         matched = _match_review_decision(task)
         archived_reply = matched is not None and _archived_reply(matched[0])
     except (_ReviewsUnreadable, OSError) as exc:
-        _log(f"withheld reviews: reply {task.get('id')} could not be checked ({exc})")
+        _log(f"withheld reviews: reply {task.get('id')} could not be checked ({diagnostics.describe(exc)})")
         record = getattr(exc, "record", "")
         _queue_review_control_result(task, body=(
             f"Your reply could not be checked: the review record `{record}` is not a readable "
@@ -1328,7 +1335,7 @@ def _handle_review_decision(task: dict) -> bool:
         try:
             _resolve_review_card(path, record)
         except Exception as exc:  # noqa: BLE001 — durable pending state retries
-            _log(f"withheld review {record.get('review_id')} card edit deferred: {exc}")
+            _log(f"withheld review {record.get('review_id')} card edit deferred: {diagnostics.describe(exc)}")
         return True
     # Persist release before the network call; pending retries use a stable
     # dedupe key so they cannot duplicate the disclosure.
@@ -1342,7 +1349,7 @@ def _handle_review_decision(task: dict) -> bool:
         if _publish_review(path, record):
             _resolve_review_card(path, record)
     except Exception as exc:  # noqa: BLE001 — durable pending state retries
-        _log(f"withheld review {record.get('review_id')} publish deferred: {exc}")
+        _log(f"withheld review {record.get('review_id')} publish deferred: {diagnostics.describe(exc)}")
     return True
 
 
@@ -1361,11 +1368,11 @@ def _retry_pending_publications() -> None:
             if not _publish_review(path, record):
                 _log(f"withheld review {record.get('review_id')} publish still pending")
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"withheld review {record.get('review_id')} publish retry failed: {exc}")
+            _log(f"withheld review {record.get('review_id')} publish retry failed: {diagnostics.describe(exc)}")
     try:
         _settle_landed_releases()
     except Exception as exc:  # noqa: BLE001 — next poll retries
-        _log(f"withheld release settlement deferred: {exc}")
+        _log(f"withheld release settlement deferred: {diagnostics.describe(exc)}")
 
 
 def _retry_review_card_resolutions() -> None:
@@ -1379,7 +1386,7 @@ def _retry_review_card_resolutions() -> None:
             if not _resolve_review_card(path, record):
                 _log(f"withheld review {record.get('review_id')} card edit still pending")
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"withheld review {record.get('review_id')} card edit retry failed: {exc}")
+            _log(f"withheld review {record.get('review_id')} card edit retry failed: {diagnostics.describe(exc)}")
 
 
 def _control_result_path(task_id: str) -> Path:
@@ -1396,7 +1403,7 @@ def _queue_review_control_result(task: dict, body: str = "[no-send]") -> None:
         if not path.is_file():
             _atomic_private_json(path, {"id": task_id, "body": body})
     except Exception as exc:  # noqa: BLE001 — the reply is redelivered and answered then
-        _log(f"review control result {task_id} not saved: {exc}")
+        _log(f"review control result {task_id} not saved: {diagnostics.describe(exc)}")
 
 
 def _retry_review_control_results() -> None:
@@ -1414,7 +1421,7 @@ def _retry_review_control_results() -> None:
                 **_result_contract(False)})
             path.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001 — next poll retries
-            _log(f"review control result {record.get('id')} retry deferred: {exc}")
+            _log(f"review control result {record.get('id')} retry deferred: {diagnostics.describe(exc)}")
 
 
 def _is_redelivery_control(body: str) -> bool:
@@ -1448,7 +1455,7 @@ def _guarded_result_body(tid: str, body: str):
          journal_suppression, suppression_only, guarded_tier, review_artifact) = _team_guard_fns()
         from .chat_secret_filter import filter_chat_secrets
     except Exception as exc:
-        return None, f"team_result_guard unavailable: {exc}"
+        return None, f"team_result_guard unavailable: {diagnostics.describe(exc)}"
     tfile = find_task_file(TASKS_DIR, tid) or find_archived_task(TASKS_DIR, tid)
     # Absence is not owner provenance: a month-archived Team task is exactly the
     # case that would otherwise fall open.
@@ -1497,7 +1504,7 @@ def _guarded_result_body(tid: str, body: str):
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
-            return None, f"{verdict.reason}; private owner review failed: {exc}"
+            return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
     if verdict.reason is not None:
         _WITHHELD_TASK_OUTPUT[cached] = result
@@ -1603,7 +1610,7 @@ def _project_hitl(log=print) -> int:
         HitlManager, HitlStore, default_store = manager_mod.HitlManager, manager_mod.HitlStore, manager_mod.default_store
         pending_ids, project = projector.pending_ids, projector.project
     except Exception as e:  # noqa: BLE001 — an optional tier never breaks the pulse
-        log(f"hitl: projector unavailable ({e}); cards will not be delivered")
+        log(f"hitl: projector unavailable ({diagnostics.describe(e)}); cards will not be delivered")
         return 0
     workspace = _STATE.parent
     manager = HitlManager(HitlStore(default_store(workspace)))
@@ -1642,7 +1649,7 @@ def _hitl_reply_handler(owner_mxid: str, log=print):
         return replies.HitlReplyHandler(manager_mod.HitlManager(manager_mod.HitlStore(manager_mod.default_store(workspace))),
                                         owner_mxid, workspace=workspace, log=log)
     except Exception as e:  # noqa: BLE001 — an optional handler must never break the chain
-        log(f"hitl: reply handler unavailable ({e}); card clicks will not be applied")
+        log(f"hitl: reply handler unavailable ({diagnostics.describe(e)}); card clicks will not be applied")
         return None
 
 
@@ -1813,7 +1820,7 @@ def _read_text(path: str) -> str:
 
 
 # The process's credentials: every candidate registered, the winners chosen by the one owner's table.
-_SECRETS = gateway_credentials.SecretRegistry()
+_SECRETS = diagnostics.REGISTRY  # the one registry every sink withholds from
 # The vault is located only if no earlier source holds a token.
 _FOUND = gateway_credential_sources.discover(
     os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
@@ -1830,6 +1837,9 @@ if _FOUND.token_source == "file":
 elif _FOUND.token_source == "vault":
     _announce_vault_token()
 _RAW, TOKEN, URL = _FOUND.raw, _FOUND.token, _FOUND.url
+# Every credential this process holds is withheld from logs and status in any rendering.
+diagnostics.register_gateway_url(URL)
+diagnostics.register_secret(TOKEN)
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
 ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
@@ -1855,7 +1865,7 @@ PROACTIVE_ROOM_GATE: Callable[[Path, str], bool] | None = None
 OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
-_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0, "loaded": False,
+_ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
                   "held_logged": 0.0}
 ROUTING_REFRESH_S = 300.0
 ROUTING_RETRY_S = 30.0
@@ -1869,30 +1879,55 @@ def _routing_file() -> Path:
     return _STATE / f"owner-routing{_INST_SUFFIX}.json"
 
 
+def _routing_record(identity: str, gateway_url: str, owner_dm: str) -> "dict | None":
+    """The owner-routing record as persisted: the redacted URL and the keyed binding of the full
+    one, never the full URL. None when no binding can be made, so nothing unbound is written."""
+    binding = gateway_instance.binding_digest(identity, gateway_url, create=True)
+    if not binding:
+        return None
+    return {"identity": identity, "gateway": _redact_url(gateway_url), "binding": binding,
+            "owner_dm": gateway_instance.owner_room(owner_dm, identity)}
+
+
+def _migrate_routing() -> "routing_migrations.Result":
+    """The routing state's migrations, on every load: no latch, so what disk still holds (a legacy
+    record, a legacy temp still inside its age bound) is handled when it is there."""
+    return routing_migrations.migrate_owner_routing(
+        _routing_file(), record_for=_routing_record, write=_durable_write,
+        log=lambda line: _log_backoff(("owner-routing migration", line), line))
+
+
 def _load_routing() -> None:
-    if _ROUTING["loaded"]:
-        return
-    _ROUTING["loaded"] = True
-    _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # what the in-memory reading is bound to
+    """Migrate, then rebuild the reading from the disk record, on every load. A gateway reading
+    the writer has not committed yet (owner_dm != persisted) is kept until its write commits."""
+    _migrate_routing()
+    current = (_reenroll_identity(), URL)
+    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
+        _ROUTING["identity"], _ROUTING["gateway"] = current  # a reading set before any binding adopts this one
+    elif (_ROUTING["identity"], _ROUTING["gateway"]) != current:  # re-enrolled: the old reading is not ours
+        _ROUTING.update(owner_dm="", persisted="", identity=current[0], gateway=current[1])
     try:
         d = json.loads(_routing_file().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
     # another agent's reading, or this agent's reading from another gateway, authorizes nothing
-    if isinstance(d, dict) and d.get("identity") == _reenroll_identity() and d.get("gateway") == URL:
-        _ROUTING["owner_dm"] = _ROUTING["persisted"] = str(d.get("owner_dm") or "")
+    bound = isinstance(d, dict) and d.get("identity") == current[0] and bool(d.get("binding")) \
+        and hmac.compare_digest(str(d["binding"]).encode("utf-8"),
+                                gateway_instance.binding_digest(current[0], URL).encode("utf-8"))
+    disk = gateway_instance.owner_room(d.get("owner_dm"), current[0]) if bound else ""
+    # A reading that came from disk follows the disk; one the writer has not committed yet stays.
+    if not _ROUTING["owner_dm"] or _ROUTING["owner_dm"] == _ROUTING["persisted"]:
+        _ROUTING["owner_dm"] = disk
+    _ROUTING["persisted"] = disk
 
 
 def refresh_routing(force: bool = False) -> None:
     """Pull the agent's routing state from the gateway. A failed refresh books a short retry, not the
     window; an answer without a DM (no row, no field) keeps the last reading, which lives on disk."""
+    reenrolled = bool(_ROUTING["identity"] or _ROUTING["gateway"]) and (
+        (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]))
     _load_routing()
-    if not _ROUTING["identity"] and not _ROUTING["gateway"]:
-        _ROUTING["identity"], _ROUTING["gateway"] = _reenroll_identity(), URL  # a reading set before any binding adopts this one
-    elif (_reenroll_identity(), URL) != (_ROUTING["identity"], _ROUTING["gateway"]):  # re-enrolled while running
-        _ROUTING.update(owner_dm="", persisted="", loaded=False)
-        _load_routing()
-        force = True
+    force = force or reenrolled
     now = time.time()
     if not force and now < _ROUTING["next"]:
         return
@@ -1904,16 +1939,11 @@ def refresh_routing(force: bool = False) -> None:
     if _GATEWAY_OWNER_DM_HINT:
         _ROUTING["owner_dm"] = _GATEWAY_OWNER_DM_HINT
     if _ROUTING["owner_dm"] and _ROUTING["owner_dm"] != _ROUTING["persisted"]:  # until durably published
-        try:
-            f = _routing_file(); f.parent.mkdir(parents=True, exist_ok=True)
-            tmp = f.with_name(f".{f.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps({"identity": _reenroll_identity(), "gateway": URL,
-                                       "owner_dm": _ROUTING["owner_dm"]}), encoding="utf-8")
-            os.replace(tmp, f)
-            _ROUTING["persisted"] = _ROUTING["owner_dm"]
-        except OSError:
+        record = _routing_record(_reenroll_identity(), URL, _ROUTING["owner_dm"])
+        if record is None or not _durable_write(_routing_file(), json.dumps(record)):
             _ROUTING["next"] = now + ROUTING_RETRY_S  # in memory it holds; the write is retried soon
             return
+        _ROUTING["persisted"] = _ROUTING["owner_dm"]
     _ROUTING["next"] = now + (ROUTING_REFRESH_S if _ROUTING["owner_dm"] else ROUTING_RETRY_S)
 
 
@@ -2009,19 +2039,19 @@ def _outbound_worker(inflight: "set[str]") -> None:
         try:
             _post_ready_results(inflight)
         except Exception as e:  # noqa: BLE001 — failure isolation per cycle
-            _log(f"outbound worker: results drain error (isolated): {e}")
+            _log(f"outbound worker: results drain error (isolated): {diagnostics.describe(e)}")
         try:
             _post_proactive()
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: proactive drain error (isolated): {e}")
+            _log(f"outbound worker: proactive drain error (isolated): {diagnostics.describe(e)}")
         try:
             _project_hitl(log=_log)
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: hitl projection error (isolated): {e}")
+            _log(f"outbound worker: hitl projection error (isolated): {diagnostics.describe(e)}")
         try:
             _retry_pending_acks(inflight)
         except Exception as e:  # noqa: BLE001
-            _log(f"outbound worker: pending-ack retry error (isolated): {e}")
+            _log(f"outbound worker: pending-ack retry error (isolated): {diagnostics.describe(e)}")
         for tid in [t for t in first_seen if t not in inflight]:
             ms = (time.monotonic() - first_seen.pop(tid)) * 1000.0
             _log(f"outbound worker: {tid} seen->retired {ms:.0f}ms (monotonic)")
@@ -2081,7 +2111,7 @@ def _start_results_watcher() -> "threading.Thread | None":
                         backoff = min(backoff * 2, 30.0)
                         break            # dir vnode gone: rebuild registration
             except Exception as e:  # noqa: BLE001 — degraded, never fatal
-                _log(f"results watcher degraded (scan remains the floor): {e}")
+                _log(f"results watcher degraded (scan remains the floor): {diagnostics.describe(e)}")
                 _OUTBOUND_STOP.wait(min(backoff, 30.0))
                 backoff = min(backoff * 2, 30.0)
             finally:
@@ -2128,7 +2158,8 @@ def _provision_base() -> str:
 def _reenroll_identity() -> str:
     """Agent mxid: process env, then the channel .env file — the same fallback
     the token uses (desktop launchers don't export either) — then the durable
-    per-host identity enrolment wrote to state/auth/ag2space.json. Re-read per
+    per-host identity enrolment wrote to state/auth/ag2space.json; a launcher's
+    pin (agent_identity.PINNED_KEY) leaves only its AGENT_MXID. Re-read per
     call, so an identity that appears mid-episode takes effect without a restart."""
     return agent_identity.resolve(_STATE, _config_from_channel_env)
 
@@ -2147,7 +2178,11 @@ def _reenroll_claim() -> None:
     if not agent_id or not TOKEN:
         # No POST issued -> no cadence stamp. The instruction must match what
         # can actually work: file candidates are re-read every cycle, but the
-        if not agent_id:
+        if not agent_id and os.environ.get(agent_identity.PINNED_KEY):
+            _log("reenroll: this bridge's launcher pinned no agent identity, so "
+                 "no file or binding supplies one; save the agent's MXID with the "
+                 "launcher and RESTART it")
+        elif not agent_id:
             pointered = os.environ.get("AG2_DEVICE_ENV") \
                 or os.environ.get("CLAUDE_CONFIG_DIR")
             _log("reenroll: agent identity unknown — write "
@@ -2162,15 +2197,16 @@ def _reenroll_claim() -> None:
         return
     _reenroll_state["last_attempt_at"] = time.monotonic()
     try:
-        req = urllib.request.Request(
-            _provision_base() + "/connect/reenroll",
-            data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
-            # The prod edge 403s urllib's default UA — same contract as _req().
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            body = json.loads(r.read() or b"{}")
-        code = str(body.get("approval_code") or "")
+        with _gateway_call():
+            req = urllib.request.Request(
+                _provision_base() + "/connect/reenroll",
+                data=json.dumps({"agent_id": agent_id, "bearer": TOKEN}).encode(),
+                # The prod edge 403s urllib's default UA — same contract as _req().
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "sutando-gateway-client/1.0"}, method="POST")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                body = json.loads(r.read() or b"{}")
+        code = diagnostics.code_field(body.get("approval_code"), URL) or ""
         if body.get("pending") and code:
             _reenroll_state["code"] = code
             _reenroll_state["claimed_at"] = int(time.time())
@@ -2179,19 +2215,19 @@ def _reenroll_claim() -> None:
                  f"lost. RELINK CODE: {code} — the owner approves by DMing the "
                  f"concierge: relink approve {code}")
         else:
-            _log(f"reenroll: claim not parked ({str(body)[:200]})")
+            _log("reenroll: claim not parked (the answer carries no usable approval code)")
     except urllib.error.HTTPError as e:
         raw = _http_error_body(e)
         try:
             err = json.loads(raw).get("error")
         except Exception:  # noqa: BLE001 — a non-JSON body still records the status
             err = None
-        _reenroll_state["refused"] = {"status": e.code,
-                                      "error": err if isinstance(err, str) else None,
-                                      "at": int(time.time())}
-        _log(f"reenroll: claim refused HTTP {e.code} ({raw[:200]})")
+        # The body is the gateway's free text: only an error name that is a safe token leaves here.
+        err = diagnostics.code_field(err, URL)
+        _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
+        _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
-        _log(f"reenroll: claim failed: {e}")
+        _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
 
 def _reenroll_clear(recovered: bool = False) -> None:
@@ -2508,6 +2544,7 @@ MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
 MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
 
 HS_MEDIA_TOKEN = _FOUND.media_token
+diagnostics.register_secret(HS_MEDIA_TOKEN)
 # The homeserver token is attached ONLY to media URLs on this exact origin
 # (scheme+host+port). Without it configured, Matrix media URLs are never
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
@@ -2552,18 +2589,9 @@ def _redact_url(value: str) -> str:
     """Scheme+host+path only — drop userinfo, query, and fragment before a URL
     is persisted. `gateway-status.json` lives under `state/` (which vault-syncs),
     so a gateway configured with `user:pass@` userinfo or a `?token=` query param
-    must not land there in plaintext. Falls back to the bare string on any parse
-    failure (never raise from a best-effort status write)."""
-    try:
-        p = urllib.parse.urlsplit(str(value))
-        if not p.scheme and not p.netloc:
-            return str(value)
-        host = p.hostname or ""
-        if p.port:
-            host = f"{host}:{p.port}"
-        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
-    except Exception:  # noqa: BLE001 — redaction must never break status I/O
-        return str(value)
+    must not land there in plaintext. Fails closed to a placeholder on any parse
+    failure (never the raw value, never raise from a best-effort status write)."""
+    return gateway_credentials.redact_url(value)
 
 
 class _NeverFatalStream:
@@ -2609,7 +2637,8 @@ sys.stderr = _NeverFatalStream(sys.stderr)
 
 
 def _log(msg: str) -> None:
-    line = f"[remote-gateway-bridge] {msg}"
+    safe = diagnostics.scrub(gateway_credentials.redact_text(msg, globals().get("URL") or ""))
+    line = f"[remote-gateway-bridge] {safe}"
     print(line, flush=True)
     _append_log_file(line)
 
@@ -2637,6 +2666,14 @@ _REQ_TIMEOUT_S = 35
 # errors bare (RemoteDisconnected is a ConnectionResetError), and those are outages too.
 _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
+
+
+@contextlib.contextmanager
+def _gateway_call():
+    """Every call that receives the gateway URL runs inside this: what it raises carries only
+    its type, the redacted gateway and an HTTP status, so no caller can log or persist the URL."""
+    with gateway_instance.gateway_call(URL):
+        yield
 
 
 # The last response's status and edge headers, per thread, for the poll's anomaly line.
@@ -2668,22 +2705,23 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
             raise TimeoutError("request deadline already passed")
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
-    req.add_header("Authorization", f"Bearer {TOKEN}")
-    req.add_header("Accept", "application/json")
-    # CloudFlare bot-fight (error 1010) rejects python-urllib's default
-    # User-Agent with a 403; send an explicit client UA so the gateway's edge
-    req.add_header("User-Agent", "sutando-gateway-client/1.0")
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        headers = getattr(resp, "headers", None) or {}
-        _RESP_META.last = {"status": getattr(resp, "status", None),
-                           "content_length": headers.get("Content-Length"),
-                           "cf_ray": headers.get("CF-Ray")}
-        raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
-        return json.loads(raw) if raw else {}
+    with _gateway_call():
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(f"{URL}{path}", data=data, method=method)
+        req.add_header("Authorization", f"Bearer {TOKEN}")
+        req.add_header("Accept", "application/json")
+        # CloudFlare bot-fight (error 1010) rejects python-urllib's default
+        # User-Agent with a 403; send an explicit client UA so the gateway's edge
+        req.add_header("User-Agent", "sutando-gateway-client/1.0")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            headers = getattr(resp, "headers", None) or {}
+            _RESP_META.last = {"status": getattr(resp, "status", None),
+                               "content_length": headers.get("Content-Length"),
+                               "cf_ray": headers.get("CF-Ray")}
+            raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
+            return json.loads(raw) if raw else {}
 
 
 def _http_error_body(e) -> str:
@@ -2739,8 +2777,8 @@ def _reload_rotated_token() -> bool:
     # (url_from_token) AND the split form (bare secret + a separate
     file_url = (url_from_token or _read_token_file_url(TOKEN_FILE)).rstrip("/")
     if file_url and file_url != URL:
-        _log(f"token file names a DIFFERENT gateway ({file_url}) "
-             f"than the running one ({URL}) — a URL change is not hot-swappable; "
+        _log(f"token file names a DIFFERENT gateway ({_redact_url(file_url)}) "
+             f"than the running one ({_redact_url(URL)}) — a URL change is not hot-swappable; "
              "restart the bridge to move gateways")
         return False
     if not secret or secret == TOKEN:
@@ -2826,7 +2864,7 @@ def _read_ack_json(path: Path) -> dict:
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"pending-ack file {path.name} unreadable ({e}) — starting empty")
+        _log(f"pending-ack file {path.name} unreadable ({diagnostics.describe(e)}) — starting empty")
         return {}
     return {str(k): v for k, v in data.items()} if isinstance(data, dict) else {}
 
@@ -2947,7 +2985,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 raise
             if dropped is not None:
                 dropped.append((tid, durable, lease_id))
-                _log(f"task ack for {tid} lost to a dropped connection ({e}) — set aside for retry")
+                _log(f"task ack for {tid} lost to a dropped connection ({diagnostics.describe(e)}) — set aside for retry")
                 return False
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
@@ -2975,7 +3013,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
         _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
         return False
     except _NETWORK_ERRORS as e:
-        _log(f"task ack network error for {tid}: {e} — gateway may redeliver")
+        _log(f"task ack network error for {tid}: {diagnostics.describe(e)} — gateway may redeliver")
         return False
 
 
@@ -3020,7 +3058,7 @@ def _post_ack_first(tid: str, lease_id: "str | None") -> str:
     except (OSError, ValueError, http.client.HTTPException) as e:
         # A re-ack of an accepted task answers `duplicate`, so retrying is always safe.
         _log_backoff((tid, "ack-retry"), f"ack_first task {tid}: ack failed "
-                     f"({type(e).__name__}: {e}) — kept staged, retrying")
+                     f"({diagnostics.describe(e)}) — kept staged, retrying")
         return "retry"
 
 
@@ -3032,7 +3070,7 @@ def _ack_first_state(tid: str) -> "str | None":
         doc = _req("GET", f"/v1/tasks/{urllib.parse.quote(wire_tid, safe='')}/status", timeout=10)
     except (OSError, ValueError, http.client.HTTPException) as e:
         _log_backoff((tid, "ack-status"), f"ack_first task {tid}: status unreadable "
-                     f"({type(e).__name__}: {e}) — kept staged")
+                     f"({diagnostics.describe(e)}) — kept staged")
         return None
     state = doc.get("state") if isinstance(doc, dict) else None
     return state if isinstance(state, str) else None
@@ -3253,7 +3291,7 @@ def _push_pool_advertisement_now() -> None:
         _maybe_push_agent_profile(record)
         _maybe_pull_worker_labels(record)
     except Exception as e:  # noqa: BLE001 — a background push fails loudly, never silently
-        _log(f"pool advertisement push failed: {e}")
+        _log(f"pool advertisement push failed: {diagnostics.describe(e)}")
 
 
 def _workers_body(ad: dict) -> dict:
@@ -3289,7 +3327,7 @@ def _health_snapshot() -> "dict | None":
             import health_snapshot
             value = health_snapshot.snapshot(_STATE.parent)
     except Exception as e:  # noqa: BLE001 — health is optional; it never breaks a push
-        error = f"{type(e).__name__}: {e}"
+        error = diagnostics.describe(e)
     if error and error != _health_cache["error"]:
         _log(f"health snapshot unavailable: {error}")
     _health_cache.update(at=time.monotonic(), value=value, error=error)
@@ -3377,7 +3415,7 @@ def _maybe_push_workers_snapshot(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — relay must never kill the loop
         _workers_push_retry_at = now + 300
-        _log(f"workers-snapshot push failed, retrying in 5m: {e}")
+        _log(f"workers-snapshot push failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     _workers_pushed_identity = identity
     _workers_pushed_at = _now()
@@ -3442,7 +3480,7 @@ def _maybe_push_agent_profile(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — relay must never kill the loop
         _profile_push_retry_at = now + 300
-        _log(f"agent-profile push failed, retrying in 5m: {e}")
+        _log(f"agent-profile push failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     _profile_pushed_identity = key
     _log(f"agent-profile pushed for {mxid}")
@@ -3470,7 +3508,7 @@ def _maybe_pull_worker_labels(record) -> bool:
         return False
     except Exception as e:  # noqa: BLE001 — optional read cannot stop task intake
         _profile_labels_retry_at = now + 300
-        _log(f"worker-label read failed, retrying in 5m: {e}")
+        _log(f"worker-label read failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
 
     _profile_labels_checked_at = now
@@ -3498,10 +3536,10 @@ def _maybe_pull_worker_labels(record) -> bool:
         result = _WORKER_LABEL_APPLIER(labels, version, mxid)
     except Exception as e:  # noqa: BLE001 — local pool may be absent or upgrading
         _profile_labels_retry_at = now + 300
-        _log(f"worker-label apply failed, retrying in 5m: {e}")
+        _log(f"worker-label apply failed, retrying in 5m: {diagnostics.describe(e)}")
         return False
     if isinstance(result, dict) and result.get("changed"):
-        _log(f"worker labels applied from owner profile config v{version}")
+        _log(f"worker labels applied from owner profile config v{int(version)}")
     return True
 
 
@@ -3592,6 +3630,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "provider": PROVIDER,
             "tier": LOCAL_TIER,
             "inflight": len(inflight),
+            "package_version": _PACKAGE_VERSION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
                              "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
         }
@@ -3604,8 +3643,9 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        _req("POST", "/v1/heartbeat", payload, timeout=10)
+        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
+        _record_setup_hint(reply)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3619,8 +3659,33 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         _log(f"heartbeat failed: HTTP {e.code} — continuing")
         return False
     except _NETWORK_ERRORS as e:
-        _log(f"heartbeat network error: {e} — continuing")
+        _log(f"heartbeat network error: {diagnostics.describe(e)} — continuing")
         return False
+
+
+def _record_setup_hint(reply) -> None:
+    """Keep the heartbeat reply's setup_revision and versions for an adapter to read;
+    best-effort, like the heartbeat itself."""
+    if not isinstance(reply, dict):
+        return
+    # Gateway values: the revision only as a revision_field token, the versions only as PEP 440.
+    hint = {k: (diagnostics.revision_field(reply.get(k), URL) if k == "setup_revision"
+                else diagnostics.version_field(reply.get(k))) for k in SETUP_HINT_FIELDS if k in reply}
+    if "setup_revision" in hint and hint["setup_revision"] is None:
+        # A refused announcement still retires the cache it replaces: no revision is never "any".
+        hint[SETUP_REVISION_WITHHELD] = True
+    hint = {k: v for k, v in hint.items() if v is not None}
+    if not hint:
+        return
+    payload = diagnostics.safe_status(dict(hint, ts=int(time.time())),
+                                      lambda text: gateway_credentials.redact_text(text, URL))
+    try:
+        text = json.dumps(payload, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        _log(f"setup hint not recorded: {diagnostics.describe(e)}")
+        return
+    if not _durable_write(SETUP_HINT_FILE, text):
+        _log("setup hint not recorded")
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
@@ -3647,10 +3712,13 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "ts": now,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),
-            "error": _one_line(error) if error else None,
+            "error": _one_line(gateway_credentials.redact_text(error, URL)) if error else None,
             "gateway": _redact_url(URL),
             # Re-read on every write, so a lane switch or re-login shows at the next poll.
             "agent_id": (_reenroll_identity() or None) if connected else None,
+            # Keyed digest of identity + full URL: a reader matches a saved reading's binding.
+            "gateway_binding": (gateway_instance.binding_digest(_reenroll_identity(), URL)
+                                or None) if connected else None,
             "launched_via": _LAUNCHED_VIA,
             # Read by an adapter's verify: which inbox this bridge actually feeds.
             "tasks_dir": os.path.realpath(TASKS_DIR),
@@ -3703,6 +3771,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
         # Per-PID staging (sonichi/sutando#2222 follow-up): single-writer today,
         # but a shared temp name collides if a second sparrow instance ever runs;
         tmp = GATEWAY_STATUS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
+        payload = diagnostics.safe_status(payload, lambda text: gateway_credentials.redact_text(text, URL))
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, GATEWAY_STATUS_FILE)
@@ -3763,22 +3832,23 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     gateway-controlled URL must not bounce our bearer to another host — and a
     3xx is treated as a FAILURE (raise) so the redirect page's body is never
     saved as if it were the media."""
-    req = urllib.request.Request(url, method="GET")
-    for k, v in headers.items():
-        req.add_header(k, v)
-    if "Authorization" in headers:
-        class _NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *a, **kw):  # noqa: D401
-                return None
-        opener = urllib.request.build_opener(_NoRedirect)
-        resp_ctx = opener.open(req, timeout=30)
-    else:
-        resp_ctx = urllib.request.urlopen(req, timeout=30)
-    with resp_ctx as resp:
-        status = getattr(resp, "status", 200)
-        if 300 <= status < 400:
-            raise ValueError(f"authenticated media fetch got a redirect ({status})")
-        data = resp.read(cap + 1)
+    with gateway_instance.gateway_call(url):  # a gateway-supplied URL, maybe under the gateway's
+        req = urllib.request.Request(url, method="GET")
+        for k, v in headers.items():
+            req.add_header(k, v)
+        if "Authorization" in headers:
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **kw):  # noqa: D401
+                    return None
+            opener = urllib.request.build_opener(_NoRedirect)
+            resp_ctx = opener.open(req, timeout=30)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=30)
+        with resp_ctx as resp:
+            status = getattr(resp, "status", 200)
+            if 300 <= status < 400:
+                raise ValueError(f"authenticated media fetch got a redirect ({status})")
+            data = resp.read(cap + 1)
     if len(data) > cap:
         raise ValueError(f"media exceeds {cap}-byte cap")
     return data
@@ -3829,7 +3899,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
     except Exception as e:  # noqa: BLE001 — drop-in safe
-        _log(f"media fetch failed ({e}) — leaving marker as-is")
+        _log(f"media fetch failed ({diagnostics.describe(e)}) — leaving marker as-is")
         return body
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
@@ -3846,7 +3916,7 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
             f.write(data)
         path = Path(path_str)
     except Exception as e:  # noqa: BLE001
-        _log(f"media save failed ({e}) — leaving marker as-is")
+        _log(f"media save failed ({diagnostics.describe(e)}) — leaving marker as-is")
         return body
     _log(f"fetched media → {path} ({len(data)} bytes)")
     if _refs_out is not None:
@@ -3921,7 +3991,7 @@ def _write_owner_activity(task: dict, sender_tier: str | None = None) -> None:
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, OWNER_ACTIVITY_FILE)
     except Exception as e:  # noqa: BLE001
-        _log(f"owner-activity write failed: {e}")
+        _log(f"owner-activity write failed: {diagnostics.describe(e)}")
 
 
 def _fsync_in_place(tid: str, *targets: Path) -> bool:
@@ -3937,7 +4007,7 @@ def _fsync_in_place(tid: str, *targets: Path) -> bool:
             finally:
                 os.close(fd)
     except OSError as exc:
-        _log(f"durability repair failed for {tid} ({exc})")
+        _log(f"durability repair failed for {tid} ({diagnostics.describe(exc)})")
         return False
     return True
 
@@ -4039,7 +4109,7 @@ def _feed_on_task_stdin(proc: "subprocess.Popen", data: bytes, tid: str) -> None
     except (BrokenPipeError, ConnectionResetError):
         pass  # the command exited or closed stdin without reading: it ignores the payload
     except (OSError, ValueError) as exc:
-        _log(f"on-task stdin write failed for {tid}: {type(exc).__name__}: {exc}")
+        _log(f"on-task stdin write failed for {tid}: {diagnostics.describe(exc)}")
     finally:
         with contextlib.suppress(OSError):
             pipe.close()
@@ -4063,13 +4133,14 @@ def _fire_on_task(tid: str, path: Path, text: "str | None" = None) -> None:
             text = path.read_text(encoding="utf-8")
         data = text.encode("utf-8")
         argv = shlex.split(ON_TASK_CMD) + [str(path)]
-        env = {**_on_task_env(), **_on_task_header_env(text),
+        # A declared bridge's wake command acts as the agent: the owner sets its token, never the host's.
+        env = {**gateway_credential_sources.wake_environ(_on_task_env(), _RAW, URL), **_on_task_header_env(text),
                "SPARROW_TASK_ID": tid, "SPARROW_TASK_FILE": str(path)}
         proc = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
     except Exception as exc:  # noqa: BLE001 — a bad wake command never stops the pull loop
-        _log(f"on-task command failed to start for {tid}: {type(exc).__name__}: {exc}")
+        _log(f"on-task command failed to start for {tid}: {diagnostics.describe(exc)}")
         return
 
     threading.Thread(target=_feed_and_reap, args=(proc, data, tid),
@@ -4178,7 +4249,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
                 except Exception as _vault_exc:
                     _fetched = _redact_fallback(_fetched)
                     _log(f"[vault] intercept errored "
-                         f"({type(_vault_exc).__name__}: {_vault_exc}) — "
+                         f"({diagnostics.describe(_vault_exc)}) — "
                          f"redacted, NOT stored")
             else:
                 _fetched = _redact_fallback(_fetched)
@@ -4311,7 +4382,7 @@ def _load_dedup_aliases() -> "dict[str, str] | None":
     try:
         loaded = json.loads(DEDUP_ALIAS_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"dedup alias ledger unreadable ({exc}) — deferring")
+        _log(f"dedup alias ledger unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4329,7 +4400,7 @@ def _save_dedup_aliases(aliases: dict[str, str]) -> bool:
         os.replace(tmp, DEDUP_ALIAS_FILE)
         return True
     except Exception as exc:  # noqa: BLE001
-        _log(f"dedup alias persist FAILED ({exc}) — keeping original delivery")
+        _log(f"dedup alias persist FAILED ({diagnostics.describe(exc)}) — keeping original delivery")
         return False
 
 
@@ -4360,7 +4431,7 @@ def _load_task_rooms() -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except Exception as e:  # noqa: BLE001
-        _log(f"task-rooms file unreadable ({e}) — starting empty")
+        _log(f"task-rooms file unreadable ({diagnostics.describe(e)}) — starting empty")
         return {}
 
 
@@ -4374,7 +4445,7 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         tmp.write_text(json.dumps(rooms, sort_keys=True))
         os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
-        _log(f"task-rooms persist failed ({e}) — continuing")
+        _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
 
 
 def _record_task_room(tid: str, room: str) -> None:
@@ -4404,7 +4475,7 @@ def _load_task_media() -> "dict | None":
     try:
         loaded = json.loads(TASK_MEDIA_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"task-media sidecar unreadable ({exc}) — deferring")
+        _log(f"task-media sidecar unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4449,7 +4520,7 @@ def _load_ack_first() -> "dict | None":
     try:
         loaded = json.loads(ACK_FIRST_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log_backoff(("ack-first-marks",), f"ack_first marks unreadable ({exc}) — deferring")
+        _log_backoff(("ack-first-marks",), f"ack_first marks unreadable ({diagnostics.describe(exc)}) — deferring")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4595,7 +4666,7 @@ def _reclaim_parked_relay_results(inflight: "set[str]") -> None:
                     else f"a live result already holds {target.name}"))
             continue
         except OSError as e:
-            _log(f"result {local}: its parked relay result could not be moved back ({e}); "
+            _log(f"result {local}: its parked relay result could not be moved back ({diagnostics.describe(e)}); "
                  "the next start reclaims it")
             continue
         _log(f"result {local}: reclaimed the relay result an older bridge parked ({copy.name}); "
@@ -4625,7 +4696,7 @@ def _load_held() -> "dict | None":
     try:
         loaded = json.loads(ACK_FIRST_MANIFEST_FILE.read_text())
     except (OSError, ValueError) as exc:
-        _log(f"ack_first manifest unreadable ({exc}) — nothing staged is acked or published")
+        _log(f"ack_first manifest unreadable ({diagnostics.describe(exc)}) — nothing staged is acked or published")
         return None
     return loaded if isinstance(loaded, dict) else None
 
@@ -4980,6 +5051,7 @@ def _relay_failed_sent(broker_id: str) -> bool:
 
 
 _POLL_ANOMALIES = 0
+_POLL_ANOMALY_LINE = ""  # the last anomaly's line: built from our own fields, logged by the loop
 
 
 class _PollAnomaly(Exception):
@@ -4993,17 +5065,18 @@ def _served_key(task: dict) -> str:
 def _poll_task_list(resp) -> list:
     """The poll's served tasks. A 200 with no `tasks` list (an empty body, or other JSON) is
     counted and raised: it can stand for a batch the broker served and the client never saw."""
-    global _POLL_ANOMALIES
+    global _POLL_ANOMALIES, _POLL_ANOMALY_LINE
     tasks = resp.get("tasks") if isinstance(resp, dict) else None
     if isinstance(tasks, list):
         return tasks
     _POLL_ANOMALIES += 1
     meta = getattr(_RESP_META, "last", None) or {}
     shape = "an empty body" if resp == {} else f"{type(resp).__name__} without a tasks list"
-    raise _PollAnomaly(
+    _POLL_ANOMALY_LINE = (
         f"poll anomaly #{_POLL_ANOMALIES}: answered {shape} (status={meta.get('status')}, "
         f"content-length={meta.get('content_length')}, cf-ray={meta.get('cf_ray')}) "
         "— any task served in it is lost to this client until its lease expires")
+    raise _PollAnomaly()
 
 
 def _receive_round(tasks: list) -> "tuple[list, dict]":
@@ -5053,9 +5126,9 @@ def _isolated(task: dict, take, *args, fates: "dict | None" = None) -> bool:
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
             raise                     # the loop's auth recovery owns a rejected bearer
-        why = f"HTTPError: {e}"
+        why = diagnostics.describe(e)
     except Exception as e:  # noqa: BLE001 — one task must not withhold its batch's acks
-        why = f"{type(e).__name__}: {e}"
+        why = diagnostics.describe(e)
     if fates is not None:
         fates[_served_key(task)] = "dropped"
     _log(f"task {_served_key(task)} not taken ({why}) — not acked; the broker re-serves it")
@@ -5308,7 +5381,7 @@ def _load_settle_pending() -> bool:
                 raise ValueError("ids is not a list")
         except (OSError, ValueError, KeyError, TypeError) as e:
             disposal.report_once("settle-ledger", _log,
-                                 f"the settle-intent ledger could not be read ({e}); it is left as it is "
+                                 f"the settle-intent ledger could not be read ({diagnostics.describe(e)}); it is left as it is "
                                  "and nothing is written over it until it can be")
             return False
         _SETTLE_PENDING.update(t for t in ids if isinstance(t, str) and _valid_local_tid(t))
@@ -5412,7 +5485,7 @@ def _room_bound_result(name: str, room: "str | None") -> bool:
 def _gate_failed(name: str, exc: Exception) -> None:
     if name not in _GATE_FAILED_LOGGED:
         _GATE_FAILED_LOGGED.add(name)
-        _log(f"proactive {name} held: room gate failed ({exc}) — a room-bound "
+        _log(f"proactive {name} held: room gate failed ({diagnostics.describe(exc)}) — a room-bound "
              "result is never delivered unchecked")
 
 # Bodies above this never fit a Matrix event, so they are undeliverable no
@@ -5504,7 +5577,7 @@ def _record_proactive_receipt(item_id: str, room: str) -> None:
         record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
-        _log(f"proactive receipt write failed for {item_id}: {e} "
+        _log(f"proactive receipt write failed for {item_id}: {diagnostics.describe(e)} "
              "(delivery unaffected)")
 
 
@@ -5558,7 +5631,7 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
         dest_dir.mkdir(parents=True, exist_ok=True)
         claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
     except OSError as e:
-        _log(f"could not retire proactive {original.name} ({e}) — re-queueing")
+        _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
         try:
             claim.rename(original)
         except OSError:
@@ -5598,7 +5671,10 @@ def _room_upgraded_to(err_body: str) -> "str | None":
         return None
     if not isinstance(d, dict) or d.get("reason") != "room_upgraded":
         return None
-    return str(d.get("replacement_room") or "")
+    room = d.get("replacement_room")
+    # A gateway value: kept only as a room id holding no registered secret.
+    ok = isinstance(room, str) and gateway_instance.MATRIX_ROOM_RE.fullmatch(room) and not diagnostics.contains_secret(room)
+    return room if ok else ""
 
 
 def _owner_dm_upgrade_held(room: str) -> bool:
@@ -5646,7 +5722,7 @@ def _hold_owner_dm_upgrade(room: str, replacement: str, noticed: "set | None" = 
         try:
             _atomic_private_json(_upgrade_hold_file(), d)
         except OSError as e:
-            _log(f"could not record owner-DM upgrade hold ({e})")
+            _log(f"could not record owner-DM upgrade hold ({diagnostics.describe(e)})")
         _log(f"owner DM {room} was upgraded to {replacement or '(unknown)'}, which this agent "
              "has not joined — holding owner-DM nudges until the owner DM is repointed")
     _notify_owner_dm_upgrade(d, noticed)
@@ -5672,14 +5748,14 @@ def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
     except Exception as exc:  # noqa: BLE001
         if tried >= MAX_TRANSIENT_ATTEMPTS:
             d["notice"] = "gave_up"
-            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({exc}) — the owner was "
+            _log(f"owner-DM upgrade notify GAVE UP after {tried} attempt(s) ({diagnostics.describe(exc)}) — the owner was "
                  f"NOT told that {room} was upgraded to {replacement or '(unknown)'}")
         else:
-            _log(f"owner-DM upgrade notify failed ({exc}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
+            _log(f"owner-DM upgrade notify failed ({diagnostics.describe(exc)}) — will retry ({tried}/{MAX_TRANSIENT_ATTEMPTS})")
     try:
         _atomic_private_json(_upgrade_hold_file(), d)
     except OSError as e:
-        _log(f"could not record owner-DM upgrade notice state ({e})")
+        _log(f"could not record owner-DM upgrade notice state ({diagnostics.describe(e)})")
 
 
 def _post_proactive() -> None:
@@ -5747,7 +5823,7 @@ def _post_proactive() -> None:
                 claim.rename(f)
             except OSError as restore_exc:
                 _log(f"CRITICAL: proactive {claim.name} was not ready AND restore "
-                     f"to {f.name} failed ({restore_exc}) — owner nudge stranded "
+                     f"to {f.name} failed ({diagnostics.describe(restore_exc)}) — owner nudge stranded "
                      f"under live pid until restart")
             continue
         route, room_override, routed_body = _proactive_route(claimed_text)
@@ -5828,7 +5904,7 @@ def _post_proactive() -> None:
                 outcome = _resolve_send_failure(
                     claim, f, _UnconfirmedDelivery("no event_id in response"))
                 _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(response {str(resp)[:120]!r}) — {outcome}; check "
+                     f"(a {type(resp).__name__} answer with no event_id) — {outcome}; check "
                      "REMOTE_PROACTIVE_ROOM and the agent's room membership")
                 continue
         except urllib.error.HTTPError as e:
@@ -5838,8 +5914,10 @@ def _post_proactive() -> None:
                 except OSError:
                     pass
                 raise
-            replacement = _room_upgraded_to(_http_error_body(e)) if (
-                e.code == 400 and room_override is None) else None
+            replacement = None
+            if e.code == 400 and room_override is None:
+                err_body = _http_error_body(e)
+                replacement = _room_upgraded_to(err_body)
             if replacement is not None:
                 try:
                     claim.rename(f)  # stays pending: not a failed attempt, the room moved
@@ -5852,7 +5930,7 @@ def _post_proactive() -> None:
             continue
         except (urllib.error.URLError, TimeoutError) as e:
             outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send network error for {f.name}: {e} — {outcome}")
+            _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
             continue
         _record_proactive_receipt(f.stem, dest_room)
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -5881,7 +5959,7 @@ def _load_inflight() -> set[str]:
         return set()
     except Exception as e:  # noqa: BLE001
         _INFLIGHT_DEGRADED = True
-        _log(f"inflight file unreadable ({e}) — starting empty")
+        _log(f"inflight file unreadable ({diagnostics.describe(e)}) — starting empty")
         return set()
 
 
@@ -5971,7 +6049,7 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
                 _reask_id(tid), commit_identity=_commit,
                 channel_dir=CHANNEL_DIR, holder_delivery_state=_holder_delivery_state)
     except OSError as e:
-        _log(f"dedup decision for {tid} deferred: {e}")
+        _log(f"dedup decision for {tid} deferred: {diagnostics.describe(e)}")
         return "defer", None, room
     return action, payload, room
 
@@ -6034,7 +6112,7 @@ def _relay_results_retrying(now: float) -> "dict | None":
         return {"count": len(ages), "oldest_age_s": int(max(ages))} if ages else None
     except Exception as e:  # noqa: BLE001 - this field never costs the rest of the status write
         _log_backoff(("relay-results-retrying",), f"relay_results_retrying not reported "
-                     f"({type(e).__name__}: {e}); the rest of the gateway status is written")
+                     f"({diagnostics.describe(e)}); the rest of the gateway status is written")
         return None
 
 
@@ -6101,7 +6179,7 @@ def _recover_disposing_claims() -> None:
         disposal.recover_abandoned_claims(RESULTS_DIR, _log)
     except Exception as e:  # noqa: BLE001 - the adapter boundary fails open
         disposal.report_once(f"recovery:{RESULTS_DIR}", _log,
-                             f"result disposal: recovery failed ({e}); delivery continues")
+                             f"result disposal: recovery failed ({diagnostics.describe(e)}); delivery continues")
 
 
 def _disposed_copy_exists(tid: str, generation) -> bool:
@@ -6110,7 +6188,7 @@ def _disposed_copy_exists(tid: str, generation) -> bool:
     try:
         return disposal.disposed_copy_exists(RESULTS_DIR, tid, generation, _log)
     except OSError as e:
-        _log(f"result {tid}: could not check for a disposed copy ({e})")
+        _log(f"result {tid}: could not check for a disposed copy ({diagnostics.describe(e)})")
         return False
 
 
@@ -6156,7 +6234,7 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
         _log(f"result {tid}: {why} but the result file vanished before "
              "quarantine and no quarantined copy of the body this pass read was found")
     except OSError as e:
-        _log(f"result {tid}: {why} but quarantine failed ({e}) — "
+        _log(f"result {tid}: {why} but quarantine failed ({diagnostics.describe(e)}) — "
              "leaving it in place")
 
 
@@ -7081,7 +7159,7 @@ def _retire_orphan(rfile, directory, base: str, generation) -> bool:
     try:
         done = disposal.retire_generation(RESULTS_DIR, rfile, generation, _log, directory, _names(base))
     except OSError as e:
-        _log(f"orphan sweep: {stem} could not be moved ({e}); left in place")
+        _log(f"orphan sweep: {stem} could not be moved ({diagnostics.describe(e)}); left in place")
         return False
     if done.outcome is disposal.Retirement.FALLBACK:
         _log(f"orphan sweep: {stem} was not moved to {Path(directory).name}/: {done.cause}")
@@ -7316,7 +7394,7 @@ def _release_singleton() -> None:
         try:
             _ws_retain(_LOCK_ROLE, _LOCK_WS)  # else our dead pid gets it reaped at once
         except Exception as e:
-            _log(f"singleton: retain failed ({e}) — the held lock can be reaped once this pid exits")
+            _log(f"singleton: retain failed ({diagnostics.describe(e)}) — the held lock can be reaped once this pid exits")
         return
     try:
         _ws_release(_LOCK_ROLE, _LOCK_WS)
@@ -7397,7 +7475,7 @@ def _acquire_singleton() -> bool:
     try:
         r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S)
     except Exception as e:  # fail-open — never wedge task delivery on a lock bug
-        _log(f"singleton: acquire error ({e}) — proceeding without lock")
+        _log(f"singleton: acquire error ({diagnostics.describe(e)}) — proceeding without lock")
         return True
     if r.status == "deferred":
         h = r.holder or {}
@@ -7487,13 +7565,13 @@ def _maybe_start_event_channel() -> None:
                     if poster is not None:
                         poster.sweep()
                 except Exception as e:  # noqa: BLE001 — drain must never break anything
-                    _log(f"event drain error (isolated): {e}")
+                    _log(f"event drain error (isolated): {diagnostics.describe(e)}")
                 time.sleep(2.0)
         threading.Thread(target=_drain_loop, name="sparrow-event-drain", daemon=True).start()
         _log("event channel + consumer started (SPARROW_EVENTS enabled) — isolated "
              "daemon threads, task delivery unaffected")
     except Exception as e:  # noqa: BLE001 — event startup must NEVER break tasks
-        _log(f"event channel start failed (task delivery unaffected): {e}")
+        _log(f"event channel start failed (task delivery unaffected): {diagnostics.describe(e)}")
 
 
 def _poll_timeout_is_empty(last_ok: float, now: float,
@@ -7507,15 +7585,30 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
 
 
 def main() -> None:
+    # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
+    gateway_instance.install_scrubbing_excepthooks(lambda: URL)
     if _FOUND.fatal:
         sys.exit(f"FATAL: {_FOUND.fatal}")
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
+    if not URL and gateway_credential_sources.credentials_injected(os.environ) \
+            and gateway_credential_sources.token_url_shaped(_RAW):
+        sys.exit("FATAL: no gateway URL for this declared bridge — its vault token starts with a URL scheme but "
+                 "has no url|secret separator. If it is a combined token that lost its '|', store it again under "
+                 "its AG2_RELAY_TOKEN_<worker> vault key as 'https://<gateway>|<secret>'; if it is an opaque "
+                 "bearer, store the agent's gateway URL under its AG2_RELAY_URL_<worker> key; "
+                 "`python3 src/sparrow_agent_bridge.py --preflight` names both keys.")
+    if not URL and gateway_credential_sources.credentials_injected(os.environ):
+        # A declared bridge's environment URLs are stripped: only the owner's vault entries can supply it.
+        sys.exit("FATAL: no gateway URL for this declared bridge — its vault token is a bare secret. Store the "
+                 "agent's gateway URL under its AG2_RELAY_URL_<worker> vault key, or the combined "
+                 "'https://<gateway>|<secret>' token under its AG2_RELAY_TOKEN_<worker> key; "
+                 "`python3 src/sparrow_agent_bridge.py --preflight` names both keys.")
     if not URL:
         # A token that starts with a URL scheme but yielded no URL means the
         # url|secret separator was swallowed (e.g. a %7C survived decoding, or a
         _hint = (" — the token carries a gateway URL but the url|secret separator "
-                 "looks missing/corrupted" if TOKEN[:4].lower() == "http" else "")
+                 "looks missing/corrupted" if gateway_credential_sources.token_url_shaped(_RAW) else "")
         sys.exit("FATAL: no gateway URL — set REMOTE_TASK_URL, or use the combined "
                  f"'https://<gateway>|<secret>' onboarding token{_hint}.")
     _resolve_host_label()
@@ -7530,15 +7623,15 @@ def main() -> None:
         try:
             sweep()
         except Exception as e:  # noqa: BLE001 — what a sweep leaves waits for the next start
-            _log(f"{sweep.__name__} failed ({type(e).__name__}: {e}) — continuing")
+            _log(f"{sweep.__name__} failed ({diagnostics.describe(e)}) — continuing")
     try:
         # Before the drain and the orphan sweep, so the body is back in flight under its id.
         _reclaim_parked_relay_results(inflight)
         _keep_relay_results_in_flight(inflight)
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
-        _log(f"relay result reclaim failed ({type(e).__name__}: {e}) — continuing")
+        _log(f"relay result reclaim failed ({diagnostics.describe(e)}) — continuing")
     abandoned_suspects: set[str] = set()
-    _log(f"starting — gateway={URL} provider={PROVIDER} tasks={TASKS_DIR} "
+    _log(f"starting — gateway={_redact_url(URL)} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     # Always name where the diagnostics live: after an incident this line is the
     # trailhead (a bare-launched bridge under default dirs writes status to
@@ -7643,22 +7736,24 @@ def main() -> None:
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
             _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
-        except _PollAnomaly as e:
+        except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
-            _log_backoff(("poll-anomaly",), f"{e} — backing off {backoff}s")
+            _log_backoff(("poll-anomaly",), f"{_POLL_ANOMALY_LINE} — backing off {backoff}s")
             _emit_gateway_status(False, error="poll answered without a task list", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
-            _log(f"poll network error: {type(e).__name__}: {e} — {poll_failures} consecutive, "
+            _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
                  f"{int(time.time() - poll_grace_since)}s since last successful poll — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {e}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
-            _log(f"unexpected: {e} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {e}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
+            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+                                 poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
