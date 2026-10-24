@@ -144,10 +144,13 @@ class Probe(unittest.TestCase):
     ABSENT = object()
 
     def tmux_probe_env(self, pane_pid=None, socket=None):
-        """The probe's PATH carries the stand-in tmux, which knows one socket and one pane."""
-        return mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ['PATH']}",
-                                            "STUB_SOCKET": socket if socket is not None else self.sock,
-                                            "STUB_PANE_PID": str(pane_pid if pane_pid is not None else self.core.pid)})
+        """The probe resolves the stand-in tmux (one socket, one pane) and finds the stand-in ps on PATH."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ['PATH']}",
+                                                         "STUB_SOCKET": socket if socket is not None else self.sock,
+                                                         "STUB_PANE_PID": str(pane_pid if pane_pid is not None else self.core.pid)}))
+        stack.enter_context(mock.patch.object(hc, "_resolve_tmux_bin", return_value=str(self.bin / "tmux")))
+        return stack
 
     def probe(self, **kw):
         kw.setdefault("workspace_dir", self.ws)
@@ -255,6 +258,12 @@ class Probe(unittest.TestCase):
         self.assertTrue(claude_argv.names_session("claude --name=sutando-core --x", "sutando-core"))
         self.assertEqual(claude_argv.session_name("claude --name 'sutando core'"), "sutando core")
         self.assertEqual(claude_argv.session_name("claude --resume"), "")
+        # The boot prompt follows `--`; nothing after it names a session, and the first --name wins.
+        for args in ("claude --resume abc -- --name sutando-core", "claude -- --name=sutando-core",
+                     "claude --name other --name sutando-core", "claude --name", "claude --name=", "claude --name --"):
+            self.assertFalse(claude_argv.names_session(args, "sutando-core"), args)
+        self.assertEqual(claude_argv.session_name("claude --name sutando-core -- --name other"), "sutando-core")
+        self.assertEqual(claude_argv.session_name('claude --name sutando-core -- "say --name x"'), "sutando-core")
 
     def test_a_record_without_a_session_or_launch_mode_is_not_proof(self):
         for fields in ({"session": self.ABSENT}, {"session": ""}, {"launch": self.ABSENT}, {"launch": "screen"},
@@ -290,6 +299,7 @@ class Probe(unittest.TestCase):
         # An apostrophe in the argv (a boot prompt's) breaks shlex; the whitespace fallback still reads the name.
         malformed = "claude --name sutando-core -- don't stop"
         self.assertEqual(run("names-session", malformed, "sutando-core").returncode, 0)
+        self.assertEqual(run("names-session", "claude -- --name sutando-core", "sutando-core").returncode, 1)
         self.assertEqual(claude_argv.session_name(malformed), "sutando-core")
         self.assertEqual(run("session-name", "claude --name=sutando-core").stdout.strip(), "sutando-core")
         self.assertEqual(run("session-name").returncode, 2)
@@ -310,7 +320,7 @@ class Probe(unittest.TestCase):
         real_run = hc.subprocess.run
 
         def tmux_cannot_run(argv, **kw):
-            if argv[0] == "tmux":
+            if str(argv[0]).endswith("tmux"):
                 raise OSError("tmux cannot run")
             return real_run(argv, **kw)
 
@@ -335,6 +345,9 @@ class Probe(unittest.TestCase):
         self.assertEqual(self.probe()["status"], "ok")
         self.assertIn("is not the core the launch record describes",
                       self._bound_record_fails(start=self.start.replace(self.start[-4:], "1999")))
+        # A prefix of the real start (the year cut off) is not the start: the comparison is exact.
+        self.assertIn("is not the core the launch record describes", self._bound_record_fails(start=self.start[:-5]))
+        self.assertIn("is not the core the launch record describes", self._bound_record_fails(start=self.start + " "))
 
     def _launcher_writes_record(self, locale):
         """record_core_launch_settings from session-launch.sh, run as the launcher would under `locale`."""

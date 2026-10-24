@@ -69,22 +69,27 @@ claude_named_pids() {
 }
 
 # Exact `--name $SESSION` (never `$SESSION-2`), read by the shared owner src/claude_argv.py;
-# a host with no Python (a fresh Mac) gets the same token rule in bash.
+# a host with no Python (a fresh Mac) gets the owner's rule in bash: the first `--name`
+# before a bare `--` decides, nothing after `--` counts, a missing value names nothing.
 claude_argv_names_session() {
-  local args="$1" rc prev w
+  local args="$1" rc expect="" name="" found="" w
+  [ -n "${SESSION:-}" ] || return 1
   if [ -n "${PY:-}" ]; then
     "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION" 2>/dev/null
     rc=$?
     [ "$rc" -le 1 ] && return "$rc"
   fi
-  prev=""
   set -f
   for w in $args; do
-    if { [ "$prev" = "--name" ] && [ "$w" = "$SESSION" ]; } || [ "$w" = "--name=$SESSION" ]; then set +f; return 0; fi
-    prev="$w"
+    if [ -n "$expect" ]; then name="$w"; found=1; break; fi
+    case "$w" in
+      --) break ;;
+      --name) expect=1 ;;
+      --name=*) name="${w#--name=}"; found=1; break ;;
+    esac
   done
   set +f
-  return 1
+  [ -n "$found" ] && [ "$name" = "$SESSION" ]
 }
 
 claude_named_process_running() {
@@ -97,11 +102,13 @@ claude_private_socket_in_use() {
   [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
 }
 
-# claude_named_pids restricted to processes running inside a pane of the tmux
-# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+# claude_named_pids restricted to processes running inside a pane of session $SESSION on
+# $TMUX_SOCKET (the pane pid itself or one of its descendants). Session-scoped on purpose:
+# a same-name claude under another session's pane on the same socket is not this core.
+# The health probe's `_pid_outside_session_pane` applies the same invocation and walk.
 claude_named_pids_on_socket() {
   local panes pid p depth
-  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null)" || return 0
   [ -n "$panes" ] || return 0
   for pid in $(claude_named_pids); do
     p="$pid"; depth=0
@@ -465,10 +472,10 @@ sweep_legacy_claude_hooks_for_launch() {
   bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: legacy hook sweep failed (rc=$?) — old copies may still fire" >&2
 }
 
-# The one live `claude --name $SESSION` this launcher just proved up; on a private
-# socket only a pane of this server counts.
+# The one live `claude --name $SESSION` in a pane of that session on $TMUX_SOCKET: the only
+# process the sweep may count as the replacement, on the default socket too.
 live_core_pid() {
-  if claude_private_socket_in_use; then claude_named_pids_on_socket; else claude_named_pids; fi | head -n 1
+  claude_named_pids_on_socket | head -n 1
 }
 
 # Every launch past the attach/adopt exits drops the previous core's record first: a
@@ -483,7 +490,13 @@ retire_core_launch_record() {
 # stay and the record says so (health then refuses to sweep them). Arguments: the proven
 # pid (default: the one live on this socket) and the launch mode, `tmux` or `bare`.
 settle_core_launch_hooks() {
-  local pid="${1:-$(live_core_pid)}" launch="${2:-tmux}"
+  local pid="${1:-}" launch="${2:-tmux}"
+  [ -n "$pid" ] || pid="$(live_core_pid)"
+  if [ -z "$pid" ]; then
+    echo "session-launch: no claude --name $SESSION in a pane of that session on $TMUX_SOCKET — legacy hook entries kept, no launch record" >&2
+    retire_core_launch_record
+    return 0
+  fi
   if [ -n "${OUTSIDE_CORE_LIVE:-}" ]; then
     echo "session-launch: a same-name core is live outside $TMUX_SOCKET — legacy hook entries kept, it still runs them" >&2
   else
@@ -493,23 +506,28 @@ settle_core_launch_hooks() {
 }
 
 # A launch with no tmux `exec`s claude in this very shell, so the core keeps this pid: the
-# proof it is up is pid $1's argv naming $SESSION. A detached helper waits up to ~10s for
-# that and settles then; a failed exec (still bash) or an early exit settles nothing.
+# proof it is up is pid $1's argv naming $SESSION for 10 consecutive samples (2s), the
+# bare-launch counterpart of the tmux sites' liveness poll. A helper, double-forked so it
+# is launchd's child and never claude's zombie, waits up to ~12s for that and settles
+# then; a failed exec (still bash), a death inside the window or no proof settles nothing.
 settle_bare_core_launch_hooks_after_exec() {
   local pid="$1"
   [ -n "${PY:-}" ] || return 0
-  (
+  ( (
     set +e
-    for _ in $(seq 1 50); do
+    seen=0
+    for _ in $(seq 1 60); do
       sleep 0.2
       args="$(ps -p "$pid" -o args= 2>/dev/null)"
       [ -n "$args" ] || exit 0
       if "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION"; then
-        settle_core_launch_hooks "$pid" bare
+        seen=$((seen + 1))
+        [ "$seen" -ge 10 ] && { settle_core_launch_hooks "$pid" bare; exit 0; }
+      elif [ "$seen" -gt 0 ]; then
         exit 0
       fi
     done
-  ) > /dev/null 2>&1 &
+  ) & ) > /dev/null 2>&1
 }
 
 # The record the health probe reads for what the live core was launched with, bound to that

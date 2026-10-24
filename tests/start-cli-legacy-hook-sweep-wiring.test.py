@@ -70,7 +70,7 @@ WORKER_ENV = {"SUTANDO_TMUX_SESSION": "sutando-worker-" + "c" * 32, "SUTANDO_INS
 
 
 @unittest.skipUnless(shutil.which("node"), "node is required to build the launch settings")
-class LaunchSchedules(unittest.TestCase):
+class LaunchHarness(unittest.TestCase):
     """The launchers run for real against a scratch checkout; only tmux, pgrep, ps and claude
     are stand-ins. A legacy project settings file is present throughout."""
 
@@ -154,6 +154,7 @@ class LaunchSchedules(unittest.TestCase):
         self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes, "the legacy settings file changed")
         self.assertFalse(self.record().exists(), "a launch record was written without a launch")
 
+class LaunchSchedules(LaunchHarness):
     def test_no_op_attach_sweeps_nothing(self):
         self.live_core()
         run = self.run_core()
@@ -212,13 +213,19 @@ class LaunchSchedules(unittest.TestCase):
 
     def test_a_launch_without_tmux_settles_once_the_exec_is_proven_live(self):
         # The stand-in core stays up; exec keeps the launcher's pid, so the record must name it.
+        started = time.monotonic()
         proc = self._launch_bare("#!/bin/bash\nsleep 60\n")
         for _ in range(100):
             if self.record().exists():
                 break
             time.sleep(0.2)
         self.assertTrue(self.record().exists(), "no launch record within 20s of a bare launch")
+        self.assertGreaterEqual(time.monotonic() - started, 2.0, "settled before the 2s stability window")
         self.assertIsNone(proc.poll(), "the stand-in core exited")
+        time.sleep(0.5)
+        table = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,stat="], capture_output=True, text=True).stdout
+        zombies = [ln for ln in table.splitlines() if ln.split()[1:2] == [str(proc.pid)] and ln.split()[2].startswith("Z")]
+        self.assertEqual(zombies, [], "the settle helper was left as the core's zombie")
         rec = json.loads(self.record().read_text())
         self.assertEqual((rec["pid"], rec["session"], rec["launch"]), (proc.pid, "sutando-core", "bare"))
         self.assertEqual(self.marker.read_text().count("ran"), 1)
@@ -230,6 +237,16 @@ class LaunchSchedules(unittest.TestCase):
         os.killpg(proc.pid, 9)
         proc.wait()
         self.assertIn("is not running", self.hc()._launch_record_binds_live_core(rec))
+
+    def test_a_core_that_dies_inside_the_stability_window_settles_nothing(self):
+        # exec succeeds and the argv names the session, then the core dies at 1s: no proof.
+        proc = self._launch_bare("#!/bin/bash\nsleep 1\nexit 42\n")
+        proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 42)
+        time.sleep(3)
+        self.assertFalse(self.record().exists(), "a core that died inside the window left a launch record")
+        self.assertFalse(self.marker.exists(), "a core that died inside the window swept the copies")
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
 
     def test_a_failed_exec_without_tmux_settles_nothing(self):
         proc = self._launch_bare("#!/nonexistent/interpreter\n")
@@ -345,6 +362,126 @@ class GatedSweep(unittest.TestCase):
         self.assertIn("legacy hook sweep failed", r.stderr)
 
 
+# Two sessions on one socket: `sutando-core` (pane 300 once launched) and `other` (pane 100).
+# pid 200 is `claude --name sutando-core`, parented by $CORE_PPID — 100 (foreign) or 300 (ours).
+TMUX_TWO_SESSIONS = r"""#!/bin/bash
+while [ "$1" = "-S" ]; do shift 2; done
+sub="$1"; shift
+target=""; all=""; prev=""; for a in "$@"; do [ "$prev" = "-t" ] && target="$a"; [ "$a" = "-a" ] && all=1; prev="$a"; done
+case "$sub" in
+  has-session) { [ "$target" = "=sutando-core" ] && [ -f "$SESS_MARK" ]; } || [ "$target" = "=other" ]; exit $? ;;
+  new-session) touch "$SESS_MARK" "$PANE_MARK"; exit 0 ;;
+  new-window) echo 0; exit 0 ;;
+  list-panes) if [ -n "$all" ]; then echo 100; [ -f "$PANE_MARK" ] && echo 300; exit 0; fi
+              case "$target" in
+                =sutando-core) [ -f "$SESS_MARK" ] || { echo "can't find session" >&2; exit 1; }; [ -f "$PANE_MARK" ] && echo 300; exit 0 ;;
+                =other) echo 100; exit 0 ;;
+                *) echo "can't find session" >&2; exit 1 ;;
+              esac ;;
+  kill-session) rm -f "$SESS_MARK" "$PANE_MARK"; exit 0 ;;
+  *) exit 0 ;;
+esac
+"""
+PS_TWO_SESSIONS = r"""#!/bin/bash
+want=""; prev=""; for a in "$@"; do [ "$prev" = "-p" ] && want="$a"; prev="$a"; done
+case "$want" in 100|200|300) ;; *) exec /bin/ps "$@" ;; esac
+case "$*" in
+  *ppid=*) if [ "$want" = 200 ]; then echo "$CORE_PPID"; else echo 1; fi ;;
+  *lstart=*) echo "Thu Jan  1 00:00:00 2026" ;;
+  *) if [ "$want" = 200 ]; then echo "claude --name sutando-core"; else echo bash; fi ;;
+esac
+exit 0
+"""
+# The same-name claude appears once a session was launched, wherever it is parented.
+PGREP_TWO_SESSIONS = r"""#!/bin/bash
+case "$*" in *core-input-watch*) exit 0 ;; esac
+case "$*" in *claude*) [ -f "$PANE_MARK" ] && { echo "200 claude"; exit 0; }; exit 1 ;; esac
+exit 1
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node is required to build the launch settings")
+class SessionScopedProof(LaunchHarness):
+    """The sweep's proof is a `claude --name <session>` under a pane of THAT session on the socket,
+    the invocation the health probe binds the record with; a same-name claude under another
+    session's pane on the same socket proves nothing. One fixture pins both readers."""
+
+    def setUp(self):
+        super().setUp()
+        bind = self.td / "bin"
+        for name, body in (("tmux", TMUX_TWO_SESSIONS), ("ps", PS_TWO_SESSIONS), ("pgrep", PGREP_TWO_SESSIONS)):
+            (bind / name).write_text(body)
+            (bind / name).chmod(0o755)
+        self.private = str(self.td / "private.sock")
+
+    def _env(self, core_ppid, private):
+        env = {**self.env, "CORE_PPID": str(core_ppid)}
+        if private:
+            env["SUTANDO_TMUX_SOCKET"] = self.private
+        return env
+
+    def _launcher_pids_on_socket(self, core_ppid, socket):
+        self.sess.write_text("")
+        self.pane.write_text("")
+        script = ('REPO="$1"; SESSION=sutando-core; TMUX_SOCKET="$2"; PY="$3"; . "$REPO/src/agent/claude/cli/session-launch.sh"; '
+                  'claude_named_pids_on_socket; echo "live=$(live_core_pid)"')
+        run = subprocess.run(["/bin/bash", "-c", script, "_", str(self.root), socket, sys.executable],
+                             env=self._env(core_ppid, False), capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.split()
+
+    def _probe_binds(self, core_ppid, socket):
+        hc = self.hc()
+        env = {"PATH": f"{self.td / 'bin'}:{os.environ['PATH']}", "CORE_PPID": str(core_ppid),
+               "SESS_MARK": str(self.sess), "PANE_MARK": str(self.pane)}
+        with mock.patch.dict(os.environ, env):
+            return hc._pid_outside_session_pane(200, socket, "sutando-core", tmux_bin=str(self.td / "bin" / "tmux"))
+
+    def test_launcher_and_probe_read_the_same_session_scoped_pane_set(self):
+        for socket in ("/tmp/sutando-tmux.sock", self.private):
+            with self.subTest(socket=socket):
+                self.assertEqual(self._launcher_pids_on_socket(300, socket), ["200", "live=200"])
+                self.assertEqual(self._probe_binds(300, socket), "")
+                self.assertEqual(self._launcher_pids_on_socket(100, socket), ["live="])
+                self.assertIn("is not in a pane of session sutando-core", self._probe_binds(100, socket))
+
+    def test_a_same_name_claude_under_another_sessions_pane_never_authorizes_the_sweep(self):
+        for private in (False, True):
+            with self.subTest(private=private):
+                self.marker.unlink(missing_ok=True)
+                self.legacy.write_bytes(self.legacy_bytes)
+                for m in (self.sess, self.pane):
+                    m.unlink(missing_ok=True)
+                run = self.run_core(env=self._env(100, private))
+                if private:
+                    self.assertNotEqual(run.returncode, 0, "a launch with no core in the session's panes reported success")
+                    self.assertIn("did not come up", run.stdout + run.stderr)
+                else:
+                    self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                    self.assertIn("no claude --name sutando-core in a pane of that session", run.stderr)
+                self.assertFalse(self.marker.exists(), "the installer ran on a foreign-session claude")
+                self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
+                self.assertFalse(self.record().exists(), "a record was written for a foreign-session claude")
+
+    def test_a_claude_under_the_sessions_own_pane_sweeps_once_and_binds(self):
+        run = self.run_core(env=self._env(300, True))
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.marker.read_text().count("ran"), 1)
+        rec = json.loads(self.record().read_text())
+        self.assertEqual((rec["pid"], rec["launch"], rec["socket"], rec["session"]), (200, "tmux", self.private, "sutando-core"))
+        hooks = json.loads(self.legacy.read_text())["hooks"]
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["echo operator"])
+        hc = self.hc()
+        env = {"PATH": f"{self.td / 'bin'}:{os.environ['PATH']}", "CORE_PPID": "300",
+               "SESS_MARK": str(self.sess), "PANE_MARK": str(self.pane)}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(hc, "_resolve_tmux_bin", return_value=str(self.td / "bin" / "tmux")):
+            self.assertEqual(hc._launch_record_binds_live_core(rec), "")
+            env["CORE_PPID"] = "100"
+            with mock.patch.dict(os.environ, env):
+                self.assertIn("is not in a pane of session", hc._launch_record_binds_live_core(rec))
+
+
 class NamedPids(unittest.TestCase):
     """`claude_named_pids` (session-launch.sh) names the session token-wise through claude_argv,
     with and without a Python on the host."""
@@ -373,6 +510,12 @@ class NamedPids(unittest.TestCase):
                 self.assertEqual(self._pids("claude --name sutando-core-2", py), [])
                 self.assertEqual(self._pids("claude --name sutando-core-watcher", py), [])
                 self.assertEqual(self._pids("claude --resume", py), [])
+                # Prompt text after `--` never names a session; the first --name decides; no value names nothing.
+                self.assertEqual(self._pids("claude --resume abc -- --name sutando-core", py), [])
+                self.assertEqual(self._pids("claude -- --name=sutando-core", py), [])
+                self.assertEqual(self._pids("claude --name other --name sutando-core", py), [])
+                self.assertEqual(self._pids("claude --name", py), [])
+                self.assertEqual(self._pids("claude --name sutando-core -- --name other", py), ["4242"])
 
 
 if __name__ == "__main__":

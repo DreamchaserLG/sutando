@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The one reading of which session a claude process's argv names (`--name X` / `--name=X`).
 
+The first `--name` before a bare `--` decides; nothing after `--` (the boot prompt) counts.
+
 Every liveness reader that identifies a core by its argv (the heartbeat, the quota seat
 probe, the launch-record probe, the bare-launch settle helper) takes the answer from here.
 Token-wise on purpose: a substring test on `--name sutando-core` is also satisfied by
@@ -17,14 +19,20 @@ import sys
 
 
 def session_name(args: str) -> str:
-    """The value after `--name` (next token, or `--name=`), '' when argv names no session."""
+    """The value of the FIRST `--name` (next token, or `--name=`) before a bare `--`, else ''.
+
+    The launcher puts the boot prompt after `--`, so prompt text never names a session;
+    a `--name` with no value names none.
+    """
     try:
         toks = shlex.split(args or "")
     except ValueError:
         toks = (args or "").split()
     for i, tok in enumerate(toks):
-        if tok == "--name" and i + 1 < len(toks):
-            return toks[i + 1]
+        if tok == "--":
+            return ""
+        if tok == "--name":
+            return toks[i + 1] if i + 1 < len(toks) else ""
         if tok.startswith("--name="):
             return tok[len("--name="):]
     return ""

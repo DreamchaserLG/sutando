@@ -178,14 +178,14 @@ class EndToEnd(unittest.TestCase):
                                   ("dead pid", {**bound, "pid": gone.pid}),
                                   ("other start", {**bound, "start": start[:-4] + "1999"}),
                                   ("bare record naming another session", {**bound, "launch": "bare", "session": "sutando-core-2"})):
-                    with self.subTest(record=name), mock.patch.dict(os.environ, probe_env):
+                    with self.subTest(record=name), mock.patch.dict(os.environ, probe_env), mock.patch.object(hc, "_resolve_tmux_bin", return_value=str(bind / "tmux")):
                         record.write_text(json.dumps(rec))
                         checks = [hc.check_claude_hook_registration()]
                         self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
                         self.assertFalse(checks[0]["_live_core_has_launch_hooks"], checks[0]["detail"])
                         hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
                         self.assertEqual(proj.read_text(), legacy, f"{name}: the record authorized the sweep")
-                with mock.patch.dict(os.environ, probe_env):
+                with mock.patch.dict(os.environ, probe_env), mock.patch.object(hc, "_resolve_tmux_bin", return_value=str(bind / "tmux")):
                     record.write_text(json.dumps(bound))
                     checks = [hc.check_claude_hook_registration()]
                     self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])

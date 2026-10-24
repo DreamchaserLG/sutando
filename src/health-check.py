@@ -11842,11 +11842,15 @@ def _launch_record_binds_live_core(rec: dict) -> str:
     return _pid_outside_session_pane(pid, sock, session)
 
 
-def _pid_outside_session_pane(pid: int, sock: str, session: str) -> str:
-    """'' when `pid` is a pane process of `session` on `sock` or a descendant of one, else why not."""
+def _pid_outside_session_pane(pid: int, sock: str, session: str, tmux_bin: Optional[str] = None) -> str:
+    """'' when `pid` is a pane process of `session` on `sock` or a descendant of one, else why not.
+
+    The launcher's `claude_named_pids_on_socket` (session-launch.sh) applies the same invocation
+    and ppid walk, so what authorized the sweep is what binds the record.
+    """
     try:
-        lp = subprocess.run(["tmux", "-S", sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"],
-                            capture_output=True, text=True, timeout=10)
+        lp = subprocess.run([tmux_bin or _resolve_tmux_bin(), "-S", sock, "list-panes", "-s", "-t", f"={session}",
+                             "-F", "#{pane_pid}"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as exc:
         return f"cannot list the panes of {session} on {sock} ({exc}) — the record is not proof"
     panes = {x.strip() for x in (lp.stdout or "").splitlines() if x.strip().isdigit()}

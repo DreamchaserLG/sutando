@@ -48,7 +48,7 @@ case "$sub" in
     [ -f "$SESS_MARK" ] || exit 1
     if [ -f "$PANE_MARK" ]; then
       case "$*" in
-        *-a*) echo "%(pid)s" ;;
+        *"#{pane_pid}"*) echo "%(pid)s" ;;
         *) echo "0 %%0 %(pid)s" ;;
       esac
     fi
