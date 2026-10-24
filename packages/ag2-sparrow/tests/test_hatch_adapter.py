@@ -3916,6 +3916,21 @@ class Hold(Base):
         self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space")],
                                          f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"))
 
+    def test_a_mid_line_marker_or_mention_in_the_served_line_falls_back(self):
+        for i, line in enumerate(("Waiting [dm-only] for my owner.", "Waiting. [attach: /etc/hosts]",
+                                  "Waiting. [channel: !other:ag2.space]", "Waiting for @room.",
+                                  "Waiting, @alice:ag2.space.")):
+            with self.subTest(line=line):
+                tid = f"task-17847000001{i:02d}"
+                self.result_file = self.results / f"{tid}.txt"
+                self.notice = self.results / f"proactive-hold-{tid}.txt"
+                self.add_task(tid, f"$ev{i}", thread_root="$root")
+                self.serve(line)
+                r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+                self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space"), ("thread", "$root")],
+                                                 f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"))
+
     def test_a_served_line_for_a_revision_sparrow_did_not_announce_is_not_used(self):
         self.add_task(self.TID, "$ev1")
         self.serve(self.SERVED)
@@ -3935,9 +3950,16 @@ class Hold(Base):
         for bad in ("Waiting.\n[channel: !other:ag2.space]", "[channel: !other:ag2.space] ok",
                     "[thread: $other] ok", "Waiting.\u2028[channel: !other:ag2.space]",
                     "Waiting.\r", " Waiting.", "", "run `<REPLY_COMMAND> reply` now",
-                    "x" * (runtime_text.HELD_LINE_MAX + 1), 7, None, ["Waiting."]):
+                    "x" * (runtime_text.HELD_LINE_MAX + 1), 7, None, ["Waiting."],
+                    "Waiting [dm-only] for my owner.", "Waiting. [attach: /etc/hosts]",
+                    "Waiting. [file: /etc/hosts]", "Waiting. [send: /etc/hosts]",
+                    "Waiting. [channel: !other:ag2.space]", "Waiting [thread: $other] here.",
+                    "Waiting. [no-send]", "Waiting for @room.", "Waiting, @alice:ag2.space.",
+                    "Waiting (cc @alice)."):
             with self.subTest(line=bad):
                 self.assertIsNone(runtime_text.held_line(cache(bad)))
+        self.assertEqual(runtime_text.held_line(cache("Waiting [soon] for my owner.")),
+                         "Waiting [soon] for my owner.", "a bracket that is no marker is plain text")
         self.assertIsNone(runtime_text.held_line(cache(self.SERVED, text_schema_version=2)))
         self.assertIsNone(runtime_text.held_line(None))
 

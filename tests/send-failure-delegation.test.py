@@ -14,6 +14,7 @@ The source scan is TOKEN-SPECIFIC — it flags inline status comparisons, not th
 words "transient" or "retry" — so renaming cannot satisfy it.
 """
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tests"))
+from _helpers.hermetic_env import hermetic_env  # noqa: E402
 import send_failure_policy as sfp  # noqa: E402
 from proactive_recovery import release_claim  # noqa: E402
 
@@ -94,15 +97,37 @@ class TestSparrowDelegation(unittest.TestCase):
         self.assertNotIn("should_retry", body)
 
     def test_sparrow_parks_to_the_repo_wide_quarantine(self):
-        # results/undelivered/ is what health-check's probe scans; an archive/
-        # subdir is a park with no reader (review blocker, 2026-08-16).
-        # The bridge takes the directory from the shared destination owner, which Hatch's
-        # hold-line reader uses too, and that owner names the repo-wide quarantine.
-        self.assertIn("UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / _delivery_destination.UNDELIVERED_DIR",
-                      SPARROW)
-        destination = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
-                       / "delivery_destination.py").read_text()
-        self.assertIn('UNDELIVERED_DIR = "undelivered"', destination)
+        # results/undelivered/ is what health-check's probe scans; an archive/ subdir has no reader.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run(
+                [sys.executable, "-c", _PARK_PROBE], capture_output=True, text=True, timeout=120,
+                env=hermetic_env(tmp, PYTHONPATH=str(REPO / "packages" / "ag2-sparrow"),
+                                 AGENT_CONNECT_RESULT_DIR=str(Path(tmp) / "results"),
+                                 AGENT_CONNECT_TASK_DIR=str(Path(tmp) / "tasks"),
+                                 AGENT_CONNECT_STATE_DIR=str(Path(tmp) / "state"),
+                                 REMOTE_PROACTIVE_ROOM=""))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            results = Path(tmp) / "results"
+            self.assertEqual(out.stdout.strip(), "parked")
+            self.assertEqual(sorted(p.name for p in (results / "undelivered").iterdir()),
+                             ["proactive-park.txt"])
+            self.assertEqual((results / "undelivered" / "proactive-park.txt").read_text(), "body\n")
+            self.assertEqual(sorted(p.name for p in results.iterdir()), ["undelivered"])
+
+
+# A permanent send failure on a claimed proactive file, through the bridge's own binder.
+_PARK_PROBE = """
+import os, urllib.error
+from ag2_sparrow import remote_gateway_bridge as gb, delivery_destination as dd
+gb.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+queued = gb.RESULTS_DIR / "proactive-park.txt"
+queued.write_text("body\\n")
+claim = dd.claim_path(queued, os.getpid())
+queued.rename(claim)
+err = urllib.error.HTTPError("u", 404, "gone", {}, None)
+gb._resolve_send_failure(claim, queued, err)
+print("parked" if (gb.RESULTS_DIR / "undelivered" / queued.name).is_file() else "not parked")
+"""
 
 
 class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):

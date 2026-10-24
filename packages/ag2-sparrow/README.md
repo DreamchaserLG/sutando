@@ -260,7 +260,10 @@ main session. An item that waits for the owner's go is parked with
 line to the item's room (in its thread when it has one), then records a hold marker
 (`RESULT_DIR/.task-holds/<task id>.json`). The line is the served `runtime_text.held_line` from the
 setup cache `wake-context` reads, when that cache is usable and the line is one plain
-printable line of at most 300 characters with no backtick and no leading `[` or space;
+printable line of at most 300 characters with no backtick, no leading `[` or space, no
+delivery marker anywhere in it (judged by `result_markers.neutralize_markers`, so a mid-line
+`[dm-only]`, `[attach: …]` or `[channel: …]` is refused) and no `@`, so it cannot mention
+anyone (`@room` or `@user:server`). Markdown or HTML in it is posted as plain text;
 otherwise it is the built-in "Waiting for my owner's go on this.". The line is never queued twice: a
 durable record (`<task id>.notice` beside the marker) is written before it is
 queued, and only the caller that wrote it queues the line. A hold is recorded
