@@ -798,10 +798,58 @@ class TestRefusalPaths(Base):
         p = _task(self.tasks, "task-a.txt", "old")
         gen = tt.generation_of(p)
         _replace(p, "new")
-        with self.assertRaisesRegex(tt.TransitionRefused, "changed since it was planned"):
-            tt.archive_generation(self.tasks, "task-a.txt", gen, self.archive)
+        with mock.patch.object(tt.task_archive, "claim_generation",
+                               side_effect=AssertionError("the live name was renamed")):
+            with self.assertRaisesRegex(tt.TransitionRefused, "changed since it was planned"):
+                tt.archive_generation(self.tasks, "task-a.txt", gen, self.archive)
         self.assertIn("task: new", p.read_text())
         self.assertEqual(self.archive_names(), [])
+
+    def test_a_task_replaced_after_preflight_is_refused_before_its_name_is_taken(self):
+        """The pre-claim check, not place_claim's give-back, refuses it: the new
+        task's live name is never renamed away, not even briefly."""
+        p = _task(self.tasks, "task-a.txt", "A")
+        q = _task(self.tasks, "task-b.txt", "old B")
+        real, claimed = tt.task_archive.claim_generation, []
+
+        def spy(name, **kw):
+            claimed.append(name)
+            return real(name, **kw)
+
+        with self.inject("after_claim", p, lambda: _replace(q, "new B")), \
+                mock.patch.object(tt.task_archive, "claim_generation", side_effect=spy):
+            out = self.run_transition(["task-a.txt", "task-b.txt"], _naming)
+        self.assertEqual(claimed, ["task-a.txt"])
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("'task-b.txt': changed since it was planned (a new generation", out["errors"][0])
+        self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
+        self.assertIn("task: new B", q.read_text())
+        self.assertEqual(self.journals(), [])
+
+    def test_a_refused_claim_whose_journal_rewrite_fails_still_finishes_the_pass(self):
+        """Dropping a refused name from the journal is best-effort: recovery reads
+        an unrenamed recorded claim as still live, so the pass goes on."""
+        p = _task(self.tasks, "task-a.txt", "A")
+        q = _task(self.tasks, "task-b.txt", "old B")
+        real_set, seen_b = tt._Journal.set, []
+
+        def set_failing_after_b_is_dropped(self_, **fields):
+            if "task-b.txt" in self_.data["claims"]:
+                seen_b.append(1)
+            elif seen_b and fields.get("stage") == "claiming":
+                raise OSError(28, "No space left on device")
+            real_set(self_, **fields)
+
+        with self.inject("after_claim", p, lambda: _replace(q, "new B")), \
+                mock.patch.object(tt._Journal, "set", set_failing_after_b_is_dropped):
+            out = self.run_transition(["task-a.txt", "task-b.txt"], _naming)
+        self.assertTrue(seen_b)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("changed since it was planned", out["errors"][0])
+        self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
+        self.assertEqual(self.notices()[0].read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertIn("task: new B", q.read_text())
+        self.assertEqual(self.journals(), [])
 
     def test_archive_generation_gives_back_a_claim_rewritten_after_the_rename(self):
         p = _task(self.tasks, "task-a.txt", "old")
