@@ -193,22 +193,39 @@ class WitnessedPublish(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name)
 
+    MODULES = (result_publish, _load_vendored())  # the bridge imports the vendored copy
+
     def test_the_witness_shares_the_committed_inode_through_a_rename(self):
-        target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
-        result_publish.publish_witnessed(target, "body\n", witness)
-        self.assertEqual(target.read_text(), "body\n")
-        self.assertEqual(os.stat(witness).st_ino, os.stat(target).st_ino)
-        target.rename(self.dir / "retired.txt")
-        self.assertEqual(os.stat(witness).st_nlink, 2)
-        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                mod.publish_witnessed(target, "body\n", witness)
+                self.assertEqual(target.read_text(), "body\n")
+                self.assertEqual(os.stat(witness).st_ino, os.stat(target).st_ino)
+                target.rename(self.dir / "retired.txt")
+                self.assertEqual(os.stat(witness).st_nlink, 2)
+                self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
+                for p in self.dir.iterdir():
+                    p.unlink()
 
     def test_a_taken_name_is_refused_and_leaves_no_witness(self):
-        target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
-        target.write_text("other\n")
-        with self.assertRaises(FileExistsError):
-            result_publish.publish_witnessed(target, "body\n", witness)
-        self.assertEqual(target.read_text(), "other\n")
-        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["proactive-a.txt"])
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+                target.write_text("other\n")
+                with self.assertRaises(FileExistsError):
+                    mod.publish_witnessed(target, "body\n", witness)
+                self.assertEqual(target.read_text(), "other\n")
+                self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["proactive-a.txt"])
+                target.unlink()
+
+    def test_a_failed_witness_rename_leaves_no_staging(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__):
+                target = self.dir / "proactive-a.txt"
+                with self.assertRaises(OSError):
+                    mod.publish_witnessed(target, "body\n", self.dir / "no-such-dir" / "w.witness")
+                self.assertEqual(list(self.dir.iterdir()), [])
 
 
 class ConcurrencyDrill(unittest.TestCase):
