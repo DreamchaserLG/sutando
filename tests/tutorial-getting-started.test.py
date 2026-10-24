@@ -185,7 +185,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("start the call and pick your agent under &ldquo;Bring an agent?&rdquo;", by["calls"].how)
         self.assertIn("open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords",
                       by["activity"].how)
-        self.assertIn(("settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"), by["apps"].images)
+        self.assertIn(("settings-integrations", "settings-integrations.jpg", "Settings \u2192 Apps \u2192 Integrations"),
+                      by["apps"].images)
 
     def test_room_audience_says_your_agent(self):
         room = gs.render_page("Blue", "claude", "room")
@@ -202,7 +203,7 @@ class RenderTest(unittest.TestCase):
         for core in gs.CORES:
             text = re.sub(r"data:image/[^\"]+", "", gs.render_page("Blue", core)).lower()
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
-        self.assertNotIn("02-microphone", " ".join(f for s in gs.SECTIONS for f, _ in s.images))
+        self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
     def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
@@ -667,22 +668,23 @@ class AssetTest(unittest.TestCase):
         tp = gs.tour_page
         seen = {}
         for s in tp.sections_for("claude"):
-            for f, _ in s.images:
-                digest = hashlib.sha256((tp.ASSETS / f).read_bytes()).hexdigest()
-                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {f}")
+            for shot in s.images:
+                digest = hashlib.sha256((tp.ASSETS / shot.file).read_bytes()).hexdigest()
+                self.assertNotIn(digest, seen, f"{s.id} reuses {seen.get(digest)}'s image {shot.file}")
                 seen[digest] = s.id
 
 
     def test_every_step_image_exists_and_is_small(self):
         tp = gs.tour_page
-        used = {f for s in tp.sections_for("claude") for f, _ in s.images}
+        used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
         files = {p.name: p.stat().st_size for p in tp.ASSETS.glob("*.jpg")}
         self.assertEqual(used, set(files))
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
         for s in tp.sections_for("claude"):
-            for f, alt in s.images:
-                self.assertTrue(alt.strip(), f)
+            for shot in s.images:
+                self.assertTrue(shot.alt.strip(), shot.file)
+                self.assertEqual(shot.asset, shot.file[:-4])  # today's asset names are the file stems
 
     def test_each_step_with_an_image_renders_it_inline(self):
         page = gs.render_page("Blue", "claude")
@@ -694,7 +696,7 @@ class AssetTest(unittest.TestCase):
             self.assertTrue([s for s in gs.SECTIONS if s.id == sid][0].images, sid)
 
     def test_rendered_page_size_is_bounded(self):
-        self.assertLess(len(gs.render_page("Blue", "claude").encode()), 400_000)
+        self.assertLessEqual(len(gs.render_page("Blue", "claude").encode()), 300_000)
 
 
 class EdgeTest(unittest.TestCase):
@@ -821,7 +823,8 @@ class MainTest(unittest.TestCase):
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out), {"ok": True, "action": "created", "kind": "html-p1",
-                                           "summoned": True, "name": "Blue"})
+                                           "summoned": True, "name": "Blue", "list": "file",
+                                           "revision": gs.tour_page.FEATURES.revision, "media": []})
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
@@ -1125,12 +1128,14 @@ class PublishTest(unittest.TestCase):
 
     def test_first_run_creates_writes_and_summons(self):
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True})
+        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True,
+                               "revision": gs.tour_page.FEATURES.revision, "media": []})
         room = self.room()
         self.assertEqual(room["pages"], {"html-p1": self.page()})
         parts = gs.chunks(self.page())
         self.assertGreater(len(parts), 1)  # the page is over one write's limit
-        self.assertIn(gs.owner_marker(self.ME), parts[0])  # the create's own body carries ownership
+        # The create's own body carries ownership, and the list revision the page was built from.
+        self.assertIn(gs.owner_marker(self.ME, gs.tour_page.FEATURES.revision), parts[0])
         self.assertEqual([c[0] for c in room["calls"]],
                          ["pages", "create", "read", "append", "summon"])
         appended = [c for c in room["calls"] if c[0] == "append"]

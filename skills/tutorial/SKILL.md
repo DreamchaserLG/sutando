@@ -109,17 +109,30 @@ each room's entry.
   same operation id returns the same page, so an unclear create is retried, never repeated.
 - The entry is `pending` until the rest of the page is appended, then `complete`. Any failure
   leaves an entry the next run resumes; nothing is created twice.
-- A re-link or reinstall that reuses the DM rewrites the page in place. A page someone removed
-  from the list is created again.
+- A re-link or reinstall that reuses the DM rewrites the page in place, as does `/tutorial` sent
+  again. A page someone removed from the list is created again.
+- The ownership tag also records the feature list's revision the page was built from
+  (`data-revision="tutorial.2026-10-23.1"`). **Rebuild rule:** a page is rebuilt in place when the
+  engine's list revision is newer than the page's. `publish --if-newer` applies exactly that rule
+  and nothing else: a complete page whose revision is current is left alone even when a rebuild
+  would differ (another name or core), a stale page is rewritten with the prompts it was last
+  built with (recorded in the entry), a page from before lists had a revision counts as stale, and
+  a `pending` page is finished whatever its revision. It summons no one. Run it after an engine
+  update, in every room with an entry, so an owner's page gains the steps a release added:
+
+  ```bash
+  python3 skills/tutorial/scripts/getting_started.py publish --if-newer
+  ```
 - If the marker file is lost, a listed "Getting started" page is reused only when its text
   carries this agent's ownership marker. A same-titled page without it is never touched. More
   than one marked page, or no agent id to check with, stops with exit 4 and the reason.
 
 `getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
-prints the HTML.
+prints the HTML. Both `render` and `publish` take `--list <path-or-url>` (below).
 
-**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`). Each step is
-one line on what it is and one thing to try, in this order:
+**What the page says.** A short, interactive AG2 Space tour (`scripts/tour_page.py`) rendered
+from the skill's feature list, `feature-list.json`. Each step is one line on what it is and one
+thing to try, in the list's order:
 1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
 2. Rooms.
 3. Commons.
@@ -131,15 +144,81 @@ one line on what it is and one thing to try, in this order:
 8. Activity & notices.
 9. Mobile.
 
-On a Claude Code core it adds "Import your Claude Code history"; on Codex or an unknown core that
-step is left out. Every prompt says where to paste it (your DM or a room). When every step is
-done, a closing card offers one more prompt. UI labels match the AG2 Space client and its current
-screenshots; reword them in `tour_page.py` when the client changes.
+On a Claude Code core it adds "Import your Claude Code history" (the step with `runtime: claude`);
+on Codex or an unknown core that step is left out. Every prompt says where to paste it (your DM or
+a room). When every step is done, a closing card offers one more prompt.
 
-**Screenshots.** `assets/*.jpg` are real UI crops, adapted from Zerlinda's Sutando's "Getting
-started with AG2 Space" page. Each is cropped so that no person's name, room or account shows,
-and each is at most 60 KB. They are inlined as `data:` URIs, so the page stays self-contained. A
-step names its images in `Section.images` as (file, alt).
+**The feature list.** `feature-list.json` is the per-release list the tour is generated from, in
+the shape AG2 Space's backend serves for owner setup copy (ag2space-backend#2898's `owner` block),
+so one validated format can serve both:
+
+```json
+{"schema_version": 1, "revision": "tutorial.2026-10-23.1",
+ "steps": [{"id": "dm", "title": "Your DM", "body": ["what it is", "what to try"],
+            "surface": "dm", "screenshot": null, "since_release": "2026-10-15",
+            "paste": "What can you do for me today?"}]}
+```
+
+- `id`: a slug; it is the step's prompt slot (`--prompts`) and its CSS/JS anchor. A step whose id
+  has no icon or accent in `tour_page.py` renders with the default ones.
+- `body`: exactly two parts, what the feature is and what to try, as trusted markup with `{name}`
+  for your escaped name. A part may be `{"text": ...}`; a link (`href`) is refused, the page
+  carries no external URL.
+- `surface`: `dm`, `room` or `mobile`; where the step is tried. With `paste` it must be `dm` or
+  `room`, and it decides the "Paste in:" hint.
+- `screenshot`: `null` or a list of asset references `{"asset", "fallback_file", "alt"}`. `asset`
+  is the name of the capture in the room's media (today the file's stem); `fallback_file` is the
+  crop under `assets/` inlined when the room has no such media; `alt` is required. The backend's
+  single asset name is a list here because a step carries up to three crops.
+- `since_release`: the release date (`YYYY-MM-DD`) that introduced the feature.
+- `runtime` (optional): `claude` or `codex`; the step appears on that core only.
+- `revision`: `tutorial.YYYY-MM-DD.N`. Any change to the list bumps it; two revisions order by
+  date, then N.
+
+Workflow when the client changes or a release adds a feature: edit `feature-list.json` (text,
+`paste`, `screenshot` crops), bump `revision`, run the tutorial tests (they validate the list and
+the size caps). Nobody rewords `tour_page.py`; it holds the renderer, icons and accents. A list
+that does not validate fails the load with the step and field named, so a bad edit never renders.
+
+**A served list.** `--list <path-or-url>` renders from another list instead of the file: a JSON
+file, or an https URL (the backend endpoint from ag2space-backend#2898 with a `tutorial` scope,
+once it exists). The file stays the fallback: a list that cannot be read or does not validate is
+reported on stderr and the skill's own file is used, and the result's `list` says which was used.
+Nothing is fetched unless `--list` names a URL.
+
+**Screenshots are Commons asset references.** Images travel as room media, not as the page's own
+bytes (decided for #5836): each `screenshot` entry names its asset, and the page points an
+`<img src>` at the room's media for it, `mxc://<server>/<id>`, the form room-commons' `room_pdf.py`
+accepts from the `room.media.upload` Action (`data_b64`, `mime`, `filename`, `post: false`;
+answered with `mxc`; refused in an encrypted room). Which assets a room has is the room's media
+map, `{asset name: "mxc://..."}`, passed as `--media <json>` to `render` or `publish`, recorded in
+the room's entry and reused on every later run there (a later `--media` adds to it); `clean_media`
+drops names the list does not use and anything that is not a well-formed `mxc://` URI. An asset
+with no mapping is inlined from its `fallback_file` as a `data:` URI, so a room with no uploads
+gets today's page byte for byte. `assets/*.jpg` are real UI crops, adapted from Zerlinda's
+Sutando's "Getting started with AG2 Space" page, each cropped so that no person's name, room or
+account shows. Two caps, enforced by the tests: each fallback file is at most 60 KB, and every
+rendered page variant in fallback mode is at most 300 KB, so publishing a page publicly stays well
+under the 413 that an image-heavy page met (#5318). Fully mapped, the page shrinks to text (under
+40 KB). Room media does not load on a public copy of a page (`page-publish`), so a copy meant for
+the public is rendered without `--media`.
+
+**Visuals (follow-up).** Part 2 of #5836 captures the images from the current client at release
+time, uploads each with `room.media.upload` to the room's media and records `{asset: mxc}` in the
+room's entry, so every DM's page points at the same release's captures and shrinks to text. Before
+the first `asset` is set it witnesses that the HTML surface loads an `<img src="mxc://...">` in a
+room (the Doc surface is known to). The visuals comment asks for:
+1. screenshots for the three imageless steps (Your DM, Connect other agents, Import your Claude
+   Code history);
+2. one "result" image per step showing the payoff (a plan in Commons, another agent's reply in a
+   Teamwork thread, an answer that used the connected Calendar);
+3. very short animations for the key actions: inviting an agent to a room, @-mentioning an agent,
+   pressing Connect for an app;
+4. an overview image at the top marking where each step lives in the client.
+
+Each list entry names its own assets (crop, result image, optional animation) as further
+`screenshot` references; with media references the animations' budget is the upload's, not the
+page's, while every fallback file stays under the caps above.
 
 **How the page behaves.**
 - It is one self-contained HTML document with no external URL.
@@ -155,8 +234,8 @@ step names its images in `Section.images` as (file, alt).
 - Copy outcomes are announced in a live status region. Animations stop under
   `prefers-reduced-motion`. Without scripts, every step shows.
 
-**Size.** With its screenshots the page is about 215 KB, over the 196,608 bytes Room Commons
-takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
+**Size.** With its screenshots the page is about 215 KB (capped at 300 KB), over the 196,608
+bytes Room Commons takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
 of at most 120,000 bytes (`CHUNK_BYTES`). Each piece is passed to `room_commons.py` as one argument,
 and Linux caps a single argument at 131,072 bytes. A refresh is one `replace` when both the old and
 new text fit one piece; otherwise it clears the old text in pieces and appends the new.

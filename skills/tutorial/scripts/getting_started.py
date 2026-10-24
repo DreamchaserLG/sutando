@@ -1,17 +1,34 @@
 #!/usr/bin/env python3
 """The owner's "Getting started" page in AG2 Space: render it, and create or refresh it in one room.
 
-  getting_started.py render --name NAME|auto [--core claude|codex|unknown|auto]   -> the page's HTML
+  getting_started.py render --name NAME|auto [--core claude|codex|unknown|auto] [--list PATH|URL]
+      -> the page's HTML
   getting_started.py plan --room ROOM                   -> {"action": "create"|"update", "kind": ...}
   getting_started.py publish [--room ROOM] [--name NAME|auto] [--owner MXID] [--core ...] [--summon]
-      [--room-commons PATH]
+      [--room-commons PATH] [--list PATH|URL] [--media PATH] [--if-newer]
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool,
-          "name": the name used}
+          "name": the name used, "revision": the feature list's, "list": "file" or the --list source,
+          "media": the asset names the page points at room media for}
 
-The page (tour_page.py) is a short interactive AG2 Space tour: eight sections, plus a Claude Code
-history import section when the core is Claude Code (`--core auto` asks the engine's config
-resolver; unknown omits it). `--name auto` uses this agent's Matrix profile displayname, else a
-name made from its mxid's localpart, else "Sutando"; it never fails.
+The page (tour_page.py) is a short interactive AG2 Space tour rendered from the skill's feature
+list (feature-list.json: nine steps for every core, plus the Claude Code history import step when
+the core is Claude Code; `--core auto` asks the engine's config resolver, unknown omits it).
+`--list` renders from another list instead, a file or an https URL (the backend's served list,
+once it exists); a list that cannot be read or does not validate is reported on stderr and the
+skill's own file is used. Nothing is fetched unless --list names a URL. `--name auto` uses this
+agent's Matrix profile displayname, else a name made from its mxid's localpart, else "Sutando";
+it never fails.
+
+Each screenshot in the list is an asset reference. `--media PATH` (a JSON object {asset name:
+"mxc://..."}, the room media an upload of that capture returned) makes the page point at the
+room's media for those assets; the map is recorded in the room's entry and reused on later runs
+there, and an asset with no mapping is inlined from its fallback file, as every one is today.
+
+The page records the list's revision in its ownership tag. `publish` rewrites a page whose text
+differs from what it would write (a new name, core, list or prompts); with --if-newer it rewrites a
+complete page only when the list's revision is newer than the page's, reusing the prompts the page
+was last built with, so a pass after an engine update refreshes stale pages and leaves current ones
+alone. A page built before lists had a revision counts as older than any list.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
 credentials come from the environment, else from the AG2 Space channel env file
@@ -60,8 +77,8 @@ sys.path.insert(0, str(REPO / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
-    AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, IMPORT_SECTION, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
-    render_page, sections_for,
+    AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
+    render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
 )
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
@@ -73,6 +90,8 @@ SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
 # 196,608-byte write.
 CHUNK_BYTES = 120_000
 USER_AGENT = "sutando-tutorial/1"
+LIST_TIMEOUT = 10
+LIST_MAX_BYTES = 1_048_576
 FALLBACK_NAME = "Sutando"
 MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
 ROOM_ID = re.compile(r"^![A-Za-z0-9._=/+\-]+:[A-Za-z0-9.\-]+(?::\d+)?$")
@@ -219,15 +238,60 @@ def redact(text: str, env: Optional[Mapping[str, str]]) -> str:
     return SECRET_SHAPE.sub(lambda m: (m.group(1) or "") + "[redacted]", text)
 
 
-def load_prompts(path: Optional[Path]) -> Dict[str, str]:
-    """The usable prompts in a --prompts JSON file; {} when there is none or it cannot be read, so
-    a bad file never fails the run (every slot keeps its default)."""
+def fetch_list(url: str) -> FeatureList:
+    """The feature list served at an https URL, validated like the file. Only https is fetched."""
+    if not url.startswith("https://"):
+        raise ValueError(f"a served feature list must be an https URL, got {url!r}")
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=LIST_TIMEOUT) as resp:
+            raw = resp.read(LIST_MAX_BYTES + 1)
+    except Exception as exc:  # noqa: BLE001 - any transport failure falls back to the file
+        raise ValueError(f"cannot fetch the feature list: {type(exc).__name__}") from None
+    if len(raw) > LIST_MAX_BYTES:
+        raise ValueError(f"the served feature list is over {LIST_MAX_BYTES} bytes")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"the served feature list is not JSON: {exc}") from None
+    return parse_list(data)
+
+
+def resolve_list(source: Optional[str], note: Callable[[str], None] = lambda s: None) -> tuple:
+    """(features, label): the list `source` names (a file path, or an https URL), else the skill's
+    own file. A source that cannot be read or does not validate is reported through `note` and the
+    file is used; the label says which list was used."""
+    if source:
+        try:
+            got = fetch_list(source) if "://" in source else load_list(Path(source))
+            return got, source
+        except ValueError as exc:
+            note(f"getting_started: --list {source} not used ({exc}); using the skill's own list")
+    return tour_page.FEATURES, "file"
+
+
+def load_prompts(path: Optional[Path], slots: Optional[tuple] = None) -> Dict[str, str]:
+    """The usable prompts in a --prompts JSON file for `slots` (the skill's own list's by default);
+    {} when there is none or it cannot be read, so a bad file never fails the run (every slot keeps
+    its default)."""
     if path is None:
         return {}
     try:
-        return clean_prompts(json.loads(path.read_text(encoding="utf-8")))
+        return clean_prompts(json.loads(path.read_text(encoding="utf-8")), slots)
     except (OSError, ValueError):
         return {}
+
+
+def load_media(path: Optional[Path]) -> Dict[str, str]:
+    """The raw asset-name to mxc map in a --media JSON file; {} when there is none or it cannot be
+    read. `clean_media` keeps only the list's names and well-formed URIs."""
+    if path is None:
+        return {}
+    try:
+        got = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def inputs_path(workspace: Path) -> Path:
@@ -315,7 +379,8 @@ def owned(page: dict, text: str, agent: Optional[str]) -> Optional[bool]:
     by = page.get("by") or ""
     if by and by != agent:
         return False
-    return owner_marker(agent) in text
+    mark = read_marker(text)
+    return bool(mark) and mark[0] == agent
 
 
 def plan(rooms: Dict[str, dict], room: str, pages: Optional[List[dict]] = None) -> dict:
@@ -439,10 +504,20 @@ def _fill(commons: Commons, kind: str, page: str) -> None:
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
             summon: bool = False, core: str = "unknown", audience: str = "dm",
-            agent: Optional[str] = None, prompts: object = None, roles: object = None) -> dict:
-    page = render_page(name, core, audience, agent, prompts, roles)
+            agent: Optional[str] = None, prompts: object = None, roles: object = None,
+            features: Optional[FeatureList] = None, if_newer: bool = False,
+            media: object = None) -> dict:
+    features = features or tour_page.FEATURES
     with _locked(marker):
         rooms = load_marker(marker)
+        if if_newer and not clean_prompts(prompts):
+            # No one is in the loop to pass the owner's prompts again: keep the page's own.
+            prompts = rooms.get(commons.room, {}).get("prompts")
+        prompts = clean_prompts(prompts, tour_page.prompt_slots(features))
+        recorded = rooms.get(commons.room, {}).get("media")
+        media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
+                             **(media if isinstance(media, dict) else {})}, features)
+        page = render_page(name, core, audience, agent, prompts, roles, features, media)
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
         if step["action"] == "reconcile":
@@ -472,13 +547,25 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             if step["action"] == "adopt":
                 _record(marker, rooms, commons.room, {"kind": kind, "state": "pending"})
             current = commons.read(kind)
+            was = read_marker(current)
+            page_revision = was[1] if was else None
             if current == page:
                 action = "unchanged"
+            elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
+                action = "unchanged"
+                page = current
             else:
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        _record(marker, rooms, commons.room, {"kind": kind, "state": "complete", "hash": content_hash(page)})
-    result = {"ok": True, "action": action, "kind": kind, "summoned": False}
+        entry = {"kind": kind, "state": "complete", "hash": content_hash(page),
+                 "revision": (read_marker(page) or (None, features.revision))[1]}
+        if prompts:
+            entry["prompts"] = prompts
+        if media:
+            entry["media"] = media
+        _record(marker, rooms, commons.room, entry)
+    result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
+              "media": sorted(media)}
     if step["action"] == "adopt":
         result["adopted"] = True
     # Summoned once: when this page's creation finishes (here, or resumed from our own pending
@@ -514,6 +601,13 @@ def _personal_args(parser: argparse.ArgumentParser) -> None:
                         + ", ".join(PROMPT_SLOTS) + "); bad or missing entries keep the default")
     parser.add_argument("--roles", default="", help="the first-contact \"I picked: ...\" payload as given, "
                         "e.g. \"Founder, Product Manager.\" (labels, or slugs)")
+    parser.add_argument("--media", type=Path, metavar="PATH",
+                        help="JSON object {asset name: \"mxc://...\"}: the room media to point those "
+                             "screenshots at; an asset not mapped is inlined from its fallback file")
+    parser.add_argument("--list", dest="feature_list", metavar="PATH|URL",
+                        help=f"render from this feature list (a JSON file, or an https URL) instead of "
+                             f"{LIST_PATH.name}; one that cannot be read or does not validate is reported "
+                             "on stderr and the skill's own file is used")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -546,6 +640,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="dm (default): the owner's DM; room: any other room, where the page says \"your agent\"")
     _personal_args(u)
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
+    u.add_argument("--if-newer", action="store_true",
+                   help="rewrite a complete page only when the feature list's revision is newer than the "
+                        "page's (a pass after an engine update); the prompts it was built with are kept")
     u.add_argument("--room-commons", type=Path, default=None,
                    help="path to room_commons.py (default: beside this skill, else the installed skill)")
     args = ap.parse_args(argv)
@@ -560,10 +657,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(plan(load_marker(marker_path(_workspace())), args.room)))
             return 0
         name = clean_name(resolve_name(args.name, args.agent_mxid))
+        features, listed = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
+        prompts = load_prompts(args.prompts, tour_page.prompt_slots(features))
+        media = load_media(args.media)
         if args.command == "render":
             core = detect_core() if args.core == "auto" else args.core
-            sys.stdout.write(render_page(name, core, args.audience, None, load_prompts(args.prompts),
-                                         args.roles))
+            sys.stdout.write(render_page(name, core, args.audience, None, prompts, args.roles, features, media))
             return 0
     except ValueError as exc:
         print(f"getting_started: {exc}", file=sys.stderr)
@@ -577,12 +676,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = publish(Commons(script, args.room, env), marker_path(_workspace()),
                          name, args.owner, args.summon,
                          detect_core() if args.core == "auto" else args.core, args.audience,
-                         args.agent_mxid or agent_mxid() or None, load_prompts(args.prompts),
-                         args.roles)
+                         args.agent_mxid or agent_mxid() or None, prompts, args.roles, features,
+                         args.if_newer, media)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4
-    print(json.dumps({**result, "name": name}))
+    print(json.dumps({**result, "name": name, "list": listed}))
     return 0
 
 
