@@ -54,6 +54,13 @@ def _replace(live: Path, ask: str) -> None:
     os.replace(tmp, live)
 
 
+def _unref(text: str) -> str:
+    """A published notice without its transaction line, which every notice ends with."""
+    head, sep, tail = text.rstrip("\n").rpartition("\n\n(ref ")
+    assert sep and tail.endswith(")") and len(tail) == 17, text
+    return head + "\n"
+
+
 def _notice(text: str | None):
     """A renderer that says `text` whatever landed (None: nothing to say)."""
     return lambda landed: text
@@ -133,7 +140,7 @@ class TestExclusivePublication(Base):
         self.assertEqual([o["errors"] for o in outs], [[], []])
         self.assertEqual([o["recovered"] for o in outs], [[], []], "a live pass's journal is never taken")
         self.assertEqual(len({o["result"] for o in outs}), 2)
-        self.assertEqual(sorted(p.read_text() for p in self.notices()),
+        self.assertEqual(sorted(_unref(p.read_text()) for p in self.notices()),
                          ["notice task-a.txt\n", "notice task-b.txt\n"])
         self.assertEqual(self.archive_names(), ["task-a.txt", "task-b.txt"])
         self.assertEqual(sorted(x.name for x in self.archive.iterdir() if x.name.startswith(".")), [])
@@ -150,7 +157,7 @@ class TestExclusivePublication(Base):
         self.assertEqual((first["errors"], second["errors"]), ([], []))
         self.assertEqual(Path(first["result"]).name, f"{PREFIX}1800000000-{os.getpid()}-aaaa.txt")
         self.assertEqual(Path(second["result"]).name, f"{PREFIX}1800000000-{os.getpid()}-bbbb.txt")
-        self.assertEqual(Path(first["result"]).read_text(), "first\n")
+        self.assertEqual(_unref(Path(first["result"]).read_text()), "first\n")
         self.assertEqual([p.name for p in self.results.iterdir() if p.name.startswith(".")], [],
                          "no staging left behind by the refused attempt")
         self.assertEqual(self.journals(), [])
@@ -260,7 +267,7 @@ class TestGenerationGuard(Base):
         self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
         self.assertIn("old", (self.archive / "task-a.txt").read_text())
         self.assertIn("new", p.read_text())
-        self.assertEqual(Path(out["result"]).read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(_unref(Path(out["result"]).read_text()), "archived: task-a.txt->task-a.txt\n")
 
     def test_a_failed_placing_move_puts_the_claim_back(self):
         p = _task(self.tasks, "task-a.txt", "A")
@@ -307,7 +314,7 @@ class TestNoClobberAndSymlinks(Base):
         self.assertEqual((self.archive / "task-a.txt").read_text(), "earlier\n")
         self.assertIn("task: A", (self.archive / "task-a.txt.2").read_text())
         self.assertFalse((self.tasks / "task-a.txt").exists())
-        self.assertEqual(Path(out["result"]).read_text(), "archived: task-a.txt->task-a.txt.2\n")
+        self.assertEqual(_unref(Path(out["result"]).read_text()), "archived: task-a.txt->task-a.txt.2\n")
 
     def test_names_that_are_not_bare_are_refused_before_anything_moves(self):
         (self.ws / "secret.txt").write_text("stay")
@@ -487,7 +494,7 @@ class TestJournalRecovery(Base):
         out = self.recover()
         self.assertEqual(out["errors"], [])
         self.assertEqual(Path(out["recovered"][0]["result"]).name, reserved)
-        self.assertEqual(Path(out["recovered"][0]["result"]).read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(_unref(Path(out["recovered"][0]["result"]).read_text()), "archived: task-a.txt->task-a.txt\n")
         self.invariants(gen, "task: A", notice_committed=True)
         self.assertEqual(self.recover()["recovered"], [])
 
@@ -847,7 +854,7 @@ class TestRefusalPaths(Base):
         self.assertEqual(len(out["errors"]), 1, out)
         self.assertIn("changed since it was planned", out["errors"][0])
         self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
-        self.assertEqual(self.notices()[0].read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(_unref(self.notices()[0].read_text()), "archived: task-a.txt->task-a.txt\n")
         self.assertIn("task: new B", q.read_text())
         self.assertEqual(self.journals(), [])
 
@@ -883,7 +890,7 @@ class TestRefusalPaths(Base):
         self.assertEqual(len(out["errors"]), 1, out)
         self.assertIn("another pass archived it", out["errors"][0])
         self.assertEqual(out["archived"], {"task-b.txt": "task-b.txt"})
-        self.assertEqual(self.notices()[0].read_text(), "archived: task-b.txt->task-b.txt\n")
+        self.assertEqual(_unref(self.notices()[0].read_text()), "archived: task-b.txt->task-b.txt\n")
         self.assertEqual(self.journals(), [])
         self.assertFalse(q.exists())
 
@@ -1212,7 +1219,7 @@ class TestCrashWindows(Base):
         self.assertEqual(reserved.read_text(), "FOREIGN NOTICE\n")
         mine = Path(out["recovered"][0]["result"])
         self.assertNotEqual(mine, reserved)
-        self.assertEqual(mine.read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(_unref(mine.read_text()), "archived: task-a.txt->task-a.txt\n")
         self.assertEqual(self.journals(), [])
 
     def test_a_failed_recovery_publish_keeps_the_journal(self):
@@ -1234,8 +1241,86 @@ class TestCrashWindows(Base):
         self.assertEqual(len(self.journals()), 1)
         again = self.recover()
         self.assertEqual(again["errors"], [])
-        self.assertEqual(Path(again["recovered"][0]["result"]).read_text(),
+        self.assertEqual(_unref(Path(again["recovered"][0]["result"]).read_text()),
                          "archived: task-a.txt->task-a.txt\n")
+
+    def test_a_foreign_notice_with_an_identical_body_is_not_adopted(self):
+        """Two transactions can render the same text; only the transaction id
+        the notice ends with says whose it is."""
+        reserved = self.crash_at_publishing()
+        reserved.write_text("archived: task-a.txt->task-a.txt\n")  # same text, not this txn's
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        mine = Path(out["recovered"][0]["result"])
+        self.assertNotEqual(mine, reserved)
+        txn = None if not self.notices() else mine.read_text().rstrip().rsplit("(ref ", 1)[-1][:-1]
+        self.assertTrue(txn and txn not in reserved.read_text())
+        self.assertEqual(_unref(mine.read_text()), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(reserved.read_text(), "archived: task-a.txt->task-a.txt\n")
+        self.assertEqual(self.journals(), [])
+
+    def crash_with_b_linked_at_2(self):
+        """A landed; B's claim linked into the archive at `.2` (`task-b.txt` and
+        `.1` held older records) and the pass killed before the claim unlink."""
+        _task(self.tasks, "task-a.txt", "A")
+        b = _task(self.tasks, "task-b.txt", "B")
+        gen_b = tt.generation_of(b)
+        self.archive.mkdir()
+        (self.archive / "task-b.txt").write_text("older\n")
+        (self.archive / "task-b.txt.1").write_text("older still\n")
+
+        def at(where, name):
+            if where == "after_link" and name.startswith("task-b.txt.claim-"):
+                raise Crash("killed between B's link and its claim unlink")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt", "task-b.txt"], _naming)
+        return gen_b
+
+    def test_one_recovery_resolves_a_gap_a_duplicate_claim_and_a_same_text_foreign_notice(self):
+        gen_b = self.crash_with_b_linked_at_2()
+        claim = next(x for x in self.tasks.iterdir() if x.name.startswith("task-b.txt.claim-"))
+        self.assertEqual(os.stat(claim).st_ino, os.stat(self.archive / "task-b.txt.2").st_ino)
+        (self.archive / "task-b.txt.1").unlink()  # an older record requeued meanwhile
+        expected = ("archived: task-a.txt->task-a.txt, task-b.txt->task-b.txt\n\n"
+                    "(Published by a later pass after an interrupted one.)\n"
+                    "task-b.txt is archived as tasks/archive/task-b.txt.2.\n")
+        foreign = self.results / f"{PREFIX}1-1-foreign.txt"
+        foreign.write_text(expected)
+        real_mint, names = tt._mint_name, iter([foreign.name])
+        with mock.patch.object(tt, "_mint_name", side_effect=lambda *a: next(names, None) or real_mint(*a)):
+            out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["recovered"][0]["landed"],
+                         {"task-a.txt": "task-a.txt", "task-b.txt": "task-b.txt.2"})
+        self.assertEqual(self.archive_names(), ["task-a.txt", "task-b.txt", "task-b.txt.2"], "no .3")
+        self.assertFalse(claim.exists())
+        self.assertEqual(os.stat(self.archive / "task-b.txt.2").st_nlink, 1)
+        self.assertEqual(tt.generation_of(self.archive / "task-b.txt.2"), gen_b)
+        mine = Path(out["recovered"][0]["result"])
+        self.assertNotEqual(mine, foreign)
+        self.assertEqual(_unref(mine.read_text()), expected)
+        self.assertEqual(foreign.read_text(), expected)
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(self.recover()["recovered"], [])
+        self.assertEqual(len(self.notices()), 2)
+
+    def test_a_notice_waits_while_a_claimed_task_is_unresolved_then_names_it(self):
+        self.crash_with_b_linked_at_2()
+        claim = next(x for x in self.tasks.iterdir() if x.name.startswith("task-b.txt.claim-"))
+        hidden = Path(self.tmp.name) / "hidden"
+        os.rename(self.archive / "task-b.txt.2", hidden)
+        claim.unlink()  # B is nowhere this pass can see
+        first = self.recover()
+        self.assertIn("lost track of 'task-b.txt'", first["errors"][0])
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1), "no A-only notice")
+        os.rename(hidden, self.archive / "task-b.txt.2")
+        second = self.recover()
+        self.assertEqual(second["errors"], [], second)
+        text = _unref(Path(second["recovered"][0]["result"]).read_text())
+        self.assertIn("task-a.txt->task-a.txt", text)
+        self.assertIn("task-b.txt is archived as tasks/archive/task-b.txt.2.", text)
+        self.assertEqual((len(self.notices()), self.journals()), (1, []))
 
     def test_still_safe_refuses_a_file_right_before_its_claim(self):
         p, b = self.two_tasks()

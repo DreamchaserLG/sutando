@@ -39,9 +39,10 @@ is archived is a promise. `transition()` keeps it as a staged transaction:
   gone) and continues it from the recorded stage: a claim already linked into
   the archive is only unlinked, an unplaced claim is placed, a placement whose
   record was lost is found by generation among every `.N`. The notice names
-  only what landed, and a reserved name counts as published only when it holds
-  exactly this body; another notice's file is never adopted. The journal is
-  removed, or kept when a file cannot be found. Each generation ends with
+  only what landed and ends with `(ref <txn>)`, the journal's transaction id;
+  a file at the reserved name counts as published only when it carries that
+  id, so another notice is never adopted. While any claimed file cannot be
+  found, nothing is published and the journal is kept. Each generation ends with
   exactly one copy, live or archived; a second recovery pass does nothing new.
 """
 from __future__ import annotations
@@ -198,6 +199,15 @@ def _problems(dirs: _Dirs, moves: dict) -> list[str]:
 def _mint_name(prefix: str, now: float | None) -> str:
     second = int(time.time() if now is None else now)
     return f"{prefix}{second}-{os.getpid()}-{secrets.token_hex(4)}.txt"
+
+
+def _stamp(body: str, txn: str) -> str:
+    """The notice as published: its last line names the transaction that owns it."""
+    return f"{body.rstrip()}\n\n(ref {txn})\n"
+
+
+def _owned_by(held: bytes, txn: str) -> bool:
+    return held.rstrip().endswith(f"(ref {txn})".encode())
 
 
 def _publish_at(results_dir: Path, name: str, body: str) -> Path:
@@ -492,16 +502,17 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
             lost = True
             report["errors"].append(f"lost track of {name!r}: its claim {claim} is gone and no "
                                     "archived copy carries its generation; its journal "
-                                    f"tasks/archive/{j.name} is kept — check tasks/archive/")
+                                    f"tasks/archive/{j.name} and its notice wait until it is found "
+                                    "— check tasks/archive/")
         j.set(claims=claims, landed=landed, quarantined=quarantined)
     report["landed"] = landed
+    if lost:  # a notice now would omit it, and a later pass would adopt that notice
+        j.release()
+        return
     if landed or d.get("result"):
         if not _publish_recovered(j, results_dir, landed, report):
             return
-    if lost:
-        j.release()
-    else:
-        j.remove()
+    j.remove()
 
 
 def _recovered_body(d: dict, landed: dict) -> "str | None":
@@ -518,14 +529,18 @@ def _recovered_body(d: dict, landed: dict) -> "str | None":
 
 
 def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dict) -> bool:
-    """Publish the journal's notice once. A name already taken counts as this
-    notice only when it holds exactly this body; a foreign one gets a new name."""
+    """Publish the journal's notice once. A taken name counts as this notice only
+    when the file carries this journal's transaction id; any other gets a new name."""
     d = j.data
-    if d.get("stage") != "publishing" or not isinstance(d.get("body"), str) or not d.get("result"):
+    txn = d.get("txn")
+    if (d.get("stage") != "publishing" or not isinstance(d.get("body"), str) or not d.get("result")
+            or not isinstance(txn, str) or not txn):
         body = _recovered_body(d, landed)
         if body is None:
             return True
-        j.set(stage="publishing", result=_mint_name(d.get("prefix") or "proactive-", None), body=body)
+        txn = txn if isinstance(txn, str) and txn else secrets.token_hex(8)
+        j.set(stage="publishing", txn=txn, body=_stamp(body, txn),
+              result=_mint_name(d.get("prefix") or "proactive-", None))
     body = d["body"]
     for _ in range(_NAME_ATTEMPTS):
         target = results_dir / d["result"]
@@ -535,7 +550,7 @@ def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dic
             held = None
         except OSError as exc:
             held = exc
-        if held == body.encode("utf-8"):
+        if isinstance(held, bytes) and _owned_by(held, txn):
             report["result"] = str(target)  # committed before the crash: no second notice
             return True
         if held is None:
@@ -608,7 +623,7 @@ def transition(tasks_dir: Path, results_dir: Path, archive_dir: Path, *,
             return out
         try:
             j = _Journal.create(dirs, now, {
-                "stage": "planned", "prefix": prefix, "moves": moves,
+                "stage": "planned", "txn": secrets.token_hex(8), "prefix": prefix, "moves": moves,
                 "body": render({}), "rendered_for": {}, "claims": {}, "landed": {},
                 "quarantined": {}, "result": None})
         except OSError as exc:
@@ -659,10 +674,11 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
                 j.data["quarantined"][name] = claim
                 _mark_quarantine(dirs, claim)
         j.set(stage="placed")
-    out["body"] = render(out["archived"])
-    if out["body"] is None:
+    body = render(out["archived"])
+    if body is None:
         j.remove()
         return
+    out["body"] = _stamp(body, j.data["txn"])
     for _ in range(_NAME_ATTEMPTS):
         name = _mint_name(prefix, now)
         j.set(stage="publishing", result=name, body=out["body"])

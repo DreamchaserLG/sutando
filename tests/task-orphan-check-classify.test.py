@@ -107,6 +107,13 @@ class Workspace:
         self.tmp.cleanup()
 
 
+def _unref(text: str) -> str:
+    """A published notice without its transaction line."""
+    head, sep, _ = text.rstrip("\n").rpartition("\n\n(ref ")
+    assert sep, text
+    return head + "\n"
+
+
 class ClassifyBase(unittest.TestCase):
     def setUp(self):
         self.mod = _load()
@@ -1034,7 +1041,7 @@ class TestApplyPlan(ClassifyBase):
         self.assertEqual(out["archived"], ["task-a.txt"])
         self.assertEqual(out["silent_archived"], [])
         self.assertEqual(self.recovery_files(), [Path(out["result"])])
-        self.assertEqual(Path(out["result"]).read_text(), plan["body"])
+        self.assertEqual(_unref(Path(out["result"]).read_text()), plan["body"])
         self.assertFalse((self.ws.root / "tasks" / "task-a.txt").exists())
         self.assertTrue((self.ws.root / "tasks" / "archive" / "task-a.txt").exists())
         again = self.apply()
@@ -1600,11 +1607,13 @@ class TestCli(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(sorted(Path(elsewhere).iterdir()), [], "nothing lands in the cwd")
         out = json.loads(res.stdout)
-        self.assertEqual({k: out[k] for k in plan}, plan)
+        self.assertEqual({k: out[k] for k in plan if k != "body"},
+                         {k: v for k, v in plan.items() if k != "body"})
+        self.assertEqual(_unref(out["body"]), plan["body"])
         self.assertEqual(out["archived"], [f"{IMPORT_ID}.txt"])
         self.assertTrue((self.ws.root / "tasks" / "archive" / f"{IMPORT_ID}.txt").exists())
         self.assertEqual(Path(out["result"]).parent, self.ws.root / "results")
-        self.assertEqual(Path(out["result"]).read_text(), plan["body"])
+        self.assertEqual(_unref(Path(out["result"]).read_text()), plan["body"])
 
     def test_apply_flag_exits_one_when_the_publish_fails(self):
         self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: hi\n")
