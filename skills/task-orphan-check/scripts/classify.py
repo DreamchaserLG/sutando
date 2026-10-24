@@ -721,11 +721,11 @@ def apply_plan(workspace: Path, now: float | None = None) -> dict:
     Returns the plan plus `result` (the published path or None), `body` (the
     notice as published), `archived`, `silent_archived` (names actually
     moved), `landed` ({name: archive name}), `quarantined` ({name: claim
-    kept in tasks/}), `recovered` (interrupted passes finished first) and
-    `errors` (one line each)."""
+    kept in tasks/}), `recovered` (interrupted passes finished first), `swept`
+    (dead passes' unjournaled claims given back) and `errors` (one line each)."""
     plan, groups = _plan(workspace, now)
     out = {**plan, "result": None, "archived": [], "silent_archived": [], "landed": {},
-           "quarantined": {}, "recovered": [], "errors": list(plan.get("errors") or [])}
+           "quarantined": {}, "recovered": [], "swept": [], "errors": list(plan.get("errors") or [])}
     if out["errors"]:
         return out
     tasks_dir = workspace / "tasks"
@@ -736,6 +736,7 @@ def apply_plan(workspace: Path, now: float | None = None) -> dict:
         render=lambda landed: _final_body(groups, landed))
     out["result"], out["body"], out["landed"] = done["result"], done["body"], done["archived"]
     out["quarantined"], out["recovered"] = done["quarantined"], done["recovered"]
+    out["swept"] = done["swept"]
     out["errors"] += done["errors"]
     for key, moved in (("archive", "archived"), ("silent_archive", "silent_archived")):
         out[moved] = [name for name in plan[key] if name in done["archived"]]

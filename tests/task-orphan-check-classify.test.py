@@ -1073,6 +1073,17 @@ class TestApplyPlan(ClassifyBase):
         self.assertEqual(sorted((self.ws.root / "tasks" / "archive").glob(".notice-*.json")), [])
         self.assertEqual(len(self.recovery_files()), 1)
 
+    def test_a_dead_passs_claim_given_back_is_reported_as_swept(self):
+        """The transition's `swept` reaches the caller: a claim it gave back to its
+        live name is a change on disk the operator must be able to see."""
+        (self.ws.root / "tasks" / "archive").mkdir(exist_ok=True)
+        stray = self.ws.root / "tasks" / "task-z.txt.claim-4000000000-abcdef0123"  # no such pid
+        stray.write_text("task: Z\n")
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["swept"], [{"claim": stray.name, "live": "task-z.txt"}])
+        self.assertEqual((self.ws.root / "tasks" / "task-z.txt").read_text(), "task: Z\n")
+
     def test_done_and_silent_rows_move_without_a_result(self):
         self.ws.task("task-done.txt", chat_task_text("task-done", NOW - 900))
         (self.ws.root / "results" / "task-done.txt").write_text("answered\n")
