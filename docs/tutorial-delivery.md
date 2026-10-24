@@ -36,12 +36,12 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   revision; its own request, `--summon` and new prompts or media included, waits for the next
   run). A page still as before means the rewrite never ran and the run proceeds as usual. Any other
   page is someone's edit: it is kept, and the entry from before the rewrite stands whole, so the
-  next run keeps it too. A rewrite that fits one room-commons call (this host's argument budget:
-  ARG_MAX less the environment, 131,072 bytes per argument on Linux) is a single `replace` whose
+  next run keeps it too. A rewrite that fits one room-commons call (1 MiB a text; arguments travel
+  over stdin, so no exec limit applies) is a single `replace` whose
   needle is the whole page, so a page that changed since it was read is refused whole and nothing
   in between is written. When only the old page fits a call, the first call replaces the whole page
   by the new page's first piece and the rest is appended, every call read back. A page no call can
-  hold (the default page on Linux) is not rewritten: the run exits 4 and leaves it as is, because a
+  hold is not rewritten: the run exits 4 and leaves it as is, because a
   page cleared in pieces cannot be put back where an edit made meanwhile left it. A run that
   resumes continues from the call the journal recorded, never from the page's length.
 - **Pages this script cannot vouch for.** The page's tag carries a digest of the page itself, so a

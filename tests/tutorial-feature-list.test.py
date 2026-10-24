@@ -473,7 +473,7 @@ class _Cli(unittest.TestCase):
         door = mock.patch.object(gs, "connect_actions", return_value=self.door)
         door.start()
         self.addCleanup(door.stop)
-        base.pin_host_budget(self)
+        base.linux_exec_limit(self)
 
     def main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -496,8 +496,8 @@ class _Cli(unittest.TestCase):
         gs.save_marker(marker, rooms)
 
     def chunked(self):
-        """The rewrite above the one-call budget (every page on a Linux host): cleared and appended
-        in pieces. On this host the default page may fit one call; the tests pin both paths."""
+        """The rewrite above the one-call budget: the whole page replaced by the target's first
+        piece, the rest appended. Real pages fit one call; the tests pin both paths."""
         return mock.patch.object(gs, "one_call", return_value=False)
 
     def publish(self, *extra):
@@ -1326,14 +1326,14 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "resumed", target))
         opener.assert_not_called()
 
-    LINUX = (131_071, 2_000_000)  # Linux's per-argument cap: the 214 KB page fits no call
+    SMALL = (131_071, 2_000_000)  # a call budget that holds no 214 KB text
     SPLIT = (250_000, 400_000)  # the page fits an argument, but not beside the whole new page
 
     def test_a_page_no_call_can_hold_is_refused_and_left_as_is(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         self.newer = self.write_list("tutorial.2026-11-01.1")
-        for budget in (self.LINUX, (70_000, 140_000)):
+        for budget in (self.SMALL, (70_000, 140_000)):
             with self.subTest(budget=budget):
                 mine, target, theirs, calls, code, out, err = self.edited_run(
                     "read:2:prepend", self.newer, prompts, chunked=False, budget={"return_value": budget})
@@ -1353,13 +1353,13 @@ class IfNewerTest(_Cli):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         self.newer = self.write_list("tutorial.2026-11-01.1")
-        for budget in (self.LINUX, self.SPLIT):
+        for budget in (self.SMALL, self.SPLIT):
             for hook in ("read:2", "read:3"):
                 with self.subTest(budget=budget, hook=hook):
                     mine, target, theirs, calls, code, out, err = self.edited_run(
                         f"{hook}:prepend", self.newer, prompts, chunked=False, budget={"return_value": budget})
                     got = json.loads(out)
-                    if budget == self.LINUX:  # refused before any write: no read for the owner to follow
+                    if budget == self.SMALL:  # refused before any write: no read for the owner to follow
                         self.assertEqual((code, got["ok"], theirs, self.page_text()), (4, False, None, mine))
                         continue
                     self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
@@ -1547,7 +1547,7 @@ class DocTest(unittest.TestCase):
         self.assertIn("`updating`", text)
         self.assertIn("refuses to run without one", text)
         canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
-        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "digest", "argument budget",
+        for word in ("--if-newer", "kept", "updating", "resumed", "journal", "read back", "digest", "over stdin",
                      "mxc://", "1 MiB", "--agent-mxid", "Last verified:"):
             self.assertIn(word, canon)
 

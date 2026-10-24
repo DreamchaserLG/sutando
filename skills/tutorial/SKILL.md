@@ -130,12 +130,12 @@ each room's entry.
   there (`"action": "resumed"`, reporting the journalled name and revision; its own inputs,
   `--summon` included, wait for the next run); a page still as before means the rewrite never ran
   and the run proceeds as usual; any other page is someone's edit, kept with the entry from before
-  the rewrite, whole. A rewrite that fits one room-commons call (both texts within this host's
-  argument budget: ARG_MAX less the environment, and 131,072 bytes per argument on Linux) is one
+  the rewrite, whole. A rewrite that fits one room-commons call (both texts within `CALL_BYTES`,
+  1 MiB each; arguments reach `room_commons.py` over stdin, so no exec limit applies) is one
   `replace` whose needle is the whole page, so a page that changed since it was read is refused as
   a whole and nothing in between is written. When the old page fits a call but not beside the new
   one, the first call replaces the whole page by the new page's first piece and the rest is
-  appended, each call read back. A page no call can hold (the default page on Linux) is never
+  appended, each call read back. A page no call can hold is never
   rewritten in pieces: the run exits 4 and leaves it as is, since a page cut away piece by piece
   cannot be put back where an edit made meanwhile left it. The
   page's tag carries a digest of the page, so a page found after the marker is lost is adopted as
@@ -272,8 +272,8 @@ page's, while every fallback file stays under the caps above.
 
 **Size.** With its screenshots the page is about 215 KB (capped at 300 KB), over the 196,608
 bytes Room Commons takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
-of at most 120,000 bytes (`CHUNK_BYTES`). Each piece is passed to `room_commons.py` as one argument,
-and Linux caps a single argument at 131,072 bytes. A refresh is one `replace` when the old and new
+of at most 120,000 bytes (`CHUNK_BYTES`). Arguments reach `room_commons.py` as JSON on stdin,
+never argv, so Linux's 131,072-byte cap on one argument does not apply. A refresh is one `replace` when the old and new
 text fit one call; else one `replace` of the whole old page by the new page's first piece, then
 appends; a page no call can hold is left as is (exit 4).
 

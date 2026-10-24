@@ -60,7 +60,7 @@ DM. `owner` and `roles` apply only in that file's own room; a missing, unreadabl
 or a field of the wrong shape, is ignored. `--name` defaults to auto.
 
 Exit codes: 0 done, 2 bad arguments, 3 the room-commons skill is not installed, 4 a room-commons
-call failed, ownership was unclear, or the page is too large for one call on this host (the marker
+call failed, ownership was unclear, or the page is too large for one call (the marker
 keeps what is known, so the next run resumes).
 """
 from __future__ import annotations
@@ -99,9 +99,15 @@ PROFILE_TIMEOUT = 5
 CREATE_ACTION = "room.commons.pages.create"
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
 SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
-# Each piece is one argv string: under Linux's 131,072-byte per-argument cap and Room Commons'
-# 196,608-byte write.
+# A piece of a create or an append: under Room Commons' 196,608-byte write.
 CHUNK_BYTES = 120_000
+# room_commons.py runs with its argv read from stdin: a page can exceed what an OS lets one exec carry.
+ARGV_FROM_STDIN = ("import json, os, runpy, sys\n"
+                   "sys.argv = json.load(sys.stdin)\n"
+                   "sys.stdin = open(os.devnull)\n"
+                   "sys.path[0] = os.path.dirname(os.path.abspath(sys.argv[0]))\n"
+                   "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+CALL_BYTES = 1_048_576  # what one call may carry: well above the page cap, so a page is one replace
 USER_AGENT = "sutando-tutorial/1"
 LIST_TIMEOUT = 10
 FALLBACK_NAME = "Sutando"
@@ -487,14 +493,15 @@ class Commons:
         return kind
 
     def run(self, *args: str, kind: Optional[str] = None, as_json: bool = False) -> str:
-        argv = [sys.executable, str(self.script)]
+        argv = [str(self.script)]
         if as_json:
             argv.append("--json")
         if kind:
             argv += ["--kind", kind]
         argv += list(args)
         try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=self.env)
+            done = subprocess.run([sys.executable, "-c", ARGV_FROM_STDIN], input=json.dumps(argv), capture_output=True,
+                                  text=True, timeout=120, env=self.env)
         except subprocess.TimeoutExpired:
             raise PublishError(f"room-commons {args[0]} timed out") from None
         if done.returncode != 0:
@@ -537,13 +544,9 @@ class Commons:
 
 
 def call_budget(env: Optional[Mapping[str, str]] = None) -> tuple:
-    """(bytes one argument may hold, bytes left for the two texts of one call) on this host: Linux
-    caps an argument at 131,072 bytes; every host caps argv plus environment at ARG_MAX."""
-    env = os.environ if env is None else env
-    total = os.sysconf("SC_ARG_MAX") if hasattr(os, "sysconf") else 262_144
-    used = sum(len(str(k).encode("utf-8")) + len(str(v).encode("utf-8")) + 2 for k, v in env.items()) + 8192
-    per_arg = 131_071 if sys.platform.startswith("linux") else total
-    return per_arg, max(0, total - used)
+    """(bytes one text may hold, bytes the two texts of one call may hold together). Arguments go
+    over stdin (`Commons.run`), so no exec limit applies; CALL_BYTES bounds a call instead."""
+    return CALL_BYTES, 2 * CALL_BYTES
 
 
 def fits_call(a: str, b: str, env: Optional[Mapping[str, str]] = None) -> bool:
@@ -560,8 +563,7 @@ def one_call(old: str, new: str, env: Optional[Mapping[str, str]] = None) -> boo
 
 
 def piece_limit(env: Optional[Mapping[str, str]] = None) -> int:
-    """Bytes one piece of a piecewise write may hold on this host: CHUNK_BYTES, or less when one
-    argument may hold less."""
+    """Bytes one appended piece may hold: CHUNK_BYTES, or less when one text of a call may hold less."""
     return max(1, min(CHUNK_BYTES, call_budget(env)[0]))
 
 
@@ -573,8 +575,8 @@ def rewritable(old: str, new: str, env: Optional[Mapping[str, str]] = None) -> b
 
 
 def too_large(kind: str, page: str, env: Optional[Mapping[str, str]] = None) -> str:
-    return (f"{kind} is {len(page.encode('utf-8'))} bytes, more than one room-commons call can carry on this "
-            f"host ({call_budget(env)[0]} bytes an argument); it is left as is, not rewritten in pieces")
+    return (f"{kind} is {len(page.encode('utf-8'))} bytes, more than one room-commons call can carry "
+            f"({call_budget(env)[0]} bytes a text); it is left as is, not rewritten in pieces")
 
 
 def rewrite_steps(old: str, new: str, whole: Optional[bool] = None,

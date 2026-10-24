@@ -32,7 +32,6 @@ SCRIPT = REPO / "skills" / "tutorial" / "scripts" / "getting_started.py"
 spec = importlib.util.spec_from_file_location("getting_started", SCRIPT)
 gs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gs)
-REAL_CALL_BUDGET = gs.call_budget
 
 STUB = textwrap.dedent('''
     import json, os, sys
@@ -671,7 +670,7 @@ class ChunkTest(unittest.TestCase):
         self.assertEqual("".join(parts), text)
         self.assertTrue(all(len(p.encode("utf-8")) <= 7 for p in parts))
         self.assertEqual(gs.chunks(""), [])
-        self.assertLess(gs.CHUNK_BYTES, 131_072)  # Linux MAX_ARG_STRLEN, below Commons' 196,608
+        self.assertLess(gs.CHUNK_BYTES, 196_608)  # Room Commons takes 196,608 bytes in one write
 
 
 class AssetTest(unittest.TestCase):
@@ -1156,12 +1155,16 @@ class FakeActions:
         return {"kind": self.kind or made[operation_id], "surface": "html", "operation_id": operation_id}
 
 
-# A host whose argument budget holds the whole page (macOS); tests of other budgets patch their own.
-WHOLE_PAGE_BUDGET = (1_048_576, 1_000_000)
+REAL_RUN = subprocess.run
 
 
-def pin_host_budget(test: unittest.TestCase) -> None:
-    patcher = mock.patch.object(gs, "call_budget", return_value=WHOLE_PAGE_BUDGET)
+def linux_exec_limit(test: unittest.TestCase) -> None:
+    """Hold every exec to Linux's 131,072-byte cap on one argument, whatever the host."""
+    def run(argv, *a, **kw):
+        if any(len(str(x).encode("utf-8")) >= 131_072 for x in argv):
+            raise OSError(7, "Argument list too long")
+        return REAL_RUN(argv, *a, **kw)
+    patcher = mock.patch.object(subprocess, "run", run)
     patcher.start()
     test.addCleanup(patcher.stop)
 
@@ -1180,7 +1183,7 @@ class PublishTest(unittest.TestCase):
         self.door = FakeActions(self.state)
         os.environ["STUB_STATE"] = str(self.state)
         os.environ.pop("STUB_FAIL", None)
-        pin_host_budget(self)
+        linux_exec_limit(self)
 
     def tearDown(self):
         os.environ.pop("STUB_STATE", None)
@@ -1248,15 +1251,26 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(len([c for c in calls if c[0] == "append"]), len(gs.chunks(new)) - 1)
         self.assertEqual(self.room()["pages"], {"html-p1": new})
 
-    def test_linux_caps_one_argument(self):
-        with mock.patch.object(gs.sys, "platform", "linux"):
-            self.assertEqual(REAL_CALL_BUDGET({})[0], 131_071)
+    def test_arguments_travel_over_stdin_whatever_their_size(self):
+        big = "x" * 300_000  # over Linux's 131,072-byte cap on one exec argument
+        self.state.write_text(json.dumps({"pages": {"html-p1": ""}, "calls": [], "next": 2}))
+        real, seen = subprocess.run, []  # the exec-limit guard: a payload in argv would fail here
+
+        def spy(argv, **kw):
+            seen.append((argv, kw.get("input") or ""))
+            return real(argv, **kw)
+        with mock.patch.object(gs.subprocess, "run", spy):
+            gs.Commons(self.stub, self.ROOM).run("append", self.ROOM, big, kind="html-p1")
+        self.assertEqual(self.room()["pages"]["html-p1"], big)
+        self.assertTrue(all(len(a) < 1000 for a in seen[0][0]))
+        self.assertIn(big, seen[0][1])
+        self.assertGreater(gs.call_budget()[0], gs.tour_page.PAGE_MAX_BYTES)  # every page is one replace
 
     def test_a_page_no_call_can_hold_is_never_rewritten_in_pieces(self):
         commons = gs.Commons(self.stub, self.ROOM)
         old, new = self.page(), self.page(core="claude")
         self.state.write_text(json.dumps({"pages": {"html-p1": old}, "calls": [], "next": 2}))
-        with mock.patch.object(gs, "call_budget", return_value=(131_071, 2_000_000)):  # Linux's per-argument cap
+        with mock.patch.object(gs, "call_budget", return_value=(131_071, 2_000_000)):  # holds no 214 KB text
             self.assertFalse(gs.rewritable(old, new))
             with self.assertRaisesRegex(gs.PublishError, "left as is, not rewritten in pieces"):
                 commons.rewrite("html-p1", old, new)
