@@ -701,9 +701,13 @@ SECTIONS = [s for s in FEATURES.steps if s.runtime is None]
 PROMPT_SLOTS = prompt_slots(FEATURES)
 
 
+PAGE_TAIL = f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
 MARKER = re.compile(r'<meta name="sutando-tutorial" content="([^"]*)"(?: data-revision="([^"]*)")?'
                     r'(?: data-digest="([0-9a-f]{64})")?>')
 DIGEST_SLOT = "f" * 64
+DIGEST_ATTR = re.compile(r' data-digest="[0-9a-f]{64}"')
+PAGE_HEAD = ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
 
 
 def owner_marker(agent: str, revision: Optional[str] = None, digest: Optional[str] = None) -> str:
@@ -712,6 +716,18 @@ def owner_marker(agent: str, revision: Optional[str] = None, digest: Optional[st
     rev = f' data-revision="{html.escape(revision, quote=True)}"' if revision else ""
     dig = f' data-digest="{digest}"' if digest else ""
     return f'<meta name="sutando-tutorial" content="{html.escape(agent, quote=True)}"{rev}{dig}>'
+
+
+def strip_digest(text: str) -> str:
+    """`text` with the tag's digest attribute removed: the form a page took before tags carried one."""
+    return DIGEST_ATTR.sub("", text, count=1)
+
+
+def page_shape_ok(text: str) -> bool:
+    """Whether `text` begins and ends exactly as this renderer writes a page and carries one
+    ownership tag: a page with anything added before, after or around the tag fails."""
+    return text.startswith(PAGE_HEAD + "<meta name=\"sutando-tutorial\"") and text.endswith(PAGE_TAIL) \
+        and len(MARKER.findall(text)) == 1 and text.count("<!doctype") == 1 and text.count("</html>") == 1
 
 
 def page_digest_ok(text: str) -> Optional[bool]:
@@ -753,8 +769,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     body = "".join(_section(s, i == 0, who, prompts, media) for i, s in enumerate(secs))
     light, dark = _palette(tuple(s.id for s in features.steps if s.id not in ACCENTS))
     page = (
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"{PAGE_HEAD}"
         f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'light': light, 'darkvars': dark}}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
@@ -773,7 +788,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"
         "<button type=\"button\" id=\"all\" aria-pressed=\"false\">Show all</button></nav>"
         f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div>"
-        f"</main>{SCRIPT}{COPY_SCRIPT}</body></html>\n"
+        f"{PAGE_TAIL}"
     )
     if agent:  # the tag's digest covers the whole page with the digest itself blanked
         page = page.replace(f'data-digest="{DIGEST_SLOT}"',

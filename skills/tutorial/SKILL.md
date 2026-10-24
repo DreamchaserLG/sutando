@@ -138,7 +138,15 @@ each room's entry.
   with at most one piece already cleared (noted in the result, never recorded as written). The
   page's tag carries a digest of the page, so a page found after the marker is lost is adopted as
   this script's only when the digest matches; otherwise it is kept as found and never rewritten
-  until a render equals it. Creation goes through the same journal, and a run settles any journal
+  until a render equals it. A page from before tags carried a digest (our tag with a
+  `data-revision` and no `data-digest`) is adopted as ours once, and rewritten with the digest,
+  when it equals this run's render less the digest, or failing that when it is the room's only
+  tutorial page and shaped exactly as one is written (our head, one tag, our tail); any other such
+  page is kept as found. The shape rule cannot tell an edit inside the body of such a page from an
+  older render, so a pre-digest page the owner edited inside is upgraded with the rest. A write that landed on a page someone edited meanwhile is taken back the
+  way it was made (a whole page replaced back, an appended piece removed, a cleared piece put back
+  at the front in pieces that fit a call); when a piece cannot fit, nothing more is written and the
+  result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
   before it reads its own name, list, prompts or media. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 

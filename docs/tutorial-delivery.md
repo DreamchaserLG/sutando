@@ -46,8 +46,12 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
 - **Pages this script cannot vouch for.** The page's tag carries a digest of the page itself, so a
   page found after the marker is lost is adopted as this script's only when the digest matches; a
   page that does not match, or one whose creation never finished as journalled, is kept as found
-  and never rewritten until a render equals it. Creation runs through the same journal as a
-  rewrite.
+  and never rewritten until a render equals it. A page from before tags carried a digest (our
+  tag, a `data-revision`, no `data-digest`) is adopted once and rewritten with the digest when it
+  equals the run's render less the digest, or when it is the room's only tutorial page and shaped
+  exactly as one is written; otherwise it is kept. Creation runs through the same journal as a
+  rewrite. A write taken back is undone the way it was made, in pieces that fit a call; a piece
+  that cannot fit stops the undo, writes nothing more, and the result names the page as left.
 - **Recovery comes first.** A run settles any journal in the room before it resolves its name,
   fetches or opens a list, or opens prompts or media; the identity is resolved and checked once and
   used for the name, the tag and the journal alike.

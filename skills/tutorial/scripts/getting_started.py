@@ -90,7 +90,7 @@ import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
     AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
-    role_labels, LIST_MAX_BYTES, read_regular, page_digest_ok,
+    role_labels, LIST_MAX_BYTES, read_regular, page_digest_ok, page_shape_ok, strip_digest,
 )
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
@@ -555,8 +555,14 @@ def one_call(old: str, new: str, env: Optional[Mapping[str, str]] = None) -> boo
     return bool(old) and fits_call(old, new, env)
 
 
+def piece_limit(env: Optional[Mapping[str, str]] = None) -> int:
+    """Bytes one piece of a piecewise write may hold on this host: CHUNK_BYTES, or less when one
+    argument may hold less."""
+    return max(1, min(CHUNK_BYTES, call_budget(env)[0]))
+
+
 def rewrite_steps(old: str, new: str, whole: Optional[bool] = None,
-                  env: Optional[Mapping[str, str]] = None) -> List[tuple]:
+                  env: Optional[Mapping[str, str]] = None, piece: int = 0) -> List[tuple]:
     """The room-commons calls that take a page from `old` to `new`, each with the text the page
     holds once it has run: one `replace` of the whole page when it fits a call (`one_call`), else
     `old` cleared piece by piece (each needle a whole piece), then `new` appended in pieces.
@@ -564,20 +570,21 @@ def rewrite_steps(old: str, new: str, whole: Optional[bool] = None,
     whole = one_call(old, new, env) if whole is None else whole
     if whole and old:
         return [("replace", (old, new), new)]
+    piece = piece or piece_limit(env)
     steps, text = [], old
-    for part in chunks(old):
+    for part in chunks(old, piece):
         text = text.replace(part, "", 1)
         steps.append(("replace", (part, ""), text))
-    for part in chunks(new):
+    for part in chunks(new, piece):
         text += part
         steps.append(("append", (part,), text))
     return steps
 
 
-def fill_steps(first: str, page: str) -> List[tuple]:
+def fill_steps(first: str, page: str, piece: int = 0) -> List[tuple]:
     """The appends that finish a page whose create wrote `first`, its first piece."""
     steps, text = [], first
-    for part in chunks(page[len(first):]):
+    for part in chunks(page[len(first):], piece or CHUNK_BYTES):
         text += part
         steps.append(("append", (part,), text))
     return steps
@@ -609,14 +616,16 @@ def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[
 
 # What a journal (an `updating` rewrite, or a `creating`/`pending` create) carries beyond the
 # complete entry it becomes; `done` is the number of calls that ran, `mode` fill or rewrite.
-JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "landed", "previous", "mode", "whole", "name", "core",
+JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "previous", "mode", "whole", "piece", "name", "core",
                 "audience", "agent")
+HEAD_CHARS = 64  # the page's opening characters: the needle when text is put back at its front
 
 
 def _steps(journal: dict) -> List[tuple]:
+    piece = journal.get("piece") or CHUNK_BYTES
     if journal.get("mode") == "fill":
-        return fill_steps(journal["before"], journal["target"])
-    return rewrite_steps(journal["before"], journal["target"], whole=bool(journal.get("whole")))
+        return fill_steps(journal["before"], journal["target"], piece)
+    return rewrite_steps(journal["before"], journal["target"], whole=bool(journal.get("whole")), piece=piece)
 
 
 def _journal(entry: dict, current: str, page: str, previous: Optional[dict], name: str, core: str,
@@ -624,13 +633,15 @@ def _journal(entry: dict, current: str, page: str, previous: Optional[dict], nam
              env: Optional[Mapping[str, str]] = None) -> dict:
     journal = {**entry, "state": "updating", "target": page, "before": current, "source": content_hash(current),
                "done": 0, "mode": mode, "whole": mode == "rewrite" and one_call(current, page, env),
-               "previous": previous or None, "name": name, "core": core, "audience": audience, "agent": agent}
+               "piece": piece_limit(env), "previous": previous or None, "name": name, "core": core,
+               "audience": audience, "agent": agent}
     journal["steps"] = [content_hash(text) for _, _, text in _steps(journal)]
     return journal
 
 
 def _complete(journal: dict) -> dict:
-    return {**{k: v for k, v in journal.items() if k not in JOURNAL_KEYS + ("updated_at",)}, "state": "complete"}
+    return {**{k: v for k, v in journal.items() if k not in JOURNAL_KEYS + ("updated_at", "operation_id")},
+            "state": "complete"}
 
 
 def _restore(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> None:
@@ -642,11 +653,13 @@ def _restore(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> No
         raise PublishError(f"could not restore the record of {entry.get('kind')} in {marker}: {exc}") from None
 
 
-def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict, now: str) -> None:
+def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict, now: str,
+                 undo: Optional[str] = None) -> None:
     """The page is someone else's now: the entry from before the rewrite stands, literally, with a
     note of how far the rewrite got; a page this script never finished is recorded as foreign (its
     hash, never rewritten unless a render equals it). Nothing of the target counts as written."""
-    note = {"interrupted": {"done": journal.get("done", 0), "target": journal.get("hash")}}
+    note = {"interrupted": {"done": journal.get("done", 0), "target": journal.get("hash"), "page": now,
+                            **({"undo": undo} if undo else {})}}
     if journal.get("previous"):
         _restore(marker, rooms, room, {**journal["previous"], **note})
     else:
@@ -655,20 +668,41 @@ def _stand_aside(marker: Path, rooms: Dict[str, dict], room: str, journal: dict,
                                       **note})
 
 
-def _undo(commons: Commons, kind: str, left: str, found: str) -> bool:
-    """Take back one call whose page read back wrong: the text it left is replaced by the text it
-    found, when both fit a call and the text it left is still there, so the page is again what
-    the other writer had, their edit included. True when that landed."""
-    if not fits_call(left, found, commons.env):
-        return False
-    try:
-        commons.run("replace", commons.room, left, found, kind=kind)
-    except PublishError:
-        return False
-    return True
+def _undo(commons: Commons, kind: str, step: tuple, found: str) -> str:
+    """Take back one call whose page read back wrong, so the page is again what the other writer
+    had, their edit included: a whole-page replace is replaced back; an appended piece is removed;
+    a cleared piece is put back at the front, in pieces each fitting a call, before the page's
+    first characters. `undone`, `unfit` (no write: a piece cannot fit this host's call budget) or
+    `failed` (a needle was gone by the time it was tried)."""
+    cmd, args, left = step
+    if cmd == "append" or args[1]:  # an appended piece, or the whole new page
+        needle, back = (args[0], "") if cmd == "append" else (args[1], args[0])
+        if not fits_call(needle, back, commons.env):
+            return "unfit"
+        try:
+            commons.run("replace", commons.room, needle, back, kind=kind)
+        except PublishError:
+            return "failed"
+        return "undone"
+    per_arg, total = call_budget(commons.env)
+    head = found[:HEAD_CHARS].encode("utf-8")
+    room = min(per_arg, total - 2 * len(head)) - len(head)
+    if room <= 0:
+        return "unfit"
+    for piece in reversed(chunks(args[0], room)):
+        current = commons.read(kind)
+        head = current[:HEAD_CHARS]
+        try:
+            if head:
+                commons.run("replace", commons.room, head, piece + head, kind=kind)
+            else:
+                commons.run("append", commons.room, piece, kind=kind)
+        except PublishError:
+            return "failed"
+    return "undone"
 
 
-def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str, fresh: bool) -> str:
+def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -> str:
     """Run the journalled calls from the one the journal records. Each call runs only on the page
     the previous call leaves, is refused by Commons when its needle is gone, and is read back
     before the next; a page in no state of the journal stops everything before the next write.
@@ -699,16 +733,11 @@ def _advance(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str, 
                 now = content_hash(commons.read(kind))
                 if now != expected[i + 1]:
                     # Someone wrote outside the needle meanwhile: this call is taken back when it can
-                    # be, and the page is theirs; otherwise the run stops here, by name.
-                    if _undo(commons, kind, steps[i][2], steps[i - 1][2] if i else journal["before"]):
-                        _stand_aside(marker, rooms, room, journal, content_hash(commons.read(kind)))
-                        return "edited"
-                    if not fresh:
-                        _stand_aside(marker, rooms, room, journal, now)
-                        return "edited"
-                    _record(marker, rooms, room, {**journal, "done": i + 1, "landed": now})
-                    raise PublishError(f"{kind} does not read back as expected after call {i + 1} of the rewrite "
-                                       f"(sha256 {now}); nothing further was written and it stays recorded")
+                    # be, and the page is theirs, as it stands, with how far the undo got noted.
+                    undo = _undo(commons, kind, steps[i], steps[i - 1][2] if i else journal["before"])
+                    _stand_aside(marker, rooms, room, journal,
+                                 now if undo == "unfit" else content_hash(commons.read(kind)), undo)
+                    return "edited"
             i += 1
         journal = {**journal, "done": i}
         _record(marker, rooms, room, journal)
@@ -735,7 +764,7 @@ def _settle(commons: Commons, marker: Path, rooms: Dict[str, dict], room: str) -
         return "finished"
     if journal.get("state") == "updating" and now == journal["source"] and not journal.get("done"):
         return "untouched"
-    return _advance(commons, marker, rooms, room, fresh=False)
+    return _advance(commons, marker, rooms, room)
 
 
 def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Optional[str]) -> Optional[dict]:
@@ -767,8 +796,10 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
         return None
     if settled == "edited":
         kept = rooms[commons.room]
+        note = kept.get("interrupted") or {}
         return {"ok": True, "action": "kept", "edited": True, "kind": journal["kind"], "summoned": False,
-                "revision": kept.get("revision"), "media": sorted(kept.get("media") or {})}
+                "revision": kept.get("revision"), "media": sorted(kept.get("media") or {}),
+                **({"landed": note["page"]} if note.get("undo") and note["undo"] != "undone" else {})}
     result = {"ok": True, "action": "resumed", "resumed": True, "kind": journal["kind"], "summoned": False,
               "revision": journal.get("revision"), "media": sorted(journal.get("media") or {}),
               **{k: journal.get(k) for k in ("name", "core", "audience", "agent")}}
@@ -814,7 +845,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         entry = _entry(None, page, features, prompts, roles, media)
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
-        adopted = False
+        adopted = upgrade = False
         if step["action"] == "reconcile":
             found = commons.reconcile(pages, agent)
             if found:
@@ -822,16 +853,21 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 # so; otherwise it is adopted as it stands and never rewritten.
                 live = commons.read(found)
                 tag = read_marker(live)
+                ours = page_digest_ok(live)
+                if ours is None and tag and tag[1]:
+                    # From before tags carried a digest: ours when it is this render less the
+                    # digest, or the only tutorial page here and shaped exactly as one is written.
+                    ours = upgrade = live == strip_digest(page) or (page_shape_ok(live) and len(candidates(pages)) == 1)
                 _record(marker, rooms, commons.room,
                         {"kind": found, "state": "complete", "hash": content_hash(live), "revision": tag[1] if tag else None,
-                         **({} if page_digest_ok(live) else {"foreign": True})})
+                         **({} if ours else {"foreign": True})})
                 step, adopted = {"action": "update", "kind": found, "pending": False}, True
             else:
                 step = {"action": "create", "kind": None, "pending": False}
         kind = step["kind"]
         if step["action"] in ("create", "resume"):
             op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
-            first, earlier = chunks(page)[0], rooms.get(commons.room, {}).get("before")
+            first, earlier = chunks(page, piece_limit(commons.env))[0], rooms.get(commons.room, {}).get("before")
             journal = _journal(entry, first, page, None, name, core, audience, agent, mode="fill")
             _record(marker, rooms, commons.room, {**journal, "state": "creating", "operation_id": op})
             kind = commons.create_page(PAGE_TITLE, first, op)
@@ -848,7 +884,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                             "revision": features.revision, "media": sorted(media)}
             _record(marker, rooms, commons.room, {**journal, "kind": kind, "state": "pending", "operation_id": op})
             try:
-                outcome = _advance(commons, marker, rooms, commons.room, fresh=True)
+                outcome = _advance(commons, marker, rooms, commons.room)
             except PublishError as exc:
                 raise PublishError(f"{exc}; {kind} stays recorded as pending and the next run "
                                    "finishes it") from None
@@ -864,7 +900,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 action = "unchanged"
             elif not written or content_hash(current) != written:
                 action = "kept"  # a page this script cannot vouch for, or edited since: theirs stays
-            elif if_newer and not newer(features.revision, page_revision):
+            elif if_newer and not upgrade and not newer(features.revision, page_revision):
                 action = "unchanged"
             else:
                 # Every call of the rewrite checks the page it expects and is read back; a run cut
@@ -872,8 +908,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 _record(marker, rooms, commons.room,
                         _journal({**entry, "kind": kind}, current, page, known, name, core, audience, agent,
                                  env=commons.env))
-                action = "updated" if _advance(commons, marker, rooms, commons.room, fresh=True) == "finished" \
-                    else "kept"
+                action = "updated" if _advance(commons, marker, rooms, commons.room) == "finished" else "kept"
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
         # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
         if action in ("created", "updated") or action == "unchanged" and current == page:
@@ -884,6 +919,9 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         result["adopted"] = True
     if action == "kept":
         result["edited"] = True
+        note = rooms.get(commons.room, {}).get("interrupted") or {}
+        if note.get("undo") and note["undo"] != "undone":
+            result["landed"] = note["page"]  # the page as left: a write landed on it and stayed
     # Summoned once, when this page is created; a creation finished by a later run summons there.
     if owner and (summon or action == "created"):
         try:
@@ -1029,6 +1067,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if result.get("edited"):
         print(f"getting_started: {result['kind']} in {args.room} was edited since this script last wrote it, "
               "or is not a page it wrote; kept as is, not rewritten", file=sys.stderr)
+        if result.get("landed"):
+            print(f"getting_started: one write had landed on it before the edit was seen and could not be taken "
+                  f"back; the page is as left (sha256 {result['landed']})", file=sys.stderr)
     print(json.dumps({"list": "journal", **result} if result.get("resumed") else result))
     return 0
 

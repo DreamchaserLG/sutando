@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import sys
+import itertools
 import tempfile
 import threading
 import types
@@ -943,7 +944,7 @@ class IfNewerTest(_Cli):
                     self.assertEqual(entry["hash"], gs.content_hash(mine))
                     self.assertEqual(self.writes_since(n), [])
 
-    def edited_run(self, hook, newer, prompts, chunked=True, extra=()):
+    def edited_run(self, hook, newer, prompts, chunked=True, extra=(), budget=None):
         """A created page, then an --if-newer rewrite during which the stub's owner edits the page
         right after call `hook`. Returns (the page before, the target, the owner's text, the stub
         calls, the run's exit code and output)."""
@@ -957,14 +958,15 @@ class IfNewerTest(_Cli):
         target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
                                 tp.load_list(newer), load_media_of(extra))
         os.environ["STUB_EDIT_AFTER"] = hook
-        with self.chunked() if chunked else contextlib.nullcontext():
+        with self.chunked() if chunked else contextlib.nullcontext(), \
+                mock.patch.object(gs, "call_budget", **budget) if budget else contextlib.nullcontext():
             code, out, err = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts),
                                           "--roles", "Founder", *extra)
         os.environ.pop("STUB_EDIT_AFTER")
         db = json.loads((self.tmp / "room.json").read_text())
         return mine, target, (db.get("edits") or [None])[-1], db["calls"], code, out, err
 
-    def expect_edit(self, mine, target, theirs, calls, code, out, after, steps):
+    def expect_edit(self, mine, target, theirs, calls, code, out, after, steps, budget=None):
         """What a run must have done when the owner's edit landed right after write `after` (0:
         before the first write). A needle the edit broke is refused and nothing is written; a
         write that landed on a changed page is taken back when both texts fit a call on this host,
@@ -986,26 +988,30 @@ class IfNewerTest(_Cli):
             self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
             self.assertEqual(self.page_text(), theirs)
             self.assertEqual(writes[after:], [])
-            done = i
-        elif left in landed and gs.fits_call(left, pre, os.environ):
-            self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
-            self.assertEqual(self.page_text(), landed.replace(left, pre, 1))  # the write taken back
-            self.assertEqual(writes[after:], [steps[i][0], "replace"][: 2 if after == 0 else 1] if after == 0 else ["replace"])
-            done = i
+            done, undo = i, None
         else:
-            self.assertEqual((code, got["ok"]), (4, False))
-            self.assertIn(f"does not read back as expected after call {i + 1}", got["reason"])
-            self.assertIn(gs.content_hash(landed), got["reason"])
-            self.assertEqual(self.page_text(), landed)
-            journal = self.entry()
-            self.assertEqual((journal["state"], journal["done"], journal["landed"]),
-                             ("updating", i + 1, gs.content_hash(landed)))
-            n = self.calls()
-            code, out, _ = self.publish("--if-newer", "--list", str(self.newer))
-            self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
-            self.assertEqual(self.page_text(), landed)
-            self.assertEqual(self.writes_since(n), [])
-            done = i + 1
+            # The write landed on a changed page and is taken back the way it was made: an appended
+            # piece removed, a cleared piece put back at the front in pieces that fit a call.
+            cmd, args, _ = steps[i]
+            if cmd == "append":
+                undone = landed.replace(args[0], "", 1) if args[0] in landed else None
+                undo_writes = ["replace"] if undone is not None else []
+            else:
+                per_arg, total = budget or gs.call_budget(os.environ)
+                h = len(pre[:gs.HEAD_CHARS].encode())
+                undone = args[0] + landed
+                undo_writes = ["replace"] * len(gs.chunks(args[0], min(per_arg, total - 2 * h) - h))
+            self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+            self.assertEqual(writes[after:], ([cmd] if after == 0 else []) + undo_writes)  # the write, then its undo
+            if undone is None:  # the edit broke the piece itself: nothing can be taken back
+                self.assertEqual((self.page_text(), got["landed"]), (landed, gs.content_hash(landed)))
+                done, undo = i, "failed"
+            else:
+                self.assertEqual(self.page_text(), undone)
+                self.assertNotIn("landed", got)
+                done, undo = i, "undone"
+        self.assertEqual(self.entry()["interrupted"].get("undo"), undo)
+        self.assertEqual(self.entry()["interrupted"]["page"], gs.content_hash(self.page_text()))
         entry = self.entry()
         self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["done"]),
                          ("complete", gs.content_hash(mine), done))
@@ -1325,6 +1331,118 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "resumed", target))
         opener.assert_not_called()
 
+    def test_above_the_call_budget_a_write_is_taken_back_in_pieces_or_not_at_all(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        self.newer = self.write_list("tutorial.2026-11-01.1")
+        # A host whose calls take 70,000 bytes an argument: the 214 KB page is written in 70,000-byte
+        # pieces, and a cleared piece put back needs two calls of 69,936 bytes.
+        for mode in ("append", "inplace"):
+            with self.subTest(mode=mode):
+                mine, target, theirs, calls, code, out, err = self.edited_run(
+                    f"replace:1:{mode}", self.newer, prompts, chunked=False, budget={"return_value": (70_000, 140_000)})
+                steps = gs.rewrite_steps(mine, target, whole=False, piece=70_000)
+                self.assertEqual(len(steps[0][1][0].encode()), 70_000)
+                self.expect_edit(mine, target, theirs, calls, code, out, 1, steps, budget=(70_000, 140_000))
+                self.assertEqual(self.page_text(), steps[0][1][0] + theirs)  # the piece back at the front
+                sizes = [c[3] for c in calls if c[0] == "replace"][1:]
+                self.assertEqual(len(sizes), 2)
+                self.assertTrue(all(s <= 70_000 for s in sizes))
+        # A host whose budget cannot hold one piece of the undo: nothing more is written, the page
+        # is left as it stands and the result names it.
+        budget = {"side_effect": itertools.chain([(70_000, 140_000)] * 2, itertools.repeat((60, 100)))}
+        mine, target, theirs, calls, code, out, err = self.edited_run("replace:1:append", self.newer, prompts,
+                                                                     chunked=False, budget=budget)
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True))
+        self.assertEqual([c[0] for c in calls if c[0] in ("replace", "append")], ["replace"])  # no undo write
+        self.assertEqual(self.page_text(), theirs)  # the page as the clear left it, note included
+        self.assertEqual(got["landed"], gs.content_hash(theirs))
+        self.assertIn("could not be taken back", err)
+        self.assertIn(got["landed"], err)
+        entry = self.entry()
+        self.assertEqual((entry["state"], entry["hash"], entry["interrupted"]["undo"], entry["interrupted"]["page"]),
+                         ("complete", gs.content_hash(mine), "unfit", gs.content_hash(theirs)))
+        n = self.calls()
+        code, out, _ = self.publish("--if-newer", "--list", str(self.newer))
+        self.assertEqual((code, json.loads(out)["action"], self.page_text()), (0, "kept", theirs))
+        self.assertEqual(self.writes_since(n), [])
+
+    def legacy_page(self, **kw):
+        """A page as a head before the digest wrote it: this head's render, the digest stripped."""
+        page = tp.render_page(kw.pop("name", "Blue"), kw.pop("core", "codex"), "dm", kw.pop("agent", self.ME), **kw)
+        self.assertIsNone(tp.page_digest_ok(tp.strip_digest(page)))
+        return tp.strip_digest(page)
+
+    def seed(self, page, by=None):
+        db = {"pages": {"html-p1": page}, "calls": [], "next": 2, "by": {"html-p1": by or self.ME}}
+        (self.tmp / "room.json").write_text(json.dumps(db))
+
+    def test_a_pre_digest_page_with_our_tag_is_adopted_and_upgraded_once(self):
+        self.seed(self.legacy_page())  # equal to this run's render, less the digest
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "updated", True, False))
+        page = self.page_text()
+        self.assertTrue(tp.page_digest_ok(page))
+        self.assertEqual(page, tp.render_page("Blue", "codex", "dm", self.ME))
+        entry = self.entry()
+        self.assertEqual((entry["state"], entry["hash"], entry.get("foreign")), ("complete", gs.content_hash(page), None))
+        code, out, _ = self.publish("--if-newer")
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+        self.assertEqual(json.loads(self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
+                                              "--room-commons", str(self.stub), "--agent-mxid", self.ME)[1])["kind"],
+                         "html-p1")
+        self.assertEqual(len([k for k in json.loads((self.tmp / "room.json").read_text())["pages"]]), 1)
+        # Not equal to the render (another name then), but the only tutorial page and shaped as one
+        # is written: adopted and upgraded, even under --if-newer at the same revision.
+        gs.marker_path(self.tmp / "ws").unlink()
+        self.seed(self.legacy_page(name="Old"))
+        code, out, _ = self.publish("--if-newer")
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got.get("adopted")), (0, "updated", True))
+        self.assertTrue(tp.page_digest_ok(self.page_text()))
+        self.assertIn("Getting started with Blue", self.page_text())
+        self.assertIsNone(self.entry().get("foreign"))
+        code, out, _ = self.publish("--if-newer")
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+
+    def test_a_pre_digest_page_with_a_foreign_tag_or_an_edit_is_kept(self):
+        other = "@other.agent:example.test"
+        self.seed(self.legacy_page(agent=other), by=other)
+        theirs = self.page_text()
+        code, out, _ = self.publish()
+        got = json.loads(out)
+        self.assertEqual((code, got["action"], got["kind"]), (0, "created", "html-p2"))  # theirs is never touched
+        db = json.loads((self.tmp / "room.json").read_text())
+        self.assertEqual(db["pages"]["html-p1"], theirs)
+        self.assertFalse([c for c in db["calls"] if c[0] in ("replace", "append") and c[1] == "html-p1"])
+        # Our tag, visibly edited (text outside the page, a second tag): kept as found, foreign. An
+        # edit inside the body of a pre-digest page is not told apart from an older render.
+        shutil.rmtree(self.tmp / "ws", ignore_errors=True)
+        for theirs in (self.legacy_page() + "<p>OWNER NOTES</p>",
+                       "<!-- mine -->" + self.legacy_page(),
+                       self.legacy_page().replace("<title>", tp.owner_marker(self.ME, "tutorial.2026-01-01.1") + "<title>")):
+            with self.subTest(theirs=theirs[:30] + theirs[-30:]):
+                self.seed(theirs)
+                gs.marker_path(self.tmp / "ws").unlink(missing_ok=True)
+                for extra in ((), ("--if-newer",), ("--name", "Kai")):
+                    n = self.calls()
+                    code, out, _ = self.publish(*extra)
+                    got = json.loads(out)
+                    self.assertEqual((code, got["action"], got["edited"]), (0, "kept", True), extra)
+                    self.assertEqual(self.page_text(), theirs)
+                    self.assertEqual(self.writes_since(n), [])
+                self.assertEqual((self.entry()["foreign"], self.entry()["hash"]), (True, gs.content_hash(theirs)))
+        # Two tutorial pages in the room: the shape rule alone does not adopt either.
+        gs.marker_path(self.tmp / "ws").unlink()
+        legacy = self.legacy_page(name="Old")
+        db = {"pages": {"html-p1": legacy, "html-p2": legacy.replace("Old", "Older")}, "calls": [], "next": 3,
+              "by": {"html-p1": self.ME, "html-p2": self.ME}}
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["ok"]), (4, False))  # two marked pages: refused, as before
+
     def test_a_pending_page_is_finished_whatever_the_revision(self):
         self.door.fail = "after"
         code, out, _ = self.publish()
@@ -1332,6 +1450,8 @@ class IfNewerTest(_Cli):
         code, out, _ = self.publish("--if-newer")
         self.assertEqual((code, json.loads(out)["action"]), (0, "resumed"))
         self.assertEqual(self.page_text(), tp.render_page("Blue", "codex", "dm", self.ME))
+        self.assertEqual(self.entry()["state"], "complete")
+        self.assertNotIn("operation_id", self.entry())  # the create is over: nothing of its journal stays
 
     def test_publish_api_takes_the_list_and_the_rule(self):
         marker = gs.marker_path(self.tmp / "ws")
