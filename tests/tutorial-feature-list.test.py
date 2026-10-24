@@ -1329,6 +1329,20 @@ class IfNewerTest(_Cli):
     SMALL = (131_071, 2_000_000)  # a call budget that holds no 214 KB text
     SPLIT = (250_000, 400_000)  # the page fits an argument, but not beside the whole new page
 
+    def test_a_default_size_page_refreshes_under_linuxs_exec_limit(self):
+        code, out, _ = self.publish()
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        mine = self.page_text()
+        self.assertGreater(len(mine.encode()), 131_072)  # over Linux's cap on one exec argument
+        n = self.calls()
+        newer = self.write_list("tutorial.2026-11-01.1")
+        code, out, err = self.publish("--if-newer", "--list", str(newer))  # setUp holds every exec to that cap
+        self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
+        writes = self.writes_since(n)
+        self.assertEqual([w[0] for w in writes], ["replace"])
+        self.assertEqual(writes[0][2], len(mine.encode()))  # one replace whose needle is the whole page
+
     def test_a_page_no_call_can_hold_is_refused_and_left_as_is(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
