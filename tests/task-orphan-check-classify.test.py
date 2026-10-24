@@ -1250,16 +1250,14 @@ class TestApplyTransition(ClassifyBase):
         claim-then-verify move this unlinked the new task with errors=[]."""
         self._orphan("task-a.txt", "old ask")
         tt = self.mod.task_transition
-        real, calls = tt._source_problem, []
+        fired = []
 
-        def check_then_replace(fd, name, gen):
-            r = real(fd, name, gen)
-            calls.append(name)
-            if calls.count("task-a.txt") == 2:  # the move's own check, after the pre-flight's
+        def at(point, name):  # the owner's named injection point: after its check, before the rename
+            if point == "before_claim" and name == "task-a.txt" and not fired:
+                fired.append(1)
                 self._replace_live("task-a.txt", "new ask")
-            return r
 
-        with unittest.mock.patch.object(tt, "_source_problem", side_effect=check_then_replace):
+        with unittest.mock.patch.object(tt, "_checkpoint", side_effect=at):
             out = self.mod.apply_plan(self.ws.root, NOW)
         self.assertEqual(out["archived"], [])
         self.assertEqual(len(out["errors"]), 1, out)

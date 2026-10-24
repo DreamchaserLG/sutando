@@ -206,11 +206,44 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
                 os.unlink(str(tmp), dir_fd=dst_dir_fd)
             break
     os.unlink(str(src), dir_fd=src_dir_fd)
+    if dst_dir_fd is not None:
+        _fsync_dir(dst_dir_fd)
+    if src_dir_fd is not None:
+        _fsync_dir(src_dir_fd)
     return candidate
 
 
 # The one owner of collision naming, callable from outside the archive path too.
 move_without_clobbering = _move_without_clobbering
+
+
+def _checkpoint(point: str, name: str) -> None:
+    """A named injection point for tests (`before_give_back`); a no-op in production."""
+
+
+def _fsync_dir(fd: int) -> None:
+    """A rename or link is durable only once its directory is: without this, power
+    loss after the call can strand a claim the journal already names."""
+    import os
+    if os.name != "nt":
+        os.fsync(fd)
+
+
+def find_landed(dest: str, generation: str, *, dst_dir_fd: int) -> "str | None":
+    """The name among `dest`, `dest.1`, `dest.2`, ... (the `.N` sequence
+    `move_without_clobbering` mints) that holds `generation`, or None. A link
+    keeps the inode, so a placement whose record was lost is found by identity."""
+    import os
+    n = 0
+    while True:
+        candidate = dest if n == 0 else f"{dest}.{n}"
+        try:
+            st = os.lstat(candidate, dir_fd=dst_dir_fd)
+        except FileNotFoundError:
+            return None
+        if file_generation(st) == generation:
+            return candidate
+        n += 1
 
 
 def file_generation(st) -> str:
@@ -234,11 +267,13 @@ def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChange
     """Link the claim back to its name without replacing whatever holds it now;
     the claim is private, so unlinking it by name is safe. Returns the error to raise."""
     import os
+    _checkpoint("before_give_back", name)
     try:
         os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except FileExistsError:
         return GenerationChanged(name, why, kept_as=claim)
     os.unlink(claim, dir_fd=dir_fd)
+    _fsync_dir(dir_fd)
     return GenerationChanged(name, why)
 
 
@@ -260,6 +295,7 @@ def claim_generation(name: str, *, src_dir_fd: int, claim: "str | None" = None) 
     import os
     claim = claim or claim_name(name)
     os.rename(name, claim, src_dir_fd=src_dir_fd, dst_dir_fd=src_dir_fd)
+    _fsync_dir(src_dir_fd)
     return claim
 
 

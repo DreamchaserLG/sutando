@@ -46,6 +46,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import secrets
 import stat
 import time
@@ -70,6 +71,10 @@ Render = Callable[[dict], "str | None"]
 
 class TransitionRefused(Exception):
     """A precondition failed; nothing was changed for the item it names."""
+
+
+def _checkpoint(point: str, name: str) -> None:
+    """A named injection point for tests (`before_claim`, `after_claim`); a no-op in production."""
 
 
 def is_bare_name(name: str) -> bool:
@@ -273,6 +278,7 @@ class _Journal:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.rename(tmp, self.name, src_dir_fd=self.dirs.archive_fd, dst_dir_fd=self.dirs.archive_fd)
+            task_archive._fsync_dir(self.dirs.archive_fd)
         except BaseException:
             try:
                 os.unlink(tmp, dir_fd=self.dirs.archive_fd)
@@ -318,11 +324,14 @@ def _claim(dirs: _Dirs, name: str, generation: str | None, claim: str | None = N
     problem = dirs.problem() or _source_problem(dirs.tasks_fd, name, generation)
     if problem:
         raise TransitionRefused(f"refused to move {name!r}: {problem}")
+    _checkpoint("before_claim", name)
     try:
-        return task_archive.claim_generation(name, src_dir_fd=dirs.tasks_fd, claim=claim)
+        claim = task_archive.claim_generation(name, src_dir_fd=dirs.tasks_fd, claim=claim)
     except FileNotFoundError:
         raise TransitionRefused(f"refused to move {name!r}: no longer in tasks/ — another pass "
                                 "archived it and sent its notice") from None
+    _checkpoint("after_claim", name)
+    return claim
 
 
 def _place(dirs: _Dirs, claim: str, name: str, generation: str) -> "tuple[str | None, str | None, bool]":
@@ -361,17 +370,59 @@ def archive_generation(tasks_dir: Path, name: str, generation: str | None,
 # ── recovery of an interrupted pass ──────────────────────────────────────────
 
 def _find_placed(dirs: _Dirs, name: str, generation: str) -> str | None:
-    """The archive name holding `generation` among `name`, `name.1`, ...: a
-    link keeps the inode, so a placement the crash hid is found by identity."""
-    for n in range(0, 10000):
-        candidate = name if n == 0 else f"{name}.{n}"
+    return task_archive.find_landed(name, generation, dst_dir_fd=dirs.archive_fd)
+
+
+QUARANTINE_SUFFIX = ".quarantined"
+
+
+def _mark_quarantine(dirs: _Dirs, claim: str) -> None:
+    """A quarantined claim is kept on purpose; the marker keeps the sweep off it."""
+    try:
+        fd = os.open(claim + QUARANTINE_SUFFIX, os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=dirs.tasks_fd)
+        os.close(fd)
+    except OSError:
+        pass
+
+
+_CLAIM_RE = re.compile(r"^(?P<live>.+)\.claim-(?P<pid>\d+)-[0-9a-f]+$")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OverflowError, ValueError):
+        return False  # gone, or a number no process can carry
+    except PermissionError:
+        return True
+    return True
+
+
+def _sweep_dead_claims(dirs: _Dirs, journaled: set[str], out: dict) -> None:
+    """A `<name>.claim-<pid>-…` in tasks/ that no journal names and whose pid is
+    gone was left by a pass that died between its claim and its record (or by a
+    journal since removed): there is no generation to verify it against, so it
+    is given back to its live name without replacing, for the next plan to
+    judge; when that name is taken it stays, reported, for the operator."""
+    for entry in sorted(os.listdir(dirs.tasks_fd)):
+        m = _CLAIM_RE.match(entry)
+        if not m or entry in journaled or _pid_alive(int(m.group("pid"))):
+            continue
+        if _exists(entry + QUARANTINE_SUFFIX, dirs.tasks_fd):
+            continue  # kept on purpose, named in its pass's errors
+        live = m.group("live")
         try:
-            st = os.lstat(candidate, dir_fd=dirs.archive_fd)
-        except FileNotFoundError:
-            return None
-        if _generation(st) == generation:
-            return candidate
-    return None
+            os.link(entry, live, src_dir_fd=dirs.tasks_fd, dst_dir_fd=dirs.tasks_fd)
+        except FileExistsError:
+            out["errors"].append(f"orphaned claim tasks/{entry} from a dead pass; its name {live!r} is "
+                                 "taken, so it is kept — rename it back to requeue")
+            continue
+        except OSError as exc:
+            out["errors"].append(f"orphaned claim tasks/{entry} from a dead pass could not be given back ({exc})")
+            continue
+        os.unlink(entry, dir_fd=dirs.tasks_fd)
+        task_archive._fsync_dir(dirs.tasks_fd)
+        out["swept"].append({"claim": entry, "live": live})
 
 
 def _exists(name: str, dir_fd: int | None = None) -> bool:
@@ -419,6 +470,7 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
                 report["errors"].append(error)
                 if kept:
                     quarantined[name] = claim
+                    _mark_quarantine(dirs, claim)
         elif _source_problem(dirs.tasks_fd, name, generation) is None:
             del claims[name]  # recorded but never renamed: still live under its name, planned afresh
         else:
@@ -453,11 +505,21 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
 
 
 def _recover_all(dirs: _Dirs, results_dir: Path, out: dict) -> None:
+    journaled: set[str] = set()
     for name in sorted(n for n in os.listdir(dirs.archive_fd)
                        if n.startswith(JOURNAL_PREFIX) and n.endswith(".json")):
         j = _Journal.take(dirs, name)
-        if j is not None:
-            _recover(dirs, j, results_dir, out)
+        if j is None:
+            try:  # a live pass's claims are its own, not strays
+                fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=dirs.archive_fd)
+                with os.fdopen(fd, "r", encoding="utf-8") as fh:
+                    journaled.update((json.load(fh).get("claims") or {}).values())
+            except (OSError, ValueError, AttributeError):
+                pass
+            continue
+        journaled.update((j.data.get("claims") or {}).values())
+        _recover(dirs, j, results_dir, out)
+    _sweep_dead_claims(dirs, journaled, out)
 
 
 # ── the transaction ──────────────────────────────────────────────────────────
@@ -469,9 +531,10 @@ def transition(tasks_dir: Path, results_dir: Path, archive_dir: Path, *,
     the files that landed ({name: archive name}), or None when there is
     nothing to say. Returns `result` (the notice's path or None), `body`,
     `archived` ({name: landed name}), `quarantined` ({name: claim name}),
-    `recovered` (interrupted passes finished first) and `errors`."""
+    `recovered` (interrupted passes finished first), `swept` (dead passes'
+    unjournaled claims given back) and `errors`."""
     out: dict = {"result": None, "body": None, "archived": {}, "quarantined": {}, "recovered": [],
-                 "errors": []}
+                 "swept": [], "errors": []}
     dirs, problem = _open_dirs(tasks_dir, archive_dir)
     if dirs is None:
         out["errors"].append(f"{problem}; nothing published, nothing moved")
@@ -538,6 +601,7 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
             if kept:
                 out["quarantined"][name] = claim
                 j.data["quarantined"][name] = claim
+                _mark_quarantine(dirs, claim)
         j.set(stage="placed")
     out["body"] = render(out["archived"])
     if out["body"] is None:

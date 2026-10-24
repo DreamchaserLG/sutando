@@ -98,19 +98,23 @@ class Base(unittest.TestCase):
     def archive_names(self) -> list[str]:
         return sorted(x.name for x in self.archive.iterdir() if not x.name.startswith("."))
 
-    def replace_on_second_check(self, p: Path, ask: str):
-        """Susan's and Kewei's round-6 repro: the live name is rewritten the instant
-        the move's own generation check returns (the pre-flight's came first)."""
-        real, calls = tt._source_problem, []
+    def inject(self, point: str, p: Path, action, module=None):
+        """Run `action()` once at the named checkpoint for `p` — `before_claim` /
+        `after_claim` in task_transition, `before_give_back` in task_archive —
+        the explicit injection points the owner calls, not a call count."""
+        module, fired = module or tt, []
 
-        def check_then_replace(fd, name, gen):
-            r = real(fd, name, gen)
-            calls.append(name)
-            if calls.count(p.name) == 2:
-                _replace(p, ask)
-            return r
+        def at(where, name):
+            if where == point and name == p.name and not fired:
+                fired.append(1)
+                action()
 
-        return mock.patch.object(tt, "_source_problem", side_effect=check_then_replace)
+        return mock.patch.object(module, "_checkpoint", side_effect=at)
+
+    def replace_before_claim(self, p: Path, ask: str):
+        """Susan's and Kewei's round-6 repro: the live name is rewritten after the
+        move's own generation check and before the claim rename."""
+        return self.inject("before_claim", p, lambda: _replace(p, ask))
 
 
 class TestExclusivePublication(Base):
@@ -200,7 +204,7 @@ class TestGenerationGuard(Base):
     def test_replaced_between_the_generation_check_and_the_claim_puts_the_new_task_back(self):
         p = _task(self.tasks, "task-a.txt", "old")
         gen = tt.generation_of(p)
-        with self.replace_on_second_check(p, "new"):
+        with self.replace_before_claim(p, "new"):
             out = tt.transition(self.tasks, self.results, self.archive, moves={"task-a.txt": gen},
                                 render=_naming, prefix=PREFIX)
         self.assertEqual(len(out["errors"]), 1, out)
@@ -214,26 +218,29 @@ class TestGenerationGuard(Base):
     def test_a_name_retaken_during_the_give_back_quarantines_the_claim(self):
         p = _task(self.tasks, "task-a.txt", "old")
         gen = tt.generation_of(p)
-        real_link = os.link
-
-        def retaken(src, dst, **kw):
-            if str(src).startswith("task-a.txt.claim-") and str(dst) == "task-a.txt":
-                _task(self.tasks, "task-a.txt", "newer still")  # a third writer wins the name
-            return real_link(src, dst, **kw)
-
-        with self.replace_on_second_check(p, "new"), mock.patch.object(tt.os, "link", side_effect=retaken):
+        retake = self.inject("before_give_back", p, lambda: _task(self.tasks, "task-a.txt", "newer still"),
+                             module=tt.task_archive)  # a third writer wins the name during the give-back
+        with self.replace_before_claim(p, "new"), retake:
             out = tt.transition(self.tasks, self.results, self.archive, moves={"task-a.txt": gen},
                                 render=_naming, prefix=PREFIX)
         self.assertEqual(len(out["errors"]), 1, out)
         self.assertIn("quarantined as tasks/task-a.txt.claim-", out["errors"][0])
         self.assertIn("rename it back to requeue", out["errors"][0])
-        kept = [x for x in self.tasks.iterdir() if x.name.startswith("task-a.txt.claim-")]
+        kept = [x for x in self.tasks.iterdir() if x.name.startswith("task-a.txt.claim-")
+                and not x.name.endswith(tt.QUARANTINE_SUFFIX)]
         self.assertEqual(len(kept), 1)
         self.assertEqual(out["quarantined"], {"task-a.txt": kept[0].name})
         self.assertIn("new", kept[0].read_text())
         self.assertIn("newer still", p.read_text())
         self.assertEqual(self.archive_names(), [])
         self.assertEqual(self.journals(), [], "nothing landed: nothing to publish, journal closed")
+        self.assertTrue((self.tasks / (kept[0].name + tt.QUARANTINE_SUFFIX)).exists(), "marked as kept on purpose")
+        swept = self.recover_sweep()
+        self.assertEqual(swept["swept"], [], "a quarantine is never swept as a stray")
+        self.assertTrue((self.tasks / kept[0].name).exists(), "the quarantined bytes are still there")
+
+    def recover_sweep(self) -> dict:
+        return tt.transition(self.tasks, self.results, self.archive, moves={}, render=_notice(None), prefix=PREFIX)
 
     def test_a_writer_recreating_the_live_name_during_the_move_is_never_touched(self):
         """After the claim rename the live name is free; a task written there is
@@ -503,8 +510,11 @@ class TestJournalRecovery(Base):
         live under its own name — planned afresh — never as gone."""
         p = _task(self.tasks, "task-a.txt", "A")
         gen = tt.generation_of(p)
-        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=Crash("before rename")), \
-                self.assertRaises(Crash):
+
+        def die():
+            raise Crash("before rename")
+
+        with self.inject("before_claim", p, die), self.assertRaises(Crash):
             self.run_transition(["task-a.txt"], _naming)
         journal = json.loads(self.journals()[0].read_text())
         self.assertEqual(journal["stage"], "claiming")
@@ -526,14 +536,11 @@ class TestJournalRecovery(Base):
         recorded claim is present; recovery places it, never reports it gone."""
         p = _task(self.tasks, "task-a.txt", "A")
         gen = tt.generation_of(p)
-        real = tt.task_archive.claim_generation
 
-        def rename_then_crash(*a, **kw):
-            real(*a, **kw)
+        def die():
             raise Crash("after rename, before the record")
 
-        with mock.patch.object(tt.task_archive, "claim_generation", side_effect=rename_then_crash), \
-                self.assertRaises(Crash):
+        with self.inject("after_claim", p, die), self.assertRaises(Crash):
             self.run_transition(["task-a.txt"], _naming)
         journal = json.loads(self.journals()[0].read_text())
         self.assertEqual(journal["stage"], "claiming")
@@ -656,6 +663,54 @@ class TestJournalRecovery(Base):
         self.assertEqual([x.name for x in outside.iterdir() if not x.name.startswith(".")], [])
         self.assertTrue(any(x.name.startswith("task-a.txt.claim-") for x in self.tasks.iterdir()),
                         "the claim is still there for the next recovery")
+
+    def test_a_dead_passs_unjournaled_claim_is_given_back_and_reported(self):
+        """A claim whose pid is gone and that no journal names (its pass died
+        between the claim and the record, or the journal is gone): given back to
+        its live name for the next plan to judge, never deleted."""
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"  # no such pid
+        stray.write_text("task: Z\n")
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(out["swept"], [{"claim": stray.name, "live": "task-z.txt"}])
+        self.assertEqual(self.live_names(), ["archive", "task-z.txt"])
+        self.assertEqual((self.tasks / "task-z.txt").read_text(), "task: Z\n")
+
+    def test_a_dead_passs_claim_whose_name_is_taken_is_kept_and_reported(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: Z old\n")
+        _task(self.tasks, "task-z.txt", "Z new")
+        out = self.recover()
+        self.assertEqual(out["swept"], [])
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("orphaned claim tasks/task-z.txt.claim-", out["errors"][0])
+        self.assertIn("rename it back to requeue", out["errors"][0])
+        self.assertTrue(stray.exists())
+        self.assertIn("Z new", (self.tasks / "task-z.txt").read_text())
+
+    def test_a_live_passs_claim_is_never_swept(self):
+        mine = self.tasks / f"task-z.txt.claim-{os.getpid()}-abcdef0123"
+        mine.write_text("task: Z\n")
+        out = self.recover()
+        self.assertEqual((out["swept"], out["errors"]), ([], []))
+        self.assertTrue(mine.exists())
+
+    def test_the_directories_are_fsynced_after_the_journal_and_the_claim(self):
+        _task(self.tasks, "task-a.txt", "A")
+        synced = []
+        real = os.fsync
+
+        def spy(fd):
+            synced.append(os.fstat(fd).st_ino)
+            return real(fd)
+
+        with mock.patch("os.fsync", side_effect=spy):  # task_archive imports os per function
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(out["errors"], [])
+        inodes = {os.stat(self.tasks).st_ino: "tasks", os.stat(self.archive).st_ino: "archive"}
+        names = [inodes.get(i, "other") for i in synced]
+        self.assertGreaterEqual(names.count("archive"), 3, "journal persists: planned, claiming, claimed, …")
+        self.assertGreaterEqual(names.count("tasks"), 2, "the claim rename and the placing move")
 
     def test_pending_notices_lists_the_journals_read_only(self):
         self.archive.mkdir()

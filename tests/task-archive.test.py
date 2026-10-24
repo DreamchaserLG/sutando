@@ -624,6 +624,17 @@ class TestMoveGeneration(unittest.TestCase):
         self.assertEqual(got, name)
         self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", name])
 
+    def test_find_landed_walks_the_n_sequence_this_module_mints(self):
+        p = self._file("task-a.txt", "A")
+        gen = self._gen(p)
+        (self.dst / "task-a.txt").write_text("earlier")
+        (self.dst / "task-a.txt.1").write_text("earlier still")
+        landed = self.move("task-a.txt", gen)
+        self.assertEqual(landed, Path("task-a.txt.2"))
+        self.assertEqual(_task_archive.find_landed("task-a.txt", gen, dst_dir_fd=self.dfd), "task-a.txt.2")
+        self.assertIsNone(_task_archive.find_landed("task-a.txt", "0:0:0:0", dst_dir_fd=self.dfd))
+        self.assertIsNone(_task_archive.find_landed("task-b.txt", gen, dst_dir_fd=self.dfd))
+
     def test_a_gone_name_raises_file_not_found(self):
         with self.assertRaises(FileNotFoundError):
             self.move("task-a.txt", "1:1:1:1")
