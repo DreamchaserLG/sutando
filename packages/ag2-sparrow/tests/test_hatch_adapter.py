@@ -4,6 +4,7 @@ The hook script runs against a stub hook runtime (log/silent/wake/state) and the
 real task-field helper; `flock` and `timeout` are stubbed. Run:
     python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
 """
+import hashlib
 import json
 import os
 import re
@@ -408,6 +409,9 @@ class HookScript(Base):
     def test_a_hook_registered_before_the_held_branch_never_wakes_for_a_held_item(self):
         # A pip upgrade leaves the registered hook as it was: 0.6.0's shell with this package.
         old = Path(__file__).with_name("hatch_hook_0_6_0.sh")
+        source = json.loads(old.with_name(old.name + ".provenance.json").read_text())
+        self.assertEqual((source["source_tag"], hashlib.sha256(old.read_bytes()).hexdigest()),
+                         ("sparrow-v0.6.0", source["sha256"]), "the fixture is the released hook, unedited")
         self.assertNotIn("held", old.read_text())
         self.add_task("task-1784700000001", "$held", mtime=1000)
         self.add_task("task-1784700000002", "$open", mtime=2000)
