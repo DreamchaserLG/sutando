@@ -1529,6 +1529,30 @@ class TestRound9(Base):
         self.assertIn("ORIGINAL ASK", kept[0].read_text())
         self.assertEqual((self.notices(), len(self.journals())), ([], 1))
 
+    def test_a_replaced_claim_is_never_given_back_or_cleared_by_later_passes(self):
+        p = _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        real = tt.task_archive.move_without_clobbering
+        held = []
+
+        def replace_then_move(src, dest, **kw):
+            held.append(str(src))
+            _replace(self.tasks / str(src), "REPLACEMENT BYTES")
+            return real(src, dest, **kw)
+
+        with mock.patch.object(tt.task_archive, "move_without_clobbering", side_effect=replace_then_move):
+            self.run_transition(["task-a.txt"], _naming)
+        claim = self.tasks / held[0]
+        for _ in range(2):
+            out = self.recover()
+            self.assertEqual(len(out["errors"]), 1, out)
+            self.assertIn(f"kept as tasks/{claim.name}.displaced", out["errors"][0])
+            self.assertIn("waits for the operator", out["errors"][0])
+            self.assertFalse(p.exists(), "the replacement is never promoted to a live task")
+            self.assertIn("REPLACEMENT BYTES", claim.read_text())
+            self.assertIn("ORIGINAL ASK", (self.tasks / f"{claim.name}.displaced").read_text())
+            self.assertEqual((len(self.journals()), self.notices(), self.archive_names()), (1, [], []))
+        self.assertTrue((self.tasks / (claim.name + tt.QUARANTINE_SUFFIX)).exists())
+
     # 5 — an unreadable witness keeps the journal
     def retired_notice(self):
         p = _task(self.tasks, "task-a.txt", "A")

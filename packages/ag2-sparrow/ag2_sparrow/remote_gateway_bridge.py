@@ -316,7 +316,7 @@ from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
 from . import __version__ as _PACKAGE_VERSION
-from .outbox import DeliveryOutcome, record_delivered
+from .outbox import DeliveryOutcome, item_status, record_delivered
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -5569,12 +5569,16 @@ def _room_is_deliverable_here(room: str) -> bool:
     return room.split(":", 1)[1] == own
 
 
+def _proactive_receipts() -> Path:
+    return RESULTS_DIR / ".outbox-ag2space-proactive"
+
+
 def _record_proactive_receipt(item_id: str, room: str) -> None:
     """Durable "delivered where" for the proactive leg. The log line naming the
     room rotates; this outlives it. Fail-open: a receipt write must never
     unwind a delivery that already happened."""
     try:
-        record_delivered(RESULTS_DIR / ".outbox-ag2space-proactive", item_id,
+        record_delivered(_proactive_receipts(), item_id,
                          provider="ag2space-proactive", destination=room)
     except Exception as e:  # noqa: BLE001 — receipt is best-effort by design
         _log(f"proactive receipt write failed for {item_id}: {diagnostics.describe(e)} "
@@ -5608,6 +5612,9 @@ def _recover_orphan_proactive() -> None:
             except OSError:
                 continue
         target = f.with_name(name.split(".sending")[0] + ".txt")
+        if item_status(_proactive_receipts(), target.stem) == "DELIVERED":
+            _retire_delivered_proactive(f, target)  # sent before its archive failed: never re-queue
+            continue
         if target.exists():
             continue  # collision — leave for an operator, never clobber
         try:
@@ -5631,8 +5638,23 @@ def _retire_delivered_proactive(claim: Path, original: Path) -> None:
              "— keeping it under a hidden delivered name")
     try:
         claim.rename(original.with_name(f".{original.stem}.delivered-{stamp}"))
-    except OSError:
-        claim.unlink(missing_ok=True)  # left as a claim it would be sent again after a restart
+    except OSError as e:  # kept as the claim: its receipt stops a restart re-queueing it
+        _log(f"could not move delivered proactive {original.name} aside ({diagnostics.describe(e)}) "
+             "— left as its claim for a later pass")
+
+
+def _reap_delivered_proactive() -> None:
+    """Move each hidden `.<stem>.delivered-<ts>` into results/archive/, as its
+    delivery would have; one that still cannot move waits for a later pass."""
+    for f in RESULTS_DIR.glob(".proactive-*.delivered-*"):
+        stem, _, stamp = f.name[1:].rpartition(".delivered-")
+        if not stem or not stamp.isdigit():
+            continue
+        try:
+            ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            f.rename(ARCHIVE_RESULTS_DIR / f"{stem}-{stamp}.txt")
+        except OSError:
+            continue
 
 
 def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
@@ -5791,6 +5813,7 @@ def _post_proactive() -> None:
     PROACTIVE_ROOM_GATE re-judges the room the CLAIMED body names, since the
     peek may have read a body still being written."""
     noticed: "set[tuple[str, str]]" = set()
+    _reap_delivered_proactive()
     for f in sorted(RESULTS_DIR.glob("proactive-*.txt")):
         # PEEK before claiming: a file explicitly routed to a non-Matrix
         # destination ([channel: <discord/slack id>]) belongs to that bridge —

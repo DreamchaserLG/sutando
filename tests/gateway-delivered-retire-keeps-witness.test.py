@@ -102,19 +102,43 @@ class DeliveredRetireKeepsTheWitness(unittest.TestCase):
         self.assertEqual(self.drain(archive), [], "nothing more to deliver")
         self.assertEqual(sorted((self.tasks / "archive").glob(".notice-*.json")), [])
 
-    def test_with_no_rename_possible_the_delivered_claim_is_unlinked_not_left_to_resend(self):
+    def patched_dirs(self):
+        saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR)
+        gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, self.results / "archive"
+        self.addCleanup(lambda: setattr(gb, "RESULTS_DIR", saved[0]) or setattr(gb, "ARCHIVE_RESULTS_DIR", saved[1]))
+
+    def test_with_no_rename_possible_the_delivered_claim_is_kept_not_unlinked(self):
+        self.patched_dirs()
         claim = self.results / f"{PREFIX}1.sending.{os.getpid()}"
         claim.write_text("delivered\n")
-        original = self.results / f"{PREFIX}1.txt"
-        saved = gb.ARCHIVE_RESULTS_DIR
-        gb.ARCHIVE_RESULTS_DIR = self.results / "archive"
-        try:
-            with mock.patch.object(Path, "rename", side_effect=OSError(5, "Input/output error")):
-                gb._retire_delivered_proactive(claim, original)
-        finally:
-            gb.ARCHIVE_RESULTS_DIR = saved
-        self.assertFalse(claim.exists(), "a claim left in place would be sent again after a restart")
-        self.assertFalse(original.exists())
+        with mock.patch.object(Path, "rename", side_effect=OSError(5, "Input/output error")):
+            gb._retire_delivered_proactive(claim, self.results / f"{PREFIX}1.txt")
+        self.assertEqual(claim.read_text(), "delivered\n", "the delivered inode keeps a name")
+
+    def test_a_dead_owners_delivered_claim_is_retired_never_requeued_and_later_reaped(self):
+        import subprocess
+        self.patched_dirs()
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
+        claim.write_text("delivered\n")
+        ino = os.stat(claim).st_ino
+        gb.record_delivered(self.results / ".outbox-ag2space-proactive", f"{PREFIX}1",
+                            provider="ag2space-proactive")  # the receipt the delivery path writes
+        archive = self.results / "archive"
+        archive.mkdir(mode=0o555)
+        self.addCleanup(archive.chmod, 0o755)
+        gb._recover_orphan_proactive()
+        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "a delivered nudge is never re-queued")
+        (hidden,) = self.results.glob(f".{PREFIX}1.delivered-*")
+        self.assertEqual(os.stat(hidden).st_ino, ino)
+        gb._reap_delivered_proactive()
+        self.assertTrue(hidden.exists(), "still unmovable: it waits")
+        archive.chmod(0o755)
+        gb._reap_delivered_proactive()
+        (archived,) = archive.iterdir()
+        self.assertEqual((os.stat(archived).st_ino, archived.read_text()), (ino, "delivered\n"))
+        self.assertEqual(list(self.results.glob(".*.delivered-*")), [])
 
 
 if __name__ == "__main__":

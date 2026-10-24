@@ -444,17 +444,28 @@ def _place(dirs: _Dirs, claim: str, name: str,
                       f"({exc.cause}); its journal is kept and the next pass finishes it"), \
             False, exc.landed, True
     except task_archive.PlacementMismatch as exc:
-        kept = getattr(exc, "kept_as", None)
-        where = f"its judged bytes are kept as tasks/{kept}" if kept else "its judged bytes could not be kept"
-        return None, (f"refused to move {name!r}: tasks/{claim} was replaced after it was judged, so "
-                      f"nothing was archived; {where}, and the journal waits for the operator"), \
-            False, None, True
+        return None, _mismatch_line(name, claim, getattr(exc, "kept_as", None)), False, None, \
+            {"claim": claim, "displaced": getattr(exc, "kept_as", None)}
     except task_archive.GenerationChanged as exc:
         if exc.kept_as:
             return None, (f"refused to move {name!r}: {exc.why}; its name was taken again, so it is "
                           f"quarantined as tasks/{exc.kept_as} — rename it back to requeue"), True, None, False
         return None, (f"refused to move {name!r}: {exc.why}; it is back under its name, live, and "
                       "the next pass reports it"), False, None, False
+
+
+def _mismatch_line(name: str, claim: str, displaced: "str | None") -> str:
+    where = (f"the planned bytes are kept as tasks/{displaced}" if displaced
+             else "the planned bytes could not be kept")
+    return (f"refused to move {name!r}: tasks/{claim} was replaced after it was judged, so nothing "
+            f"was archived; {where}; both stay where they are and the journal waits for the operator")
+
+
+def _record_mismatch(dirs: _Dirs, j: "_Journal", name: str, pending) -> None:
+    """A replaced claim is never given back or cleared: marked, and journaled for the operator."""
+    if isinstance(pending, dict):
+        j.data.setdefault("mismatched", {})[name] = pending
+        _mark_quarantine(dirs, pending["claim"])
 
 
 def archive_generation(tasks_dir: Path, name: str, generation: str | None,
@@ -617,6 +628,11 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
     for name, generation in d["moves"].items():
         if name in landed or name in quarantined:
             continue
+        held = (d.get("mismatched") or {}).get(name)
+        if held:
+            unresolved = True
+            report["errors"].append(_mismatch_line(name, held.get("claim"), held.get("displaced")))
+            continue
         if name in refused:
             error = _finish_return(dirs, name, refused[name])
             if error is None or "quarantined" in error:
@@ -650,7 +666,8 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
                 landed[name] = got
             else:
                 report["errors"].append(error)
-                unresolved = unresolved or pending
+                unresolved = unresolved or bool(pending)
+                _record_mismatch(dirs, j, name, pending)
                 if kept:
                     quarantined[name] = claim
                     _mark_quarantine(dirs, claim)
@@ -980,7 +997,8 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
             continue
         j.set(stage="claimed")
         landed, error, kept, unsynced, pending = _place(dirs, claim, name, generation or "")
-        unresolved = unresolved or pending
+        unresolved = unresolved or bool(pending)
+        _record_mismatch(dirs, j, name, pending)
         if unsynced:
             j.data.setdefault("unsynced", {})[name] = unsynced
         if landed:
