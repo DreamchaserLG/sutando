@@ -20,6 +20,14 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+# The tmux the probe asks for the recorded session's panes on the recorded socket.
+TMUX_PANES = r"""#!/bin/bash
+# list-panes of =sutando-core on $STUB_SOCKET answers $STUB_PANE_PID; any other socket or session has no server.
+sock=""; prev=""; for a in "$@"; do [ "$prev" = "-S" ] && sock="$a"; prev="$a"; done
+case " $* " in *" list-panes "*" -t =sutando-core "*) ;; *) echo "can't find session" >&2; exit 1 ;; esac
+[ "$sock" = "${STUB_SOCKET:-}" ] || { echo "no server running on $sock" >&2; exit 1; }
+echo "${STUB_PANE_PID:-}"
+"""
 
 
 def _load():
@@ -147,12 +155,42 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(proj.read_text(), legacy, "an unbound record authorized the sweep")
                 core = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core" sleep 300'])
                 self.addCleanup(core.kill)
-                start = subprocess.run(["ps", "-p", str(core.pid), "-o", "lstart="], capture_output=True, text=True).stdout.strip()
-                record.write_text(json.dumps({"pid": core.pid, "start": start, "session": "sutando-core",
-                                              "other_core_live": False, "settings": settings}))
-                checks = [hc.check_claude_hook_registration()]
-                self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
-                hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
+                gone = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core" sleep 300'])
+                gone.kill()
+                gone.wait()
+                start = subprocess.run(["ps", "-p", str(core.pid), "-o", "lstart="], env=hc._C_LOCALE_ENV(),
+                                       capture_output=True, text=True).stdout.strip()
+                bind = Path(td) / "bin"
+                bind.mkdir()
+                (bind / "tmux").write_text(TMUX_PANES)
+                (bind / "tmux").chmod(0o755)
+                sock = str(Path(td) / "core.sock")
+                bound = {"pid": core.pid, "start": start, "session": "sutando-core", "socket": sock,
+                         "launch": "tmux", "other_core_live": False, "settings": settings}
+                probe_env = {"PATH": f"{bind}:{os.environ['PATH']}", "STUB_SOCKET": sock, "STUB_PANE_PID": str(core.pid)}
+                # Each of these is the bound record with one thing wrong; none may authorize the sweep.
+                older = {k: v for k, v in bound.items() if k not in ("socket", "launch")}
+                for name, rec in (("older launcher, no socket or mode", older),
+                                  ("empty socket", {**bound, "socket": ""}),
+                                  ("null socket", {**bound, "socket": None}),
+                                  ("no socket key", {k: v for k, v in bound.items() if k != "socket"}),
+                                  ("foreign socket", {**bound, "socket": str(Path(td) / "other.sock")}),
+                                  ("dead pid", {**bound, "pid": gone.pid}),
+                                  ("other start", {**bound, "start": start[:-4] + "1999"}),
+                                  ("bare record naming another session", {**bound, "launch": "bare", "session": "sutando-core-2"})):
+                    with self.subTest(record=name), mock.patch.dict(os.environ, probe_env):
+                        record.write_text(json.dumps(rec))
+                        checks = [hc.check_claude_hook_registration()]
+                        self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
+                        self.assertFalse(checks[0]["_live_core_has_launch_hooks"], checks[0]["detail"])
+                        hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
+                        self.assertEqual(proj.read_text(), legacy, f"{name}: the record authorized the sweep")
+                with mock.patch.dict(os.environ, probe_env):
+                    record.write_text(json.dumps(bound))
+                    checks = [hc.check_claude_hook_registration()]
+                    self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
+                    self.assertTrue(checks[0]["_live_core_has_launch_hooks"], checks[0]["detail"])
+                    hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
             self.assertEqual(checks[0]["status"], "ok", checks[0]["detail"])
             left = [h["command"] for g in json.loads(proj.read_text())["hooks"]["Stop"] for h in g["hooks"]]
             self.assertEqual(left, ["echo operator"])

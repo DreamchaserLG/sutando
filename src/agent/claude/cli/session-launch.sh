@@ -462,20 +462,42 @@ retire_core_launch_record() {
 
 # Once the new core is proven live: sweep the copies it replaced, then record what it runs.
 # A same-name core left running outside this socket still depends on the copies, so they
-# stay and the record says so (health then refuses to sweep them).
+# stay and the record says so (health then refuses to sweep them). Arguments: the proven
+# pid (default: the one live on this socket) and the launch mode, `tmux` or `bare`.
 settle_core_launch_hooks() {
+  local pid="${1:-$(live_core_pid)}" launch="${2:-tmux}"
   if [ -n "${OUTSIDE_CORE_LIVE:-}" ]; then
     echo "session-launch: a same-name core is live outside $TMUX_SOCKET — legacy hook entries kept, it still runs them" >&2
   else
     sweep_legacy_claude_hooks_for_launch
   fi
-  record_core_launch_settings "$(live_core_pid)"
+  record_core_launch_settings "$pid" "$launch"
+}
+
+# A launch with no tmux `exec`s claude in this very shell, so the core keeps this pid: the
+# proof it is up is pid $1's argv naming $SESSION. A detached helper waits up to ~10s for
+# that and settles then; a failed exec (still bash) or an early exit settles nothing.
+settle_bare_core_launch_hooks_after_exec() {
+  local pid="$1"
+  [ -n "${PY:-}" ] || return 0
+  (
+    set +e
+    for _ in $(seq 1 50); do
+      sleep 0.2
+      args="$(ps -p "$pid" -o args= 2>/dev/null)"
+      [ -n "$args" ] || exit 0
+      if "$PY" "$REPO/src/claude_argv.py" names-session "$args" "$SESSION"; then
+        settle_core_launch_hooks "$pid" bare
+        exit 0
+      fi
+    done
+  ) > /dev/null 2>&1 &
 }
 
 # The record the health probe reads for what the live core was launched with, bound to that
-# process (pid + start time). No settings, or no live pid, retires any record instead.
+# process (pid + start time + launch mode). No settings, or no live pid, retires any record instead.
 record_core_launch_settings() {
-  local pid="${1:-}" ws start
+  local pid="${1:-}" launch="${2:-tmux}" ws start
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
   if [ "${SETTINGS_ARGS[0]:-}" != --settings ] || [ -z "${PY:-}" ] || [ -z "$pid" ]; then
     rm -f "$ws/state/core-launch-settings.json"
@@ -484,14 +506,15 @@ record_core_launch_settings() {
   # LC_ALL=C: the health probe compares this text with a C-locale ps; a localized %c never matches.
   start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
   _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" _pid="$pid" _start="$start" _session="$SESSION" \
-    _socket="$TMUX_SOCKET" _outside="${OUTSIDE_CORE_LIVE:-}" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
+    _socket="$TMUX_SOCKET" _launch="$launch" _outside="${OUTSIDE_CORE_LIVE:-}" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
     || echo "session-launch: core launch-settings record not written (non-fatal)" >&2
 import json, os, sys, tempfile, time
 path = sys.argv[1]
 os.makedirs(os.path.dirname(path), exist_ok=True)
 rec = {"ts": int(time.time()), "repo": os.environ["_repo"], "pid": int(os.environ["_pid"]),
        "start": os.environ["_start"], "session": os.environ["_session"], "socket": os.environ["_socket"],
-       "other_core_live": bool(os.environ["_outside"]), "settings": json.loads(os.environ["_settings_json"])}
+       "launch": os.environ["_launch"], "other_core_live": bool(os.environ["_outside"]),
+       "settings": json.loads(os.environ["_settings_json"])}
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".core-launch-settings.")
 with os.fdopen(fd, "w") as f:
     json.dump(rec, f)

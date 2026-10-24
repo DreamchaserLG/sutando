@@ -82,6 +82,7 @@ from cron_loop_policy import (  # noqa: E402
 )
 from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # noqa: E402
 import process_pins  # noqa: E402
+import claude_argv  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
@@ -11811,36 +11812,57 @@ def _core_launch_settings(repo: Path) -> tuple[Optional[dict], str]:
 
 
 def _launch_record_binds_live_core(rec: dict) -> str:
-    """'' when the record's pid is the live core it describes, else why the record is not proof."""
-    pid, start = rec.get("pid"), rec.get("start")
-    session = rec.get("session") or "sutando-core"
-    if not isinstance(pid, int) or not isinstance(start, str) or not start:
+    """'' when the record's pid is the live core it describes, else why the record is not proof.
+
+    A `tmux` record binds only when that pid runs inside a pane of the recorded session on the
+    recorded socket; a `bare` record (no tmux at launch) binds on exact pid, start and name.
+    """
+    pid, start, session = rec.get("pid"), rec.get("start"), rec.get("session")
+    launch, sock = rec.get("launch"), rec.get("socket")
+    complete = (isinstance(pid, int) and not isinstance(pid, bool) and isinstance(start, str) and start
+                and isinstance(session, str) and session and launch in ("tmux", "bare"))
+    if not complete:
         return "the launch record is not bound to a process (written by an older launcher) — restart the core"
     try:
         # LC_ALL=C: the launcher records lstart in the C locale; a localized %c never matches it.
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=,args="], env=_C_LOCALE_ENV(),
-                             capture_output=True, text=True, timeout=10).stdout.strip()
+        lstart = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="], env=_C_LOCALE_ENV(),
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        args = subprocess.run(["ps", "-p", str(pid), "-o", "args="], env=_C_LOCALE_ENV(),
+                              capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return f"cannot read process {pid} for the launch record ({exc})"
-    if not out:
+    if not lstart:
         return f"the recorded core (pid {pid}) is not running — the launch record is stale"
-    if not out.startswith(start) or _argv_session_name(out[len(start):]) != session:
+    if lstart != start or claude_argv.session_name(args) != session:
         return f"pid {pid} is not the core the launch record describes — the record is stale"
-    return ""
+    if launch == "bare":
+        return ""
+    if not isinstance(sock, str) or not sock:
+        return "the launch record names no tmux socket for a tmux launch — the record is stale"
+    return _pid_outside_session_pane(pid, sock, session)
 
 
-def _argv_session_name(args: str) -> str:
-    """The value of `--name` in a ps args column, token-wise: `--name a` is not `--name a-2`."""
+def _pid_outside_session_pane(pid: int, sock: str, session: str) -> str:
+    """'' when `pid` is a pane process of `session` on `sock` or a descendant of one, else why not."""
     try:
-        toks = shlex.split(args)
-    except ValueError:
-        toks = args.split()
-    for i, tok in enumerate(toks):
-        if tok == "--name" and i + 1 < len(toks):
-            return toks[i + 1]
-        if tok.startswith("--name="):
-            return tok[len("--name="):]
-    return ""
+        lp = subprocess.run(["tmux", "-S", sock, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"],
+                            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"cannot list the panes of {session} on {sock} ({exc}) — the record is not proof"
+    panes = {x.strip() for x in (lp.stdout or "").splitlines() if x.strip().isdigit()}
+    if lp.returncode != 0 or not panes:
+        return f"no pane of session {session} answers on socket {sock} — the record is stale"
+    p, depth = str(pid), 0
+    while p.isdigit() and int(p) > 1 and depth < 16:
+        if p in panes:
+            return ""
+        try:
+            p = subprocess.run(["ps", "-o", "ppid=", "-p", p], capture_output=True, text=True,
+                               timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            break
+        depth += 1
+    return f"pid {pid} is not in a pane of session {session} on socket {sock} — the record is stale"
 
 
 def _fmt_records(records) -> str:

@@ -27,6 +27,9 @@ from pathlib import Path
 from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+import claude_argv  # noqa: E402
+
 BUILDER = "src/agent/claude/cli/build-core-settings.mjs"
 TABLE = "src/agent/claude/cli/owned-hooks.json"
 OWNED = ("check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh",
@@ -42,6 +45,14 @@ if [ "${LC_ALL:-}" != "C" ]; then
   out="$(printf '%s\n' "$out" | sed -E 's/^ *(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Z][a-z]{2}) +([0-9]+) ([0-9:]+) ([0-9]{4})/\3. \2 \5 \4 \1/')"
 fi
 printf '%s\n' "$out"
+"""
+# The tmux the probe asks for the recorded session's panes on the recorded socket.
+TMUX_PANES = r"""#!/bin/bash
+# list-panes of =sutando-core on $STUB_SOCKET answers $STUB_PANE_PID; any other socket or session has no server.
+sock=""; prev=""; for a in "$@"; do [ "$prev" = "-S" ] && sock="$a"; prev="$a"; done
+case " $* " in *" list-panes "*" -t =sutando-core "*) ;; *) echo "can't find session" >&2; exit 1 ;; esac
+[ "$sock" = "${STUB_SOCKET:-}" ] || { echo "no server running on $sock" >&2; exit 1; }
+echo "${STUB_PANE_PID:-}"
 """
 
 
@@ -104,6 +115,9 @@ class Probe(unittest.TestCase):
         self.bin.mkdir()
         (self.bin / "ps").write_text(PS_LOCALIZED)
         (self.bin / "ps").chmod(0o755)
+        (self.bin / "tmux").write_text(TMUX_PANES)
+        (self.bin / "tmux").chmod(0o755)
+        self.sock = str(Path(self._td.name) / "core.sock")
         settings, why = hc._core_launch_settings(self.repo)
         assert settings is not None, why
         self.record(settings)
@@ -117,9 +131,21 @@ class Probe(unittest.TestCase):
     def record(self, settings, **fields):
         (self.ws / "state").mkdir(parents=True, exist_ok=True)
         rec = {"ts": 1, "repo": str(self.repo), "pid": self.core.pid, "start": self.start,
-               "session": "sutando-core", "socket": "/tmp/t.sock", "other_core_live": False, "settings": settings}
+               "session": "sutando-core", "socket": "", "launch": "bare", "other_core_live": False,
+               "settings": settings}
         rec.update(fields)
+        for key, value in list(rec.items()):
+            if value is self.ABSENT:
+                del rec[key]
         (self.ws / "state" / "core-launch-settings.json").write_text(json.dumps(rec))
+
+    ABSENT = object()
+
+    def tmux_probe_env(self, pane_pid=None, socket=None):
+        """The probe's PATH carries the stand-in tmux, which knows one socket and one pane."""
+        return mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ['PATH']}",
+                                            "STUB_SOCKET": socket if socket is not None else self.sock,
+                                            "STUB_PANE_PID": str(pane_pid if pane_pid is not None else self.core.pid)})
 
     def probe(self, **kw):
         kw.setdefault("workspace_dir", self.ws)
@@ -220,14 +246,49 @@ class Probe(unittest.TestCase):
         self.start = subprocess.run(["ps", "-p", str(self.core.pid), "-o", "lstart="], env=hc._C_LOCALE_ENV(),
                                     capture_output=True, text=True).stdout.strip()
         self.assertIn("is not the core the launch record describes", self._bound_record_fails(session="sutando-core"))
-        self.assertEqual(hc._argv_session_name("claude --name=sutando-core-2 --x"), "sutando-core-2")
-        self.assertEqual(hc._argv_session_name("claude --name 'sutando core'"), "sutando core")
+        # The probe reads the name through the one shared owner; pin the policy there.
+        self.assertIs(hc.claude_argv, claude_argv)
+        self.assertFalse(claude_argv.names_session("claude --name sutando-core-2", "sutando-core"))
+        self.assertFalse(claude_argv.names_session("claude --name sutando-core-watcher", "sutando-core"))
+        self.assertTrue(claude_argv.names_session("claude --name=sutando-core --x", "sutando-core"))
+        self.assertEqual(claude_argv.session_name("claude --name 'sutando core'"), "sutando core")
+        self.assertEqual(claude_argv.session_name("claude --resume"), "")
+
+    def test_a_record_without_a_session_or_launch_mode_is_not_proof(self):
+        for fields in ({"session": self.ABSENT}, {"session": ""}, {"launch": self.ABSENT}, {"launch": "screen"},
+                       {"pid": True}):
+            with self.subTest(fields=fields):
+                self.assertIn("not bound to a process", self._bound_record_fails(**fields))
+
+    def test_a_tmux_record_binds_only_through_a_pane_of_its_session_on_its_socket(self):
+        settings, _ = hc._core_launch_settings(self.repo)
+        for pane in (self.core.pid, os.getpid()):
+            with self.subTest(pane=pane):
+                self.record(settings, launch="tmux", socket=self.sock)
+                with self.tmux_probe_env(pane_pid=pane):
+                    rec = json.loads((self.ws / "state" / "core-launch-settings.json").read_text())
+                    self.assertEqual(hc._launch_record_binds_live_core(rec), "")
+                    self.assertEqual(self.probe()["status"], "ok")
+        for fields, why in (({"socket": str(Path(self._td.name) / "other.sock")}, "no pane of session"),
+                            ({"socket": ""}, "names no tmux socket"), ({"socket": None}, "names no tmux socket"),
+                            ({"socket": self.ABSENT}, "names no tmux socket")):
+            with self.subTest(fields=fields), self.tmux_probe_env():
+                self.assertIn(why, self._bound_record_fails(launch="tmux", **fields))
+        with self.tmux_probe_env(pane_pid=1):
+            self.assertIn("is not in a pane of session", self._bound_record_fails(launch="tmux", socket=self.sock))
+        # Without any tmux on PATH a tmux record is not proof either.
+        self.assertIn("the record is", self._bound_record_fails(launch="tmux", socket=self.sock))
+
+    def test_a_bare_record_needs_no_tmux_and_still_needs_the_exact_start(self):
+        self.assertEqual(self.probe()["status"], "ok")
+        self.assertIn("is not the core the launch record describes",
+                      self._bound_record_fails(start=self.start.replace(self.start[-4:], "1999")))
 
     def _launcher_writes_record(self, locale):
         """record_core_launch_settings from session-launch.sh, run as the launcher would under `locale`."""
         settings, _ = hc._core_launch_settings(self.repo)
         script = ('REPO="$1"; SESSION=sutando-core; TMUX_SOCKET=/tmp/t.sock; PY="$2"; SETTINGS_ARGS=(--settings "$3"); '
-                  '. "$4"; record_core_launch_settings "$5"')
+                  '. "$4"; record_core_launch_settings "$5" bare')
         env = hermetic_env(PATH=f"{self.bin}:/usr/bin:/bin", LC_ALL=locale)
         run = subprocess.run(["/bin/bash", "-c", script, "_", str(self.repo), sys.executable, json.dumps(settings),
                               str(LAUNCHER), str(self.core.pid)], env=env, capture_output=True, text=True, timeout=60)
@@ -243,7 +304,8 @@ class Probe(unittest.TestCase):
         for writer, reader in (("de_DE.UTF-8", "en_US.UTF-8"), ("en_US.UTF-8", "de_DE.UTF-8")):
             with self.subTest(writer=writer, reader=reader):
                 rec = self._launcher_writes_record(writer)
-                self.assertEqual((rec["pid"], rec["session"], rec["start"]), (self.core.pid, "sutando-core", self.start))
+                self.assertEqual((rec["pid"], rec["session"], rec["start"], rec["launch"]),
+                                 (self.core.pid, "sutando-core", self.start, "bare"))
                 self.assertTrue(rec["start"].startswith(WEEKDAY), rec["start"])
                 with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ['PATH']}", "LC_ALL": reader}):
                     self.assertEqual(hc._launch_record_binds_live_core(rec), "")

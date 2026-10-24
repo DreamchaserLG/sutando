@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -54,7 +55,8 @@ exit 1
 PS_STUB = r"""#!/bin/bash
 case "$*" in *ppid=*) echo 1; exit 0 ;; esac
 want=""; prev=""; for a in "$@"; do [ "$prev" = "-p" ] && want="$a"; prev="$a"; done
-[ "$want" = "%s" ] && [ -f "$CORE_MARK" ] || exit 0
+[ "$want" = "%s" ] || exec /bin/ps "$@"
+[ -f "$CORE_MARK" ] || exit 0
 case "$*" in *lstart=*) echo "Thu Jan  1 00:00:00 2026" ;; *) cat "$CORE_MARK" ;; esac
 exit 0
 """ % FAKEPID
@@ -182,10 +184,61 @@ class LaunchSchedules(unittest.TestCase):
         sys.path.insert(0, str(REPO / "src"))
         import claude_hooks_settings as chs
         rec = json.loads(self.record().read_text())
-        self.assertEqual((rec["repo"], rec["pid"], rec["session"], rec["other_core_live"]),
-                         (str(self.root), int(FAKEPID), "sutando-core", False))
+        self.assertEqual((rec["repo"], rec["pid"], rec["session"], rec["other_core_live"], rec["launch"], rec["socket"]),
+                         (str(self.root), int(FAKEPID), "sutando-core", False, "tmux", "/tmp/sutando-tmux.sock"))
         self.assertTrue(rec["start"])
         self.assertTrue(chs.owned_launch_records(self.root) <= chs.records_in(rec["settings"]))
+
+    def _no_tmux_env(self):
+        """A PATH with every system binary and node, and no tmux anywhere on it."""
+        sysbin = self.td / "sysbin"
+        sysbin.mkdir()
+        for d in ("/usr/bin", "/bin"):
+            for f in Path(d).iterdir():
+                if f.name != "tmux" and not (sysbin / f.name).exists():
+                    (sysbin / f.name).symlink_to(f)
+        (sysbin / "node").symlink_to(shutil.which("node"))
+        (self.td / "bin" / "tmux").unlink()
+        env = {**self.env, "PATH": f"{self.td / 'bin'}:{sysbin}"}
+        self.assertIsNone(shutil.which("tmux", path=env["PATH"]))
+        return env
+
+    def _launch_bare(self, claude_body):
+        (self.td / "bin" / "claude").write_text(claude_body)
+        proc = subprocess.Popen(["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh")], env=self._no_tmux_env(),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: os.killpg(proc.pid, 9) if proc.poll() is None else None)
+        return proc
+
+    def test_a_launch_without_tmux_settles_once_the_exec_is_proven_live(self):
+        # The stand-in core stays up; exec keeps the launcher's pid, so the record must name it.
+        proc = self._launch_bare("#!/bin/bash\nsleep 60\n")
+        for _ in range(100):
+            if self.record().exists():
+                break
+            time.sleep(0.2)
+        self.assertTrue(self.record().exists(), "no launch record within 20s of a bare launch")
+        self.assertIsNone(proc.poll(), "the stand-in core exited")
+        rec = json.loads(self.record().read_text())
+        self.assertEqual((rec["pid"], rec["session"], rec["launch"]), (proc.pid, "sutando-core", "bare"))
+        self.assertEqual(self.marker.read_text().count("ran"), 1)
+        hooks = json.loads(self.legacy.read_text())["hooks"]
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["echo operator"])
+        self.assertEqual(self.hc()._launch_record_binds_live_core(rec), "")
+        out = self.probe()
+        self.assertEqual(out["status"], "ok", out["detail"])
+        os.killpg(proc.pid, 9)
+        proc.wait()
+        self.assertIn("is not running", self.hc()._launch_record_binds_live_core(rec))
+
+    def test_a_failed_exec_without_tmux_settles_nothing(self):
+        proc = self._launch_bare("#!/nonexistent/interpreter\n")
+        proc.communicate(timeout=60)
+        self.assertNotEqual(proc.returncode, 0)
+        time.sleep(1.5)
+        self.assertFalse(self.record().exists(), "a failed exec left a launch record")
+        self.assertFalse(self.marker.exists(), "a failed exec swept the copies")
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
 
     def test_a_later_launch_without_settings_retires_the_record_and_health_refuses_to_sweep(self):
         # Production path twice: a full launch, then the core dies and a launch with no node

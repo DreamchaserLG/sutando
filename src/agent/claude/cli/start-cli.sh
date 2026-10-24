@@ -640,6 +640,8 @@ if ! command -v tmux > /dev/null 2>&1; then
   fi
   stash_shutdown_sentinel
   clear_shutdown_sentinel
+  # exec keeps this pid: the helper settles the hooks once $$ is proven to be the core.
+  settle_bare_core_launch_hooks_after_exec "$$"
   # errexit would exit on the failed exec before the restore below is reached;
   # drop it just around the exec and re-raise the exec's own status.
   set +e

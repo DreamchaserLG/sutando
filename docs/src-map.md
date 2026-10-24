@@ -45,6 +45,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
+- **`claude_argv.py`** — The one reading of which session a claude process's argv names (`--name X` / `--name=X`).
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
 - **`claude_hooks_settings.py`** — Remove the hook entries older Sutando installers wrote into settings files.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
