@@ -9,8 +9,8 @@ did on 2026-09-11: a consented Claude-Code import task (the desktop's legacy
 five minutes was, by the prose rule, an ORPHAN — archived into the aggregated
 recovery DM on the next boot, although the owner had consented, the import is
 resumable, and the watcher's startup sweep would simply re-emit it. This
-script encodes the rules so a test can pin them; the agent still performs
-step 3 (archive moves, the aggregated DM) from the verdicts printed here.
+script encodes the rules so a test can pin them. `--plan` prints step 3's
+plan (what moves, the complete recovery body); `--apply` performs it.
 
 Verdicts (first match wins):
   done            a completion marker exists — results/<id>.txt (live or
@@ -94,6 +94,7 @@ if str(REPO / "src") not in sys.path:
 
 import local_task_protocol as ltp  # noqa: E402
 import result_markers  # noqa: E402
+import result_publish  # noqa: E402
 
 # The worker-pool skill is optional: without it there is no router, so nobody can
 # hold a task. Any stat failure but ENOENT propagates — unreadable is not absent.
@@ -536,10 +537,9 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
     `id` is display/marker data a legacy or missing-header task's own BODY
     can forge to anything, including a path-traversal shape (`../x`) or one
     naming an unrelated real file; it is never a filesystem path here or
-    anywhere this plan is acted on. The skill performs exactly the moves this
-    returns and prints exactly the body this returns -- it does not derive
-    either from `id`, and it does not reconstruct the body from individual
-    rows by hand.
+    anywhere this plan is acted on. `apply_plan()` performs exactly the moves
+    this returns and publishes exactly the body this returns -- nothing derives
+    either from `id` or reconstructs the body from individual rows by hand.
 
     Returns `{"archive": [...], "silent_archive": [...], "body": str|None}`;
     `archive`/`silent_archive` are bare filenames under `tasks/`.
@@ -641,6 +641,49 @@ def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict
     return body
 
 
+RESULT_PREFIX = "proactive-orphan-recovery-"
+
+
+def apply_plan(workspace: Path, now: float | None = None) -> dict:
+    """Step 3, performed: publish `body` whole (the repo's one `results/`
+    publisher), THEN move the plan's files, every path under `workspace`. A
+    failed publish moves nothing, so an orphan is never archived unreported.
+
+    Returns the plan plus `result` (the published path or None), `archived`,
+    `silent_archived` (names actually moved) and `errors` (one line each)."""
+    plan = recovery_plan(workspace, now)
+    out = {**plan, "result": None, "archived": [], "silent_archived": [], "errors": []}
+    tasks_dir = workspace / "tasks"
+    archive_dir = tasks_dir / "archive"
+    if plan["body"] is not None:
+        target = workspace / "results" / f"{RESULT_PREFIX}{int(time.time())}.txt"
+        try:
+            result_publish.publish_text(target, plan["body"])
+        except OSError as exc:
+            out["errors"].append(f"result write failed ({exc}); nothing moved")
+            return out
+        out["result"] = str(target)
+    if plan["archive"] or plan["silent_archive"]:
+        try:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            out["errors"].append(f"could not create {archive_dir}: {exc}; nothing moved")
+            return out
+    for key, moved in (("archive", "archived"), ("silent_archive", "silent_archived")):
+        for name in plan[key]:
+            # Belt and braces: the plan only emits bare basenames, so anything else is a bug.
+            if not name or name in (".", "..") or Path(name).name != name:
+                out["errors"].append(f"refused to move {name!r}: not a bare filename")
+                continue
+            try:
+                os.replace(tasks_dir / name, archive_dir / name)
+            except OSError as exc:
+                out["errors"].append(f"move failed for {name}: {exc}")
+            else:
+                out[moved].append(name)
+    return out
+
+
 def resolve_workspace() -> Path | None:
     try:
         res = subprocess.run(["bash", str(REPO / "scripts" / "sutando-config.sh"), "workspace"],
@@ -658,14 +701,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--plan", action="store_true",
                     help="print step 3/3b/3c's plan (archive filenames + the complete "
                          "recovery body) instead of the raw per-task classification")
+    ap.add_argument("--apply", action="store_true",
+                    help="perform step 3: publish the plan's body through src/result_publish.py, "
+                         "then archive its files under the workspace; a failed publish moves "
+                         "nothing (exit 1 when anything failed)")
     args = ap.parse_args(argv)
     ws = Path(args.workspace) if args.workspace else resolve_workspace()
     if ws is None:
         print("orphan-check: workspace could not be resolved", file=sys.stderr)
         return 2
-    out = recovery_plan(ws, args.now) if args.plan else classify_workspace(ws, args.now)
+    if args.apply:
+        out = apply_plan(ws, args.now)
+    elif args.plan:
+        out = recovery_plan(ws, args.now)
+    else:
+        out = classify_workspace(ws, args.now)
     print(json.dumps(out, indent=2))
-    return 0
+    return 1 if out.get("errors") else 0
 
 
 if __name__ == "__main__":

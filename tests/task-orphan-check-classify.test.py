@@ -1001,6 +1001,107 @@ class TestRecoveryPlan(ClassifyBase):
         self.assertEqual(parse_markers(plan["body"]).actions, [])
 
 
+class TestApplyPlan(ClassifyBase):
+    """Item 2 (kewei-red, round 4), preferred form: applying the plan has one
+    executable owner, `apply_plan()` (`--apply`), with resolved workspace paths
+    and tested failure semantics -- the write through `src/result_publish.py`
+    BEFORE any move, and no move at all when the write fails. Every failure
+    here is a real filesystem condition, not a mock, except the two guards
+    that the plan itself can never trigger."""
+
+    def _orphan(self, name: str = "task-a.txt", **kw) -> None:
+        self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+
+    def recovery_files(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+
+    def test_apply_publishes_then_archives_and_a_second_pass_has_no_replay(self):
+        self._orphan()
+        plan = self.mod.recovery_plan(self.ws.root, NOW)
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(out["archived"], ["task-a.txt"])
+        self.assertEqual(out["silent_archived"], [])
+        self.assertEqual(self.recovery_files(), [Path(out["result"])])
+        self.assertEqual(Path(out["result"]).read_text(), plan["body"])
+        self.assertFalse((self.ws.root / "tasks" / "task-a.txt").exists())
+        self.assertTrue((self.ws.root / "tasks" / "archive" / "task-a.txt").exists())
+        again = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual((again["archived"], again["result"], again["errors"]), ([], None, []))
+        self.assertEqual(len(self.recovery_files()), 1, "no second DM for an archived task")
+
+    def test_the_published_result_is_whole_with_no_staging_left_behind(self):
+        self._orphan()
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        leftovers = [p.name for p in (self.ws.root / "results").iterdir()
+                     if p.name != Path(out["result"]).name]
+        self.assertEqual(leftovers, [])
+        self.assertEqual(self.mod.result_markers.parse_markers(
+            Path(out["result"]).read_text()).actions, [])
+
+    def test_a_failed_publish_moves_nothing(self):
+        self._orphan()
+        (self.ws.root / "results").rmdir()
+        (self.ws.root / "results").write_text("not a directory")  # publish's mkdir fails
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("result write failed", out["errors"][0])
+        self.assertIsNone(out["result"])
+        self.assertEqual(out["archived"], [])
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists(), "untouched for the next pass")
+        self.assertFalse((self.ws.root / "tasks" / "archive").exists())
+
+    def test_done_and_silent_rows_move_without_a_result(self):
+        self.ws.task("task-done.txt", chat_task_text("task-done", NOW - 900))
+        (self.ws.root / "results" / "task-done.txt").write_text("answered\n")
+        self.ws.task("task-voice.txt", chat_task_text("task-voice", NOW - 900, source="voice"))
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["errors"], [])
+        self.assertIsNone(out["result"])
+        self.assertEqual(self.recovery_files(), [])
+        self.assertEqual(out["archived"], ["task-done.txt"])
+        self.assertEqual(out["silent_archived"], ["task-voice.txt"])
+        for name in ("task-done.txt", "task-voice.txt"):
+            self.assertTrue((self.ws.root / "tasks" / "archive" / name).exists(), name)
+
+    def test_an_unwritable_archive_dir_moves_nothing_after_the_publish(self):
+        self._orphan()
+        (self.ws.root / "tasks" / "archive").write_text("a file where the dir should be")
+        out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertIsNotNone(out["result"], "the DM is still published")
+        self.assertEqual(out["archived"], [])
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("could not create", out["errors"][0])
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
+
+    def test_a_failed_move_is_reported_per_name_and_the_others_proceed(self):
+        self._orphan("task-a.txt")
+        self._orphan("task-b.txt")
+        real_replace = self.mod.os.replace
+
+        def flaky(src, dst):
+            if Path(src).name == "task-a.txt":
+                raise PermissionError("EPERM")
+            return real_replace(src, dst)
+
+        with unittest.mock.patch.object(self.mod.os, "replace", side_effect=flaky):
+            out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["archived"], ["task-b.txt"])
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("task-a.txt", out["errors"][0])
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
+
+    def test_a_name_that_is_not_a_bare_filename_is_refused(self):
+        (self.ws.root / "notes").mkdir()
+        (self.ws.root / "notes" / "secret.txt").write_text("stay")
+        forged = {"archive": ["../notes/secret.txt", "", ".."], "silent_archive": [], "body": None}
+        with unittest.mock.patch.object(self.mod, "recovery_plan", return_value=forged):
+            out = self.mod.apply_plan(self.ws.root, NOW)
+        self.assertEqual(out["archived"], [])
+        self.assertEqual(len(out["errors"]), 3, out)
+        self.assertTrue((self.ws.root / "notes" / "secret.txt").exists())
+
+
 class TestAgeSources(ClassifyBase):
     def test_bad_timestamp_falls_back_to_epoch_ms_in_id(self):
         self.ws.task(f"{IMPORT_ID}.txt", import_task_text().replace(iso(NOW - 379), "yesterday"))
@@ -1113,6 +1214,35 @@ class TestCli(unittest.TestCase):
         self.assertEqual(cli_out, direct)
         self.assertEqual(cli_out["archive"], [f"{IMPORT_ID}.txt"])
         self.assertIsNotNone(cli_out["body"])
+
+    def test_apply_flag_from_a_foreign_cwd_resolves_under_the_workspace(self):
+        """`/startup` runs from the repository, never the workspace: `--apply`
+        must move under `--workspace` whatever the cwd, exit 0, and report the
+        same plan fields `--plan` would."""
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 1801))
+        self.ws.status("staged", NOW - 1701, task_id=OLDER_RUN_ID)  # -> deferred (orphan)
+        plan = _load().recovery_plan(self.ws.root, NOW)
+        with tempfile.TemporaryDirectory() as elsewhere:
+            res = subprocess.run([sys.executable, str(SCRIPT), "--workspace", str(self.ws.root),
+                                  "--now", str(NOW), "--apply"], capture_output=True,
+                                 text=True, cwd=elsewhere)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(sorted(Path(elsewhere).iterdir()), [], "nothing lands in the cwd")
+        out = json.loads(res.stdout)
+        self.assertEqual({k: out[k] for k in plan}, plan)
+        self.assertEqual(out["archived"], [f"{IMPORT_ID}.txt"])
+        self.assertTrue((self.ws.root / "tasks" / "archive" / f"{IMPORT_ID}.txt").exists())
+        self.assertEqual(Path(out["result"]).parent, self.ws.root / "results")
+        self.assertEqual(Path(out["result"]).read_text(), plan["body"])
+
+    def test_apply_flag_exits_one_when_the_publish_fails(self):
+        self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: hi\n")
+        (self.ws.root / "results").rmdir()
+        (self.ws.root / "results").write_text("not a directory")
+        res = self.run_cli("--workspace", str(self.ws.root), "--now", str(NOW), "--apply")
+        self.assertEqual(res.returncode, 1, res.stdout)
+        self.assertTrue(json.loads(res.stdout)["errors"])
+        self.assertTrue((self.ws.root / "tasks" / "task-a.txt").exists())
 
     def test_workspace_resolved_through_sutando_config(self):
         mod = _load()
@@ -1362,15 +1492,16 @@ class TestTrustedIdentityNotBodyForgeable(ClassifyBase):
                         "- task-ok.txt [owner, DM, 15m ago]: hello")
 
 
-class TestSkillInvokesPlanMode(unittest.TestCase):
-    """Item 3 (kewei-red, round 4): the `--plan` delegation had no pin --
-    changing SKILL.md step 3's command from `classify.py --plan` to
-    `classify.py` left all 93 classifier tests and the 16 import/skill tests
-    green, because nothing read the doc's own text. This is a DATA pin
-    (REVIEW.md criterion 14's structural-duplication exception, labeled as
-    one): it asserts on SKILL.md's literal content, never on behavior, and is
-    paired with TestCli.test_plan_flag_end_to_end_matches_recovery_plan_exactly
-    -- the behavioral test of the unit this doc delegates to."""
+class TestSkillInvokesApplyMode(unittest.TestCase):
+    """Item 3 (kewei-red, round 4): the delegation to the script had no pin --
+    changing SKILL.md step 3's command left every behavioral test green,
+    because nothing read the doc's own text. This is a DATA pin (REVIEW.md
+    criterion 14's structural-duplication exception, labeled as one): it
+    asserts on SKILL.md's literal content, never on behavior, and is paired
+    with TestCli's `--apply` / `--plan` end-to-end tests and TestApplyPlan --
+    the behavioral tests of the unit this doc delegates to. The ordering and
+    root contracts v0.1.12 pinned here as prose are now pinned in TestApplyPlan
+    as behavior; what the doc must not do is reintroduce a hand move or write."""
 
     SKILL_MD = REPO / "skills" / "task-orphan-check" / "SKILL.md"
 
@@ -1379,30 +1510,24 @@ class TestSkillInvokesPlanMode(unittest.TestCase):
         self.step3 = self.text.split("### Step 3", 1)[1].split("### Step 4", 1)[0]
         self.step4 = self.text.split("### Step 4", 1)[1].split("### Step 5", 1)[0]
 
-    def test_step_3_invokes_plan_mode(self):
-        self.assertIn("classify.py --plan", self.step3)
-        self.assertIn("do not construct an archive move or the recovery body by hand", self.step3)
+    def test_step_3_invokes_apply_mode(self):
+        self.assertIn("classify.py --apply", self.step3)
+        self.assertIn("do not construct an archive move, a result write or the recovery body "
+                      "by hand", self.step3)
 
-    def test_step_3_consumes_archive_silent_archive_and_body_without_rederiving(self):
-        for key in ("`archive`", "`silent_archive`", "`body`"):
+    def test_step_3_names_the_plan_fields_it_consumes_and_the_publisher(self):
+        for key in ("`archive`", "`silent_archive`", "`body`", "`result`", "`errors`",
+                    "src/result_publish.py"):
             self.assertIn(key, self.step3, key)
 
-    def test_step_3_writes_the_result_before_any_archive_move(self):
-        """Item 2's ordering fix: the result write must be listed (and
-        therefore performed) before either archive move, so a write failure
-        never strands an already-archived, notification-dependent orphan."""
-        write_pos = self.step3.index("proactive-orphan-recovery-${ts}")
-        archive_pos = self.step3.index('mv "$WS/tasks/$name" "$WS/tasks/archive/$name"')
-        silent_pos = self.step3.index("same move, no result write")
-        self.assertLess(write_pos, archive_pos)
-        self.assertLess(write_pos, silent_pos)
+    def test_step_3_and_step_4_prescribe_no_hand_move_or_write(self):
+        for forbidden in ("mv ", "mkdir -p", "date +%s", "rename into place"):
+            self.assertNotIn(forbidden, self.step3, forbidden)
+            self.assertNotIn(forbidden, self.step4, forbidden)
 
-    def test_step_3_and_step_4_resolve_paths_under_the_workspace(self):
-        """Item 2's path fix: every move target is resolved under `$WS`,
-        never the bare `tasks/...` that only works when cwd == workspace."""
-        self.assertIn('mv "$WS/tasks/$name" "$WS/tasks/archive/$name"', self.step3)
-        self.assertNotIn('mv "tasks/$name"', self.step3)
-        self.assertIn("$WS/tasks/archive/", self.step4)
+    def test_step_3_states_the_write_first_no_move_on_failure_contract(self):
+        self.assertIn("only THEN moves", self.step3)
+        self.assertIn("a failed publish moves nothing", self.step3)
 
 
 if __name__ == "__main__":
