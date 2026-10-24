@@ -319,6 +319,40 @@ class HookScript(Base):
         self.assertIn("hold <its result_file>` once", p["worker_note"])
         self.assertEqual(self.stored()["woken"]["task-1784700000001"]["n"], 2)
 
+    def test_a_held_item_is_rewoken_as_held_and_never_answered(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        self.run_script()
+        self.assertNotIn("held: true", self.payload()["worker_note"])
+        # The worker parked the first item with `hold` after its first wake.
+        task_hold.place(self.results, "task-1784700000001")
+        st = self.stored()
+        for tid in ("task-1784700000001", "task-1784700000002"):
+            st["woken"][tid]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        p = self.payload()
+        held, open_ = p["matches"]
+        self.assertEqual((held["task_id"], held["rewake"], held["held"]),
+                         ("task-1784700000001", True, True))
+        self.assertEqual((open_["task_id"], open_["rewake"]), ("task-1784700000002", True))
+        self.assertNotIn("held", open_, "an unheld item is unchanged")
+        note = p["worker_note"]
+        self.assertIn("Items with held: true already wait for your owner's go: never answer one", note)
+        self.assertIn("repeat only its HANDOFF block", note)
+        self.assertIn("If one is held (held: true), waits on the main session", note)
+        # Released (answered through `reply`), the item is woken for as before, unflagged.
+        task_hold.release(self.results, "task-1784700000001")
+        st = self.stored()
+        st["woken"]["task-1784700000001"]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script()
+        (m,) = self.payload()["matches"]
+        self.assertNotIn("held", m)
+        self.assertNotIn("held: true already wait", self.payload()["worker_note"])
+
     def test_rewakes_stop_at_the_cap(self):
         self.add_task("task-1784700000001", "$reply")
         self.state.write_text(json.dumps({
@@ -723,6 +757,17 @@ class TaskFields(Base):
         self.assertEqual((item["event_id"], item["thread_root"], item["sender"], item["sender_name"],
                           item["access_tier"], item["collaborator"]),
                          ("$m", "$t", "@bob:ag2.space", "Bob", "owner", False))
+
+    def test_a_held_task_carries_held_and_an_unheld_one_does_not(self):
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        task_hold.place(self.results, "task-1784700000001")
+        held, open_ = task_fields.list_open_tasks(self.tasks, self.results)
+        self.assertEqual((held["task_id"], held["held"]), ("task-1784700000001", True))
+        self.assertNotIn("held", open_)
+        # A marker that is not a whole, well-formed hold is no hold.
+        (self.results / task_hold.HOLD_DIR / "task-1784700000002.json").write_text("{")
+        self.assertNotIn("held", task_fields.list_open_tasks(self.tasks, self.results)[1])
 
     def test_snippet_skips_the_matrix_reply_fallback(self):
         # As the gateway folds it: quoted lines, the blank separator, then the reply.

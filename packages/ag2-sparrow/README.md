@@ -286,6 +286,9 @@ sends a heartbeat wake, skipped while the activity marker
 is still unwritten 30 minutes after its wake is woken for again, marked
 `rewake: true`, up to 3 wakes in all. One still open 30 minutes after
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
+A held item is woken for with `held: true` on every wake, and the note tells the
+worker to answer nothing for it and repeat only its `HANDOFF` block, so a fresh
+worker session never acts on an item that waits for the owner's go.
 
 Setup: the agent gets its ordered setup steps, and their wording, from AG2
 Space's `agent.setup.steps` Action, then runs `ag2-sparrow-hatch install --mxid
