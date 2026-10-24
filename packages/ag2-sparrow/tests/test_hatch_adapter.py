@@ -4,6 +4,7 @@ The hook script runs against a stub hook runtime (log/silent/wake/state) and the
 real task-field helper; `flock` and `timeout` are stubbed. Run:
     python3 packages/ag2-sparrow/tests/test_hatch_adapter.py
 """
+import fcntl
 import hashlib
 import json
 import os
@@ -4001,7 +4002,7 @@ class Hold(Base):
         self.assertIsNone(runtime_text.held_line(cache(self.SERVED, text_schema_version=2)))
         self.assertIsNone(runtime_text.held_line(None))
 
-    def test_an_answer_between_the_drains_claim_and_its_send_posts_no_line(self):
+    def test_lock_order_a_the_reply_withdraws_first_and_the_drain_posts_nothing(self):
         from ag2_sparrow import remote_gateway_bridge as gb
         self.add_task(self.TID, "$ev1")
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
@@ -4033,11 +4034,12 @@ class Hold(Base):
         self.assertEqual(len(answers), 1, "the answer landed while the line was claimed")
         self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
         self.assertEqual(posts, [], "the claimed line was withdrawn, never posted")
+        self.assertIn("was withdrawn; it will not post", answers[0].stderr)
         self.assertFalse(list(self.results.glob(f"{self.notice.stem}.sending.*")))
         self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
         self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
 
-    def test_an_answer_after_the_drains_withdrawal_check_never_precedes_the_line(self):
+    def test_lock_order_b_the_drain_sends_first_and_the_reply_reports_the_post(self):
         from ag2_sparrow import remote_gateway_bridge as gb
         self.add_task(self.TID, "$ev1")
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
@@ -4070,6 +4072,65 @@ class Hold(Base):
         self.assertEqual(posts, [(f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}", False)],
                          "the answer waited for the send it raced; it never came before the line")
         self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
+        self.assertIn("was already posted before this answer", answers[0].stderr)
+        self.assertNotIn("withdrawn", answers[0].stderr, "the losing reply never claims a withdrawal")
+        self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
+
+    def drain_with(self, req):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        with mock.patch.object(gb, "RESULTS_DIR", self.results), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_STATE", self.home / "state"), \
+                mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
+                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            gb._post_proactive()
+
+    def lock_is_free(self):
+        lock = self.results / delivery_destination.SEND_LOCK_DIR / "lock"
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(fd)
+
+    def test_every_send_outcome_releases_the_lock_and_keeps_its_inode(self):
+        import urllib.error
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        lock = self.results / delivery_destination.SEND_LOCK_DIR / "lock"
+        line, inode = self.notice.read_text(), None
+        outcomes = [urllib.error.URLError("down"), TimeoutError("slow"),
+                    urllib.error.HTTPError("u", 503, "busy", {}, None), {"ok": True}]
+        for outcome in outcomes:
+            with self.subTest(outcome=type(outcome).__name__):
+                calls = []
+
+                def req(method, path, payload=None, timeout=None, outcome=outcome):
+                    calls.append(self.lock_is_free())
+                    if isinstance(outcome, BaseException):
+                        raise outcome
+                    return outcome  # no event_id: unconfirmed, retried
+                if not self.notice.exists():
+                    self.notice.write_text(line)  # an earlier outcome parked it
+                self.drain_with(req)
+                self.assertEqual(calls, [False], "one send, made under the lock")
+                self.assertTrue(self.lock_is_free())
+                inode = inode or lock.stat().st_ino
+                self.assertEqual(lock.stat().st_ino, inode, "one lock file, never recreated")
+        def auth(method, path, payload=None, timeout=None):
+            raise urllib.error.HTTPError("u", 401, "auth", {}, None)
+        if not self.notice.exists():
+            self.notice.write_text(line)
+        with self.assertRaises(urllib.error.HTTPError):
+            self.drain_with(auth)
+        self.assertTrue(self.lock_is_free(), "an auth error raised out of the drain releases it")
+        self.assertEqual(lock.stat().st_ino, inode)
 
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")

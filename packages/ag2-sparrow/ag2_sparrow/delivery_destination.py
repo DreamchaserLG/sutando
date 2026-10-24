@@ -28,7 +28,7 @@ UNDELIVERED_DIR = "undelivered"
 # The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
 CLAIM_INFIX = ".sending."
 # A producer withdraws a queued or claimed `<stem>.txt` by creating `<stem>.withdrawn` under
-# send_lock; the drain checks for it and POSTs under the same lock.
+# send_lock; the drain checks for it, sends and settles under the same lock.
 WITHDRAWN_SUFFIX = ".withdrawn"
 # A directory of its own, so no reader listing the results dir sees a lock file.
 SEND_LOCK_DIR = ".proactive-send-lock"
@@ -47,19 +47,31 @@ def withdrawn_path(queued: Path) -> Path:
     return queued.with_name(queued.stem + WITHDRAWN_SUFFIX)
 
 
+class SendLockUnavailable(OSError):
+    """The send lock could not be taken; nothing under it ran."""
+
+
 @contextlib.contextmanager
 def send_lock(result_dir: Path):
-    """Exclusive lock on `result_dir`/SEND_LOCK_DIR/lock: the drain holds it from its withdrawal check
-    through the POST, and a producer holds it while it withdraws, so one never splits the other.
-    OSError when the lock cannot be taken; a platform without flock (no Hatch there) skips it."""
+    """Exclusive lock on the fixed file `result_dir`/SEND_LOCK_DIR/lock, which is never unlinked, so
+    every process and restart locks the same inode. The drain holds it from its withdrawal check
+    through the send's settlement, and a producer holds it while it withdraws; acquisition is the
+    linearization point. Released on every exit; SendLockUnavailable when it cannot be taken. A
+    platform without flock (no Hatch there) skips it."""
     if fcntl is None:
         yield
         return
-    lock_dir = Path(result_dir) / SEND_LOCK_DIR
-    lock_dir.mkdir(mode=0o700, exist_ok=True)
-    fd = os.open(lock_dir / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        lock_dir = Path(result_dir) / SEND_LOCK_DIR
+        lock_dir.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(lock_dir / "lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise SendLockUnavailable(str(e)) from e
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as e:
+            raise SendLockUnavailable(str(e)) from e
         yield
     finally:
         os.close(fd)

@@ -282,11 +282,15 @@ cannot write its state directory) `hold` exits 3: "can't confirm the room is del
 `task-not-picked-up`; running `hold` again records it when it can. The item's result_file
 stays free for the real answer, and `reply` withdraws a hold line that is
 still queued and ends the hold. A line the drain has already claimed is withdrawn
-with a `<stem>.withdrawn` sentinel. `reply` writes it under the results dir's
-send lock (`.proactive-send-lock/lock`), and the drain holds that lock from its sentinel check through
-the POST, so the line is either sent before the answer is queued or never sent. The
-remaining window is a POST already on the wire that times out on the drain's side:
-the gateway may still deliver that line after the answer. For a sender who is not the owner, the
+with a `<stem>.withdrawn` sentinel. Both sides take the results dir's send lock (the
+fixed file `.proactive-send-lock/lock`, never unlinked, so every process and restart locks
+one inode), and acquiring it is the linearization point. If `reply` acquires first, it
+withdraws the line and the drain then sends nothing. If the drain acquires first, it holds
+the lock from its sentinel check through the send and its settlement (receipt, archive,
+retry or park); `reply` waits, then reports that outcome on stderr ("already posted",
+"withdrawn" when a failed send was handed back, "parked unsent", or "unconfirmed") instead
+of claiming a withdrawal. The remaining boundary is that one: once the drain has won
+serialization and begun the send transaction, the line goes out ahead of the answer. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker

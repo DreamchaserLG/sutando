@@ -1278,27 +1278,54 @@ def hold(args) -> int:
               "still reads task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if task_settled(result_dir, tid):
-        _withdraw_line(result_dir, tid)
+        _report_withdrawal(result_dir, tid)
         _release_quietly(result_dir, tid, token)
-        print(f"NOT held: {tid} was answered meanwhile; notice withdrawn", file=sys.stderr)
+        print(f"NOT held: {tid} was answered meanwhile", file=sys.stderr)
         return REPLY_NOT_POSTED
     print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
     return REPLY_POSTED
 
 
-def _withdraw_line(result_dir: Path, tid: str) -> None:
-    """Take `tid`'s hold line off the queue; one the drain has claimed is withdrawn with its
-    sentinel under the drain's send lock, so it is either already sent or never sent."""
+# What _withdraw_line reports for each outcome; "none" (no line was ever queued) says nothing.
+WITHDRAW_NOTES = {
+    "withdrawn": "the hold line of {tid} was withdrawn; it will not post",
+    "posted": "the hold line of {tid} was already posted before this answer",
+    "unsent": "the hold line of {tid} was parked unsent; it will not post",
+    "unconfirmed": "the hold line of {tid} left the queue before this answer; whether it "
+                   "posted is unconfirmed",
+}
+
+
+def _withdraw_line(result_dir: Path, tid: str) -> str:
+    """Take `tid`'s hold line off the queue under the drain's send lock, and say where it stands:
+    "withdrawn" (it will not post), "posted", "unsent", "unconfirmed", or "none" (never queued).
+    A send that took the lock first is settled before this runs, so its outcome is the one told."""
     notice = _hold_notice(result_dir, tid)
     try:
         with delivery_destination.send_lock(result_dir):
+            queued = notice.exists()
             notice.unlink(missing_ok=True)
             if _line_claimed(result_dir, notice):
                 delivery_destination.withdrawn_path(notice).touch()
+                return "withdrawn"
+            if queued:
+                return "withdrawn"
+            if not task_hold.notice_marked(result_dir, tid):
+                return "none"
+            return {"delivered": "posted", "undelivered": "unsent"}.get(
+                hold_line_outcome(result_dir, tid), "unconfirmed")
     except OSError as e:
         notice.unlink(missing_ok=True)
         print(f"note: could not withdraw the hold line of {tid} under the send lock "
               f"({diagnostics.describe(e)}); a claimed one may still post", file=sys.stderr)
+        return "unconfirmed"
+
+
+def _report_withdrawal(result_dir: Path, tid: str) -> str:
+    where = _withdraw_line(result_dir, tid)
+    if where in WITHDRAW_NOTES:
+        print("note: " + WITHDRAW_NOTES[where].format(tid=tid), file=sys.stderr)
+    return where
 
 
 def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:
@@ -1327,7 +1354,7 @@ def reply(args) -> int:
         return 2
     root = gateway_instance.outbox_root(result_dir, instance)
     # The answer supersedes its hold line, before the answer itself is queued.
-    _withdraw_line(result_dir, tid)
+    _report_withdrawal(result_dir, tid)
     _prune_claims(result_dir, task_dir)
     if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
             or not _publish_once(result_file, body)):

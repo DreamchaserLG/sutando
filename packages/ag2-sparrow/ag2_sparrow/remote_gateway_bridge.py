@@ -5751,27 +5751,67 @@ def _notify_owner_dm_upgrade(d: dict, noticed: "set | None" = None) -> None:
         _log(f"could not record owner-DM upgrade notice state ({diagnostics.describe(e)})")
 
 
-_WITHDRAWN = object()
-
-
-class _SendLockUnavailable(Exception):
-    """The send lock could not be taken, so nothing was sent."""
-
-
-def _send_unless_withdrawn(withdrawn: Path, payload: dict):
-    """POST `payload` unless its producer withdrew it; _WITHDRAWN when it did. The check and the
-    POST share the send lock a withdrawal is written under, so neither splits the other."""
+def _send_claimed(f: Path, claim: Path, withdrawn: Path, payload: dict, dest_room: str,
+                  room_override: "str | None", noticed: set) -> None:
+    """Send one claimed proactive file and settle it (receipt, archive, retry or park), run under
+    the send lock: a producer withdrawing it sees either this whole outcome or no send at all."""
+    if withdrawn.exists():
+        _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
+        _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
+        withdrawn.unlink(missing_ok=True)
+        return
     try:
-        lock = _delivery_destination.send_lock(RESULTS_DIR)
-        lock.__enter__()
-    except OSError as e:
-        raise _SendLockUnavailable() from e
+        resp = _req("POST", "/v1/room", payload, timeout=15)
+        # A bare 200 is NOT proof of delivery: the gateway can swallow a
+        # room-send failure server-side (bad room id, kicked agent,
+        receipt = classify_response(200, resp, id_keys=("event_id",))
+        delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
+            PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
+        )
+        if not delivered:
+            # Accepted but unconfirmed. It may ALSO have been delivered, so
+            # the retry must be bounded — an unbounded one duplicates.
+            outcome = _resolve_send_failure(
+                claim, f, _UnconfirmedDelivery("no event_id in response"))
+            _log(f"proactive send for {f.name} got no delivery signal "
+                 f"(a {type(resp).__name__} answer with no event_id) — {outcome}; check "
+                 "REMOTE_PROACTIVE_ROOM and the agent's room membership")
+            return
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            try:
+                claim.rename(f)  # un-claim before auth handling takes over
+            except OSError:
+                pass
+            raise
+        replacement = None
+        if e.code == 400 and room_override is None:
+            err_body = _http_error_body(e)
+            replacement = _room_upgraded_to(err_body)
+        if replacement is not None:
+            try:
+                claim.rename(f)  # stays pending: not a failed attempt, the room moved
+            except OSError:
+                pass
+            _hold_owner_dm_upgrade(dest_room, replacement, noticed)
+            return
+        outcome = _resolve_send_failure(claim, f, e)
+        _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
+        return
+    except (urllib.error.URLError, TimeoutError) as e:
+        outcome = _resolve_send_failure(claim, f, e)
+        _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
+        return
+    _record_proactive_receipt(f.stem, dest_room)
+    ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     try:
-        if withdrawn.exists():
-            return _WITHDRAWN
-        return _req("POST", "/v1/room", payload, timeout=15)
-    finally:
-        lock.__exit__(None, None, None)
+        claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
+    except OSError:
+        claim.unlink(missing_ok=True)
+    _PROACTIVE_ATTEMPTS.pop(f.name, None)
+    withdrawn.unlink(missing_ok=True)  # a withdrawal that came after the send
+    _ENGINE_COUNTS["legacy_sends"] += 1
+    _log(f"delivered proactive {f.name} to {dest_room}")
 
 
 def _post_proactive() -> None:
@@ -5903,72 +5943,17 @@ def _post_proactive() -> None:
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
         thread_root = _proactive_thread_root(claimed_text, f.name)
         withdrawn = _delivery_destination.withdrawn_path(f)
+        payload = {"op": "message", "room_id": dest_room, "body": body,
+                   **({"thread_root": thread_root} if thread_root else {})}
         try:
-            resp = _send_unless_withdrawn(withdrawn, {
-                "op": "message", "room_id": dest_room, "body": body,
-                **({"thread_root": thread_root} if thread_root else {})})
-            if resp is _WITHDRAWN:
-                _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
-                _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
-                withdrawn.unlink(missing_ok=True)
-                continue
-            # A bare 200 is NOT proof of delivery: the gateway can swallow a
-            # room-send failure server-side (bad room id, kicked agent,
-            receipt = classify_response(200, resp, id_keys=("event_id",))
-            delivered = receipt.outcome is DeliveryOutcome.CONFIRMED or (
-                PROACTIVE_TRUST_OK and isinstance(resp, dict) and resp.get("ok") is True
-            )
-            if not delivered:
-                # Accepted but unconfirmed. It may ALSO have been delivered, so
-                # the retry must be bounded — an unbounded one duplicates.
-                outcome = _resolve_send_failure(
-                    claim, f, _UnconfirmedDelivery("no event_id in response"))
-                _log(f"proactive send for {f.name} got no delivery signal "
-                     f"(a {type(resp).__name__} answer with no event_id) — {outcome}; check "
-                     "REMOTE_PROACTIVE_ROOM and the agent's room membership")
-                continue
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                try:
-                    claim.rename(f)  # un-claim before auth handling takes over
-                except OSError:
-                    pass
-                raise
-            replacement = None
-            if e.code == 400 and room_override is None:
-                err_body = _http_error_body(e)
-                replacement = _room_upgraded_to(err_body)
-            if replacement is not None:
-                try:
-                    claim.rename(f)  # stays pending: not a failed attempt, the room moved
-                except OSError:
-                    pass
-                _hold_owner_dm_upgrade(dest_room, replacement, noticed)
-                continue
-            outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send failed for {f.name}: HTTP {e.code} — {outcome}")
-            continue
-        except (urllib.error.URLError, TimeoutError) as e:
-            outcome = _resolve_send_failure(claim, f, e)
-            _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
-            continue
-        except _SendLockUnavailable as e:
+            with _delivery_destination.send_lock(RESULTS_DIR):
+                _send_claimed(f, claim, withdrawn, payload, dest_room, room_override, noticed)
+        except _delivery_destination.SendLockUnavailable as e:
             try:
                 claim.rename(f)  # nothing was sent: hand it back for a later pass
             except OSError:
                 pass
-            _log(f"proactive {f.name} not sent: the send lock could not be taken ({diagnostics.describe(e.__cause__ or e)})")
-            continue
-        _record_proactive_receipt(f.stem, dest_room)
-        ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{int(time.time())}.txt")
-        except OSError:
-            claim.unlink(missing_ok=True)
-        _PROACTIVE_ATTEMPTS.pop(f.name, None)
-        withdrawn.unlink(missing_ok=True)  # a withdrawal that came after the send
-        _ENGINE_COUNTS["legacy_sends"] += 1
-        _log(f"delivered proactive {f.name} to {dest_room}")
+            _log(f"proactive {f.name} not sent: the send lock could not be taken ({diagnostics.describe(e)})")
 
 
 def _load_inflight() -> set[str]:
