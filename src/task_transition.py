@@ -623,4 +623,8 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
         return
     out["errors"].append(f"could not reserve a result name under {results_dir}; the archived files "
                          f"are recorded in tasks/archive/{j.name}, published by the next pass")
+    try:  # the last reserved name is another notice's: recovery must not read it as committed
+        j.set(stage="placed", result=None)
+    except OSError:
+        pass
     j.release()

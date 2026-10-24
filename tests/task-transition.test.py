@@ -728,5 +728,252 @@ class TestJournalRecovery(Base):
         self.assertTrue(bad.exists())
 
 
+class TestRefusalPaths(Base):
+    """Each refusal leaves the live task where it was and names why."""
+
+    def rename_then_crash(self):
+        real = tt.task_archive.claim_generation
+
+        def go(*a, **kw):
+            real(*a, **kw)
+            raise Crash("after rename")
+
+        return mock.patch.object(tt.task_archive, "claim_generation", side_effect=go)
+
+    def test_preflight_names_a_non_regular_source_and_promises_nothing_for_no_moves(self):
+        (self.tasks / "task-d.txt").mkdir()
+        self.assertEqual(tt.preflight(self.tasks, self.archive, {}), [])
+        self.assertFalse(self.archive.exists(), "no moves: nothing is created")
+        gen = tt.generation_of(self.tasks / "task-d.txt")
+        self.assertEqual(tt.preflight(self.tasks, self.archive, {"task-d.txt": gen}),
+                         ["refused to move 'task-d.txt': not a regular file"])
+        self.assertTrue((self.tasks / "task-d.txt").is_dir())
+
+    def test_preflight_refuses_an_archive_dir_not_directly_under_tasks(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        elsewhere = self.ws / "archive"
+        out = tt.preflight(self.tasks, elsewhere, {"task-a.txt": tt.generation_of(p)})
+        self.assertEqual(len(out), 1)
+        self.assertIn("is not directly under", out[0])
+        self.assertFalse(elsewhere.exists())
+
+    def test_a_missing_tasks_dir_refuses_the_whole_transition(self):
+        gone = self.ws / "no-tasks"
+        out = tt.transition(gone, self.results, gone / "archive", moves={}, render=_notice("n\n"),
+                            prefix=PREFIX)
+        self.assertIn(f"could not open {gone}", out["errors"][0])
+        self.assertEqual(self.notices(), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a mode-000 directory")
+    def test_an_unopenable_archive_dir_is_refused_with_its_reason(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        self.archive.mkdir(mode=0)
+        self.addCleanup(self.archive.chmod, 0o755)
+        out = tt.preflight(self.tasks, self.archive, {"task-a.txt": tt.generation_of(p)})
+        self.assertEqual(len(out), 1)
+        self.assertIn(f"could not open {self.archive}", out[0])
+        self.assertTrue(p.exists())
+
+    def test_an_archive_dir_removed_after_preflight_is_reported_gone(self):
+        dirs, problem = tt._open_dirs(self.tasks, self.archive)
+        self.assertIsNone(problem)
+        try:
+            self.assertIsNone(dirs.problem())
+            self.archive.rmdir()
+            self.assertIn("tasks/archive/ is gone since pre-flight", dirs.problem())
+        finally:
+            dirs.close()
+
+    def test_archive_generation_refuses_a_symlinked_archive_dir(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        self.archive.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(tt.TransitionRefused, "is a symlink"):
+            tt.archive_generation(self.tasks, "task-a.txt", tt.generation_of(p), self.archive)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(p.exists())
+
+    def test_archive_generation_refuses_a_task_replaced_after_planning(self):
+        p = _task(self.tasks, "task-a.txt", "old")
+        gen = tt.generation_of(p)
+        _replace(p, "new")
+        with self.assertRaisesRegex(tt.TransitionRefused, "changed since it was planned"):
+            tt.archive_generation(self.tasks, "task-a.txt", gen, self.archive)
+        self.assertIn("task: new", p.read_text())
+        self.assertEqual(self.archive_names(), [])
+
+    def test_archive_generation_gives_back_a_claim_rewritten_after_the_rename(self):
+        p = _task(self.tasks, "task-a.txt", "old")
+        gen = tt.generation_of(p)
+
+        def rewrite_claim():
+            claim = next(x for x in self.tasks.iterdir() if ".claim-" in x.name)
+            with claim.open("a") as fh:
+                fh.write("appended while claimed\n")
+
+        with self.inject("after_claim", p, rewrite_claim):
+            with self.assertRaisesRegex(tt.TransitionRefused, "back under its name, live"):
+                tt.archive_generation(self.tasks, "task-a.txt", gen, self.archive)
+        self.assertIn("appended while claimed", p.read_text())
+        self.assertEqual((self.live_names(), self.archive_names()), (["archive", "task-a.txt"], []))
+
+    def test_a_name_gone_at_the_claim_is_refused_as_already_archived(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        with self.inject("before_claim", p, p.unlink):
+            with self.assertRaisesRegex(tt.TransitionRefused, "another pass archived it"):
+                tt.archive_generation(self.tasks, "task-a.txt", gen, self.archive)
+
+    def test_a_name_gone_at_the_claim_in_a_transition_is_dropped_from_the_journal(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        q = _task(self.tasks, "task-b.txt", "B")
+        moves = {n: tt.generation_of(self.tasks / n) for n in ("task-a.txt", "task-b.txt")}
+        with self.inject("before_claim", p, p.unlink):
+            out = tt.transition(self.tasks, self.results, self.archive, moves=moves,
+                                render=_naming, prefix=PREFIX)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("another pass archived it", out["errors"][0])
+        self.assertEqual(out["archived"], {"task-b.txt": "task-b.txt"})
+        self.assertEqual(self.notices()[0].read_text(), "archived: task-b.txt->task-b.txt\n")
+        self.assertEqual(self.journals(), [])
+        self.assertFalse(q.exists())
+
+    def test_a_journal_that_cannot_be_written_moves_nothing_and_leaves_no_debris(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        with mock.patch.object(tt.json, "dump", side_effect=OSError(28, "No space left on device")):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("could not write the journal", out["errors"][0])
+        self.assertIn("nothing moved", out["errors"][0])
+        self.assertTrue(p.exists())
+        self.assertEqual([x.name for x in self.archive.iterdir()], [], "no lock, tmp or journal left")
+        self.assertEqual(self.notices(), [])
+
+    def test_a_publish_with_nothing_to_move_that_fails_is_reported(self):
+        self.results.rmdir()
+        self.results.write_text("not a directory")
+        out = self.run_transition([], _notice("notice\n"))
+        self.assertIsNone(out["result"])
+        self.assertIn("result write failed", out["errors"][0])
+        self.assertIn("nothing moved", out["errors"][0])
+
+    def test_publish_exclusive_never_replaces_a_taken_name(self):
+        taken = self.results / f"{PREFIX}1-1-aaaa.txt"
+        taken.write_text("earlier notice\n")
+        names = iter([taken.name, f"{PREFIX}1-1-bbbb.txt"])
+        with mock.patch.object(tt, "_mint_name", side_effect=lambda *a: next(names)):
+            got = tt.publish_exclusive(self.results, PREFIX, "later\n")
+        self.assertEqual(got.name, f"{PREFIX}1-1-bbbb.txt")
+        self.assertEqual(taken.read_text(), "earlier notice\n")
+
+    def test_every_name_taken_keeps_the_journal_for_the_next_pass(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        taken = self.results / f"{PREFIX}1-1-aaaa.txt"
+        taken.write_text("earlier notice\n")
+        with mock.patch.object(tt, "_mint_name", return_value=taken.name):
+            out = self.run_transition(["task-a.txt"], _naming)
+            with self.assertRaisesRegex(OSError, "could not reserve a result name"):
+                tt.publish_exclusive(self.results, PREFIX, "x\n")
+        self.assertIn("could not reserve a result name", out["errors"][0])
+        self.assertEqual(taken.read_text(), "earlier notice\n")
+        self.assertEqual(len(self.journals()), 1)
+        again = TestJournalRecovery.recover(self)
+        self.assertEqual(again["errors"], [])
+        self.assertEqual(len(self.notices()), 2, "the earlier notice is not taken for this one")
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(tt.generation_of(self.archive / "task-a.txt"), gen)
+
+
+class TestRecoveryEdges(Base):
+    """Recovery's own failure paths: each reports and keeps what it cannot finish."""
+
+    crash_after, invariants = TestJournalRecovery.crash_after, TestJournalRecovery.invariants
+    recover, rename_then_crash = TestJournalRecovery.recover, TestRefusalPaths.rename_then_crash
+
+    def recorded_claim(self) -> Path:
+        return self.tasks / json.loads(self.journals()[0].read_text())["claims"]["task-a.txt"]
+
+    def test_a_claim_rewritten_while_its_name_was_retaken_is_quarantined_and_marked(self):
+        _task(self.tasks, "task-a.txt", "old")
+        with self.rename_then_crash(), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        claim = self.recorded_claim()
+        _replace(claim, "rewritten while claimed")
+        _task(self.tasks, "task-a.txt", "a new ask")
+        out = self.recover()
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn(f"quarantined as tasks/{claim.name}", out["errors"][0])
+        self.assertIn("rewritten while claimed", claim.read_text())
+        self.assertIn("a new ask", (self.tasks / "task-a.txt").read_text())
+        self.assertTrue((self.tasks / (claim.name + tt.QUARANTINE_SUFFIX)).exists())
+        self.assertEqual((self.notices(), self.archive_names()), ([], []))
+
+    def test_a_claim_lost_with_no_archived_copy_is_reported_not_invented(self):
+        _task(self.tasks, "task-a.txt", "A")
+        with self.rename_then_crash(), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        self.recorded_claim().unlink()
+        out = self.recover()
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("lost track of 'task-a.txt'", out["errors"][0])
+        self.assertEqual(out["recovered"][0]["landed"], {})
+        self.assertEqual(self.notices(), [])
+
+    def test_a_recovery_whose_publish_fails_keeps_the_journal_and_finishes_later(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        with self.crash_after("placed"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        self.results.rmdir()
+        self.results.write_text("not a directory")
+        out = self.recover()
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn("could not publish tasks/archive/.notice-", out["errors"][0])
+        self.assertEqual(len(self.journals()), 1)
+        self.results.unlink()
+        self.results.mkdir()
+        self.assertEqual(self.recover()["errors"], [])
+        self.invariants(gen, "task: A", notice_committed=True)
+
+    def test_a_journal_that_is_not_an_object_is_reported_and_left(self):
+        self.archive.mkdir()
+        bad = self.archive / f"{tt.JOURNAL_PREFIX}1-2-abc.json"
+        bad.write_text("[]")
+        out = self.recover()
+        self.assertIn("is unreadable; left for the operator", out["errors"][0])
+        self.assertTrue(bad.exists())
+
+    def test_a_held_journal_is_skipped_even_when_unreadable(self):
+        import fcntl
+        self.archive.mkdir()
+        held = self.archive / f"{tt.JOURNAL_PREFIX}1-2-abc.json"
+        held.write_text("not json")
+        fd = os.open(self.archive / f"{held.name}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        out = self.recover()
+        self.assertEqual((out["recovered"], out["errors"]), ([], []))
+        self.assertTrue(held.exists())
+
+    def test_a_quarantined_dead_claim_is_never_swept(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: Z\n")
+        (self.tasks / (stray.name + tt.QUARANTINE_SUFFIX)).write_text("")
+        out = self.recover()
+        self.assertEqual((out["swept"], out["errors"]), ([], []))
+        self.assertTrue(stray.exists())
+        self.assertFalse((self.tasks / "task-z.txt").exists())
+
+    def test_a_claim_whose_pid_belongs_to_another_user_is_treated_as_live(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: Z\n")
+        with mock.patch.object(tt.os, "kill", side_effect=PermissionError):
+            out = self.recover()
+        self.assertEqual((out["swept"], out["errors"]), ([], []))
+        self.assertTrue(stray.exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
