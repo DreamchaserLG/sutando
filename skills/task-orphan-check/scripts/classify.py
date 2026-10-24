@@ -295,6 +295,9 @@ def _safe_line(build, *raw_parts: str) -> str:
     raise ValueError(f"could not make a safe line from {raw_parts!r}")
 
 
+_ARCHIVE_TAIL_RE = re.compile(r"\.txt(\.\d+)?$")
+
+
 def recovery_line(file: str, task_id: str, tier: str, label: str, age_s: int,
                   text_preview: str) -> str:
     """The exact preview bullet step 3 prints verbatim -- never reconstructed from raw
@@ -310,7 +313,7 @@ def recovery_line(file: str, task_id: str, tier: str, label: str, age_s: int,
     age_m = max(0, age_s // 60)
 
     def build(f: str, tid: str, t: str) -> str:
-        stem = f[:-len(".txt")] if f.endswith(".txt") else f
+        stem = _ARCHIVE_TAIL_RE.sub("", f)  # `task-a.txt.1` (a `.N` landing) still reads as task-a
         ident = f if tid == stem else f"{f} (claimed id: {tid})"
         return f"- {ident} [{t}, {label}, {age_m}m ago]: {text_preview}"
 
@@ -529,7 +532,7 @@ def classify_workspace(workspace: Path, now: float | None = None) -> dict:
             # "owner" matches the documented default for an absent/unknown tier.
             row = {"file": path.name, "id": path.stem, "access_tier": "owner",
                    "source": "", "trusted_source": "", "label": "DM", "age_s": 0,
-                   "well_formed": False,
+                   "well_formed": False, "preview": neutralize(f"(unreadable: {exc})"),
                    "recovery_line": recovery_line(path.name, path.stem, "owner", "DM", 0,
                                                   neutralize(f"(unreadable: {exc})")),
                    "verdict": "orphan",
@@ -563,12 +566,24 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
     either from `id` or reconstructs the body from individual rows by hand.
 
     Returns `{"archive": [...], "silent_archive": [...], "generation": {...},
-    "body": str|None, "errors": [...]}`; `archive`/`silent_archive` are bare
-    filenames under `tasks/`, `generation` the identity of each file's bytes
-    when it was planned (`task_transition.generation_of`), which is what
-    `apply_plan()` moves and nothing else. `errors` non-empty means the plan
-    must not be applied (a body the adapter could never deliver).
+    "body": str|None, "pending_notices": [...], "errors": [...]}`;
+    `archive`/`silent_archive` are bare filenames under `tasks/`, `generation`
+    the identity of each file's bytes when it was planned
+    (`task_transition.generation_of`), which is what `apply_plan()` moves and
+    nothing else, `body` the notice as it reads when every file lands under
+    its own name (apply re-renders it from the names that actually landed),
+    `pending_notices` the journals an earlier failed publish left for apply
+    to publish first. `errors` non-empty means the plan must not be applied
+    (a body the adapter could never deliver).
     """
+    return _plan(workspace, now)[0]
+
+
+# The planned notice must leave room for the `.N` tails the final one may carry.
+BODY_MARGIN_B = 1024
+
+
+def _plan(workspace: Path, now: float | None = None) -> tuple[dict, dict]:
     now = time.time() if now is None else now
     result = classify_workspace(workspace, now)
     tasks = result.get("tasks") or []
@@ -599,18 +614,33 @@ def recovery_plan(workspace: Path, now: float | None = None) -> dict:
         elif verdict == "unknown":
             unknown.append(row)
 
-    body = None
-    if deferred or stalled or unbound or unknown:
-        body = _recovery_body(deferred, stalled, unbound, unknown)
+    groups = {"deferred": deferred, "stalled": stalled, "unbound": unbound, "unknown": unknown}
+    body = _final_body(groups, {name: name for name in archive})
     generation = {name: task_transition.generation_of(workspace / "tasks" / name)
                   for name in (*archive, *silent_archive)}
     errors = []
-    if body is not None and len(body.encode("utf-8")) > task_transition.PROACTIVE_MAX_BODY_B:
+    limit = task_transition.PROACTIVE_MAX_BODY_B - BODY_MARGIN_B
+    if body is not None and len(body.encode("utf-8")) > limit:
         errors.append(f"recovery body is {len(body.encode('utf-8'))} bytes "
-                      f"(> {task_transition.PROACTIVE_MAX_BODY_B}): undeliverable, so nothing "
-                      "will be published or moved")
-    return {"archive": archive, "silent_archive": silent_archive, "generation": generation,
-            "body": body, "errors": errors}
+                      f"(> {limit}): undeliverable, so nothing will be published or moved")
+    plan = {"archive": archive, "silent_archive": silent_archive, "generation": generation,
+            "body": body, "pending_notices": task_transition.pending_notices(
+                workspace / "tasks" / "archive"), "errors": errors}
+    return plan, groups
+
+
+def _final_body(groups: dict, landed: dict) -> str | None:
+    """The notice for what actually landed: deferred rows are named by their
+    archive name (`task-a.txt.1` after a collision), rows that did not land
+    are left for the next pass to report; stalled / unbound / unknown rows
+    were never moved and are always named."""
+    deferred = [{**row, "recovery_line": recovery_line(
+                    landed[row["file"]], row["id"], row["access_tier"], row["label"],
+                    row["age_s"], row.get("preview", ""))}
+                for row in groups["deferred"] if row["file"] in landed]
+    if not (deferred or groups["stalled"] or groups["unbound"] or groups["unknown"]):
+        return None
+    return _recovery_body(deferred, groups["stalled"], groups["unbound"], groups["unknown"])
 
 
 def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict],
@@ -659,9 +689,10 @@ def _recovery_body(deferred: list[dict], stalled: list[dict], unbound: list[dict
 
     lines += [
         "",
-        "To re-queue a task: move its file from tasks/archive/ back to tasks/ -- use the "
-        "filename shown in its preview line above (the task's `file`), never a name built "
-        "from its `id`, which can differ.",
+        "To re-queue a task: move it from tasks/archive/ back to tasks/ -- use the archive "
+        "filename shown in its preview line above (a `.N` tail means an older record held "
+        "the name; drop the tail when moving it back), never a name built from its `id`, "
+        "which can differ.",
         "The archived file retains its original body (incl. system-instructions block for "
         "non-owner tasks), so re-queueing preserves sandboxing.",
         "If none still matter: no action needed — they're already archived.",
@@ -680,28 +711,31 @@ RESULT_PREFIX = "proactive-orphan-recovery-"
 
 def apply_plan(workspace: Path, now: float | None = None) -> dict:
     """Step 3, performed by `src/task_transition.py`, the one owner of the
-    report-then-archive transition: pre-flight every move (archive dir, bare
-    names, each file still the generation the plan captured), publish `body`
-    under an exclusive name, THEN move exactly those generations, never
-    overwriting an archived record. A pre-flight or publish failure changes
-    nothing, so an orphan is never archived unreported and a re-run after the
-    fix reports it once.
+    archive-then-report transition: pre-flight every move (pinned directory
+    handles, bare names, each file still the generation the plan captured),
+    claim and place exactly those generations without overwriting an archived
+    record, render the notice from the names they landed under and publish it
+    last, journaled so a failed publish is retried by the next pass without
+    moving anything again. A pre-flight failure changes nothing.
 
-    Returns the plan plus `result` (the published path or None), `archived`,
-    `silent_archived` (names actually moved), `landed` ({name: archive name})
-    and `errors` (one line each)."""
-    plan = recovery_plan(workspace, now)
+    Returns the plan plus `result` (the published path or None), `body` (the
+    notice as published), `archived`, `silent_archived` (names actually
+    moved), `landed` ({name: archive name}), `quarantined` ({name: claim
+    kept in tasks/}), `recovered` (interrupted passes finished first) and
+    `errors` (one line each)."""
+    plan, groups = _plan(workspace, now)
     out = {**plan, "result": None, "archived": [], "silent_archived": [], "landed": {},
-           "errors": list(plan.get("errors") or [])}
+           "quarantined": {}, "recovered": [], "errors": list(plan.get("errors") or [])}
     if out["errors"]:
         return out
     tasks_dir = workspace / "tasks"
     moves = {name: (plan.get("generation") or {}).get(name)
              for name in (*plan["archive"], *plan["silent_archive"])}
-    done = task_transition.transition(tasks_dir, workspace / "results", tasks_dir / "archive",
-                                      moves=moves, body=plan["body"], prefix=RESULT_PREFIX)
-    out["result"] = done["result"]
-    out["landed"] = done["archived"]
+    done = task_transition.transition(
+        tasks_dir, workspace / "results", tasks_dir / "archive", moves=moves, prefix=RESULT_PREFIX,
+        render=lambda landed: _final_body(groups, landed))
+    out["result"], out["body"], out["landed"] = done["result"], done["body"], done["archived"]
+    out["quarantined"], out["recovered"] = done["quarantined"], done["recovered"]
     out["errors"] += done["errors"]
     for key, moved in (("archive", "archived"), ("silent_archive", "silent_archived")):
         out[moved] = [name for name in plan[key] if name in done["archived"]]
@@ -726,10 +760,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="print step 3/3b/3c's plan (archive filenames + the complete "
                          "recovery body) instead of the raw per-task classification")
     ap.add_argument("--apply", action="store_true",
-                    help="perform step 3 through src/task_transition.py: publish the plan's "
-                         "body under an exclusive name, then archive exactly the file "
-                         "generations it planned; a failed pre-flight or publish moves nothing "
-                         "(exit 1 when anything failed)")
+                    help="perform step 3 through src/task_transition.py: archive exactly the file "
+                         "generations the plan captured, then publish the notice naming where "
+                         "they landed; a failed pre-flight moves nothing, a failed publish leaves "
+                         "a journal the next --apply publishes (exit 1 when anything failed)")
     args = ap.parse_args(argv)
     ws = Path(args.workspace) if args.workspace else resolve_workspace()
     if ws is None:
