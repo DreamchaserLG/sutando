@@ -125,6 +125,47 @@ def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" 
     """Move src to dest, or to dest.N if taken. Returns where it landed.
     link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat.
     With directory handles, src/dest are names inside them and no path is re-resolved."""
+    if src_dir_fd is not None or dst_dir_fd is not None:
+        return _move_relative(src, dest, src_dir_fd, dst_dir_fd)
+    import os
+    import shutil
+    base, candidate, n = dest, dest, 0
+    while True:
+        try:
+            os.link(str(src), str(candidate))
+            break
+        except FileExistsError:
+            n += 1
+            candidate = base.with_name(f"{base.name}.{n}")
+        except OSError:
+            # Cross-device: link() can't span filesystems. Fill a private temp
+            # first — the authoritative name created early publishes a stub on a kill.
+            import tempfile
+            fd, tmp = tempfile.mkstemp(dir=str(base.parent),
+                                       prefix=f".{base.name}.", suffix=".part")
+            try:
+                with open(fd, "wb") as out, open(src, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+                shutil.copystat(str(src), tmp)
+                while True:
+                    try:
+                        os.link(tmp, str(candidate))   # atomic, refuses existing
+                        break
+                    except FileExistsError:
+                        n += 1
+                        candidate = base.with_name(f"{base.name}.{n}")
+            finally:
+                os.unlink(tmp)
+            break
+    src.unlink()
+    return candidate
+
+
+def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: "int | None") -> Path:
+    """The handle form of `_move_without_clobbering`: same policy, every call
+    relative to the directories, unlink of the (private) source by name in its handle."""
     import os
     import shutil
     import stat as _stat
@@ -138,8 +179,6 @@ def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" 
             n += 1
             candidate = base.with_name(f"{base.name}.{n}")
         except OSError:
-            # Cross-device: link() can't span filesystems. Fill a private temp
-            # first — the authoritative name created early publishes a stub on a kill.
             tmp = base.with_name(f".{base.name}.{uuid.uuid4().hex[:12]}.part")
             fd_in = os.open(str(src), os.O_RDONLY, dir_fd=src_dir_fd)
             try:
