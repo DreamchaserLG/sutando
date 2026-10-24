@@ -84,3 +84,6 @@
 /tests/agent-room-ops-*    @qingyun-wu @marklysze
 /tests/room-ops-*          @qingyun-wu @marklysze
 /tests/room_ops_*          @qingyun-wu @marklysze
+
+# Ownership and CI workflows stay with the two original owners while the code areas above widen.
+/.github/                  @sonichi @qingyun-wu
