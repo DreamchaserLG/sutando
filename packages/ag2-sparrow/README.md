@@ -257,9 +257,11 @@ with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
 main session. An item that waits for the owner's go is parked with
 `ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
-line, "Waiting for my owner's go on this.", to the item's room (in its thread
-when it has one), then records a hold marker
-(`RESULT_DIR/.task-holds/<task id>.json`). The line is never queued twice: a
+line to the item's room (in its thread when it has one), then records a hold marker
+(`RESULT_DIR/.task-holds/<task id>.json`). The line is the served `runtime_text.held_line` from the
+setup cache `wake-context` reads, when that cache is usable and the line is one plain
+printable line of at most 300 characters with no backtick and no leading `[` or space;
+otherwise it is the built-in "Waiting for my owner's go on this.". The line is never queued twice: a
 durable record (`<task id>.notice` beside the marker) is written before it is
 queued, and only the caller that wrote it queues the line. A hold is recorded
 only once the line is proven queued, being sent, or delivered per the drain's

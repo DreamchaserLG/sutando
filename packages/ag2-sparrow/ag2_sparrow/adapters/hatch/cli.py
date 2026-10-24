@@ -1198,8 +1198,17 @@ def _lane_homeserver(cfg: dict, instance: str) -> str:
     return delivery_destination.homeserver_of(rec["agent_id"])
 
 
+def _held_line(cfg: dict, instance: str) -> str:
+    """The served held line when the setup cache wake-context reads has a usable one, else
+    HOLD_NOTICE."""
+    from . import runtime_text
+    _register_device_secrets()
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    return runtime_text.held_line(runtime_text.current_cache(state, instance)) or HOLD_NOTICE
+
+
 def hold(args) -> int:
-    """Park one wake item for the owner's go: queue HOLD_NOTICE once, then mark it held."""
+    """Park one wake item for the owner's go: queue its held line once, then mark it held."""
     cfg = _installed_config()
     found = _wake_item(cfg, Path(args.result_file).expanduser())
     if found is None:
@@ -1222,7 +1231,7 @@ def hold(args) -> int:
     lines = [f"[channel: {room}]"]
     if fields.get("thread_root"):
         lines.append(f"[thread: {fields['thread_root']}]")
-    lines.append((f"{sender} " if valid_mxid(sender) else "") + HOLD_NOTICE)
+    lines.append((f"{sender} " if valid_mxid(sender) else "") + _held_line(cfg, instance))
     body = "\n".join(lines) + "\n"
     lane = _lane_homeserver(cfg, instance)
     if not lane:

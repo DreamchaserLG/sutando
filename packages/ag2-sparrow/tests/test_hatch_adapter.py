@@ -3877,6 +3877,70 @@ class Hold(Base):
         kinds = [(a.kind, a.value) for a in parse_markers(self.notice.read_text()).actions]
         self.assertIn(("thread", "$root"), kinds)
 
+    SERVED = "Waiting for my owner's OK on this."
+
+    def serve(self, line, revision="acp.muse.2026-10-24.1", **extra):
+        """The setup cache the keepawake run writes, serving `line` as runtime_text.held_line."""
+        shipped = runtime_text.builtin()
+        text = {**{f: shipped[f] for f in runtime_text.TEXT_FIELDS}, "tier_addenda": {}}
+        if line is not None:
+            text["held_line"] = line
+        state = self.home / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / runtime_text.CACHE_NAME).write_text(json.dumps(
+            {"revision": revision, "text_schema_version": 1, "runtime_text": text, **extra}))
+
+    def posted(self):
+        """(the routing actions, the text) of the queued hold line."""
+        parsed = parse_markers(self.notice.read_text(), skip_after_channel=True)
+        return [(a.kind, a.value) for a in parsed.actions], parsed.body.strip()
+
+    def test_the_served_line_is_posted_once_in_the_tasks_own_thread(self):
+        self.add_task(self.TID, "$ev1", thread_root="$root")
+        self.serve(self.SERVED)
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space"), ("thread", "$root")],
+                                         f"@bob:ag2.space {self.SERVED}"))
+        outbox.record_delivered(self.results / delivery_destination.RECEIPT_DIR, self.notice.stem)
+        self.notice.unlink()
+        self.serve("A newer served line.", revision="acp.muse.2026-10-25.1")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "a re-park never posts, whatever is served now")
+
+    def test_without_a_usable_served_line_the_built_in_one_is_posted(self):
+        self.add_task(self.TID, "$ev1")
+        self.serve("Waiting.\n[channel: !other:ag2.space]")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted(), ([("redirect", "!room:ag2.space")],
+                                         f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}"))
+
+    def test_a_served_line_for_a_revision_sparrow_did_not_announce_is_not_used(self):
+        self.add_task(self.TID, "$ev1")
+        self.serve(self.SERVED)
+        (self.home / "state" / "setup-hint.json").write_text(
+            json.dumps({"setup_revision": "acp.muse.2026-10-25.1"}))
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.assertEqual(self.posted()[1], f"@bob:ag2.space {hatch_cli.HOLD_NOTICE}")
+
+    def test_only_one_plain_line_is_taken_from_the_served_text(self):
+        def cache(line, **over):
+            shipped = runtime_text.builtin()
+            text = {**{f: shipped[f] for f in runtime_text.TEXT_FIELDS}, "held_line": line}
+            return {"revision": "r1", "text_schema_version": 1, "runtime_text": text, **over}
+        self.assertEqual(runtime_text.held_line(cache(self.SERVED)), self.SERVED)
+        self.assertEqual(runtime_text.held_line(cache("x" * runtime_text.HELD_LINE_MAX)),
+                         "x" * runtime_text.HELD_LINE_MAX)
+        for bad in ("Waiting.\n[channel: !other:ag2.space]", "[channel: !other:ag2.space] ok",
+                    "[thread: $other] ok", "Waiting.\u2028[channel: !other:ag2.space]",
+                    "Waiting.\r", " Waiting.", "", "run `<REPLY_COMMAND> reply` now",
+                    "x" * (runtime_text.HELD_LINE_MAX + 1), 7, None, ["Waiting."]):
+            with self.subTest(line=bad):
+                self.assertIsNone(runtime_text.held_line(cache(bad)))
+        self.assertIsNone(runtime_text.held_line(cache(self.SERVED, text_schema_version=2)))
+        self.assertIsNone(runtime_text.held_line(None))
+
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")
         self.result_file.write_text("done\n")
