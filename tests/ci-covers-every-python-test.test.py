@@ -1116,5 +1116,34 @@ class OptionContractThroughTheConsumerPath(unittest.TestCase):
             ["packages/x/test_else.py"])
 
 
+class LeadingRedirectsThroughTheConsumerPath(unittest.TestCase):
+    """liususan091219's review at 79f961daa, pinned through _named_in() ->
+    orphans_in(): a two-character redirect operator ahead of the command
+    (`2>> log`, `>| f`, `2>&1`) left the real test uncredited -- a false
+    orphan, the safe direction, but one this suite manufactured."""
+
+    def test_a_two_character_leading_redirect_does_not_false_orphan_a_real_test(self):
+        # Block scalars: a plain `>|`/`&>` would be a YAML fold/anchor indicator.
+        for prefix in ("2>> log", ">| /dev/null", "2>&1", "2>&1 >out", "&>/dev/null"):
+            wf = f"steps:\n  - run: |\n      {prefix} python3 packages/x/test_real.py\n"
+            self.assertEqual(_named_in(wf), {"packages/x/test_real.py"}, prefix)
+            self.assertEqual(
+                orphans_in({"packages/x/test_real.py"}, set(), _named_in(wf)), [], prefix)
+
+    def test_a_trailing_duplicating_redirect_still_credits(self):
+        """Positive control: `2>&1` after an already-credited call."""
+        wf = "steps:\n  - run: python3 packages/x/test_real.py 2>&1\n"
+        self.assertEqual(_named_in(wf), {"packages/x/test_real.py"})
+
+    def test_a_test_named_only_as_a_redirect_target_stays_an_orphan(self):
+        """The dangerous direction: `>packages/x/test_dead.py` writes the
+        file, never runs it."""
+        wf = "steps:\n  - run: python3 -V 2>&1 >packages/x/test_dead.py\n"
+        self.assertEqual(_named_in(wf), set())
+        self.assertEqual(
+            orphans_in({"packages/x/test_dead.py"}, set(), _named_in(wf)),
+            ["packages/x/test_dead.py"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

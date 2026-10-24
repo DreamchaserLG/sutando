@@ -98,6 +98,55 @@ class CommandPosition(unittest.TestCase):
         """`2> /dev/null cmd` -- same, target a separate word."""
         self.assertTrue(invokes(f"2> /dev/null bash scripts/{NAME}", NAME))
 
+    def test_every_redirect_operator_is_parsed_as_one_unit(self):
+        """liususan091219's review at 79f961daa: the peel matched ONE operator
+        character, so a two-character operator with a separate-word target
+        was misread (`2>> log cmd` ran "log"; `>| f cmd` ran "f"), and
+        `_segments()` split `2>&1 cmd` at the `&` as if it were a background
+        job. Every form below really runs its command in Bash (confirmed by
+        direct execution: `bash -c '<form> false'` exits 1 for each)."""
+        for prefix in (">>log", ">> log", "2>>log", "2>> log",
+                       ">|/dev/null", ">| /dev/null",
+                       "2>&1", "1>&2", "2>& 1", ">& /dev/null", ">&-", "<&0",
+                       "</dev/null", "< /dev/null", "<<< here",
+                       "&>/dev/null", "&> /dev/null", "&>>/dev/null",
+                       "2>&1 >out", "2>&1 >>out"):
+            line = f"{prefix} bash scripts/{NAME}"
+            self.assertTrue(program_invokes(line, NAME), line)
+
+    def test_a_command_group_opened_by_a_glued_two_character_redirect_is_peeled(self):
+        """`{&>/dev/null cmd; }` and `{>| f cmd; }` really run cmd (Bash:
+        `&`, `<`, `>` are metacharacters, so `{` stays the reserved word)."""
+        for line in (f"{{&>/dev/null bash scripts/{NAME}; }}",
+                     f"{{>| /dev/null bash scripts/{NAME}; }}",
+                     f"{{>&2 >out bash scripts/{NAME}; }}"):
+            self.assertTrue(program_invokes(line, NAME), line)
+
+    def test_a_brace_glued_to_an_fd_digit_is_a_word_not_a_group_opener(self):
+        """`{2>&1 cmd; }` is a Bash syntax error (`{2` is a word, so the
+        lone `}` is unexpected) -- nothing runs, nothing is credited."""
+        self.assertFalse(program_invokes(f"{{2>&1 bash scripts/{NAME}; }}", NAME))
+
+    def test_a_trailing_redirect_on_a_credited_line_still_credits(self):
+        """Positive control: `>&`/`>|` after the command are still just
+        redirects -- and a real `&` or `|` after them still separates."""
+        for line in (f"bash scripts/{NAME} 2>&1", f"bash scripts/{NAME} >| out",
+                     f"bash scripts/{NAME} 2>&1 | tee log",
+                     f"echo a 2>&1 & bash scripts/{NAME}",
+                     f"echo a >| f; bash scripts/{NAME}"):
+            self.assertTrue(program_invokes(line, NAME), line)
+        self.assertEqual(python_args("python3 packages/x/test_live.py 2>&1"),
+                         ["packages/x/test_live.py"])
+
+    def test_a_redirect_target_is_never_the_command(self):
+        """A redirect-only line runs nothing, and a script named as a
+        TARGET (`>scripts/x.sh`) is written to, not run."""
+        for line in ("2>&1", "2>&1 >out", ">| out", "&>>log",
+                     f"true 2>&1 >scripts/{NAME}", f": &>scripts/{NAME}",
+                     f"true 2>> scripts/{NAME}"):
+            self.assertFalse(program_invokes(line, NAME), line)
+        self.assertEqual(python_args("python3 2>&1 >packages/x/test_dead.py"), [])
+
 
 class PythonArgsPosition(unittest.TestCase):
     def test_a_quoted_real_invocation_is_named(self):

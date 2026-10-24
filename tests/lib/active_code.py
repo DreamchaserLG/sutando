@@ -73,9 +73,9 @@ def active_text(text: str) -> str:
 import re
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-# An optional fd digit plus `<`/`>` -- matches a redirect operator's own
-# leading text, glued to its target (`2>/dev/null`) or not (`2>`, `>`).
-_REDIR_TOKEN_RE = re.compile(r"^[0-9]*[<>]")
+# A whole redirect operator with its optional fd (`2>>`, `>|`, `2>&`, `<<<`,
+# `&>`): matched as one unit, so what follows is its target, glued or not.
+_REDIR_TOKEN_RE = re.compile(r"^(?:[0-9]*(?:>>|>\||>&|<<<|<<-|<<|<&|<>|<|>)|&>>|&>)")
 
 
 def _command_tokens(seg: str) -> list[str]:
@@ -103,9 +103,9 @@ def _command_tokens(seg: str) -> list[str]:
     # `!` is peeled first (below); the opener check looks PAST it too,
     # or `! { helper; }` -- which really runs helper -- goes unrecognized.
     after_bang = stripped[1:].lstrip() if leading_bang else stripped
-    # A redirect glued straight onto `{` (`{>/dev/null cmd; }`) still opens
-    # a command group in Bash -- `<`/`>` are metacharacters, not word chars.
-    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t<>")
+    # A redirect glued straight onto `{` (`{>/dev/null cmd; }`, `{&>f cmd; }`)
+    # still opens a command group: `<`/`>`/`&` are metacharacters, not word chars.
+    leading_brace = after_bang[:1] == "{" and (len(after_bang) == 1 or after_bang[1] in " \t<>&")
     import shlex
     try:
         toks = shlex.split(seg)
@@ -124,12 +124,12 @@ def _command_tokens(seg: str) -> list[str]:
             toks = toks[1:]; changed = True
         elif (leading_brace and toks[0][:1] == "{" and len(toks[0]) > 1
               and _REDIR_TOKEN_RE.match(toks[0][1:])):
-            # shlex has no redirect grammar, so `{>/dev/null` (or `{2>`)
-            # glues into one token; split the reserved-word `{` back off.
+            # shlex has no redirect grammar, so `{>/dev/null` glues into
+            # one token; split the reserved-word `{` back off.
             toks = [toks[0][1:]] + toks[1:]; changed = True
         elif _REDIR_TOKEN_RE.match(toks[0]) and len(toks) > 1:
-            # A leading redirect (`>/dev/null false`, `2> /dev/null false`)
-            # and its target -- glued or the next word -- are never the command.
+            # A leading redirect (`>/dev/null false`, `2>> log false`, `2>&1
+            # false`) and its target -- glued or the next word -- are never the command.
             m = _REDIR_TOKEN_RE.match(toks[0])
             rest = toks[1:]
             toks = rest if m.end() < len(toks[0]) else rest[1:]
@@ -1588,6 +1588,9 @@ def _raw_segments(line: str):
             # `|&` is `2>&1 |` -- same reachability as a lone `|`, confirmed
             # on Bash 5.2.32 (keweichen); this host's 3.2.57 can't run it.
             transition("|"); i += 2; continue
+        if (ch in "<>" and nxt == "&") or (ch == ">" and nxt == "|") or (ch == "&" and nxt == ">"):
+            # `>&`, `<&`, `>|`, `&>`: one redirect operator, not a separator.
+            cur.append(ch); cur.append(nxt); i += 2; continue
         if ch in ";|&":
             transition(ch); i += 1; continue
         cur.append(ch); i += 1
