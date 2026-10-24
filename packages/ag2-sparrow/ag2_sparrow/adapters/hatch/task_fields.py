@@ -1,12 +1,16 @@
 """Print the routing fields of every open task file in a task dir as one JSON array.
 
 The Hatch hook script calls this so its wake payload carries structured fields read
-with Sparrow's own header parser, never prose scraped by the shell."""
+with Sparrow's own header parser, never prose scraped by the shell. A hook that tells its
+worker what `held: true` means runs this with HELD_AWARE_ENV=1; for any other hook (one
+registered before the held branch, which a package upgrade does not rewrite) a held task is
+left out of the list, so that hook never wakes a worker for it."""
 from __future__ import annotations
 
 import argparse
 import ipaddress
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -22,6 +26,7 @@ _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
 MXID_RE = re.compile(r"@[A-Za-z0-9._=+/-]+:(?:\[(?P<ipv6>[0-9A-Fa-f:.]+)\]|"
                      rf"{_LABEL}(?:\.{_LABEL})*)(?::(?P<port>[0-9]{{1,5}}))?")
 EXIT_BAD_AGENT = 3
+HELD_AWARE_ENV = "HATCH_HOOK_HELD_AWARE"
 CHANNEL_KINDS = ("dm", "room")
 _SENDER_PREFIX = re.compile(r"\[AG2Space\s+[^\]]+\]\s*")
 # The gateway folds a message onto one line, so a reply fallback ("> <@sender> quoted"
@@ -151,7 +156,10 @@ def main(argv=None) -> int:
     if not args.task_dir.is_dir():
         print(f"task dir not found: {args.task_dir}", file=sys.stderr)
         return 2
-    json.dump(list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance), sys.stdout)
+    items = list_open_tasks(args.task_dir, args.result_dir, args.gateway_instance)
+    if os.environ.get(HELD_AWARE_ENV) != "1":
+        items = [item for item in items if not item.get("held")]
+    json.dump(items, sys.stdout)
     sys.stdout.write("\n")
     return 0
 

@@ -51,8 +51,9 @@ if [[ "$DRY_RUN" != "1" ]]; then
 fi
 
 # task_fields validates AGENT_MXID, so the hook and `install` accept the same MXIDs.
+# HELD_AWARE: this hook explains held: true (HELD_NOTE), so held tasks may be listed to it.
 rc=0
-items="$(timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
+items="$(HATCH_HOOK_HELD_AWARE=1 timeout 25 "$PY" -m ag2_sparrow.adapters.hatch.task_fields --agent "$AGENT" \
   --task-dir "$TASK_DIR" --result-dir "$RESULT_DIR" --gateway-instance "${GATEWAY_INSTANCE:-}" \
   2>/dev/null)" || rc=$?
 if [[ "$rc" -eq 3 ]]; then

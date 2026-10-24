@@ -280,7 +280,7 @@ class HookScript(Base):
     def reason(self):
         return Path(str(self.wake_out) + ".reason").read_text().strip()
 
-    def run_script(self, **env_extra):
+    def run_script(self, script=None, **env_extra):
         env = py_env(self.home)
         env.update({
             "PATH": f"{self.bin}:{os.environ['PATH']}",
@@ -290,7 +290,7 @@ class HookScript(Base):
             "WAKE_OUT": str(self.wake_out),
         })
         env.update(env_extra)
-        return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+        return subprocess.run(["bash", str(script or SCRIPT)], env=env, capture_output=True, text=True)
 
     def events_list(self):
         return self.events.read_text().split() if self.events.exists() else []
@@ -404,6 +404,40 @@ class HookScript(Base):
         (m,) = self.payload()["matches"]
         self.assertNotIn("held", m)
         self.assertNotIn("held: true already wait", self.payload()["worker_note"])
+
+    def test_a_hook_registered_before_the_held_branch_never_wakes_for_a_held_item(self):
+        # A pip upgrade leaves the registered hook as it was: 0.6.0's shell with this package.
+        old = Path(__file__).with_name("hatch_hook_0_6_0.sh")
+        self.assertNotIn("held", old.read_text())
+        self.add_task("task-1784700000001", "$held", mtime=1000)
+        self.add_task("task-1784700000002", "$open", mtime=2000)
+        self.run_script(script=old)
+        task_hold.place(self.results, "task-1784700000001")
+        st = self.stored()
+        for tid in ("task-1784700000001", "task-1784700000002"):
+            st["woken"][tid]["at"] -= 1800000
+        self.state.write_text(json.dumps(st))
+        self.reset()
+        self.run_script(script=old)
+        self.assertEqual([m["task_id"] for m in self.payload()["matches"]], ["task-1784700000002"],
+                         "the old hook is never handed the held item")
+        self.assertTrue(all("held" not in m for m in self.payload()["matches"]))
+        # Released, the item comes back to the old hook as an ordinary open item.
+        task_hold.release(self.results, "task-1784700000001")
+        self.reset()
+        self.run_script(script=old)
+        self.assertEqual([m["task_id"] for m in self.payload()["matches"]], ["task-1784700000001"])
+
+    def test_held_items_are_listed_only_to_a_hook_that_declares_it_explains_them(self):
+        self.add_task("task-1784700000001", "$held")
+        task_hold.place(self.results, "task-1784700000001")
+        argv = ["--task-dir", str(self.tasks), "--result-dir", str(self.results)]
+        for env, want in (({}, []), ({task_fields.HELD_AWARE_ENV: "0"}, []),
+                          ({task_fields.HELD_AWARE_ENV: "1"}, ["task-1784700000001"])):
+            with self.subTest(env=env):
+                r = run_main(task_fields.main, argv, {**py_env(self.home), **env})
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual([i["task_id"] for i in json.loads(r.stdout)], want)
 
     def test_rewakes_stop_at_the_cap(self):
         self.add_task("task-1784700000001", "$reply")

@@ -295,7 +295,12 @@ is still unwritten 30 minutes after its wake is woken for again, marked
 its third wake is logged once as `ag2-sparrow-hatch rewake cap` with its task id.
 A held item is woken for with `held: true` on every wake, and the note tells the
 worker to answer nothing for it and repeat only its `HANDOFF` block, so a fresh
-worker session never acts on an item that waits for the owner's go.
+worker session never acts on an item that waits for the owner's go. Only a hook that
+explains `held: true` is handed held items: it runs `task_fields` with
+`HATCH_HOOK_HELD_AWARE=1`. A hook registered before that (install stages a new script
+beside the registered one, and a package upgrade rewrites neither) is never listed a held
+item, so during a staged upgrade it never wakes a worker for one; once released, the item
+reaches it as an ordinary open item.
 
 Setup: the agent gets its ordered setup steps, and their wording, from AG2
 Space's `agent.setup.steps` Action, then runs `ag2-sparrow-hatch install --mxid
