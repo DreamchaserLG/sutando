@@ -205,12 +205,15 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
             finally:
                 os.unlink(str(tmp), dir_fd=dst_dir_fd)
             break
-    if dst_dir_fd is not None:  # the landing is durable before the source goes
-        _fsync_dir(dst_dir_fd)
-    _checkpoint("after_link", str(src))
-    os.unlink(str(src), dir_fd=src_dir_fd)
-    if src_dir_fd is not None:
-        _fsync_dir(src_dir_fd)
+    try:  # landed: from here a failure must not read as "not placed"
+        if dst_dir_fd is not None:  # the landing is durable before the source goes
+            _fsync_dir(dst_dir_fd)
+        _checkpoint("after_link", str(src))
+        os.unlink(str(src), dir_fd=src_dir_fd)
+        if src_dir_fd is not None:
+            _fsync_dir(src_dir_fd)
+    except OSError as exc:
+        raise PlacementUnsynced(str(candidate), exc) from exc
     return candidate
 
 
@@ -256,6 +259,15 @@ def file_generation(st) -> str:
     return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
+class PlacementUnsynced(Exception):
+    """The file is linked at `landed` in the archive, but making that durable or
+    removing the source failed: it is placed, not given back, and must be finished."""
+
+    def __init__(self, landed: str, cause: OSError):
+        super().__init__(f"landed as {landed}, not yet durable ({cause})")
+        self.landed, self.cause = landed, cause
+
+
 class GenerationChanged(Exception):
     """What held the name was not the planned generation. It is back under its
     name, live (`kept_as` None), or kept under its private claim name when the
@@ -278,6 +290,9 @@ def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChange
     os.unlink(claim, dir_fd=dir_fd)
     _fsync_dir(dir_fd)
     return GenerationChanged(name, why)
+
+
+give_back = _give_back
 
 
 def claim_name(name: str) -> str:

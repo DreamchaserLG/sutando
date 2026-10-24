@@ -382,8 +382,11 @@ def preview(body: str) -> str:
     return " ".join(neutralize(ask).split())[:PREVIEW_CHARS]
 
 
-def classify_task(path: Path, workspace: Path, now: float) -> dict:
+def classify_task(path: Path, workspace: Path, now: float, as_name: str | None = None) -> dict:
+    """`as_name` judges the bytes at `path` as the task file of that name (a
+    claim of it, read while held)."""
     text = path.read_text(errors="replace")
+    named = path.with_name(as_name) if as_name else path
     # Shape-union parser: this pass classifies files from every writer and
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
     parsed = ltp.parse_task_headers_lenient(text)
@@ -392,10 +395,10 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     # this set, and a file with no delimiter has no "before", so it trusts nothing.
     well_formed = any(line.startswith("task:") for line in text.split("\n"))
     strict_headers = ltp.parse_task_headers(text).headers if well_formed else {}
-    task_id = (headers.get("id") or path.stem).strip()
+    task_id = (headers.get("id") or named.stem).strip()
     # Nothing in the task's own content can forge this. Every lookup that can
     # archive, suppress, or bind a task uses it, never the header `task_id`.
-    physical_id = path.stem
+    physical_id = named.stem
     queued_at, age_from = task_queued_at(strict_headers, physical_id, path)
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
@@ -406,7 +409,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
     label = channel_label(headers)
     task_preview = preview(parsed.body)
     row = {
-        "file": path.name,
+        "file": named.name,
         "id": task_id,
         "source": source,
         "trusted_source": trusted_source,
@@ -415,7 +418,7 @@ def classify_task(path: Path, workspace: Path, now: float) -> dict:
         "label": label,
         "preview": task_preview,
         "age_s": age_s,
-        "recovery_line": recovery_line(path.name, task_id, tier, label, age_s, task_preview),
+        "recovery_line": recovery_line(named.name, task_id, tier, label, age_s, task_preview),
         "age_from": age_from,
         "well_formed": well_formed,
         "import": False,
@@ -626,27 +629,57 @@ def _plan(workspace: Path, now: float | None = None) -> tuple[dict, dict]:
                       f"(> {limit}): undeliverable, so nothing will be published or moved")
     verdicts = {row["file"]: row.get("verdict") for row in tasks
                 if row["file"] in generation}
+    archive_dir = workspace / "tasks" / "archive"
     plan = {"archive": archive, "silent_archive": silent_archive, "generation": generation,
-            "verdict": verdicts, "body": body, "pending_notices": task_transition.pending_notices(
-                workspace / "tasks" / "archive"), "errors": errors}
-    plan["plan_id"] = plan_id(plan)
+            "verdict": verdicts, "body": body,
+            "pending_notices": task_transition.pending_notices(archive_dir), "errors": errors}
+    plan["plan_id"] = plan_id(plan, _effect_state(workspace, groups))
     return plan, groups
 
 
-def plan_id(plan: dict) -> str:
+# Row fields that change with the clock (`reason` quotes ages); the rest shape the notice.
+_VOLATILE = {"age_s", "recovery_line", "stalled_line", "unbound_line", "import_idle_s", "reason"}
+
+
+def _effect_state(workspace: Path, groups: dict) -> dict:
+    """Everything else `--apply` acts on: each reported row, each pending
+    journal's bytes, and each claim in tasks/ a recovery would sweep."""
+    def digest(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return f"unreadable: {exc.__class__.__name__}"
+    tasks_dir = workspace / "tasks"
+    try:
+        claims = sorted(n for n in os.listdir(tasks_dir) if ".claim-" in n)
+    except OSError:
+        claims = []
+    return {
+        "report": {g: [{k: v for k, v in row.items() if k not in _VOLATILE} for row in rows]
+                   for g, rows in groups.items()},
+        "journals": {n: digest(tasks_dir / "archive" / n)
+                     for n in task_transition.pending_notices(tasks_dir / "archive")},
+        "claims": {n: task_transition.generation_of(tasks_dir / n) for n in claims},
+    }
+
+
+def plan_id(plan: dict, effects: dict | None = None) -> str:
     """What `--apply --plan-id` must match: which files move, as which verdict,
-    at which generation. The body is left out, since its ages change by the minute."""
+    at which generation, and every other effect `--apply` would have (the rows
+    the notice reports, the journals it recovers, the claims it sweeps). Clock-
+    driven fields are left out, so the id holds while only ages change."""
     key = {k: plan.get(k) for k in ("archive", "silent_archive", "generation", "verdict")}
-    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+    key["effects"] = effects or {}
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def _still_safe(workspace: Path, verdicts: dict, now: float | None):
     """Asked right before each claim: the file must classify as it did in the
     approved plan, so a task a worker took, or one answered meanwhile, stays."""
-    def check(name: str) -> str | None:
+    def check(name: str, read: str) -> str | None:
         try:
-            row = classify_task(workspace / "tasks" / name, workspace,
-                                time.time() if now is None else now)
+            row = classify_task(workspace / "tasks" / read, workspace,
+                                time.time() if now is None else now, as_name=name)
         except OSError as exc:
             return f"could not be re-classified ({exc})"
         if row.get("verdict") != verdicts.get(name):

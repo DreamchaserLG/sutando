@@ -184,6 +184,33 @@ class PublisherFailurePaths(unittest.TestCase):
                     self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
 
 
+class WitnessedPublish(unittest.TestCase):
+    """`publish_witnessed`: the witness is a second name of the committed inode,
+    so a link count above 1 survives the consumer renaming the result away."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def test_the_witness_shares_the_committed_inode_through_a_rename(self):
+        target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+        result_publish.publish_witnessed(target, "body\n", witness)
+        self.assertEqual(target.read_text(), "body\n")
+        self.assertEqual(os.stat(witness).st_ino, os.stat(target).st_ino)
+        target.rename(self.dir / "retired.txt")
+        self.assertEqual(os.stat(witness).st_nlink, 2)
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_a_taken_name_is_refused_and_leaves_no_witness(self):
+        target, witness = self.dir / "proactive-a.txt", self.dir / ".proactive-a.txt.t.witness"
+        target.write_text("other\n")
+        with self.assertRaises(FileExistsError):
+            result_publish.publish_witnessed(target, "body\n", witness)
+        self.assertEqual(target.read_text(), "other\n")
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["proactive-a.txt"])
+
+
 class ConcurrencyDrill(unittest.TestCase):
     """Forked writers through the production publisher; a polling reader sees whole bodies only."""
 

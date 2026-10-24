@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 __all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "main"]
+           "publish_witnessed", "main"]
 
 STAGED_SUFFIX = ".tmp"
 
@@ -91,6 +91,32 @@ def publish_text(path: str | Path, text: str, mode: int = 0o666, *, exclusive: b
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def publish_witnessed(path: str | Path, text: str, witness: str | Path) -> Path:
+    """Publish `text` at `path` exclusively, keeping `witness` as a second name of the same inode.
+
+    While the witness exists, a link count above 1 proves the commit happened even after a
+    consumer renamed the result away. Raises FileExistsError (witness removed) on a taken `path`."""
+    target, keep = Path(path), Path(witness)
+    tmp = stage_text(target, text)
+    try:
+        os.replace(tmp, keep)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        os.link(keep, target)
+    except FileExistsError:
+        keep.unlink(missing_ok=True)
+        raise
+    if os.name != "nt":
+        dfd = os.open(target.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    return target
 
 
 def main(argv: list[str]) -> int:

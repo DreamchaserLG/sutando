@@ -24,15 +24,20 @@ is archived is a promise. `transition()` keeps it as a staged transaction:
   Per file (`task_archive.claim_generation` / `place_claim`): the live name is
   taken by one atomic rename into `<name>.claim-<pid>-<token>` in the same
   directory (same filesystem, never a copy), judged through its own descriptor
-  against the planned generation, and only a match is placed by the no-clobber
-  move through the handles (`.N` on a taken name; the archive dir is fsynced
-  before the claim is unlinked). A mismatched claim is linked
+  against the planned generation and by the caller's `still_safe` (asked
+  before the rename and again while this pass holds the bytes), and only a
+  match is placed by the no-clobber move through the handles (`.N` on a taken
+  name; the archive dir is fsynced before the claim is unlinked, and a failure
+  after the link leaves the landing recorded as unsynced, never given back).
+  A mismatched claim is linked
   back to its live name without replacing; if a writer already recreated that
   name, the claimed bytes stay quarantined under the claim name, recorded, and
   reported. No live name is ever unlinked by this code or by `task_archive`.
 
   Notice. Rendered from the FINAL landed names, published last at the reserved
-  name through `result_publish`'s exclusive mode. A body over
+  name through `result_publish.publish_witnessed`: a dot-named witness link of
+  the same inode stays in results/ until the journal is gone, so a consumer
+  that renamed the result away still leaves proof of the commit. A body over
   PROACTIVE_MAX_BODY_B is refused: the delivery adapter dead-letters it.
 
   Recovery. The next pass takes each journal whose lock is free (its owner is
@@ -40,9 +45,11 @@ is archived is a promise. `transition()` keeps it as a staged transaction:
   the archive is only unlinked, an unplaced claim is placed, a placement whose
   record was lost is found by generation among every `.N`. The notice names
   only what landed and ends with `(ref <txn>)`, the journal's transaction id;
-  a file at the reserved name counts as published only when it carries that
-  id, so another notice is never adopted. While any claimed file cannot be
-  found, nothing is published and the journal is kept. Each generation ends with
+  a file at the reserved name, or a witness with a second link, counts as
+  published only when it carries that id, so another notice is never adopted
+  and a retired one is never sent again. A claim is unlinked only when it is
+  the same inode as its landing. While any claimed file cannot be found or
+  is ambiguous, nothing is published and the journal is kept. Each generation ends with
   exactly one copy, live or archived; a second recovery pass does nothing new.
 """
 from __future__ import annotations
@@ -72,7 +79,7 @@ _NAME_ATTEMPTS = 16
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 Render = Callable[[dict], "str | None"]
-StillSafe = Callable[[str], "str | None"]
+StillSafe = Callable[[str, str], "str | None"]
 
 
 class TransitionRefused(Exception):
@@ -210,8 +217,21 @@ def _owned_by(held: bytes, txn: str) -> bool:
     return held.rstrip().endswith(f"(ref {txn})".encode())
 
 
-def _publish_at(results_dir: Path, name: str, body: str) -> Path:
-    """Publish `body` at exactly `results_dir/name`, whole, never replacing.
+def _witness(name: str, txn: str) -> str:
+    return f".{name}.{txn}.witness"
+
+
+def _drop_witness(results_dir: Path, name: "str | None", txn: "str | None") -> None:
+    if name and txn:
+        try:
+            os.unlink(results_dir / _witness(name, txn))
+        except OSError:
+            pass
+
+
+def _publish_at(results_dir: Path, name: str, body: str, txn: "str | None" = None) -> Path:
+    """Publish `body` at exactly `results_dir/name`, whole, never replacing; with
+    `txn`, a witness link of the same inode stays beside it until the journal goes.
     Raises TransitionRefused for a body the adapter could never deliver,
     FileExistsError when the name is already committed; OSError propagates."""
     size = len(body.encode("utf-8"))
@@ -221,6 +241,8 @@ def _publish_at(results_dir: Path, name: str, body: str) -> Path:
         results_dir.mkdir(parents=True, exist_ok=True)
     except FileExistsError as exc:  # a file holds the directory's name: not a taken result name
         raise NotADirectoryError(errno.ENOTDIR, f"{results_dir} is not a directory") from exc
+    if txn:
+        return result_publish.publish_witnessed(results_dir / name, body, results_dir / _witness(name, txn))
     return result_publish.publish_text(results_dir / name, body, exclusive=True)
 
 
@@ -310,7 +332,12 @@ class _Journal:
             os.unlink(f"{self.name}.lock", dir_fd=self.dirs.archive_fd)
         except OSError:
             pass
-        os.close(self.lock_fd)
+        self._close()
+
+    def _close(self) -> None:
+        if self.lock_fd >= 0:
+            os.close(self.lock_fd)
+            self.lock_fd = -1
 
     def remove(self) -> None:
         try:
@@ -321,7 +348,7 @@ class _Journal:
 
     def release(self) -> None:
         """Leave the journal for recovery; only the owner's hold on the lock goes."""
-        os.close(self.lock_fd)
+        self._close()
 
 
 def pending_notices(archive_dir: Path) -> list[str]:
@@ -335,10 +362,18 @@ def pending_notices(archive_dir: Path) -> list[str]:
 
 # ── the per-file move ────────────────────────────────────────────────────────
 
+class _ClaimRefused(TransitionRefused):
+    """Refused after the rename: the claim was given back, or kept as `kept` when its name was retaken."""
+
+    def __init__(self, message: str, kept: "str | None"):
+        super().__init__(message)
+        self.kept = kept
+
+
 def _claim(dirs: _Dirs, name: str, generation: str | None, claim: str | None = None,
            still_safe: "StillSafe | None" = None) -> str:
     problem = dirs.problem() or _source_problem(dirs.tasks_fd, name, generation)
-    problem = problem or (still_safe(name) if still_safe else None)
+    problem = problem or (still_safe(name, name) if still_safe else None)
     if problem:
         raise TransitionRefused(f"refused to move {name!r}: {problem}")
     _checkpoint("before_claim", name)
@@ -348,22 +383,33 @@ def _claim(dirs: _Dirs, name: str, generation: str | None, claim: str | None = N
         raise TransitionRefused(f"refused to move {name!r}: no longer in tasks/ — another pass "
                                 "archived it and sent its notice") from None
     _checkpoint("after_claim", name)
+    problem = still_safe(name, claim) if still_safe else None
+    if problem:  # judged again now that this pass owns the bytes: nothing can change them
+        back = task_archive.give_back(claim, name, problem, dirs.tasks_fd)
+        where = (f"its name was taken again, so it is quarantined as tasks/{back.kept_as} — rename "
+                 "it back to requeue" if back.kept_as else "it is back under its name, live")
+        raise _ClaimRefused(f"refused to move {name!r}: {problem}; {where}", back.kept_as)
     return claim
 
 
-def _place(dirs: _Dirs, claim: str, name: str, generation: str) -> "tuple[str | None, str | None, bool]":
-    """(landed name, error line, quarantined): one of the first two is set; the
-    flag says the claim stayed in tasks/ as the quarantine."""
+def _place(dirs: _Dirs, claim: str, name: str,
+           generation: str) -> "tuple[str | None, str | None, bool, str | None]":
+    """(landed name, error line, quarantined, unsynced landing): one of the first
+    two is set; the flag says the claim stayed in tasks/ as the quarantine; the
+    last names a landing whose durability is unknown, to be finished by recovery."""
     try:
         landed = task_archive.place_claim(claim, name, generation, name, src_dir_fd=dirs.tasks_fd,
                                           dst_dir_fd=dirs.archive_fd)
-        return landed.name, None, False
+        return landed.name, None, False, None
+    except task_archive.PlacementUnsynced as exc:
+        return None, (f"{name!r} is linked as tasks/archive/{exc.landed} but not yet durable "
+                      f"({exc.cause}); its journal is kept and the next pass finishes it"), False, exc.landed
     except task_archive.GenerationChanged as exc:
         if exc.kept_as:
             return None, (f"refused to move {name!r}: {exc.why}; its name was taken again, so it is "
-                          f"quarantined as tasks/{exc.kept_as} — rename it back to requeue"), True
+                          f"quarantined as tasks/{exc.kept_as} — rename it back to requeue"), True, None
         return None, (f"refused to move {name!r}: {exc.why}; it is back under its name, live, and "
-                      "the next pass reports it"), False
+                      "the next pass reports it"), False, None
 
 
 def archive_generation(tasks_dir: Path, name: str, generation: str | None,
@@ -376,7 +422,7 @@ def archive_generation(tasks_dir: Path, name: str, generation: str | None,
         raise TransitionRefused(problem or "could not open the directories")
     try:
         claim = _claim(dirs, name, generation)
-        landed, error, _ = _place(dirs, claim, name, generation or "")
+        landed, error, _, _ = _place(dirs, claim, name, generation or "")
         if error:
             raise TransitionRefused(error)
         return archive_dir / landed
@@ -471,26 +517,43 @@ def _recover(dirs: _Dirs, j: _Journal, results_dir: Path, out: dict) -> None:
     out["errors"] += report["errors"]
 
 
+def _same_file(a: str, a_fd: int, b: str, b_fd: int) -> bool:
+    try:
+        sa, sb = os.lstat(a, dir_fd=a_fd), os.lstat(b, dir_fd=b_fd)
+    except OSError:
+        return False
+    return stat.S_ISREG(sa.st_mode) and (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
 def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None:
     d = j.data
     claims, landed = dict(d.get("claims") or {}), dict(d.get("landed") or {})
     quarantined = dict(d.get("quarantined") or {})
-    lost = False
+    unresolved = False
     for name, generation in d["moves"].items():
         if name in landed or name in quarantined or not claims.get(name):
             continue  # placed, quarantined, or never claimed (still live; planned afresh)
         claim = claims[name]
         found = _find_placed(dirs, name, generation)
         if found and _exists(claim, dirs.tasks_fd):
+            if not _same_file(claim, dirs.tasks_fd, found, dirs.archive_fd):
+                unresolved = True
+                report["errors"].append(
+                    f"{name!r} is archived as tasks/archive/{found}, but tasks/{claim} now holds a "
+                    f"different file; both are kept, and the journal tasks/archive/{j.name} waits "
+                    "for the operator")
+                continue
+            task_archive._fsync_dir(dirs.archive_fd)  # the landing is durable before the claim goes
             os.unlink(claim, dir_fd=dirs.tasks_fd)  # linked, then killed before the unlink
             task_archive._fsync_dir(dirs.tasks_fd)
             landed[name] = found
         elif _exists(claim, dirs.tasks_fd):
-            got, error, kept = _place(dirs, claim, name, generation)  # recorded, renamed, unplaced
+            got, error, kept, unsynced = _place(dirs, claim, name, generation)  # renamed, unplaced
             if got:
                 landed[name] = got
             else:
                 report["errors"].append(error)
+                unresolved = unresolved or bool(unsynced)
                 if kept:
                     quarantined[name] = claim
                     _mark_quarantine(dirs, claim)
@@ -499,20 +562,21 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict) -> None
         elif found:
             landed[name] = found  # renamed and placed; the crash hid the record
         else:
-            lost = True
+            unresolved = True
             report["errors"].append(f"lost track of {name!r}: its claim {claim} is gone and no "
                                     "archived copy carries its generation; its journal "
                                     f"tasks/archive/{j.name} and its notice wait until it is found "
                                     "— check tasks/archive/")
         j.set(claims=claims, landed=landed, quarantined=quarantined)
     report["landed"] = landed
-    if lost:  # a notice now would omit it, and a later pass would adopt that notice
+    if unresolved:  # a notice now would omit it, and a later pass would adopt that notice
         j.release()
         return
     if landed or d.get("result"):
         if not _publish_recovered(j, results_dir, landed, report):
             return
     j.remove()
+    _drop_witness(results_dir, d.get("result"), d.get("txn"))
 
 
 def _recovered_body(d: dict, landed: dict) -> "str | None":
@@ -544,6 +608,9 @@ def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dic
     body = d["body"]
     for _ in range(_NAME_ATTEMPTS):
         target = results_dir / d["result"]
+        if _witnessed(results_dir / _witness(d["result"], txn), txn):
+            report["result"] = str(target)  # committed; its consumer may have retired it since
+            return True
         try:
             held = target.read_bytes()
         except FileNotFoundError:
@@ -555,7 +622,7 @@ def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dic
             return True
         if held is None:
             try:
-                report["result"] = str(_publish_at(results_dir, d["result"], body))
+                report["result"] = str(_publish_at(results_dir, d["result"], body, txn))
                 return True
             except FileExistsError:
                 continue  # taken meanwhile: judged by its bytes on the next turn
@@ -571,8 +638,34 @@ def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dic
     return False
 
 
+def _witnessed(witness: Path, txn: str) -> bool:
+    """The commit happened: the witness shares its inode with a second name,
+    wherever a consumer has renamed that name since."""
+    try:
+        if os.lstat(witness).st_nlink < 2:
+            return False
+        return _owned_by(witness.read_bytes(), txn)
+    except OSError:
+        return False
+
+
+def _sweep_witnesses(results_dir: Path, txns: set[str]) -> None:
+    """A witness outlives its journal only after a crash between the two removals."""
+    try:
+        names = os.listdir(results_dir)
+    except OSError:
+        return
+    for n in names:
+        if n.startswith(".") and n.endswith(".witness") and n.rsplit(".", 2)[-2] not in txns:
+            try:
+                os.unlink(results_dir / n)
+            except OSError:
+                pass
+
+
 def _recover_all(dirs: _Dirs, results_dir: Path, out: dict) -> None:
     journaled: set[str] = set()
+    txns: set[str] = set()
     for name in sorted(n for n in os.listdir(dirs.archive_fd)
                        if n.startswith(JOURNAL_PREFIX) and n.endswith(".json")):
         j = _Journal.take(dirs, name)
@@ -580,13 +673,19 @@ def _recover_all(dirs: _Dirs, results_dir: Path, out: dict) -> None:
             try:  # a live pass's claims are its own, not strays
                 fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=dirs.archive_fd)
                 with os.fdopen(fd, "r", encoding="utf-8") as fh:
-                    journaled.update((json.load(fh).get("claims") or {}).values())
+                    held = json.load(fh)
+                journaled.update((held.get("claims") or {}).values())
+                txns.add(str(held.get("txn")))
             except (OSError, ValueError, AttributeError):
-                pass
+                txns.add("*")  # unreadable live journal: keep every witness this pass
             continue
         journaled.update((j.data.get("claims") or {}).values())
         _recover(dirs, j, results_dir, out)
+        if _exists(name, dirs.archive_fd):
+            txns.add(str(j.data.get("txn")))
     _sweep_dead_claims(dirs, journaled, out)
+    if "*" not in txns:
+        _sweep_witnesses(results_dir, txns)
 
 
 # ── the transaction ──────────────────────────────────────────────────────────
@@ -654,6 +753,11 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
             _claim(dirs, name, generation, claim, still_safe)
         except TransitionRefused as exc:
             out["errors"].append(str(exc))
+            if getattr(exc, "kept", None):
+                out["quarantined"][name] = j.data["quarantined"][name] = claim
+                _mark_quarantine(dirs, claim)
+                j.set(stage="claiming")
+                continue
             del j.data["claims"][name]  # recovery would read it as never renamed anyway
             try:
                 j.set(stage="claiming")
@@ -661,7 +765,9 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
                 pass
             continue
         j.set(stage="claimed")
-        landed, error, kept = _place(dirs, claim, name, generation or "")
+        landed, error, kept, unsynced = _place(dirs, claim, name, generation or "")
+        if unsynced:
+            j.data.setdefault("unsynced", {})[name] = unsynced
         if landed:
             out["archived"][name] = landed
             j.data["landed"][name] = landed
@@ -674,6 +780,10 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
                 j.data["quarantined"][name] = claim
                 _mark_quarantine(dirs, claim)
         j.set(stage="placed")
+    if j.data.get("unsynced"):  # placed but not yet durable: the next pass finishes and reports it
+        out["errors"].append(f"the notice waits in tasks/archive/{j.name} for the next pass")
+        j.release()
+        return
     body = render(out["archived"])
     if body is None:
         j.remove()
@@ -683,7 +793,7 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
         name = _mint_name(prefix, now)
         j.set(stage="publishing", result=name, body=out["body"])
         try:
-            out["result"] = str(_publish_at(results_dir, name, out["body"]))
+            out["result"] = str(_publish_at(results_dir, name, out["body"], j.data["txn"]))
         except FileExistsError:
             continue  # the one publisher refused the taken name; reserve another
         except (OSError, TransitionRefused) as exc:
@@ -692,6 +802,7 @@ def _run_journaled(dirs: _Dirs, j: _Journal, results_dir: Path, prefix: str, now
             j.release()
             return
         j.remove()
+        _drop_witness(results_dir, name, j.data["txn"])
         return
     out["errors"].append(f"could not reserve a result name under {results_dir}; the archived files "
                          f"are recorded in tasks/archive/{j.name}, published by the next pass")

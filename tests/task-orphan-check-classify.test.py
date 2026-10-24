@@ -1709,6 +1709,101 @@ class TestApplyNeedsTheApprovedPlan(ClassifyBase):
         self.assertNotIn(self.HELD, self.notices()[0].read_text())
 
 
+class TestApplyOwnsWhatItApproved(ClassifyBase):
+    """Round 8 (#4399): the ownership checks run while this pass holds the bytes,
+    and the approved plan_id binds every effect `--apply` has, not only the moves."""
+
+    def orphan(self, name: str) -> Path:
+        return self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+
+    def notices(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+
+    def pool(self):
+        scripts = str(REPO / "skills" / "worker-pool" / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+        import pool_router
+        import resolve_inbox_entry
+        return pool_router, resolve_inbox_entry
+
+    def at_the_claim(self, name: str, action):
+        """Run `action` at the target file's own seam: after its final pre-claim
+        check, before the rename that claims it."""
+        def at(point, which):
+            if point == "before_claim" and which == name:
+                action()
+        return unittest.mock.patch.object(self.mod.task_transition, "_checkpoint", side_effect=at)
+
+    def test_a_worker_delivery_at_the_claim_seam_keeps_its_payload(self):
+        router, resolver = self.pool()
+        p = self.orphan("task-w.txt")
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        outcome = []
+        with self.at_the_claim("task-w.txt",
+                               lambda: outcome.append(router.deliver_one(self.ws.root, "w1", "task-w"))):
+            out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertEqual(outcome, ["delivered"])
+        self.assertEqual(out["archived"], [])
+        self.assertTrue(any("now worker-held" in e and "back under its name, live" in e
+                            for e in out["errors"]), out["errors"])
+        sentinel = next((self.ws.root / "deliveries" / "w1").glob("task-w*"))
+        self.assertEqual(resolver.resolve(str(sentinel), self.ws.root), p)
+        self.assertEqual(self.notices(), [])
+
+    def test_a_completion_at_the_claim_seam_keeps_done_work_live(self):
+        p = self.orphan("task-d.txt")
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        answer = self.ws.root / "results" / "task-d.txt"
+        with self.at_the_claim("task-d.txt",
+                               lambda: self.mod.task_transition.result_publish.publish_text(answer, "answered\n")):
+            out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertEqual(out["archived"], [])
+        self.assertTrue(any("now done" in e for e in out["errors"]), out["errors"])
+        self.assertTrue(p.exists())
+        self.assertEqual(self.notices(), [])
+
+    def test_a_report_row_that_appears_after_approval_refuses_the_apply(self):
+        approved = self.mod.recovery_plan(self.ws.root, NOW)
+        self.assertIsNone(approved["body"])
+        self.ws.task(f"{IMPORT_ID}.txt", import_task_text(queued=NOW - 3 * 86400))
+        self.ws.status("scanning", NOW - 3 * 86400 + 5, task_id=IMPORT_ID)
+        self.assertEqual(self.mod.classify_workspace(self.ws.root, NOW)["tasks"][0]["verdict"],
+                         "import-stalled")
+        out = self.mod.apply_plan(self.ws.root, NOW, approved=approved["plan_id"])
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn(f"approved was {approved['plan_id']}", out["errors"][0])
+        self.assertEqual((out["result"], self.notices()), (None, []))
+
+    def test_a_journal_that_appears_after_approval_refuses_the_apply_before_recovery(self):
+        tt = self.mod.task_transition
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        b = self.orphan("task-b.txt")
+        real_set = tt._Journal.set
+
+        def die_once_claimed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "claimed":
+                raise KeyboardInterrupt("killed")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_claimed), \
+                self.assertRaises(KeyboardInterrupt):
+            tt.transition(self.ws.root / "tasks", self.ws.root / "results",
+                          self.ws.root / "tasks" / "archive", moves={b.name: tt.generation_of(b)},
+                          render=lambda landed: "x\n", prefix="proactive-orphan-recovery-")
+        journals = sorted((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))
+        claims = [x for x in (self.ws.root / "tasks").iterdir() if ".claim-" in x.name]
+        self.assertEqual((len(journals), len(claims)), (1, 1))
+        before = journals[0].read_bytes()
+        out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn(f"approved was {approved}", out["errors"][0])
+        self.assertEqual(out["recovered"], [])
+        self.assertEqual(journals[0].read_bytes(), before, "recovery did not run")
+        self.assertTrue(claims[0].exists())
+        self.assertEqual(self.notices(), [])
+
+
 class TestWorkerHeld(ClassifyBase):
     """A task the router delegated is a worker's, not a core orphan (2026-09-18 boot: four
     ag2.space owner DMs held by two worker seats were archived and reported as orphans)."""

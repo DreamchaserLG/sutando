@@ -1206,12 +1206,12 @@ class TestCrashWindows(Base):
         real = tt._publish_at
         calls = []
 
-        def taken_first(results_dir, name, body):
+        def taken_first(results_dir, name, body, *rest):
             calls.append(name)
             if len(calls) == 1:
                 (results_dir / name).write_text("FOREIGN NOTICE\n")
                 raise FileExistsError(name)
-            return real(results_dir, name, body)
+            return real(results_dir, name, body, *rest)
 
         with mock.patch.object(tt, "_publish_at", side_effect=taken_first):
             out = self.recover()
@@ -1322,10 +1322,123 @@ class TestCrashWindows(Base):
         self.assertIn("task-b.txt is archived as tasks/archive/task-b.txt.2.", text)
         self.assertEqual((len(self.notices()), self.journals()), (1, []))
 
+    def test_a_notice_retired_by_its_consumer_is_not_published_again(self):
+        """The bridge claims a proactive result by renaming it to `.sending.<pid>` and,
+        once delivered, renames that into results/archive/ (remote_gateway_bridge's
+        drain). A publisher killed before its journal went must not send it twice."""
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        with self.crash_after("published"), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        (live,) = self.notices()
+        claim = live.with_suffix(f".sending.{os.getpid()}")
+        live.rename(claim)
+        (self.results / "archive").mkdir()
+        delivered = self.results / "archive" / f"{live.stem}-1800000000.txt"
+        claim.rename(delivered)
+        out = self.recover()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(Path(out["recovered"][0]["result"]).name, live.name)
+        self.assertEqual(self.notices(), [], "no live result: nothing to deliver again")
+        self.assertEqual([x.name for x in (self.results / "archive").iterdir()], [delivered.name])
+        self.assertEqual([x.name for x in self.results.iterdir() if x.name.startswith(".")], [])
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(tt.generation_of(self.archive / "task-a.txt"), gen)
+        self.assertEqual(self.recover()["recovered"], [])
+
+    def test_an_archive_fsync_failure_after_the_link_keeps_one_name_and_the_journal(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        gen = tt.generation_of(p)
+        self.archive.mkdir()
+        archive_ino, fired = os.stat(self.archive).st_ino, []
+        real_sync = tt.task_archive._fsync_dir
+
+        def sync(fd):
+            if (not fired and os.fstat(fd).st_ino == archive_ino
+                    and (self.archive / "task-a.txt").exists()):
+                fired.append(1)
+                raise OSError(5, "Input/output error")
+            real_sync(fd)
+
+        with mock.patch.object(tt.task_archive, "_fsync_dir", side_effect=sync):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertEqual((out["archived"], out["result"]), ({}, None))
+        self.assertIn("is linked as tasks/archive/task-a.txt but not yet durable", out["errors"][0])
+        self.assertFalse(p.exists(), "a landed file is not given back under its live name")
+        (journal,) = self.journals()
+        self.assertEqual(json.loads(journal.read_text())["unsynced"], {"task-a.txt": "task-a.txt"})
+        retry = self.recover()
+        self.assertEqual(retry["errors"], [], retry)
+        self.assertEqual(self.archive_names(), ["task-a.txt"], "one generation, one archive name")
+        self.assertEqual(os.stat(self.archive / "task-a.txt").st_nlink, 1)
+        self.invariants(gen, "task: A", notice_committed=True)
+
+    def test_a_replaced_claim_entry_is_kept_and_the_journal_retained(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        fired = []
+
+        def at(where, name):
+            if where == "after_link" and not fired:
+                fired.append(name)
+                raise Crash("killed between link and unlink")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        claim = self.tasks / fired[0]
+        _replace(claim, "not the claimed bytes")
+        self.assertNotEqual(os.stat(claim).st_ino, os.stat(self.archive / "task-a.txt").st_ino)
+        out = self.recover()
+        self.assertEqual(len(out["errors"]), 1, out)
+        self.assertIn(f"tasks/{claim.name} now holds a different file", out["errors"][0])
+        self.assertIn("not the claimed bytes", claim.read_text())
+        self.assertEqual(len(self.journals()), 1)
+        self.assertEqual(self.notices(), [])
+
+    def test_a_witness_left_by_a_crash_after_the_journal_went_is_swept(self):
+        _task(self.tasks, "task-a.txt", "A")
+        real_drop = tt._drop_witness
+        with mock.patch.object(tt, "_drop_witness", side_effect=Crash("killed")), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        self.assertEqual(self.journals(), [])
+        self.assertEqual(len([x for x in self.results.iterdir() if x.name.endswith(".witness")]), 1)
+        import fcntl
+        live = self.archive / f"{tt.JOURNAL_PREFIX}1-2-abc.json"  # a live pass's, mid-publish
+        live.write_text(json.dumps({"txn": "keepme", "moves": {}, "body": None}))
+        fd = os.open(self.archive / f"{live.name}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        keep = self.results / ".proactive-x.txt.keepme.witness"
+        keep.write_text("x")
+        self.recover()
+        self.assertEqual([x.name for x in self.results.iterdir() if x.name.endswith(".witness")],
+                         [keep.name], "only a journal's own witness survives")
+        self.assertTrue(real_drop)
+        self.assertEqual(len(self.notices()), 1)
+
+    def test_a_refusal_after_the_claim_with_the_name_retaken_quarantines_the_claim(self):
+        p = _task(self.tasks, "task-a.txt", "old")
+        seen = []
+
+        def safe(name, read):
+            seen.append(read)
+            return "held by worker w1" if read != name else None
+
+        with self.inject("after_claim", p, lambda: _task(self.tasks, "task-a.txt", "new")):
+            out = self.run_transition(["task-a.txt"], _naming, still_safe=safe)
+        self.assertEqual(seen[0], "task-a.txt")
+        claim = seen[1]
+        self.assertEqual(out["quarantined"], {"task-a.txt": claim})
+        self.assertIn(f"quarantined as tasks/{claim}", out["errors"][0])
+        self.assertIn("task: old", (self.tasks / claim).read_text())
+        self.assertIn("task: new", p.read_text())
+        self.assertTrue((self.tasks / (claim + tt.QUARANTINE_SUFFIX)).exists())
+        self.assertEqual((out["archived"], self.notices(), self.journals()), ({}, [], []))
+
     def test_still_safe_refuses_a_file_right_before_its_claim(self):
         p, b = self.two_tasks()
         out = self.run_transition(["task-a.txt", "task-b.txt"], _naming,
-                                  still_safe=lambda n: "held by worker w1" if n == "task-b.txt" else None)
+                                  still_safe=lambda n, _f: "held by worker w1" if n == "task-b.txt" else None)
         self.assertEqual(out["archived"], {"task-a.txt": "task-a.txt"})
         self.assertEqual(out["errors"], ["refused to move 'task-b.txt': held by worker w1"])
         self.assertTrue(b.exists())
