@@ -11817,14 +11817,29 @@ def _launch_record_binds_live_core(rec: dict) -> str:
     if not isinstance(pid, int) or not isinstance(start, str) or not start:
         return "the launch record is not bound to a process (written by an older launcher) — restart the core"
     try:
-        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=,args="],
+        # LC_ALL=C: the launcher records lstart in the C locale; a localized %c never matches it.
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=,args="], env=_C_LOCALE_ENV(),
                              capture_output=True, text=True, timeout=10).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return f"cannot read process {pid} for the launch record ({exc})"
     if not out:
         return f"the recorded core (pid {pid}) is not running — the launch record is stale"
-    if not out.startswith(start) or (f"--name {session}" not in out and f"--name={session}" not in out):
+    if not out.startswith(start) or _argv_session_name(out[len(start):]) != session:
         return f"pid {pid} is not the core the launch record describes — the record is stale"
+    return ""
+
+
+def _argv_session_name(args: str) -> str:
+    """The value of `--name` in a ps args column, token-wise: `--name a` is not `--name a-2`."""
+    try:
+        toks = shlex.split(args)
+    except ValueError:
+        toks = args.split()
+    for i, tok in enumerate(toks):
+        if tok == "--name" and i + 1 < len(toks):
+            return toks[i + 1]
+        if tok.startswith("--name="):
+            return tok[len("--name="):]
     return ""
 
 

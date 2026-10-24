@@ -10,7 +10,7 @@ Run: python3 tests/health-check-claude-hook-registration.test.py
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
@@ -32,6 +32,17 @@ TABLE = "src/agent/claude/cli/owned-hooks.json"
 OWNED = ("check-pending-tasks.sh", "turn-start.sh", "session-handoff.sh",
          "schedule-crons-session-hint.sh", "personal-claude-compact-hint.sh",
          "watcher-rearm-session-hint.sh")
+LAUNCHER = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
+WEEKDAY = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+# A ps that answers with the real values but, like macOS under de_DE, formats lstart in the
+# locale's %c (day first, weekday last) unless LC_ALL=C.
+PS_LOCALIZED = r"""#!/bin/bash
+out="$(LC_ALL=C /bin/ps "$@")"
+if [ "${LC_ALL:-}" != "C" ]; then
+  out="$(printf '%s\n' "$out" | sed -E 's/^ *(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([A-Z][a-z]{2}) +([0-9]+) ([0-9:]+) ([0-9]{4})/\3. \2 \5 \4 \1/')"
+fi
+printf '%s\n' "$out"
+"""
 
 
 def _load():
@@ -82,9 +93,17 @@ class Probe(unittest.TestCase):
         # A real process the record binds to: argv as a core's, so ps reports `--name sutando-core`.
         self.core = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core" sleep 300'])
         self.addCleanup(self.core.kill)
-        self.start = subprocess.run(["ps", "-p", str(self.core.pid), "-o", "lstart="],
+        self.start = subprocess.run(["ps", "-p", str(self.core.pid), "-o", "lstart="], env=hc._C_LOCALE_ENV(),
                                     capture_output=True, text=True).stdout.strip()
         assert self.start, "ps did not report the probe process"
+        # What the launcher's record writer needs: the workspace resolver and a ps on PATH.
+        (self.repo / "scripts").mkdir()
+        (self.repo / "scripts" / "sutando-config.sh").write_text(
+            '#!/bin/bash\ncase "$1" in workspace) echo "%s";; *) echo "";; esac\n' % self.ws)
+        self.bin = Path(self._td.name) / "bin"
+        self.bin.mkdir()
+        (self.bin / "ps").write_text(PS_LOCALIZED)
+        (self.bin / "ps").chmod(0o755)
         settings, why = hc._core_launch_settings(self.repo)
         assert settings is not None, why
         self.record(settings)
@@ -192,6 +211,44 @@ class Probe(unittest.TestCase):
 
     def test_a_record_naming_another_session_is_stale(self):
         self.assertIn("is not the core the launch record describes", self._bound_record_fails(session="sutando-other"))
+
+    def test_a_core_whose_name_only_starts_with_the_session_is_not_that_session(self):
+        self.core.kill()
+        self.core.wait()
+        self.core = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core-2" sleep 300'])
+        self.addCleanup(self.core.kill)
+        self.start = subprocess.run(["ps", "-p", str(self.core.pid), "-o", "lstart="], env=hc._C_LOCALE_ENV(),
+                                    capture_output=True, text=True).stdout.strip()
+        self.assertIn("is not the core the launch record describes", self._bound_record_fails(session="sutando-core"))
+        self.assertEqual(hc._argv_session_name("claude --name=sutando-core-2 --x"), "sutando-core-2")
+        self.assertEqual(hc._argv_session_name("claude --name 'sutando core'"), "sutando core")
+
+    def _launcher_writes_record(self, locale):
+        """record_core_launch_settings from session-launch.sh, run as the launcher would under `locale`."""
+        settings, _ = hc._core_launch_settings(self.repo)
+        script = ('REPO="$1"; SESSION=sutando-core; TMUX_SOCKET=/tmp/t.sock; PY="$2"; SETTINGS_ARGS=(--settings "$3"); '
+                  '. "$4"; record_core_launch_settings "$5"')
+        env = hermetic_env(PATH=f"{self.bin}:/usr/bin:/bin", LC_ALL=locale)
+        run = subprocess.run(["/bin/bash", "-c", script, "_", str(self.repo), sys.executable, json.dumps(settings),
+                              str(LAUNCHER), str(self.core.pid)], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        return json.loads((self.ws / "state" / "core-launch-settings.json").read_text())
+
+    def test_the_record_binds_across_locales_because_both_sides_pin_ps_to_c(self):
+        # The stand-in ps really localizes: unpinned, lstart does not start with an English weekday.
+        localized = subprocess.run(["ps", "-o", "lstart=", "-p", str(self.core.pid)],
+                                   env=hermetic_env(PATH=f"{self.bin}:/usr/bin:/bin", LC_ALL="de_DE.UTF-8"),
+                                   capture_output=True, text=True).stdout.strip()
+        self.assertTrue(localized and not localized.startswith(WEEKDAY), localized)
+        for writer, reader in (("de_DE.UTF-8", "en_US.UTF-8"), ("en_US.UTF-8", "de_DE.UTF-8")):
+            with self.subTest(writer=writer, reader=reader):
+                rec = self._launcher_writes_record(writer)
+                self.assertEqual((rec["pid"], rec["session"], rec["start"]), (self.core.pid, "sutando-core", self.start))
+                self.assertTrue(rec["start"].startswith(WEEKDAY), rec["start"])
+                with mock.patch.dict(os.environ, {"PATH": f"{self.bin}:{os.environ['PATH']}", "LC_ALL": reader}):
+                    self.assertEqual(hc._launch_record_binds_live_core(rec), "")
+                    out = self.probe()
+                self.assertEqual(out["status"], "ok", out["detail"])
 
     def test_a_record_without_a_pid_is_not_proof(self):
         settings, _ = hc._core_launch_settings(self.repo)

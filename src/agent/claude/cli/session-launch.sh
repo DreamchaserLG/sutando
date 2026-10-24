@@ -481,7 +481,8 @@ record_core_launch_settings() {
     rm -f "$ws/state/core-launch-settings.json"
     return 0
   fi
-  start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+  # LC_ALL=C: the health probe compares this text with a C-locale ps; a localized %c never matches.
+  start="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
   _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" _pid="$pid" _start="$start" _session="$SESSION" \
     _socket="$TMUX_SOCKET" _outside="${OUTSIDE_CORE_LIVE:-}" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
     || echo "session-launch: core launch-settings record not written (non-fatal)" >&2
