@@ -533,9 +533,14 @@ fi
 #
 # On a private socket an orphan cannot be told from another install's core, and
 # adopting one leaves this socket with no server; launch fresh, kill nothing.
+# shellcheck disable=SC2034  # read by settle_core_launch_hooks (session-launch.sh)
+OUTSIDE_CORE_LIVE=""
 if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   if claude_private_socket_in_use; then
     echo "  ⚠ $SESSION claude pid(s) $(claude_named_pids | tr '\n' ' ')running outside $TMUX_SOCKET — not reusing; starting a session on this socket." >&2
+    # That core may be this checkout's: its settings-file hooks stay until it is gone.
+    # shellcheck disable=SC2034
+    OUTSIDE_CORE_LIVE=1
   else
     echo "$SESSION claude process already running (no tmux session) — reusing it." >&2
     echo "To recycle it cleanly: bash $0 --restart"
@@ -543,9 +548,10 @@ if [ -z "$RESTART_REQUESTED" ] && claude_named_process_running; then
   fi
 fi
 
-# No core is live past the attach/adopt exits, so the copies that were its hooks may go now.
-sweep_legacy_claude_hooks_for_launch
-record_core_launch_settings
+# Past the attach/adopt exits a new core is about to be launched: the previous core's
+# launch record no longer describes anything live. The copies it ran are swept only once
+# the new core is proven up (settle_core_launch_hooks at each launch site below).
+retire_core_launch_record
 
 if claude_named_tmux_session_exists; then
   # Session alive but the core claude is gone. The old behavior here was
@@ -586,6 +592,7 @@ if claude_named_tmux_session_exists; then
   done
   if claude_named_session_running; then
     clear_shutdown_sentinel
+    settle_core_launch_hooks
     CORE_WINDOW="$healed_idx"
     ensure_task_notifier
   else
@@ -678,6 +685,7 @@ if [ -t 1 ]; then
     exit 1
   fi
   clear_shutdown_sentinel
+  settle_core_launch_hooks
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_task_notifier   # the supervisor needs the core session to exist first
   ensure_core_heartbeat
@@ -695,6 +703,7 @@ else
   # Verified live above, so this is the first point at which clearing the
   # intentional-stop gate cannot open intake with nothing serving.
   clear_shutdown_sentinel
+  settle_core_launch_hooks
   [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "success: core live"
   ensure_core_monitor   # canonical session now exists — start the supervisor monitor
   ensure_task_notifier

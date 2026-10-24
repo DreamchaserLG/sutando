@@ -9,6 +9,8 @@ LaunchSchedules runs the real launchers end to end with process probes stubbed;
 GatedSweep sources the sweep step from session-launch.sh with a marker installer.
 """
 
+import importlib.util
+import io
 import json
 import os
 import shutil
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 SESSION_LAUNCH = REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh"
@@ -31,11 +34,13 @@ sub="$1"; shift
 case "$sub" in
   has-session) [ -f "$SESS_MARK" ] && exit 0 || exit 1 ;;
   new-session) name=""; prev=""; for a in "$@"; do [ "$prev" = "-s" ] && name="$a"; prev="$a"; done
-               touch "$SESS_MARK"; [ "${name%-watcher}" = "$name" ] && echo "claude --name $name" > "$CORE_MARK"; exit 0 ;;
-  kill-session) rm -f "$SESS_MARK" "$CORE_MARK"; exit 0 ;;
+               touch "$SESS_MARK"; [ "${name%-watcher}" = "$name" ] && { echo "claude --name $name" > "$CORE_MARK"; touch "$PANE_MARK"; }; exit 0 ;;
+  new-window) touch "$PANE_MARK"; echo 0; exit 0 ;;
+  list-panes) [ -f "$SESS_MARK" ] || exit 1; [ -f "$PANE_MARK" ] && echo "@PID@"; exit 0 ;;
+  kill-session) case "$*" in *-watcher*) exit 0 ;; esac; rm -f "$SESS_MARK" "$CORE_MARK" "$PANE_MARK"; exit 0 ;;
   *) exit 0 ;;
 esac
-"""
+""".replace("@PID@", FAKEPID)
 PGREP_STUB = r"""#!/bin/bash
 case "$*" in *core-input-watch*) exit 0 ;; esac
 case "$*" in *claude*) [ -f "$CORE_MARK" ] && { echo "%s claude"; exit 0; }; exit 1 ;; esac
@@ -44,7 +49,8 @@ exit 1
 PS_STUB = r"""#!/bin/bash
 case "$*" in *ppid=*) echo 1; exit 0 ;; esac
 want=""; prev=""; for a in "$@"; do [ "$prev" = "-p" ] && want="$a"; prev="$a"; done
-[ "$want" = "%s" ] && [ -f "$CORE_MARK" ] && cat "$CORE_MARK"
+[ "$want" = "%s" ] && [ -f "$CORE_MARK" ] || exit 0
+case "$*" in *lstart=*) echo "Thu Jan  1 00:00:00 2026" ;; *) cat "$CORE_MARK" ;; esac
 exit 0
 """ % FAKEPID
 # The real interpreter, with the core's long-lived daemons turned into no-ops.
@@ -68,6 +74,8 @@ class LaunchSchedules(unittest.TestCase):
         shutil.copytree(REPO / "scripts", self.root / "scripts", symlinks=True)
         (self.root / "skills/worker-pool/scripts").mkdir(parents=True)
         shutil.copy2(WORKER, self.root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        (self.root / "hooks").mkdir()
+        (self.root / "hooks" / "skip-ask-user-question.py").write_text("")
         self.ws = self.td / "ws"
         (self.ws / "state").mkdir(parents=True)
         (self.ws / "state" / "core-supervisor-relay-loop.pid").write_text(str(os.getpid()))
@@ -94,24 +102,41 @@ class LaunchSchedules(unittest.TestCase):
                            ("claude", "#!/bin/bash\nexit 0\n"), ("py", PY_STUB)):
             (bind / name).write_text(body)
             (bind / name).chmod(0o755)
-        self.sess, self.core = self.td / "sess", self.td / "core"
+        self.sess, self.core, self.pane = self.td / "sess", self.td / "core", self.td / "pane"
         self.delivery = self.td / "pool_delivery.py"
         self.delivery.write_text("# test-only\n")
         self.env = {"PATH": f"{bind}:{Path(shutil.which('node')).parent}:/usr/bin:/bin", "HOME": str(self.td / "home"),
-                    "SESS_MARK": str(self.sess), "CORE_MARK": str(self.core), "SUTANDO_PY": str(bind / "py"),
+                    "SESS_MARK": str(self.sess), "CORE_MARK": str(self.core), "PANE_MARK": str(self.pane),
+                    "SUTANDO_PY": str(bind / "py"),
                     "REAL_PY": sys.executable, "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
                     "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1"}
 
     def tearDown(self):
         shutil.rmtree(self.td, ignore_errors=True)
 
-    def live_core(self):
+    def live_core(self, in_pane=True):
         self.sess.write_text("")
         self.core.write_text("claude --name sutando-core\n")
+        if in_pane:
+            self.pane.write_text("")
 
-    def run_core(self, *args):
+    def run_core(self, *args, env=None):
         return subprocess.run(["/bin/bash", str(self.root / "src/agent/claude/cli/start-cli.sh"), *args],
-                              env=self.env, capture_output=True, text=True, timeout=120)
+                              env=env or self.env, capture_output=True, text=True, timeout=120)
+
+    def hc(self):
+        spec = importlib.util.spec_from_file_location("hc_sweep_wiring", REPO / "src" / "health-check.py")
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except SystemExit:
+            pass
+        return mod
+
+    def probe(self):
+        with mock.patch.dict(os.environ, {"SUTANDO_CORE_RUNTIME": "claude", "SUTANDO_CLAUDE_WORKING_DIR": ""}):
+            return self.hc().check_claude_hook_registration(repo_dir=self.root, config_dir=self.ws / ".claude-sutando",
+                                                            workspace_dir=self.ws)
 
     def record(self):
         return self.ws / "state" / "core-launch-settings.json"
@@ -152,8 +177,60 @@ class LaunchSchedules(unittest.TestCase):
         sys.path.insert(0, str(REPO / "src"))
         import claude_hooks_settings as chs
         rec = json.loads(self.record().read_text())
-        self.assertEqual(rec["repo"], str(self.root))
+        self.assertEqual((rec["repo"], rec["pid"], rec["session"], rec["other_core_live"]),
+                         (str(self.root), int(FAKEPID), "sutando-core", False))
+        self.assertTrue(rec["start"])
         self.assertTrue(chs.owned_launch_records(self.root) <= chs.records_in(rec["settings"]))
+
+    def test_a_later_launch_without_settings_retires_the_record_and_health_refuses_to_sweep(self):
+        # Production path twice: a full launch, then the core dies and a launch with no node
+        # (so no --settings) brings up a core that runs the settings-file copies again.
+        self.live_core()
+        run = self.run_core("--restart")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertTrue(self.record().exists())
+        for m in (self.sess, self.core, self.pane):
+            m.unlink(missing_ok=True)
+        self.legacy.write_bytes(self.legacy_bytes)
+        self.marker.unlink()
+        nonode = {**self.env, "PATH": self.env["PATH"].split(":", 1)[0] + ":/usr/bin:/bin"}
+        run = self.run_core(env=nonode)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("node unavailable", run.stderr)
+        self.assertFalse(self.record().exists(), "the first launch's record survived a launch without settings")
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
+        out = self.probe()
+        self.assertIn("no launch record for the running core", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
+        self.hc().apply_claude_hooks_fix([out], stream=io.StringIO())
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes, "--fix swept the copies the live core runs")
+
+    def _private(self, *, session):
+        self.core.write_text("claude --name sutando-core\n")
+        if session:
+            self.sess.write_text("")
+        env = {**self.env, "SUTANDO_TMUX_SOCKET": str(self.td / "private.sock")}
+        run = self.run_core(env=env)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("running outside", run.stderr)
+        self.assertIn("legacy hook entries kept", run.stderr)
+        self.assertFalse(self.marker.exists(), "swept while a same-name core outside the socket still runs")
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
+        rec = json.loads(self.record().read_text())
+        self.assertTrue(rec["other_core_live"])
+        out = self.probe()
+        self.assertIn("another same-name core was live outside the socket", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
+        return run
+
+    def test_a_private_socket_launch_beside_an_outside_core_keeps_the_copies(self):
+        run = self._private(session=False)
+        self.assertIn("starting a session on this socket", run.stderr)
+
+    def test_a_private_socket_heal_beside_an_outside_core_keeps_the_copies(self):
+        run = self._private(session=True)
+        self.assertIn("healing core window", run.stderr)
 
 
 @unittest.skipUnless(shutil.which("node"), "node is required to build the launch settings")

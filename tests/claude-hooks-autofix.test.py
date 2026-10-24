@@ -139,7 +139,17 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual(proj.read_text(), legacy, "a pre-update core's only hooks were swept")
                 settings, _ = hc._core_launch_settings(repo)
                 (ws / "state").mkdir(parents=True)
-                (ws / "state" / "core-launch-settings.json").write_text(json.dumps({"settings": settings}))
+                record = ws / "state" / "core-launch-settings.json"
+                record.write_text(json.dumps({"settings": settings}))
+                checks = [hc.check_claude_hook_registration()]
+                self.assertIn("not bound to a process", checks[0]["detail"])
+                hc.apply_claude_hooks_fix(checks, stream=io.StringIO())
+                self.assertEqual(proj.read_text(), legacy, "an unbound record authorized the sweep")
+                core = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core" sleep 300'])
+                self.addCleanup(core.kill)
+                start = subprocess.run(["ps", "-p", str(core.pid), "-o", "lstart="], capture_output=True, text=True).stdout.strip()
+                record.write_text(json.dumps({"pid": core.pid, "start": start, "session": "sutando-core",
+                                              "other_core_live": False, "settings": settings}))
                 checks = [hc.check_claude_hook_registration()]
                 self.assertEqual(checks[0]["status"], "warn", checks[0]["detail"])
                 hc.apply_claude_hooks_fix(checks, stream=io.StringIO())

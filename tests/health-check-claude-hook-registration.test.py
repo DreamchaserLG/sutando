@@ -79,6 +79,12 @@ class Probe(unittest.TestCase):
         self.ccd = Path(self._td.name) / "ccd"
         self.ccd.mkdir()
         self.ws = Path(self._td.name) / "ws"
+        # A real process the record binds to: argv as a core's, so ps reports `--name sutando-core`.
+        self.core = subprocess.Popen(["/bin/bash", "-c", 'exec -a "claude --name sutando-core" sleep 300'])
+        self.addCleanup(self.core.kill)
+        self.start = subprocess.run(["ps", "-p", str(self.core.pid), "-o", "lstart="],
+                                    capture_output=True, text=True).stdout.strip()
+        assert self.start, "ps did not report the probe process"
         settings, why = hc._core_launch_settings(self.repo)
         assert settings is not None, why
         self.record(settings)
@@ -89,10 +95,12 @@ class Probe(unittest.TestCase):
         self._env.stop()
         self._td.cleanup()
 
-    def record(self, settings):
+    def record(self, settings, **fields):
         (self.ws / "state").mkdir(parents=True, exist_ok=True)
-        (self.ws / "state" / "core-launch-settings.json").write_text(
-            json.dumps({"ts": 1, "repo": str(self.repo), "settings": settings}))
+        rec = {"ts": 1, "repo": str(self.repo), "pid": self.core.pid, "start": self.start,
+               "session": "sutando-core", "socket": "/tmp/t.sock", "other_core_live": False, "settings": settings}
+        rec.update(fields)
+        (self.ws / "state" / "core-launch-settings.json").write_text(json.dumps(rec))
 
     def probe(self, **kw):
         kw.setdefault("workspace_dir", self.ws)
@@ -165,6 +173,36 @@ class Probe(unittest.TestCase):
         self.assertEqual(out["status"], "warn")
         self.assertIn("the running core was launched without", out["detail"])
         self.assertFalse(out["_live_core_has_launch_hooks"])
+
+    def _bound_record_fails(self, **fields):
+        settings, _ = hc._core_launch_settings(self.repo)
+        self.record(settings, **fields)
+        out = self.probe()
+        self.assertEqual(out["status"], "warn")
+        self.assertFalse(out["_live_core_has_launch_hooks"], out["detail"])
+        return out["detail"]
+
+    def test_a_record_for_a_process_that_is_gone_is_stale(self):
+        self.core.kill()
+        self.core.wait()
+        self.assertIn("is not running — the launch record is stale", self._bound_record_fails())
+
+    def test_a_record_whose_start_time_differs_is_stale(self):
+        self.assertIn("is not the core the launch record describes", self._bound_record_fails(start="Thu Jan  1 00:00:00 2026"))
+
+    def test_a_record_naming_another_session_is_stale(self):
+        self.assertIn("is not the core the launch record describes", self._bound_record_fails(session="sutando-other"))
+
+    def test_a_record_without_a_pid_is_not_proof(self):
+        settings, _ = hc._core_launch_settings(self.repo)
+        (self.ws / "state" / "core-launch-settings.json").write_text(
+            json.dumps({"ts": 1, "repo": str(self.repo), "settings": settings}))
+        out = self.probe()
+        self.assertIn("not bound to a process", out["detail"])
+        self.assertFalse(out["_live_core_has_launch_hooks"])
+
+    def test_a_core_launched_beside_an_outside_socket_core_does_not_authorize_the_sweep(self):
+        self.assertIn("another same-name core was live outside the socket", self._bound_record_fails(other_core_live=True))
 
     def test_an_owned_script_that_is_gone_warns(self):
         os.remove(self.repo / "src" / "turn-start.sh")

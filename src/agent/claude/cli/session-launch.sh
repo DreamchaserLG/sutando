@@ -447,16 +447,50 @@ sweep_legacy_claude_hooks_for_launch() {
   bash "$REPO/src/install-claude-hooks.sh" || echo "session-launch: legacy hook sweep failed (rc=$?) — old copies may still fire" >&2
 }
 
-# The record the health probe reads for what the live core was launched with.
-record_core_launch_settings() {
-  [ "${SETTINGS_ARGS[0]:-}" = --settings ] && [ -n "${PY:-}" ] || return 0
+# The one live `claude --name $SESSION` this launcher just proved up; on a private
+# socket only a pane of this server counts.
+live_core_pid() {
+  if claude_private_socket_in_use; then claude_named_pids_on_socket; else claude_named_pids; fi | head -n 1
+}
+
+# Every launch past the attach/adopt exits drops the previous core's record first: a
+# launch that ends with no settings must not leave the old record to vouch for the new core.
+retire_core_launch_record() {
   local ws; ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
-  _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
+  rm -f "$ws/state/core-launch-settings.json"
+}
+
+# Once the new core is proven live: sweep the copies it replaced, then record what it runs.
+# A same-name core left running outside this socket still depends on the copies, so they
+# stay and the record says so (health then refuses to sweep them).
+settle_core_launch_hooks() {
+  if [ -n "${OUTSIDE_CORE_LIVE:-}" ]; then
+    echo "session-launch: a same-name core is live outside $TMUX_SOCKET — legacy hook entries kept, it still runs them" >&2
+  else
+    sweep_legacy_claude_hooks_for_launch
+  fi
+  record_core_launch_settings "$(live_core_pid)"
+}
+
+# The record the health probe reads for what the live core was launched with, bound to that
+# process (pid + start time). No settings, or no live pid, retires any record instead.
+record_core_launch_settings() {
+  local pid="${1:-}" ws start
+  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$ws" ] || return 0
+  if [ "${SETTINGS_ARGS[0]:-}" != --settings ] || [ -z "${PY:-}" ] || [ -z "$pid" ]; then
+    rm -f "$ws/state/core-launch-settings.json"
+    return 0
+  fi
+  start="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+  _settings_json="${SETTINGS_ARGS[1]}" _repo="$REPO" _pid="$pid" _start="$start" _session="$SESSION" \
+    _socket="$TMUX_SOCKET" _outside="${OUTSIDE_CORE_LIVE:-}" "$PY" - "$ws/state/core-launch-settings.json" <<'PY' \
     || echo "session-launch: core launch-settings record not written (non-fatal)" >&2
 import json, os, sys, tempfile, time
 path = sys.argv[1]
 os.makedirs(os.path.dirname(path), exist_ok=True)
-rec = {"ts": int(time.time()), "repo": os.environ["_repo"], "settings": json.loads(os.environ["_settings_json"])}
+rec = {"ts": int(time.time()), "repo": os.environ["_repo"], "pid": int(os.environ["_pid"]),
+       "start": os.environ["_start"], "session": os.environ["_session"], "socket": os.environ["_socket"],
+       "other_core_live": bool(os.environ["_outside"]), "settings": json.loads(os.environ["_settings_json"])}
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".core-launch-settings.")
 with os.fdopen(fd, "w") as f:
     json.dump(rec, f)

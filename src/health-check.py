@@ -11810,6 +11810,24 @@ def _core_launch_settings(repo: Path) -> tuple[Optional[dict], str]:
     return settings, ""
 
 
+def _launch_record_binds_live_core(rec: dict) -> str:
+    """'' when the record's pid is the live core it describes, else why the record is not proof."""
+    pid, start = rec.get("pid"), rec.get("start")
+    session = rec.get("session") or "sutando-core"
+    if not isinstance(pid, int) or not isinstance(start, str) or not start:
+        return "the launch record is not bound to a process (written by an older launcher) — restart the core"
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart=,args="],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"cannot read process {pid} for the launch record ({exc})"
+    if not out:
+        return f"the recorded core (pid {pid}) is not running — the launch record is stale"
+    if not out.startswith(start) or (f"--name {session}" not in out and f"--name={session}" not in out):
+        return f"pid {pid} is not the core the launch record describes — the record is stale"
+    return ""
+
+
 def _fmt_records(records) -> str:
     shown = sorted(records)[:4]
     more = f", +{len(records) - 4} more" if len(records) > 4 else ""
@@ -11865,8 +11883,14 @@ def check_claude_hook_registration(
     try:
         rec = json.loads((ws / "state" / "core-launch-settings.json").read_text(encoding="utf-8"))
         lacking = chs.launch_records(repo) - chs.records_in(rec.get("settings") or {})
+        unbound = _launch_record_binds_live_core(rec)
         if lacking:
             problems.append(f"the running core was launched without {_fmt_records(lacking)} — restart the core")
+        elif rec.get("other_core_live"):
+            problems.append("another same-name core was live outside the socket at launch, so the settings-file "
+                            "copies it runs were kept — stop it and restart the core")
+        elif unbound:
+            problems.append(unbound)
         else:
             live_ok = bool(owned_expected)
     except FileNotFoundError:
