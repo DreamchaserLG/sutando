@@ -50,7 +50,9 @@ STUB = textwrap.dedent('''
                                       if sized else rest[:1]))
     def save():
         state.write_text(json.dumps(db))
-    if cmd in os.environ.get("STUB_FAIL", "").split(","):
+    fail_at = os.environ.get("STUB_FAIL_AT", "")  # "<cmd>:<n>": the n-th call of cmd fails
+    nth = fail_at and cmd == fail_at.split(":")[0] and sum(c[0] == cmd for c in db["calls"]) == int(fail_at.split(":")[1])
+    if cmd in os.environ.get("STUB_FAIL", "").split(",") or nth:
         save(); print("boom", file=sys.stderr); sys.exit(1)
     if cmd == "pages":
         listed = [{"id": None, "kind": "html", "title": "Main"}]

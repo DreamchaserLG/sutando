@@ -118,8 +118,11 @@ each room's entry.
   would differ (another name or core), a stale page is rewritten with the prompts and roles it was
   last built with (recorded in the entry), a page from before lists had a revision counts as stale,
   and a `pending` page is finished whatever its revision. A page someone edited since it was last
-  written (its text no longer hashes to the entry) is kept, with or without `--if-newer`: the
-  result says `"action": "kept"` and stderr names the page. It summons no one. Run it after an engine
+  written (its text no longer hashes to the entry) is kept, with or without `--if-newer`, and
+  whatever the revision: the result says `"action": "kept"`, stderr names the page, and the entry
+  stands (an `unchanged` or `kept` run records nothing). A rewrite is recorded as `updating` with
+  its target before the first write; a run cut short there is finished by the next run, which
+  renders the same page from the recorded prompts, roles and media. It summons no one. Run it after an engine
   update, in every room with an entry, so an owner's page gains the steps a release added:
 
   ```bash
@@ -175,7 +178,8 @@ so one validated format can serve both:
 - `since_release`: the release date (`YYYY-MM-DD`) that introduced the feature.
 - `runtime` (optional): `claude` or `codex`; the step appears on that core only.
 - `title` and both `body` parts are plain text: no `<` or `>` (write entities such as `&rarr;`),
-  and `{name}` is the only placeholder (a literal brace is `{{` or `}}`).
+  and `{name}` is the only placeholder (a literal brace is `{{` or `}}`); all three render the
+  same way. A list, file or URL, is at most 1 MiB.
 - `revision`: `tutorial.YYYY-MM-DD.N`. Any change to the list bumps it; two revisions order by
   date, then N.
 

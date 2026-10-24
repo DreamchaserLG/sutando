@@ -8,6 +8,7 @@ keep the page publishable hold."""
 from __future__ import annotations
 
 import contextlib
+import email.message
 import importlib.util
 import io
 import json
@@ -15,7 +16,10 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 import unittest
+import urllib.request
+import urllib.response
 from pathlib import Path
 from unittest import mock
 
@@ -138,6 +142,31 @@ def many_steps(n, shots=0):
     return data
 
 
+def served_by(opened):
+    """fetch_list's opener replaced by one whose open() is `opened`."""
+    return mock.patch.object(gs, "list_opener", return_value=types.SimpleNamespace(open=opened))
+
+
+class FakeTransport(urllib.request.BaseHandler):
+    """Answers https, http and ftp requests from `routes`: {url: (status, body or Location)}."""
+    handler_order = 100
+
+    def __init__(self, routes):
+        self.routes, self.seen = routes, []
+
+    def _serve(self, req):
+        self.seen.append(req.full_url)
+        status, payload = self.routes[req.full_url]
+        headers = email.message.Message()
+        if status == 302:
+            headers["Location"] = payload
+        resp = urllib.response.addinfourl(io.BytesIO(b"" if status == 302 else payload), headers, req.full_url, status)
+        resp.msg = "Found" if status == 302 else "OK"
+        return resp
+
+    https_open = http_open = ftp_open = _serve
+
+
 class LosslessTest(unittest.TestCase):
     def test_the_list_renders_the_same_html_as_the_hard_coded_sections(self):
         cases = 0
@@ -206,7 +235,12 @@ class ListTest(unittest.TestCase):
         self.refuse(with_step(id="rooms"), "duplicate", "rooms")
         self.refuse(with_step(id="finale"), "finale")
         self.refuse(with_step(title=""), "step dm", "title")
-        self.refuse(with_step(body=["only one part"]), "body")
+        self.refuse(with_step(body=["only one part"]), "body", "2 parts")
+        self.refuse(with_step(body=["what", "how", "a third part"]), "body", "2 parts")
+        self.refuse(with_step(body=[]), "body", "2 parts")
+        self.refuse(with_step(body="what, how"), "body", "2 parts")
+        self.assertEqual(tp.BODY_PARTS, 2)
+        self.refuse(good_list(revision="other.2026-10-24.1"), "revision", "tutorial.YYYY-MM-DD.N")
         self.refuse(with_step(body=["a", {"text": "b", "href": "https://x.test"}]), "link")
         self.refuse(with_step(body=["a", {"label": "b"}]), "body part")
         self.refuse(with_step(paste=""), "paste")
@@ -241,6 +275,12 @@ class ListTest(unittest.TestCase):
         self.refuse(with_step(body=["What {}.", "How."]), "body[0]", "{name}")
         self.refuse(with_step(body=["{name!r}", "How."]), "body[0]", "{name}")
         self.refuse(with_step(body=["Unbalanced {", "How."]), "body[0]", "literal brace")
+        self.refuse(with_step(title="Step {0}"), "step dm title", "{name}", "{0}")
+        self.refuse(with_step(title="Hello {other}"), "step dm title", "{name}", "{other}")
+        self.refuse(with_step(title="Un{matched"), "step dm title", "literal brace")
+        page = tp.render_page("Blue", "codex", features=tp.parse_list(with_step(title="{{Your}} DM with {name}")))
+        self.assertEqual(page.count("{Your} DM with Blue"), 2)  # the step heading and the tour's step title
+        self.assertNotIn("{name}", page)
         data = with_step(body=["Braces {{like these}} stay literal for {name}.", "Ask {name}:"])
         page = tp.render_page("Blue", "codex", features=tp.parse_list(data))
         self.assertIn("Braces {like these} stay literal for Blue.", page)
@@ -258,6 +298,8 @@ class ListTest(unittest.TestCase):
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.1"))
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.2"))
         self.assertFalse(tp.newer("junk", None))  # an unreadable list revision never forces a rebuild
+        self.assertIsNone(tp.revision_key("other.2026-10-24.1"))  # the namespace is part of the format
+        self.assertFalse(tp.newer("other.2026-10-24.1", "tutorial.2026-10-23.9"))
 
     def test_a_new_step_renders_with_the_default_art_and_opens_its_prompt_slot(self):
         data = good_list()
@@ -286,6 +328,11 @@ class ListTest(unittest.TestCase):
                 tp.load_list(bad)
             with self.assertRaisesRegex(ValueError, "cannot read"):
                 tp.load_list(Path(tmp) / "missing.json")
+            big = Path(tmp) / "big.json"
+            big.write_bytes(json.dumps(good_list(pad="x" * tp.LIST_MAX_BYTES)).encode())
+            with self.assertRaisesRegex(ValueError, f"over the {tp.LIST_MAX_BYTES}-byte cap"):
+                tp.load_list(big)
+            self.assertEqual(gs.LIST_MAX_BYTES, tp.LIST_MAX_BYTES)  # one cap for a file and a URL
 
 
 class MediaTest(unittest.TestCase):
@@ -477,7 +524,8 @@ class ListOverrideTest(_Cli):
         self.assertFalse(state.exists() and json.loads(state.read_text()).get("pages"))  # nothing was written
 
     def test_no_network_call_without_a_list_url(self):
-        with mock.patch.object(gs.urllib.request, "urlopen", side_effect=AssertionError("network")) as net:
+        with mock.patch.object(gs.urllib.request, "urlopen", side_effect=AssertionError("network")) as net, \
+                mock.patch.object(gs, "list_opener", side_effect=AssertionError("network")) as opener:
             code, out, _ = self.main("render", "--name", "Blue", "--core", "codex")
             self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))
             other = self.write_list("tutorial.2026-11-01.1")
@@ -486,6 +534,7 @@ class ListOverrideTest(_Cli):
             code, _, _ = self.publish()
             self.assertEqual(code, 0)
         net.assert_not_called()
+        opener.assert_not_called()
 
     def test_a_served_list_replaces_the_file(self):
         served = json.dumps(good_list(revision="tutorial.2026-11-01.1", kind="tutorial", etag="x")).encode()
@@ -496,13 +545,49 @@ class ListOverrideTest(_Cli):
             seen["url"], seen["ua"], seen["timeout"] = req.full_url, req.get_header("User-agent"), timeout
             yield io.BytesIO(served)
 
-        with mock.patch.object(gs.urllib.request, "urlopen", opened):
+        with served_by(opened):
             code, out, err = self.main("render", "--name", "Blue", "--core", "codex",
                                        "--list", "https://api.example.test/setup-copy?scope=tutorial")
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(seen, {"url": "https://api.example.test/setup-copy?scope=tutorial",
                                 "ua": gs.USER_AGENT, "timeout": gs.LIST_TIMEOUT})
         self.assertEqual(out, tp.render_page("Blue", "codex", features=tp.parse_list(json.loads(served))))
+        with served_by(opened):
+            code, out, _ = self.publish("--list", "https://u:secret@api.example.test:8443/setup-copy?token=t#x")
+        self.assertEqual((code, json.loads(out)["list"]), (0, "https://api.example.test:8443/setup-copy"))
+
+    def test_a_redirect_is_followed_only_to_https(self):
+        served = json.dumps(good_list(revision="tutorial.2026-11-01.1")).encode()
+        routes = {"https://trusted.example/list": (302, "http://127.0.0.1:8080/cleartext-list"),
+                  "http://127.0.0.1:8080/cleartext-list": (200, served),
+                  "https://trusted.example/ftp": (302, "ftp://files.example/list"),
+                  "ftp://files.example/list": (200, served),
+                  "https://trusted.example/moved": (302, "https://cdn.example/list?sig=s"),
+                  "https://cdn.example/list?sig=s": (200, served)}
+        for url, target in (("https://trusted.example/list", "http://127.0.0.1:8080/cleartext-list"),
+                            ("https://trusted.example/ftp", "ftp://files.example/list")):
+            transport = FakeTransport(routes)
+            with self.assertRaises(ValueError) as caught:
+                gs.fetch_list(url, gs.list_opener(transport))
+            self.assertIn("only https", str(caught.exception))
+            self.assertEqual(transport.seen, [url])  # the cleartext target is never requested
+            self.assertNotIn("secret", str(caught.exception))
+        transport = FakeTransport(routes)
+        self.assertEqual(gs.fetch_list("https://trusted.example/moved", gs.list_opener(transport)).revision,
+                         "tutorial.2026-11-01.1")
+        self.assertEqual(transport.seen, ["https://trusted.example/moved", "https://cdn.example/list?sig=s"])
+        # Through the CLI the refusal falls back to the file; the note shows no userinfo or query.
+        with mock.patch.object(gs, "list_opener", lambda *h: urllib.request.build_opener(
+                gs._HttpsRedirects(), FakeTransport({"https://me:secret@trusted.example/list?token=abc": (302, "http://x.test/?k=v")}))):
+            code, out, err = self.main("render", "--name", "Blue", "--core", "codex",
+                                       "--list", "https://me:secret@trusted.example/list?token=abc")
+        self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))
+        self.assertIn("--list https://trusted.example/list not used", err)
+        self.assertIn("redirect to http://x.test/ refused", err)
+        for leak in ("secret", "token=abc", "k=v", "me:"):
+            self.assertNotIn(leak, err)
+        self.assertEqual(gs.safe_source("https://u:p@h.test:8443/x/y?token=1#f"), "https://h.test:8443/x/y")
+        self.assertEqual(gs.safe_source("/tmp/list.json"), "/tmp/list.json")
 
     def test_a_served_list_that_fails_falls_back(self):
         for url, payload, word in (("http://api.example.test/x", b"{}", "https"),
@@ -513,11 +598,11 @@ class ListOverrideTest(_Cli):
             def opened(req, timeout=None, payload=payload):
                 yield io.BytesIO(payload)
 
-            with mock.patch.object(gs.urllib.request, "urlopen", opened):
+            with served_by(opened):
                 code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", url)
             self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")), url)
             self.assertIn(word, err, url)
-        with mock.patch.object(gs.urllib.request, "urlopen", side_effect=OSError("refused")):
+        with served_by(mock.Mock(side_effect=OSError("refused"))):
             code, out, err = self.main("render", "--name", "Blue", "--list", "https://api.example.test/x")
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
         self.assertIn("cannot fetch", err)
@@ -547,6 +632,27 @@ class ListOverrideTest(_Cli):
         broken.write_text("{nope")
         code, out, _ = self.main("render", "--name", "Blue", "--media", str(broken))
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
+
+    def test_prompts_for_a_slot_only_the_served_list_has_are_used_and_kept(self):
+        data = good_list(revision="tutorial.2026-11-01.1")
+        data["steps"].insert(1, {"id": "marketplace", "title": "Marketplace", "surface": "dm",
+                                 "body": ["Cloud tools for {name}.", "Ask {name}:"], "screenshot": None,
+                                 "since_release": "2026-11-01", "paste": "Install the Notion tool."})
+        other = self.tmp / "m.json"
+        other.write_text(json.dumps(data))
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"marketplace": "Show me the Marketplace."}))
+        code, out, _ = self.publish("--if-newer", "--list", str(other), "--prompts", str(prompts))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+        self.assertIn("Show me the Marketplace.", self.page_text())
+        self.assertNotIn("Install the Notion tool.", self.page_text())
+        entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+        self.assertEqual(entry["prompts"], {"marketplace": "Show me the Marketplace."})
+        data["revision"] = "tutorial.2026-11-02.1"
+        other.write_text(json.dumps(data))
+        code, out, _ = self.publish("--if-newer", "--list", str(other))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
+        self.assertIn("Show me the Marketplace.", self.page_text())
 
     def test_publish_reports_which_list_it_used(self):
         other = self.write_list("tutorial.2026-11-01.1")
@@ -660,6 +766,89 @@ class IfNewerTest(_Cli):
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
         self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-01.1"))
 
+    def test_a_same_or_older_revision_pass_never_blesses_an_owner_edit(self):
+        self.publish()
+        written = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"]
+        db = json.loads((self.tmp / "room.json").read_text())
+        theirs = db["pages"]["html-p1"].replace("</main>", "<p>Our notes.</p></main>")
+        db["pages"]["html-p1"] = theirs
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        older = self.write_list("tutorial.2026-10-01.1")
+        for extra in (("--if-newer",), ("--if-newer", "--list", str(older))):
+            code, out, err = self.publish(*extra)
+            self.assertEqual((code, json.loads(out)["action"]), (0, "kept"), extra)
+            self.assertIn("edited", err)
+            self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"], written)
+        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-01.1")))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
+        self.assertEqual(self.page_text(), theirs)  # the edit survives the next revision
+
+    def test_an_unchanged_or_kept_run_leaves_the_entry_as_written(self):
+        prompts, media = self.tmp / "p.json", self.tmp / "m.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
+        self.publish("--prompts", str(prompts), "--roles", "Founder", "--media", str(media))
+        before = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+        self.assertEqual((before["prompts"], before["roles"], before["media"]),
+                         ({"dm": "Draft my update."}, "Founder", {"room-list-add": MXC_OF["room-list-add"]}))
+        more = self.tmp / "more.json"
+        more.write_text(json.dumps({"new-room-dialog": MXC_OF["new-room-dialog"]}))
+        older = self.write_list("tutorial.2026-10-01.1")
+        code, out, _ = self.publish("--if-newer", "--list", str(older), "--media", str(more))
+        self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM], before)
+        db = json.loads((self.tmp / "room.json").read_text())
+        db["pages"]["html-p1"] += "<!-- theirs -->"
+        (self.tmp / "room.json").write_text(json.dumps(db))
+        code, out, _ = self.publish("--media", str(more), "--roles", "Sales")
+        self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM], before)
+
+    def test_a_rewrite_cut_short_is_finished_by_the_next_run_at_the_exact_target(self):
+        prompts = self.tmp / "p.json"
+        prompts.write_text(json.dumps({"dm": "Draft my update."}))
+        newer = self.write_list("tutorial.2026-11-01.1")
+        target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
+                                tp.load_list(newer))
+        self.assertEqual(len(gs.chunks(target)), 2)  # the default-size page: two clears, two appends
+        boundaries = {"replace:1": ["replace"], "replace:2": ["replace", "replace"],
+                      "append:1": ["replace", "replace", "append"],
+                      "append:2": ["replace", "replace", "append", "append"]}
+        for at, calls in boundaries.items():
+            with self.subTest(at=at):
+                (self.tmp / "room.json").unlink(missing_ok=True)
+                shutil.rmtree(self.tmp / "ws", ignore_errors=True)
+                code, out, _ = self.publish()
+                self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
+                db = json.loads((self.tmp / "room.json").read_text())
+                mine = db["pages"]["html-p1"]
+                db["calls"] = []
+                (self.tmp / "room.json").write_text(json.dumps(db))
+                os.environ["STUB_FAIL_AT"] = at
+                code, out, _ = self.publish("--if-newer", "--list", str(newer), "--prompts", str(prompts),
+                                            "--roles", "Founder")
+                os.environ.pop("STUB_FAIL_AT")
+                self.assertEqual((code, json.loads(out)["ok"]), (4, False))
+                db = json.loads((self.tmp / "room.json").read_text())
+                self.assertEqual([c[0] for c in db["calls"] if c[0] in ("replace", "append")], calls)
+                left = self.page_text()
+                self.assertNotEqual(left, target)
+                if at == "append:1":
+                    self.assertEqual(left, "")  # the blank page a retry must not read as an edit
+                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+                self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"]),
+                                 ("updating", gs.content_hash(target), {"dm": "Draft my update."}, "Founder"))
+                self.assertEqual(json.loads(self.main("plan", "--room", self.ROOM)[1])["pending"], True)
+                # The retry passes no prompts or roles: the entry carries the target's.
+                code, out, err = self.publish("--if-newer", "--list", str(newer), "--owner", "@owner:example.test")
+                got = json.loads(out)
+                self.assertEqual((code, got["action"], got["summoned"], got.get("edited"), err),
+                                 (0, "updated", False, None, ""))
+                self.assertEqual(self.page_text(), target)
+                entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
+                self.assertEqual((entry["state"], entry["hash"]), ("complete", gs.content_hash(target)))
+                self.assertNotEqual(mine, target)
+
     def test_a_pending_page_is_finished_whatever_the_revision(self):
         self.door.fail = "after"
         code, out, _ = self.publish()
@@ -698,6 +887,10 @@ class DocTest(unittest.TestCase):
         self.assertNotIn("reword them in `tour_page.py`", text)
         self.assertIn(str(ASSET_CAP // 1000) + " KB", text)
         self.assertIn(str(PAGE_CAP // 1000) + " KB", text)
+        self.assertIn("`updating`", text)
+        canon = (HERE.parent / "docs" / "tutorial-delivery.md").read_text(encoding="utf-8")
+        for word in ("--if-newer", "kept", "updating", "mxc://", "1 MiB", "Last verified:"):
+            self.assertIn(word, canon)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ IMPORT_PROMPT = "Import my Claude Code history."
 SCHEMA_VERSION = 1
 LIST_PATH = Path(__file__).resolve().parent.parent / "feature-list.json"  # lint-workspace-resolution: allow-repo-root
 # A revision ends in the list's date and a sequence number, so two revisions order by (date, n).
-REVISION = re.compile(r"^[a-z][a-z0-9.-]*\.(\d{4}-\d{2}-\d{2})\.(\d+)$")
+REVISION = re.compile(r"^tutorial\.(\d{4}-\d{2}-\d{2})\.(\d+)$")
 STEP_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 ASSET_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 FALLBACK_FILE = re.compile(r"^assets/([a-z0-9][a-z0-9-]*\.jpg)$")
@@ -42,6 +42,7 @@ SURFACES = ("dm", "room", "mobile")
 RUNTIMES = ("claude", "codex")
 BODY_PARTS = 2
 STEPS_MAX = 24
+LIST_MAX_BYTES = 1_048_576  # a list from any source, file or URL
 # A fallback-mode page inlines every screenshot; Room Commons refuses a page much larger.
 PAGE_MAX_BYTES = 300_000
 
@@ -208,7 +209,7 @@ def _step(raw: object, n: int, assets: Path) -> Section:
     title = raw.get("title")
     if not isinstance(title, str) or not title.strip():
         raise ValueError(f"{where}: title must be a non-empty string")
-    _no_tags(title, f"{where} title")
+    _text(title, f"{where} title")
     body = raw.get("body")
     if not isinstance(body, list) or len(body) != BODY_PARTS:
         raise ValueError(f"{where}: body must list {BODY_PARTS} parts (what it is, what to try)")
@@ -283,6 +284,12 @@ def parse_list(data: object, assets: Optional[Path] = None) -> FeatureList:
 def load_list(path: Optional[Path] = None) -> FeatureList:
     """The feature list in a JSON file; the skill's own `feature-list.json` by default."""
     path = LIST_PATH if path is None else Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"cannot read the feature list {path}: {exc.strerror or exc}") from None
+    if size > LIST_MAX_BYTES:
+        raise ValueError(f"the feature list {path} is {size} bytes, over the {LIST_MAX_BYTES}-byte cap")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -398,7 +405,7 @@ def _section(sec: Section, first: bool, who: str, prompts: Dict[str, str], media
         f'<section class="sec card{" cur" if first else ""}" id="s-{sec.id}" data-id="{sec.id}" '
         f'aria-labelledby="h-{sec.id}" style="--accent:var(--a-{sec.id})">'
         f'<div class="icon" aria-hidden="true"><svg viewBox="0 0 64 64" focusable="false">{icon}</svg></div>'
-        f'<div class="body"><h2 id="h-{sec.id}">{sec.title}</h2>'
+        f'<div class="body"><h2 id="h-{sec.id}">{sec.title.format(name=who)}</h2>'
         f'<p>{sec.what.format(name=who)}</p><p class="how">{sec.how.format(name=who)}</p>{prompt}'
         f'{_shots(sec.images, media)}'
         f'<label class="done"><input type="checkbox" data-done="{sec.id}" disabled> Mark done</label>'
@@ -730,7 +737,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"aria-valuemin=\"0\" aria-valuemax=\"{len(secs)}\" aria-valuenow=\"0\"><span id=\"progress-fill\"></span></div></div>"
         "<nav class=\"controls\" id=\"controls\" aria-label=\"Tour steps\">"
         "<div class=\"dots\" id=\"dots\"></div>"
-        f"<p class=\"step-title\"><span id=\"step-title\">{secs[0].title}</span>"
+        f"<p class=\"step-title\"><span id=\"step-title\">{secs[0].title.format(name=who)}</span>"
         f"<span class=\"pos\" id=\"step-pos\" aria-hidden=\"true\">1/{len(secs)}</span></p>"
         "<button type=\"button\" id=\"back\" aria-label=\"Previous step\">Back</button>"
         "<button type=\"button\" id=\"next\" aria-label=\"Next step\">Next</button>"

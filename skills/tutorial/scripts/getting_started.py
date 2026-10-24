@@ -26,10 +26,12 @@ there, and an asset with no mapping is inlined from its fallback file, as every 
 
 The page records the list's revision in its ownership tag. `publish` rewrites a page whose text
 differs from what it would write (a new name, core, list or prompts), unless someone edited the page
-since it was last written: that page is kept (action "kept", a line on stderr). With --if-newer it
-rewrites a complete page only when the list's revision is newer than the page's, reusing the prompts
-and roles the page was last built with, so a pass after an engine update refreshes stale pages and
-leaves current ones alone. A page built before lists had a revision counts as older than any list.
+since it was last written: that page is kept (action "kept", a line on stderr) and its entry stands.
+With --if-newer it rewrites a complete page only when the list's revision is newer than the page's,
+reusing the prompts and roles the page was last built with, so a pass after an engine update
+refreshes stale pages and leaves current ones alone. A page built before lists had a revision counts
+as older than any list. A rewrite is recorded as `updating` before its first write and finished by
+the next run whatever the revision, so a run cut short never leaves a blank page behind.
 
 room_commons.py is found beside this skill, else in the installed skills directory. Its
 credentials come from the environment, else from the AG2 Space channel env file
@@ -80,7 +82,7 @@ import tour_page  # noqa: E402,F401
 from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these names are this CLI's API)
     AUDIENCES, CONNECT_PROMPT, PROMPT_SLOTS, clean_prompts, owner_marker, CORES, IMPORT_PROMPT, NAME_MAX, PAGE_TITLE, SECTIONS, clean_name,
     render_page, sections_for, FeatureList, LIST_PATH, clean_media, load_list, newer, parse_list, read_marker,
-    role_labels,
+    role_labels, LIST_MAX_BYTES,
 )
 
 SUMMON_CONTEXT = "A short tour of AG2 Space, with one thing to try in each part."
@@ -93,7 +95,6 @@ SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
 CHUNK_BYTES = 120_000
 USER_AGENT = "sutando-tutorial/1"
 LIST_TIMEOUT = 10
-LIST_MAX_BYTES = 1_048_576
 FALLBACK_NAME = "Sutando"
 MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
 ROOM_ID = re.compile(r"^![A-Za-z0-9._=/+\-]+:[A-Za-z0-9.\-]+(?::\d+)?$")
@@ -240,14 +241,45 @@ def redact(text: str, env: Optional[Mapping[str, str]]) -> str:
     return SECRET_SHAPE.sub(lambda m: (m.group(1) or "") + "[redacted]", text)
 
 
-def fetch_list(url: str) -> FeatureList:
-    """The feature list served at an https URL, validated like the file. Only https is fetched."""
+class RedirectRefused(Exception):
+    pass
+
+
+class _HttpsRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows a redirect only to another https URL; urllib's default also follows http and ftp."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            fp.close()
+            raise RedirectRefused(f"redirect to {safe_source(newurl)} refused; only https is fetched")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def list_opener(*handlers) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_HttpsRedirects(), *handlers)
+
+
+def safe_source(source: str) -> str:
+    """A list source as it may be printed: a URL keeps scheme, host, port and path only (no
+    userinfo, query or fragment); a file path is returned as given."""
+    if "://" not in source:
+        return source
+    parts = urllib.parse.urlsplit(source)
+    port = f":{parts.port}" if parts.port else ""
+    return f"{parts.scheme}://{parts.hostname or ''}{port}{parts.path}"
+
+
+def fetch_list(url: str, opener: Optional[urllib.request.OpenerDirector] = None) -> FeatureList:
+    """The feature list served at an https URL, validated like the file. Only https is fetched,
+    redirects included."""
     if not url.startswith("https://"):
-        raise ValueError(f"a served feature list must be an https URL, got {url!r}")
+        raise ValueError(f"a served feature list must be an https URL, got {safe_source(url)}")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=LIST_TIMEOUT) as resp:
+        with (opener or list_opener()).open(req, timeout=LIST_TIMEOUT) as resp:
             raw = resp.read(LIST_MAX_BYTES + 1)
+    except RedirectRefused as exc:
+        raise ValueError(str(exc)) from None
     except Exception as exc:  # noqa: BLE001 - any transport failure falls back to the file
         raise ValueError(f"cannot fetch the feature list: {type(exc).__name__}") from None
     if len(raw) > LIST_MAX_BYTES:
@@ -266,9 +298,9 @@ def resolve_list(source: Optional[str], note: Callable[[str], None] = lambda s: 
     if source:
         try:
             got = fetch_list(source) if "://" in source else load_list(Path(source))
-            return got, source
+            return got, safe_source(source)
         except ValueError as exc:
-            note(f"getting_started: --list {source} not used ({exc}); using the skill's own list")
+            note(f"getting_started: --list {safe_source(source)} not used ({exc}); using the skill's own list")
     return tour_page.FEATURES, "file"
 
 
@@ -387,12 +419,14 @@ def owned(page: dict, text: str, agent: Optional[str]) -> Optional[bool]:
 
 def plan(rooms: Dict[str, dict], room: str, pages: Optional[List[dict]] = None) -> dict:
     """Rewrite the recorded page while it is listed (`pending` when its first write never
-    finished); with no usable entry, reconcile against unrecorded candidates, else create."""
+    finished, or an `updating` rewrite was cut short); with no usable entry, reconcile against
+    unrecorded candidates, else create."""
     entry = rooms.get(room)
     if entry and entry.get("state") == "creating":
         return {"action": "resume", "kind": None, "pending": True, "operation_id": entry["operation_id"]}
     if entry and (pages is None or entry["kind"] in [p.get("kind") for p in pages]):
-        return {"action": "update", "kind": entry["kind"], "pending": entry.get("state") == "pending"}
+        return {"action": "update", "kind": entry["kind"],
+                "pending": entry.get("state") in ("pending", "updating")}
     if candidates(pages or []):
         return {"action": "reconcile", "kind": None, "pending": True}
     return {"action": "create", "kind": None, "pending": False}
@@ -494,6 +528,20 @@ def _record(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> Non
         raise PublishError(f"could not record {entry.get('kind') or entry['state']} in {marker}: {exc}") from None
 
 
+def _entry(kind: str, page: str, features: FeatureList, prompts: Dict[str, str], roles: object,
+           media: Dict[str, str]) -> dict:
+    """A room's complete entry for `page` and the inputs it was built from."""
+    entry = {"kind": kind, "state": "complete", "hash": content_hash(page),
+             "revision": (read_marker(page) or (None, features.revision))[1]}
+    if prompts:
+        entry["prompts"] = prompts
+    if role_labels(roles):
+        entry["roles"] = ", ".join(role_labels(roles))
+    if media:
+        entry["media"] = media
+    return entry
+
+
 def _fill(commons: Commons, kind: str, page: str) -> None:
     """Bring a page the create just wrote (or wrote earlier) to `page`: append the rest after a
     first body that matches, else rewrite whatever is there."""
@@ -510,14 +558,16 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             features: Optional[FeatureList] = None, if_newer: bool = False,
             media: object = None) -> dict:
     features = features or tour_page.FEATURES
+    slots = tour_page.prompt_slots(features)
     with _locked(marker):
         rooms = load_marker(marker)
-        if if_newer and not clean_prompts(prompts):
+        before = rooms.get(commons.room, {}).get("state")
+        if if_newer and not clean_prompts(prompts, slots):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
         if if_newer and not role_labels(roles):
             roles = rooms.get(commons.room, {}).get("roles")
-        prompts = clean_prompts(prompts, tour_page.prompt_slots(features))
+        prompts = clean_prompts(prompts, slots)
         recorded = rooms.get(commons.room, {}).get("media")
         media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
                              **(media if isinstance(media, dict) else {})}, features)
@@ -554,28 +604,23 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             was = read_marker(current)
             page_revision = was[1] if was else None
             written = rooms.get(commons.room, {}).get("hash")
+            entry = _entry(kind, page, features, prompts, roles, media)
             if current == page:
                 action = "unchanged"
+            elif not step["pending"] and written and content_hash(current) != written:
+                action = "kept"  # someone edited the page since this script wrote it: theirs stays
             elif if_newer and not step["pending"] and not newer(features.revision, page_revision):
                 action = "unchanged"
-                page = current
-            elif not step["pending"] and written and content_hash(current) != written:
-                # Someone edited the page since this script wrote it: theirs stays, hash and all.
-                action = "kept"
-                page = current
             else:
+                if not step["pending"]:
+                    # The rewrite clears, then appends: a run cut short must resume, not read the gap
+                    # as an edit. The entry carries the target so a retry renders the same page.
+                    _record(marker, rooms, commons.room, {**entry, "state": "updating"})
                 commons.rewrite(kind, current, page)
                 action = "updated"
-        entry = {"kind": kind, "state": "complete",
-                 "hash": written if action == "kept" else content_hash(page),
-                 "revision": (read_marker(page) or (None, features.revision))[1]}
-        if prompts:
-            entry["prompts"] = prompts
-        if role_labels(roles):
-            entry["roles"] = ", ".join(role_labels(roles))
-        if media:
-            entry["media"] = media
-        _record(marker, rooms, commons.room, entry)
+        if action == "updated" or step["pending"] or step["action"] == "adopt":
+            # An unchanged or kept run records nothing: inputs that were not applied stay out.
+            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
               "media": sorted(media)}
     if step["action"] == "adopt":
@@ -584,7 +629,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         result["edited"] = True
     # Summoned once: when this page's creation finishes (here, or resumed from our own pending
     # entry). Adopting a page found by its ownership marker is not a creation.
-    first = action == "created" or step["action"] == "update" and step["pending"]
+    first = action == "created" or step["action"] == "update" and step["pending"] and before != "updating"
     if owner and (summon or first):
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT,
