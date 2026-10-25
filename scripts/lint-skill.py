@@ -144,9 +144,9 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
     # that resolves inside the skill, symlinks followed, the containment discovery applies.
     for field, exts in (("pending_questions_store", (".py",)), ("orphan_reaper", (".py",)),
                         ("on_launch", (".py", ".sh"))):
-        pqs = m.get(field)
-        if pqs is None:
+        if field not in m:  # absent is fine; present means a script, so null is an error
             continue
+        pqs = m[field]
         if not isinstance(pqs, str) or not any(pqs.endswith(e) and pqs[:-len(e)] for e in exts):
             err(f"{field} must be a relative path to a {' or '.join(exts)} script")
         elif pqs.startswith("/") or ".." in Path(pqs).parts or any(c.isspace() for c in pqs):

@@ -188,10 +188,17 @@ dirs), `skills/install.ps1`, and `health-check.py --fix` (`skill-symlinks`). A d
 skill already linked on a host without the opt-in is left in place with a note; nothing deletes
 it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
 
-Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
-`pending_questions_store`, `documented_for_core`, `on_launch`) read the skill roots themselves
-(`<repo>/skills` and `<workspace>/skills`; see `src/skill_roots.py`), past
-the installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+Runtime scans read skill directories themselves, past the installers, so `scripts/lint-skill.py`
+refuses their fields on a developer-only skill. Which directories depends on the consumer:
+
+- `tools` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills`, `$SUTANDO_MEMORY_DIR/skills`
+  when set, each `$SUTANDO_EXTERNAL_PLUGIN_DIRS` entry's `skills/`, and sibling checkouts' `skills/`;
+- `documented_for_core` (`src/inline-tools.ts`): `<repo>/skills`, `<workspace>/skills` and
+  `$SUTANDO_MEMORY_DIR/skills`;
+- `pending_questions_store` and `on_launch` (`src/skill_roots.py`): `<repo>/skills` and
+  `<workspace>/skills`;
+- `hooks` (`src/skill_hooks.py`), `claude_plugin` (`src/skill-manifest-config.sh`) and
+  `supervised_worker` (`src/sparrowd.py`): `<repo>/skills` only.
 
 ## Launch hook (`on_launch`)
 

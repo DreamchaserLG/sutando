@@ -511,10 +511,12 @@ def v1_revision(e):
 
 
 def v1_audience(e, where: str):
-    """The audience a v1 entry recorded (`dm` or `room`); None for an entry from before it did."""
-    a = e.get("audience") if isinstance(e, dict) else None
-    refuse_unless(a is None or a in AUDIENCES, f"{where}: audience")
-    return a
+    """The audience a v1 entry recorded (`dm` or `room`); None only when the key is absent (an
+    entry from before it did). Present, it must be one of the two: null or anything else refuses."""
+    if not isinstance(e, dict) or "audience" not in e:
+        return None
+    refuse_unless(e["audience"] in AUDIENCES, f"{where}: audience")
+    return e["audience"]
 
 
 def classify(key: str, e):
@@ -526,9 +528,10 @@ def classify(key: str, e):
     if prev is not None:
         complete_source(prev, f"room {key}: previous")
     prev_audience = v1_audience(prev, f"room {key}: previous")
+    audience = v1_audience(e, f"room {key}")  # checked in every state, used by the complete row
     state = e.get("state", "complete")
     if state == "complete":
-        return (e.get("kind"), complete_source(e, f"room {key}"), v1_revision(e), v1_audience(e, f"room {key}")), None
+        return (e.get("kind"), complete_source(e, f"room {key}"), v1_revision(e), audience), None
     if state in ("creating", "pending"):
         op_id = e.get("operation_id")
         if state == "creating":
@@ -984,6 +987,7 @@ class SchemaTransitionTest(unittest.TestCase):
         j5(new, R)
         keep_new(new, R)
         cur = ["rooms", R, "current"]
+        rid = new["rooms"][R]["current"]["accepted_review_id"]
         old = m2(None)
         fill(old)
         j4b(old, R)
@@ -1018,6 +1022,9 @@ class SchemaTransitionTest(unittest.TestCase):
             "an opaque entry with an unknown audience": [(["rooms", "!lost", "current", "audience"], "owner")],
             "a manual selection with a dm audience": [(["rooms", "!lost", "current", "audience"], "dm")],
             "a manual selection with a room audience": [(["rooms", "!lost", "current", "audience"], "room")],
+            "a manual selection without its audience key": [(["rooms", "!lost", "current", "audience"], DELETE)],
+            "accepted proposed without its audience key": [(cur + ["proposed", "audience"], DELETE),
+                                                           (["rooms", R, "reviews", rid, "proposed", "audience"], DELETE)],
             "accepted proposed with an audience its review didn't have": [(cur + ["proposed", "audience"], "room")],
         }
         source = {"select over a changed, unreviewed C": lost, "select over a C whose chosen candidate changed": lost,
@@ -1025,7 +1032,8 @@ class SchemaTransitionTest(unittest.TestCase):
                   "select:<kind> without its current": lost, "select:<kind> without its unselected entry": lost,
                   "select:none without its unselected entries": none,
                   "an opaque entry with an unknown audience": lost, "a manual selection with a dm audience": lost,
-                  "a manual selection with a room audience": lost}
+                  "a manual selection with a room audience": lost,
+                  "a manual selection without its audience key": lost}
         for name, edits in cases.items():
             with self.subTest(name):
                 bad = source.get(name, new)
@@ -1112,7 +1120,7 @@ class SchemaTransitionTest(unittest.TestCase):
         j0(j0m, R)
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "proposed"], {"kind": None}))
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "plan"], [3]))
-        for audience in ("owner", "", None, 1):
+        for audience in ("owner", "", None, 1, DELETE):
             self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "proposed", "audience"], audience))
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R], {"journal": j0m["rooms"][R]["journal"]}))
         keep_new(m, R)
@@ -1220,6 +1228,26 @@ class ConversionMatrixTest(unittest.TestCase):
                     "migrated_from": {"at": T, "v1_rooms": {"!r": {"entry_sha256": sha(canonical(entry)),
                                                                      "entry": entry}}},
                     "rooms": {"!r": self.expected_room(entry, cur, legacy, m["rooms"]["!r"])}})
+                if cur:  # the converted entry's audience is required, null included: never defaulted
+                    bad = copy.deepcopy(m)
+                    del bad["rooms"]["!r"]["current"]["audience"]
+                    self.assertRaises(Invalid, marker, bad)
+
+    def test_an_audience_is_absent_dm_or_room_on_the_entry_and_its_previous_in_every_state(self):
+        absent = object()
+        bases = {"complete": lambda a: {"kind": "html-a", "hash": "h", **a},
+                 "creating": lambda a: {"state": "creating", "operation_id": "op", **a},
+                 "pending": lambda a: {"kind": "html-a", "state": "pending", "operation_id": "op", **a},
+                 "updating": lambda a: {"kind": "html-a", "state": "updating", **a},
+                 "previous": lambda a: {"state": "creating", "operation_id": "op", "previous": {**self.PREV, **a}}}
+        for state, build in bases.items():
+            for value in (absent, None, "dm", "room", "owner", "", {}, 1):
+                entry = build({} if value is absent else {"audience": value})
+                with self.subTest(state=state, audience="absent" if value is absent else value):
+                    if value is absent or value in ("dm", "room"):
+                        marker(m2(v1_file({"!r": entry})))
+                    else:
+                        self.assertRaises(Refused, m2, v1_file({"!r": entry}))
 
     def test_every_row_at_once_and_a_clean_first_use(self):
         m = m2(v1_file({f"!{i}": e for i, (e, _, _) in enumerate(self.ROWS.values())}))

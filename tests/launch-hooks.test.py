@@ -130,6 +130,43 @@ class RunnerTest(_Tmp):
         wait_for(self.out / "good.sh.json")
 
 
+    def in_time(self, call, seconds=10):
+        """`call()` in a thread: its result, failing if it is still running after `seconds`."""
+        got = []
+        t = threading.Thread(target=lambda: got.append(call()), daemon=True)
+        t.start()
+        t.join(seconds)
+        self.assertFalse(t.is_alive(), "start() blocked")
+        return got[0]
+
+    def test_a_fifo_or_a_symlink_at_the_log_path_starts_nothing_and_blocks_nothing(self):
+        self.logs.mkdir()
+        os.mkfifo(self.logs / "launch-hook-pipe.log")
+        outside = self.tmp / "outside.log"
+        outside.write_text("untouched\n")
+        (self.logs / "launch-hook-link.log").symlink_to(outside)
+        hooks = [("pipe", self.hook("pipe.py", PY_HOOK)), ("link", self.hook("link.py", PY_HOOK)),
+                 ("fine", self.hook("fine.sh", SH_HOOK))]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            started = self.in_time(lambda: lh.start(hooks, self.logs, sys.executable, self.env))
+        self.assertEqual([n for n, _ in started], ["fine"])
+        self.assertIn("launch-hooks: pipe: not started (log:", err.getvalue())
+        self.assertIn("launch-hooks: link: not started (log:", err.getvalue())
+        wait_for(self.out / "fine.sh.json")
+        self.assertEqual(outside.read_text(), "untouched\n")
+        self.assertFalse((self.out / "pipe.py.json").exists() or (self.out / "link.py.json").exists())
+
+    def test_a_script_that_is_neither_py_nor_sh_is_never_run(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            started = lh.start([("txt", self.hook("run.txt", SH_HOOK))], self.logs, sys.executable, self.env)
+        self.assertEqual(started, [])
+        self.assertIn("launch-hooks: txt: not started (not a .py or .sh script)", err.getvalue())
+        time.sleep(0.3)
+        self.assertFalse((self.out / "run.txt.json").exists())
+
+
 class EdgeTest(_Tmp):
     def skill(self, root: Path, name: str, manifest: dict, script: str = "", body: str = PY_HOOK) -> None:
         d = root / name
@@ -146,6 +183,9 @@ class EdgeTest(_Tmp):
         self.skill(roots, "escape", {"on_launch": "../alpha/scripts/a.py"})
         self.skill(roots, "missing", {"on_launch": "scripts/none.py"})
         self.skill(roots, "plain", {"name": "plain"})
+        self.skill(roots, "aa-nul", {"on_launch": "scripts/\x00.py"})  # sorts first: must not stop the scan
+        self.skill(roots, "ab-long", {"on_launch": "scripts/" + "a" * 5000 + ".py"})
+        self.skill(roots, "txt", {"on_launch": "scripts/run.txt"}, "scripts/run.txt", SH_HOOK)
         err = io.StringIO()
         with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.tmp / "ws"), \
                 mock.patch.object(skill_roots, "skill_roots", return_value=[roots]), \
@@ -205,6 +245,7 @@ class ContractTest(_Tmp):
         self.assertIn("must resolve inside the skill directory", run("scripts/link.py", outside)[0])
         self.assertIn("relative path to a .py or .sh script", run("scripts/hook.txt")[0])
         self.assertIn("relative path to a .py or .sh script", run(7)[0])
+        self.assertIn("relative path to a .py or .sh script", run(None)[0])
         errors, warnings = lint._lint_manifest(REPO / "skills" / "tutorial")
         self.assertEqual((errors, warnings), ([], []))
 
