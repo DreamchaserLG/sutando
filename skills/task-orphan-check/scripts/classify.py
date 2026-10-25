@@ -667,6 +667,27 @@ def _unanswered(workspace: Path, landed: dict) -> dict:
             if not completion_marker(results, Path(name).stem)}
 
 
+def _render_recovered(workspace: Path, now: float | None):
+    """An interrupted pass's notice by today's rules: each landed file classified
+    from its archived copy, and only what is still an unanswered orphan reported."""
+    def render(landed: dict) -> str | None:
+        rows = []
+        for name, where in sorted(landed.items()):
+            try:
+                row = classify_task(workspace / "tasks" / "archive" / where, workspace,
+                                    time.time() if now is None else now, as_name=name)
+            except OSError:
+                continue
+            silent = (row.get("trusted_source") or "").strip() in ("voice", "phone")
+            if row.get("verdict") == "orphan" and not silent:
+                rows.append(row)
+        if not rows:
+            return None
+        groups = {"deferred": rows, "stalled": [], "unbound": [], "unknown": []}
+        return _final_body(groups, {row["file"]: landed[row["file"]] for row in rows})
+    return render
+
+
 def _arbitration(workspace: Path):
     """The worker router's per-task lock, held around each claim so a delivery
     cannot interleave; None when the worker-pool skill is absent."""
@@ -811,7 +832,8 @@ def apply_plan(workspace: Path, now: float | None = None, *, approved: str | Non
         tasks_dir, workspace / "results", tasks_dir / "archive", moves=moves, prefix=RESULT_PREFIX,
         render=lambda landed: _final_body(groups, _unanswered(workspace, landed)),
         still_safe=_still_safe(workspace, plan["verdict"], now),
-        arbitrate=_arbitration(workspace), authorized=plan["recovery"])
+        arbitrate=_arbitration(workspace), authorized=plan["recovery"],
+        render_recovered=_render_recovered(workspace, now))
     out["result"], out["body"], out["landed"] = done["result"], done["body"], done["archived"]
     out["quarantined"], out["recovered"] = done["quarantined"], done["recovered"]
     out["swept"] = done["swept"]

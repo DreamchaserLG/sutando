@@ -1177,7 +1177,7 @@ class TestApplyPlan(ClassifyBase):
                                  "": gen(self.ws.root / "tasks"), "..": gen(self.ws.root),
                                  "./task-x.txt": gen(dotted)}}
         forged["verdict"] = {n: "orphan" for n in forged["generation"]}
-        forged["recovery"] = {"journals": {}, "sweep": []}
+        forged["recovery"] = {"journals": {}, "sweep": {}}
         forged["plan_id"] = self.mod.plan_id(forged)
         groups = {"deferred": [], "stalled": [], "unbound": [], "unknown": []}
         with unittest.mock.patch.object(self.mod, "_plan", return_value=(forged, groups)):
@@ -1927,6 +1927,70 @@ class TestRound9Arbitration(ClassifyBase):
         self.assertEqual(out["archived"], ["task-c.txt"], "done work is archived")
         self.assertFalse(any("task-c.txt" in p.read_text() for p in self.notices()),
                          "and not reported as an orphan")
+
+
+class TestRound10Recovery(ClassifyBase):
+    """Tenth round (#4399): an approval binds the exact generation it saw, and an
+    interrupted pass's notice is judged by today's completion markers."""
+
+    def orphan(self, name: str) -> Path:
+        return self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+
+    def notices(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+
+    def test_a_dead_claim_replaced_after_approval_is_never_made_live(self):
+        (self.ws.root / "tasks" / "archive").mkdir(exist_ok=True)
+        stray = self.ws.root / "tasks" / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: APPROVED BYTES\n")
+        approved = self.mod.recovery_plan(self.ws.root, NOW)["plan_id"]
+        tmp = stray.with_name(".swap")
+        tmp.write_text("task: UNAPPROVED REPLACEMENT\n")
+        os.replace(tmp, stray)
+        out = self.mod.apply_plan(self.ws.root, NOW, approved=approved)
+        self.assertTrue(out["errors"], out)
+        self.assertEqual(out["swept"], [])
+        self.assertFalse((self.ws.root / "tasks" / "task-z.txt").exists(), "no unapproved bytes go live")
+        self.assertIn("UNAPPROVED REPLACEMENT", stray.read_text())
+
+    def test_work_completed_before_recovery_is_not_reported_as_an_orphan(self):
+        tt = self.mod.task_transition
+        self.orphan("task-a.txt")
+        real_set = tt._Journal.set
+
+        def die_once_claimed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "claimed":
+                raise KeyboardInterrupt("killed")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_claimed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        tt.result_publish.publish_text(self.ws.root / "results" / "task-a.txt", "answered\n")
+        out = self.apply()
+        self.assertEqual(out["errors"], [], out)
+        self.assertEqual(self.notices(), [], "the answered task is not sent as an orphan")
+        self.assertEqual(sorted((self.ws.root / "tasks" / "archive").glob(".notice-*.json")), [])
+        self.assertTrue((self.ws.root / "tasks" / "archive" / "task-a.txt").exists())
+
+    def test_an_interrupted_pass_still_reports_an_unanswered_orphan(self):
+        tt = self.mod.task_transition
+        self.orphan("task-a.txt")
+        real_set = tt._Journal.set
+
+        def die_once_claimed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "claimed":
+                raise KeyboardInterrupt("killed")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_claimed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        out = self.apply()
+        self.assertEqual(out["errors"], [], out)
+        (notice,) = self.notices()
+        self.assertIn("- task-a.txt [", notice.read_text())
+        self.assertIn("(Published by a later pass after an interrupted one.)", notice.read_text())
 
 
 class TestWorkerHeld(ClassifyBase):

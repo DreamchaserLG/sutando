@@ -317,7 +317,7 @@ from . import team_result_guard
 from . import health_command
 from . import __version__ as _PACKAGE_VERSION
 from .outbox import DeliveryOutcome, record_delivered
-from .outbox import item_status
+from .outbox import receipt_state
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
@@ -5613,8 +5613,12 @@ def _recover_orphan_proactive() -> None:
             except OSError:
                 continue
         target = f.with_name(name.split(".sending")[0] + ".txt")
-        if item_status(_proactive_receipts(), target.stem) == "DELIVERED":
+        receipt = receipt_state(_proactive_receipts(), target.stem)
+        if receipt == "DELIVERED":
             _retire_delivered_proactive(f, target)  # sent before its archive failed: never re-queue
+            continue
+        if receipt != "absent":  # unreadable or unexpected: it may have been sent, so never re-queue
+            _log(f"proactive claim {f.name}: receipt is {receipt} — kept as its claim for an operator")
             continue
         if target.exists():
             continue  # collision — leave for an operator, never clobber

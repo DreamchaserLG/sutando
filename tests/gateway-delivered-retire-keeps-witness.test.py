@@ -140,6 +140,44 @@ class DeliveredRetireKeepsTheWitness(unittest.TestCase):
         self.assertEqual((os.stat(archived).st_ino, archived.read_text()), (ino, "delivered\n"))
         self.assertEqual(list(self.results.glob(".*.delivered-*")), [])
 
+    def dead_owner_claim_with_receipt(self, spoil):
+        import subprocess
+        self.patched_dirs()
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
+        claim.write_text("delivered\n")
+        receipts = self.results / ".outbox-ag2space-proactive"
+        gb.record_delivered(receipts, f"{PREFIX}1", provider="ag2space-proactive")
+        (record,) = (receipts / ".items").iterdir()
+        spoil(record)
+        gb._recover_orphan_proactive()
+        return claim
+
+    def test_an_unreadable_delivered_receipt_never_requeues_the_claim(self):
+        def unreadable(record):
+            record.chmod(0)
+            self.addCleanup(record.chmod, 0o644)
+
+        claim = self.dead_owner_claim_with_receipt(unreadable)
+        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
+        self.assertEqual(claim.read_text(), "delivered\n")
+
+    def test_a_torn_delivered_receipt_never_requeues_the_claim(self):
+        claim = self.dead_owner_claim_with_receipt(lambda record: record.write_text('{"status": "DELIV'))
+        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
+        self.assertEqual(claim.read_text(), "delivered\n")
+
+    def test_a_claim_with_no_receipt_at_all_is_still_requeued(self):
+        import subprocess
+        self.patched_dirs()
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
+        claim.write_text("never sent\n")
+        gb._recover_orphan_proactive()
+        self.assertEqual((self.results / f"{PREFIX}1.txt").read_text(), "never sent\n")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

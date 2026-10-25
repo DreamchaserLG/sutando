@@ -877,6 +877,23 @@ def _activity_completed(item_id: str) -> None:
         pass
 
 
+def receipt_state(root: Path, item_id: str) -> str:
+    """An item's status only when its record reads cleanly; "absent" only when no
+    record exists, and "unknown" when it is unreadable or malformed — never a guess."""
+    try:
+        raw = _item_path(Path(root), item_id).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, UnicodeDecodeError):
+        return "unknown"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "unknown"
+    status = data.get("status") if isinstance(data, dict) else None
+    return status if isinstance(status, str) and status else "unknown"
+
+
 def item_status(root: Path, item_id: str) -> Optional[str]:
     """Public read of an item's lifecycle status (READY/CLAIMED/DELIVERED/
     PARKED...); None when no record exists or the record is unreadable."""

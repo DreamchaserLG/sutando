@@ -15,6 +15,7 @@ Run: python3 tests/task-transition.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import multiprocessing
 import os
@@ -1696,12 +1697,100 @@ class TestRound9(Base):
 
     def test_recovery_effects_reads_unreadable_journals_and_missing_dirs(self):
         self.assertEqual(tt.recovery_effects(self.ws / "nowhere", self.ws / "nowhere" / "archive"),
-                         {"journals": {}, "sweep": []})
-        self.assertEqual(tt.recovery_effects(self.tasks, self.archive), {"journals": {}, "sweep": []})
+                         {"journals": {}, "sweep": {}})
+        self.assertEqual(tt.recovery_effects(self.tasks, self.archive), {"journals": {}, "sweep": {}})
         self.archive.mkdir()
         (self.archive / f"{tt.JOURNAL_PREFIX}1-2-abc.json").write_text("not json")
         self.assertEqual(tt.recovery_effects(self.tasks, self.archive),
-                         {"journals": {f"{tt.JOURNAL_PREFIX}1-2-abc.json": "unreadable"}, "sweep": []})
+                         {"journals": {f"{tt.JOURNAL_PREFIX}1-2-abc.json": "unreadable"}, "sweep": {}})
+
+
+class TestRound10(Base):
+    """Tenth-round blockers (#4399), each on the production transition."""
+
+    crash_after, invariants = TestJournalRecovery.crash_after, TestJournalRecovery.invariants
+    recover = TestJournalRecovery.recover
+
+    # 2 — the claim path is never unlinked once it holds a replacement
+    def test_a_claim_replaced_after_the_archive_link_is_kept_not_deleted(self):
+        p = _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        fired = []
+
+        def at(where, name):
+            if where == "after_link" and not fired:
+                fired.append(name)
+                _replace(self.tasks / name, "REPLACEMENT BYTES")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at):
+            out = self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(fired)
+        self.assertEqual((out["archived"], out["result"]), ({}, None))
+        self.assertIn("its claim name was replaced meanwhile", out["errors"][0])
+        self.assertIn("ORIGINAL ASK", (self.archive / "task-a.txt").read_text())
+        kept = [x for x in self.tasks.iterdir() if x.is_file() and "REPLACEMENT BYTES" in x.read_text()]
+        self.assertEqual(len(kept), 1, "the replacement bytes still exist")
+        self.assertFalse(p.exists())
+        again = self.recover()
+        self.assertIn("waits for the operator", again["errors"][0])
+        self.assertEqual((len(self.journals()), self.notices()), (1, []))
+        self.assertEqual(len([x for x in self.tasks.iterdir() if x.is_file()
+                              and "REPLACEMENT BYTES" in x.read_text()]), 1)
+
+    # 3 — a refusal whose journal write fails is still never placed
+    def refused_with_failed_persist(self, give_back=None):
+        p = _task(self.tasks, "task-a.txt", "A")
+        real_set = tt._Journal.set
+
+        def set_failing_refusal(self_, **fields):
+            if fields.get("stage") == "refusing":
+                raise OSError(5, "Input/output error")
+            real_set(self_, **fields)
+
+        patches = [mock.patch.object(tt._Journal, "set", set_failing_refusal)]
+        if give_back:
+            patches.append(mock.patch.object(tt.task_archive, "give_back", side_effect=give_back))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            try:
+                self.run_transition(["task-a.txt"], _naming,
+                                    still_safe=lambda n, read: "now done" if read != n else None)
+            except OSError:
+                pass  # a pass that lets the failed write escape dies here
+        return p
+
+    def test_a_refusal_whose_journal_write_fails_is_returned_not_archived(self):
+        p = self.refused_with_failed_persist()
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
+
+    def test_a_refusal_whose_journal_write_and_give_back_both_fail_is_returned_by_recovery(self):
+        def link_fails(claim, name, why, dir_fd):
+            raise OSError(5, "Input/output error")
+
+        p = self.refused_with_failed_persist(link_fails)
+        self.assertFalse(p.exists())
+        again = self.recover()
+        self.assertEqual(again["errors"], [], again)
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
+        self.assertEqual([x.name for x in self.tasks.iterdir() if ".claim-" in x.name], [])
+
+    # 1 — an approved sweep moves only the generation it approved
+    def test_an_approved_dead_claim_replaced_before_the_sweep_is_refused(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("APPROVED BYTES\n")
+        self.archive.mkdir()
+        approved = tt.recovery_effects(self.tasks, self.archive)
+        _replace(stray, "UNAPPROVED REPLACEMENT")
+        out = tt.transition(self.tasks, self.results, self.archive, moves={}, render=_notice(None),
+                            prefix=PREFIX, authorized=approved)
+        self.assertIn("recovery state changed", out["errors"][0])
+        self.assertEqual(out["swept"], [])
+        self.assertFalse((self.tasks / "task-z.txt").exists())
+        self.assertIn("UNAPPROVED REPLACEMENT", stray.read_text())
 
 
 if __name__ == "__main__":

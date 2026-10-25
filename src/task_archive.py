@@ -223,12 +223,35 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
         if dst_dir_fd is not None:  # the landing is durable before the source goes
             _fsync_dir(dst_dir_fd)
         _checkpoint("after_link", str(src))
-        os.unlink(str(src), dir_fd=src_dir_fd)
+        if expect is None:
+            os.unlink(str(src), dir_fd=src_dir_fd)
+        else:
+            _retire_source(str(src), str(candidate), src_dir_fd, expect)
         if src_dir_fd is not None:
             _fsync_dir(src_dir_fd)
     except OSError as exc:
         raise PlacementUnsynced(str(candidate), exc) from exc
     return candidate
+
+
+def _retire_source(src: str, landed: str, dir_fd: "int | None", expect: "tuple[int, int]") -> None:
+    """Remove the source name only if it still holds the placed inode: it is first
+    renamed to a name this call owns, so nothing else can be unlinked by name."""
+    import os
+    held = f"{src}.retiring"
+    os.rename(src, held, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    got = os.lstat(held, dir_fd=dir_fd)
+    if (got.st_dev, got.st_ino) == expect:
+        os.unlink(held, dir_fd=dir_fd)
+        return
+    kept = held
+    try:  # a replacement goes back under the name it took, never over anything
+        os.link(held, src, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        os.unlink(held, dir_fd=dir_fd)
+        kept = src
+    except FileExistsError:
+        pass
+    raise PlacementSourceReplaced(landed, kept)
 
 
 # The one owner of collision naming, callable from outside the archive path too.
@@ -279,6 +302,14 @@ class PlacementMismatch(Exception):
     def __init__(self, name: str):
         super().__init__(f"{name} was replaced after it was judged")
         self.name = name
+
+
+class PlacementSourceReplaced(Exception):
+    """Placed at `landed`, but the source name now held another inode, kept as `kept_as`."""
+
+    def __init__(self, landed: str, kept_as: str):
+        super().__init__(f"placed as {landed}; the source was replaced and is kept as {kept_as}")
+        self.landed, self.kept_as = landed, kept_as
 
 
 class PlacementUnsynced(Exception):
