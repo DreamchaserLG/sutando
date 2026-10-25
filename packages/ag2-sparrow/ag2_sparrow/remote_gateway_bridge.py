@@ -330,7 +330,7 @@ from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_r
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
-                           ready_body_of, ResultIdentity)
+                           ready_body_of, ResultIdentity, SETTLE_SEC)
 from . import result_disposal as disposal
 from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
                              publish_text as _publish_text_whole, stage_text as _stage_text)
@@ -5774,9 +5774,9 @@ def _placed_copy(stem: str, data: bytes, receipt: str) -> "Path | None":
     """An earlier placement of exactly these bytes, so a crash before retaining never doubles it."""
     s = glob.escape(stem)
     if receipt == "DELIVERED":
-        found = list(RESULTS_DIR.glob(f".{s}{_DELIVERED_INFIX}*")) + list(ARCHIVE_RESULTS_DIR.glob(f"{s}-*.txt"))
+        found = list(RESULTS_DIR.glob(f".{s}{_DELIVERED_INFIX}*")) + _owned(ARCHIVE_RESULTS_DIR, stem)
     else:
-        found = list(undelivered_quarantine.quarantine_dir(RESULTS_DIR).glob(f"{s}-*.txt"))
+        found = _owned(undelivered_quarantine.quarantine_dir(RESULTS_DIR), stem)
     return next((p for p in found if _read_claim_bytes(p) == data), None)
 
 
@@ -5797,6 +5797,7 @@ _DECIDED_SEEN: "dict[tuple[int, int], tuple[int, int, int]]" = {}
 def _reconcile_changed_decided() -> None:
     """Each drain: reconcile only the retained originals whose stat changed since last settled. A
     stat is recorded only once its reconcile settled, so a failed one is read again next drain."""
+    _retry_pending_snapshots()
     present = set()
     for r in RESULTS_DIR.glob(f".proactive-*{_DECIDED_INFIX}*"):
         try:
@@ -5823,19 +5824,19 @@ def _reconcile_decided(retained: Path) -> bool:
     if m is None:
         return True  # not a name this reconciler owns
     stem, ns = m.group("stem"), m.group("ns")
-    if not _decide_pending_snapshots(stem):
-        return False
     state, generation, epoch_now = _claim_receipt(retained, stem)
-    if generation is None:
+    if generation is None or state == "unknown":  # unreadable bytes or record: not settled, read again next drain
         _log_backoff(("proactive-decided", retained.name),
-                     f"proactive {retained.name} cannot be read; kept for an operator")
+                     f"proactive {retained.name} or its outbox record cannot be read; retried")
         return False
     if generation[:32] != m.group("digest"):
+        if not _retained_settled(retained, generation):
+            return False  # a writer may still be filling it: read again next drain
         data = _read_claim_bytes(retained)
         if data is None or hashlib.sha256(data).hexdigest() != generation:
             return False  # still being written: the next pass reads it again
         claim = None
-        if not _copy_exists(stem, data):
+        if state not in ("DELIVERED", "PARKED") and not _own_snapshot_exists(stem, data):  # terminal: its item owns them
             claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
             if not _place_snapshot(data, claim, stem):
                 return False
@@ -5851,7 +5852,7 @@ def _reconcile_decided(retained: Path) -> bool:
         if claim is not None:
             _log(f"proactive {retained.name} holds new bytes; published as {claim.name} and decided")
             _decide_orphan_claim(claim)
-        return recorded and not _claim_pending(claim)
+        return recorded
     decided = None if m.group("epoch") == "x" else int(m.group("epoch"))
     if not (state == "QUEUED" and decided is not None and epoch_now is not None and epoch_now > decided):
         return True
@@ -5868,26 +5869,45 @@ def _reconcile_decided(retained: Path) -> bool:
 _SNAPSHOT_MARK = "s"
 
 
-def _claim_pending(claim: "Path | None") -> bool:
-    return claim is not None and os.path.lexists(claim)
+_SNAPSHOT_RE = re.compile(r"(?P<stem>proactive-.+)\.sending\.(?P<pid>\d+)\.s\d+")
+_DECIDED_SETTLE_SEC = SETTLE_SEC
 
 
-def _decide_pending_snapshots(stem: str) -> bool:
-    """Decide again this process's snapshot claims for `stem` that an earlier decision left (the live
-    name was held, or placing failed); our own pid keeps the orphan sweep off them. True when none remain."""
-    pending = list(RESULTS_DIR.glob(f"{glob.escape(stem)}.sending.{os.getpid()}.{_SNAPSHOT_MARK}*"))
-    for c in pending:
+def _retained_settled(retained: Path, generation: str) -> bool:
+    """A retained original's new bytes are taken only once ready (non-empty, unchanged under the
+    read, per result_ready) and older than SETTLE_SEC: its writer never publishes whole."""
+    ready = read_ready_result_with_identity(retained)
+    if ready is None or ready.identity.digest != generation:
+        return False
+    return time.time() - ready.identity.mtime_ns / 1e9 >= _DECIDED_SETTLE_SEC
+
+
+def _retry_pending_snapshots() -> None:
+    """Each drain, once: decide again every snapshot claim whose owner is this process or dead (an
+    earlier decision was blocked, or its owner died); a live other process's stays fenced."""
+    for c in RESULTS_DIR.glob("proactive-*.sending.*.s*"):
+        m = _SNAPSHOT_RE.fullmatch(c.name)
+        if m is None:
+            continue
+        pid = int(m.group("pid"))
+        if pid != os.getpid() and _pid_alive(pid):
+            continue
         _decide_orphan_claim(c)
-    return not any(os.path.lexists(c) for c in pending)
 
 
-def _copy_exists(stem: str, data: bytes) -> bool:
-    """These exact bytes already exist for `stem`: live, claimed, hidden as delivered, archived or parked."""
-    s = glob.escape(stem)
-    found = [RESULTS_DIR / f"{stem}.txt", *RESULTS_DIR.glob(f"{s}.sending*"),
-             *RESULTS_DIR.glob(f".{s}{_DELIVERED_INFIX}*"), *ARCHIVE_RESULTS_DIR.glob(f"{s}-*.txt"),
-             *undelivered_quarantine.quarantine_dir(RESULTS_DIR).glob(f"{s}-*.txt")]
-    return any(_read_claim_bytes(p) == data for p in found)
+def _own_snapshot_exists(stem: str, data: bytes) -> bool:
+    """These bytes already sit in a snapshot claim for `stem`: only ours are immutable proof."""
+    for c in RESULTS_DIR.glob(f"{glob.escape(stem)}.sending.*.s*"):
+        m = _SNAPSHOT_RE.fullmatch(c.name)
+        if m and m.group("stem") == stem and _read_claim_bytes(c) == data:
+            return True
+    return False
+
+
+def _owned(directory: Path, stem: str) -> "list[Path]":
+    """Files in `directory` named for exactly `stem` (`<stem>-<digits>[.n].txt`), not a longer stem."""
+    return [p for p in Path(directory).glob(f"{glob.escape(stem)}-*.txt")
+            if _ARCHIVE_SUFFIX.fullmatch(p.name[len(stem):])]
 
 
 def _hand_back_decided(stem: str, data: bytes) -> bool:
@@ -5896,7 +5916,7 @@ def _hand_back_decided(stem: str, data: bytes) -> bool:
     s, live = glob.escape(stem), RESULTS_DIR / f"{stem}.txt"
     if any(_read_claim_bytes(p) == data for p in [live, *RESULTS_DIR.glob(f"{s}.sending*")]):
         return True
-    for p in undelivered_quarantine.quarantine_dir(RESULTS_DIR).glob(f"{s}-*.txt"):
+    for p in _owned(undelivered_quarantine.quarantine_dir(RESULTS_DIR), stem):
         if _read_claim_bytes(p) == data:
             try:
                 undelivered_quarantine.rename_noreplace(p, live)
@@ -6254,8 +6274,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
     if status == "DELIVERED":
         ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
         try:
-            # nanoseconds: a whole-second name let a second delivery in that second replace the first
-            claim.rename(ARCHIVE_RESULTS_DIR / f"{f.stem}-{time.time_ns()}.txt")
+            ns = time.time_ns()  # never over an earlier archive: a taken name is skipped, not replaced
+            undelivered_quarantine.place_as(claim, ARCHIVE_RESULTS_DIR, (
+                f"{f.stem}-{ns}.txt" if i == 0 else f"{f.stem}-{ns}.{i}.txt" for i in range(64)))
         except OSError as e:
             # Hidden, never live and never unlinked: no bridge globs it; a later pass archives it.
             _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept hidden")

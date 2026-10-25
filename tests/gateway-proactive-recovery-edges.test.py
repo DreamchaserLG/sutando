@@ -41,6 +41,7 @@ import json
 import shlex
 import subprocess
 import urllib.error
+from unittest import mock
 
 from _helpers import proactive_lane as pl
 from _helpers.hermetic_env import isolated_child_env
@@ -85,6 +86,15 @@ def die_as_restart(lane, item_id: str) -> None:
     for c in lane.results.glob("proactive-*.sending.*"):
         c.rename(lane.results / (c.name.split(".sending.")[0] + ".txt"))
     lane.restart()
+
+
+def archive_moves_through(rename):
+    """The delivered archive is a no-replace placement: route its moves through the test's `rename`."""
+    real = gb.undelivered_quarantine.rename_noreplace
+
+    def move(src, dst):
+        return rename(Path(src), dst) if Path(dst).parent.name == "archive" else real(src, dst)
+    return mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move)
 
 
 def two_generations() -> None:
@@ -385,7 +395,8 @@ def delivered_archive_fails() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     live = sorted(q.name for q in lane.results.glob("proactive-*.txt"))
@@ -408,7 +419,8 @@ def delivered_cannot_be_hidden() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     claims = list(lane.results.glob("proactive-9h.sending.*"))
@@ -432,7 +444,8 @@ def newer_body_survives_archive_failure() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     canonical = lane.results / "proactive-10.txt"
@@ -588,7 +601,8 @@ def recovered_delivered_claim_not_resent() -> None:
         return real(self, target)
     Path.rename = rename
     try:
-        lane.drain()
+        with archive_moves_through(rename):
+            lane.drain()
     finally:
         Path.rename = real
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
