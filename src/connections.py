@@ -25,6 +25,8 @@ record `launch` leaves, into one `state`: pending, connected, disconnected or fa
 `disconnect` marks a row `disabled` and stops its bridge, keeping the row, the vault secret
 and the launch record: the plan skips a disabled row, so a restart leaves it down until
 `reconnect` clears the flag. The primary cannot be disconnected while it is primary.
+`update_token` replaces the secret under a row's existing `token_ref` with a new code for the
+same server and agent (anything else is refused by code), clears the flag and relaunches.
 
 A row's `server_source` says where its server came from: `identity` (the resolver's
 registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
@@ -121,6 +123,27 @@ class PrimaryCannotDisconnect(PrimaryProtected):
     def __init__(self, instance: str):
         super().__init__(f"{self.CODE}: {instance or '<primary>'} is the primary connection; "
                          "make another connection primary first")
+
+
+class TokenMismatch(ConnectionsError):
+    """The new code is not this row's: `update_token` refuses it, naming the code in CODE."""
+
+    CODE = "token_mismatch"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: {detail}; connection {instance or '<primary>'} is unchanged")
+
+
+class TokenServerMismatch(TokenMismatch):
+    """The previewed server is not the row's; a code for another server is a new connection."""
+
+    CODE = "token_server_mismatch"
+
+
+class TokenAgentMismatch(TokenMismatch):
+    """Both the row and the preview name an agent and they differ; add that agent as its own row."""
+
+    CODE = "token_agent_mismatch"
 
 
 class InvalidToken(ConnectionsError):
@@ -1094,3 +1117,46 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
                     vault=vault, spawn=spawn, python=python)
     record["stopped_pid"] = stopped
     return record
+
+
+def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
+                 environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
+                 vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
+                 resolver=None, getaddrinfo=None) -> dict:
+    """Replace the secret under `instance`'s token_ref with a new code for the same connection
+    (the homeserver's Get new token or Revoke, an agent moved away and back), then relaunch the
+    bridge the way `reconnect` does. The row keeps its instance, primary flag and added_at;
+    `gateway_url` and the identity fields follow the preview (a row without an agent identity
+    learns one, see `_rekey`) and `disabled` is cleared. Refused with nothing touched: a code
+    whose preview is not this connection's (`TokenServerMismatch`), one naming another agent
+    while the row names one (`TokenAgentMismatch`), one the gateway rejected (`TokenRejected`).
+    Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
+    is that record (and the row's state), not an exception. The legacy unsuffixed row keeps its
+    own launch path: its secret is replaced and `launch` is None."""
+    _find(list_connections(workspace), instance)  # an unknown instance probes nothing
+    seen = preview_connection(token, fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
+    if seen.get("authenticated") is False:
+        raise TokenRejected("the gateway rejected this token; nothing stored")
+    vault = _vault(vault)
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
+        if _same_connection([row], seen) is None:
+            raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
+        mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
+        if mine and theirs and mine != theirs:
+            raise TokenAgentMismatch(instance, f"the code is for agent {theirs}, not {mine}")
+        _vault_store(vault, row["token_ref"], token.strip())
+        stopped = stop_bridge(instance, workspace=workspace, kill=kill) if instance else 0
+        row["gateway_url"] = str(seen["gateway_url"])
+        _rekey(row, seen)
+        row["disabled"] = False
+    out = dict(row)
+    out["stopped_pid"] = stopped
+    out["launch"] = None
+    if instance:
+        try:
+            out["launch"] = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                                   vault=vault, spawn=spawn, python=python)
+        except LaunchFailed:
+            out["launch"] = _read_json(launch_record_path(instance, workspace))
+    return out

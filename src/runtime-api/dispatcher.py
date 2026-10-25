@@ -309,6 +309,8 @@ class RuntimeDispatcher:
                 return self.connections.disconnect(params)
             if method == "connection.reconnect":
                 return self.connections.reconnect(params)
+            if method == "connection.update_token":
+                return self.connections.update_token(params)
         if method.startswith("task."):
             return self._task(method, params)
         raise ProtocolError(-32601, f"unknown method {method}")

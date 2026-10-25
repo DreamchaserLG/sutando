@@ -207,6 +207,39 @@ class ViewTests(unittest.TestCase):
             self.call("connection.disconnect", instance="nope")
         self.assertEqual(cm.exception.code, -32602)
 
+    def test_update_token_replaces_the_secret_or_answers_conflict(self):
+        self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.call("connection.disconnect", instance="beta-fixture-net")
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="beta-fixture-net", token=TOKEN_A)
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("token_server_mismatch"))
+        self.gateway.agents["https://relay.beta-fixture.net"] = ["@other:beta-fixture.net"]
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("token_agent_mismatch"))
+        self.assertNotIn("rotated", str(cm.exception))
+        self.assertEqual((self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.spawned), (TOKEN_B, []),
+                         "a refused code touches nothing")
+        self.gateway.agents["https://relay.beta-fixture.net"] = ["@sutando:beta-fixture.net"]
+        out = self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        row = out["connection"]
+        self.assertEqual((row["instance"], row["token_ref"], row["disabled"], row["state"], row["primary"]),
+                         ("beta-fixture-net", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", False, "pending", False))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], "https://relay.beta-fixture.net|rotated")
+        self.assertEqual(self.spawned, ["beta-fixture-net"], "relaunched once")
+        self.assertNotIn("rotated", json.dumps(out))
+        for params in ({"instance": "beta-fixture-net"}, {"instance": "beta-fixture-net", "token": ""}, {"token": TOKEN_B}):
+            with self.assertRaises(ProtocolError, msg=params) as cm:
+                self.call("connection.update_token", **params)
+            self.assertEqual(cm.exception.code, -32602)
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="nope", token=TOKEN_B)
+        self.assertEqual(cm.exception.code, -32602)
+        self.assertIn("nope", str(cm.exception))
+
     def test_known_servers_joins_the_registry_with_the_rows(self):
         fixtures = [dotspace.DotSpace(server="alpha-fixture.net"), dotspace.DotSpace(server="beta-fixture.net")]
         with unittest.mock.patch.object(dotspace, "registered_instances", lambda: fixtures):

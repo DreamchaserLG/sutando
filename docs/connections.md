@@ -21,7 +21,7 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `server_source` | Where `server` came from: `identity` (the DotSpace the resolver registers for the gateway host, confirmed by the gateway's own agent listing), `resolver` (the registered DotSpace alone), or `gateway` (the host itself, provisional). |
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
 | `agent_display_name`, `agent_avatar_url`, `owner_mxid` | Optional, from the same listing entry as `agent_mxid` and only on a verified preview: the entry's `display_name`, its `avatar_url` (stored only as an `mxc://` URI) and its `owner` mxid. Absent until the gateway sends them; never a secret. The list spells every one of them out, `null` when unknown. |
-| `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` clears it. Absent on older rows, which load as enabled. |
+| `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` or `update_token` clears it. Absent on older rows, which load as enabled. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
 token_ref / server) and published atomically under a lock file beside it, so a reader
@@ -112,7 +112,18 @@ be disconnected while it is primary (`PrimaryCannotDisconnect`, HTTP 409
 disabled row is a no-op. `reconnect(instance)` clears the flag, stops the bridge if one is
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
-("disconnected; reconnect it"). `remove_connection(instance)`
+("disconnected; reconnect it"). `update_token(instance, token)` is for a code that was
+rotated or revoked on the homeserver (Get new token, Revoke) or an agent moved away and
+back: it previews the new code exactly as `add` does, refuses one for another server
+(`TokenServerMismatch`, code `token_server_mismatch`) or for another agent while the row
+names one (`TokenAgentMismatch`, `token_agent_mismatch`; a code for another agent is a new
+connection, never pasted over this row) or one the gateway rejected (`token_rejected`), with
+the vault and the row untouched; otherwise it replaces the secret under the row's existing
+`token_ref`, keeps the instance, primary flag, `added_at` and launch record, updates
+`gateway_url` and the identity fields from the preview (a row without an agent identity learns
+one), clears `disabled` and relaunches the bridge the way `reconnect` does, so a disconnected
+or failed row comes back on the new code; a relaunch that fails is the row's `failed` state,
+not an error of the update. `remove_connection(instance)`
 stops that bridge the same way, then drops the row, its vault key and its launch record,
 and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
 removed env-imported row is remembered in the record's `removed_env` list, so
@@ -159,8 +170,8 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | launch | import-env | launch-plan`.
-- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | update-token | launch | import-env | launch-plan`.
+- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`; another server or agent is `CONFLICT`).
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
   | Route | Body | Answer |
@@ -173,6 +184,7 @@ not here.
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` |
   | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}`; 404 |
   | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled` |
+  | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "token_server_mismatch"}` or `{"error": "token_agent_mismatch"}` (nothing changed); 409 `{"error": "token_rejected"}`; 400 without a token; 404 |
 
 ### Authorization for the HTTP routes
 

@@ -11,8 +11,9 @@ carry a wildcard CORS grant. With the bearer: GET lists rows joined with status
 confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
 400 / 503 vault); DELETE <instance> is 204 or 409 primary; POST
 <instance>/primary is 200; POST <instance>/disconnect is 200 or 409
-primary_cannot_disconnect; POST <instance>/reconnect is 202; GET known-servers
-is 200 and is never read as an instance.
+primary_cannot_disconnect; POST <instance>/reconnect is 202; POST <instance>/token
+is 200 or 409 token_server_mismatch / token_agent_mismatch / token_rejected; GET
+known-servers is 200 and is never read as an instance.
 
 Run: python3 tests/agent-api-connections.test.py
 """
@@ -168,7 +169,8 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
                            ("GET", "/api/v1/connections/known-servers", None),
                            ("POST", "/api/v1/connections/x/disconnect", {}),
-                           ("POST", "/api/v1/connections/x/reconnect", {})):
+                           ("POST", "/api/v1/connections/x/reconnect", {}),
+                           ("POST", "/api/v1/connections/x/token", {"token": TOKEN_A})):
     s, b, h = req(method, path, body, auth=False)
     check(f"{method} {path} without a bearer is 401", s == 401, f"{s} {b}")
     check(f"{method} {path} refusal carries no wildcard CORS grant", "Access-Control-Allow-Origin" not in h, h)
@@ -332,6 +334,37 @@ s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/reconnect", {})
 check("reconnect is 202 and re-enables", s == 202 and b["launch"]["ok"] is True and SPAWNED == ["beta-fixture-net"], f"{s} {b} {SPAWNED}")
 s, b, _ = req("GET", "/api/v1/connections")
 check("the flag is cleared", [r["disabled"] for r in b["connections"]] == [False, False], b)
+SPAWNED.clear()
+
+print("== update token ==")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {})
+check("a missing token is 400", s == 400 and (b or {}).get("error") == "missing required field: token", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": TOKEN_A})
+check("a code for another server is 409 token_server_mismatch", (s, b) == (409, {"error": "token_server_mismatch"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = ["@other:beta-fixture.net"]
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("a code for another agent is 409 token_agent_mismatch", (s, b) == (409, {"error": "token_agent_mismatch"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = ["@sutando:beta-fixture.net"]
+check("a refused code changed nothing", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == TOKEN_B and SPAWNED == [], SPAWNED)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the refused row is still disabled", [r["disabled"] for r in b["connections"]] == [False, True], b)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("the same connection's new code is 200 with the row", s == 200 and (b["connection"]["instance"], b["connection"]["token_ref"],
+      b["connection"]["disabled"], b["connection"]["state"]) == ("beta-fixture-net", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", False, "pending"), f"{s} {b}")
+check("update leaks no secret", no_secret(b) and "secret-beta-rotated" not in json.dumps(b))
+check("the secret was replaced under the same key", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == "https://relay.beta-fixture.net|secret-beta-rotated")
+check("the bridge was relaunched once", SPAWNED == ["beta-fixture-net"], SPAWNED)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://rejecting-fixture.net|bad"})
+check("a code the gateway rejects is 409 token_rejected", (s, b) == (409, {"error": "token_rejected"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/nope/token", {"token": TOKEN_B})
+check("updating an unknown instance is 404", s == 404, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/token", {"token": TOKEN_B})
+check("/connections/token alone is 404, not an instance route", s == 404, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections/beta-fixture-net/token")
+check("GET <instance>/token is 404", s == 404, f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections/known-servers")
+check("known-servers still answers beside the token route", s == 200 and "servers" in (b or {}), f"{s} {b}")
 SPAWNED.clear()
 
 print("== primary, reconnect, delete ==")

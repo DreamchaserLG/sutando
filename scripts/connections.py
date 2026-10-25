@@ -10,6 +10,11 @@
   disconnect INSTANCE          stop that bridge and keep the row, token and launch record out of
                                the plan until reconnect; refused on the primary
   reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge (re-enables it)
+  update-token INSTANCE TOKEN --repo DIR --logs-dir DIR
+                               replace the row's secret with a new code for the same server and
+                               agent (TOKEN as for add, '-' reads stdin), re-enable and relaunch;
+                               another server or agent is refused (token_server_mismatch,
+                               token_agent_mismatch)
   known-servers [--json]       the resolver's DotSpace instances, each with its row if one exists
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
@@ -135,6 +140,18 @@ def cmd_reconnect(args) -> int:
     return 0
 
 
+def cmd_update_token(args) -> int:
+    token = sys.stdin.read().strip() if args.token == "-" else args.token
+    row = connections.update_token(args.instance, token, repo=args.repo, logs_dir=args.logs_dir,
+                                   workspace=args.workspace)
+    launched = row.get("launch") or {}
+    relaunch = (f"relaunched, pid {launched['pid']}" if launched.get("ok") else
+                f"relaunch failed: {launched['reason']}" if launched else "legacy bridge not relaunched here")
+    print(f"updated token of {args.instance or '(legacy)'} ({row['server']}; vault key {row['token_ref']} replaced; "
+          f"{relaunch})")
+    return 0
+
+
 def cmd_import_env(args) -> int:
     created = connections.import_from_env(os.environ, workspace=args.workspace)
     for row in created:
@@ -190,6 +207,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
+    s = sub.add_parser("update-token"); s.add_argument("instance"); s.add_argument("token")
+    s.add_argument("--repo", type=Path, required=True); s.add_argument("--logs-dir", type=Path, required=True)
+    s.set_defaults(fn=cmd_update_token)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)

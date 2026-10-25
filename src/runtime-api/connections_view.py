@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Connections surface for the Sutando Server: connection.list / known_servers / add / remove /
-set_primary / disconnect / reconnect.
+set_primary / disconnect / reconnect / update_token.
 
 Thin binding over the connections DOMAIN module (src/connections.py), the one
 writer of `state/connections.json`. The composer injects the resolved workspace,
@@ -10,8 +10,9 @@ carry a vault key name, never a secret. The methods are the daemon-native form
 of the HTTP resource: GET = list, POST without confirm = preview, POST with
 confirm = create (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
 POST <instance>/primary = set_primary, POST <instance>/disconnect = disconnect,
-POST <instance>/reconnect = reconnect, GET known-servers = known_servers; a confirm
-whose identity moved, and a disconnect of the primary, answer CONFLICT, the 409.
+POST <instance>/reconnect = reconnect, POST <instance>/token = update_token,
+GET known-servers = known_servers; a confirm whose identity moved, a disconnect of
+the primary, and a new code for another server or agent answer CONFLICT, the 409.
 
 Mutation sits on the same footing as task.submit: the Unix socket is the
 owner's, and no device grant is required.
@@ -130,3 +131,20 @@ class ConnectionsView:
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"launch": record}
+
+    # ── connection.update_token ─────────────────────────────────────────────
+    def update_token(self, params: dict) -> dict:
+        """{instance, token}: the row on the new code, relaunched; another server or agent is CONFLICT."""
+        instance = self._instance(params)
+        token = params.get("token")
+        if not isinstance(token, str) or not token.strip():
+            raise ProtocolError(-32602, "missing required param: token")
+        try:
+            row = connections.update_token(instance, token, repo=self.repo, logs_dir=self.logs_dir,
+                                           workspace=self.workspace, vault=self.vault, spawn=self.spawn,
+                                           kill=self.kill, fetch=self.fetch, getaddrinfo=self.getaddrinfo)
+        except connections.TokenMismatch as e:
+            raise ProtocolError(CONFLICT, str(e))
+        except connections.ConnectionsError as e:
+            raise ProtocolError(-32602, str(e))
+        return {"connection": connections.status_for(row, self.workspace)}

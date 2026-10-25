@@ -191,7 +191,8 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
     The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
     POST previews or (confirm) creates, DELETE removes, POST <instance>/primary moves the primary,
-    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches.
+    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches,
+    POST <instance>/token replaces the secret with a new code for the same connection.
     Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
@@ -253,6 +254,19 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                                             vault=vault, spawn=spawn, kill=kill, fetch=fetch,
                                             getaddrinfo=getaddrinfo)
             return 202, {"launch": record}
+        if len(parts) == 2 and method == "POST" and parts[1] == "token":
+            token = body.get("token")
+            if not isinstance(token, str) or not token.strip():
+                return 400, {"error": "missing required field: token"}
+            try:
+                row = _connections.update_token(parts[0], token, repo=repo, logs_dir=logs_dir, workspace=ws,
+                                                vault=vault, spawn=spawn, kill=kill, fetch=fetch,
+                                                getaddrinfo=getaddrinfo)
+            except _connections.TokenMismatch as e:
+                return 409, {"error": e.CODE}
+            except _connections.TokenRejected:
+                return 409, {"error": "token_rejected"}
+            return 200, {"connection": _connections.status_for(row, ws)}
         return 404, {"error": "not found"}
     except _connections.VaultUnavailable:
         return 503, {"error": "vault_unavailable"}

@@ -1038,6 +1038,127 @@ class Disconnect(Base):
         self.assertFalse(C.launch_record_path("beta-fixture-net", self.ws).exists())
 
 
+class UpdateToken(Base):
+    NEW_B = "https://relay.beta-fixture.net:8443/relay2|secret-beta-rotated"
+
+    def setUp(self):
+        super().setUp()
+        self.spawned = []
+
+        def spawn(argv, env, log_path):
+            self.spawned.append((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"]))
+            return 4343
+        self.spawn = spawn
+        self.add()  # alpha is primary
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch("beta-fixture-net", self.ws, ok=False, reason="no_token")
+
+    def update(self, instance, token, **kw):
+        kw.setdefault("fetch", agents("@s:beta-fixture.net"))
+        kw.setdefault("kill", lambda *a: self.fail("nothing runs"))
+        kw.setdefault("spawn", self.spawn)
+        return C.update_token(instance, token, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                              workspace=self.ws, vault=self.vault, **kw)
+
+    def beta(self):
+        return {r["instance"]: r for r in self.rows()}["beta-fixture-net"]
+
+    def test_same_server_and_agent_replaces_the_secret_and_relaunches(self):
+        self.assertEqual(C.status_for(self.beta(), self.ws)["state"], "failed")
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        before = self.beta()
+        self.assertEqual(C.status_for(before, self.ws)["state"], "disconnected")
+        out = self.update("beta-fixture-net", self.NEW_B)
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.NEW_B, "replaced under the same key")
+        self.assertEqual(set(self.vault.store), {"AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"})
+        after = self.beta()
+        self.assertEqual((after["instance"], after["token_ref"], after["primary"], after["added_at"], after["server"],
+                          after["agent_mxid"]),
+                         (before["instance"], before["token_ref"], False, before["added_at"], "beta-fixture.net",
+                          "@s:beta-fixture.net"))
+        self.assertEqual((after["disabled"], after["gateway_url"]), (False, "https://relay.beta-fixture.net:8443/relay2"))
+        self.assertEqual(self.spawned, [("beta-fixture-net", self.NEW_B)], "launched once, on the new code")
+        self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["stopped_pid"]), (True, 4343, 0))
+        self.assertEqual(C.status_for(after, self.ws)["state"], "pending", "the failed launch record is replaced")
+        self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
+        self.assertNotIn("secret-beta", json.dumps(out))
+        self.assertFalse(self.rows()[0].get("disabled"), "the other row is untouched")
+
+    def test_a_row_without_an_identity_learns_it_from_the_new_code(self):
+        row, _ = self.add("https://chat.s.space|secret-s", fetch=unreachable)
+        self.assertEqual((row["server"], row["server_source"], row.get("agent_mxid")), ("s.space", "resolver", None))
+        out = self.update("s-space", "https://chat.s.space|secret-s-rotated", fetch=agents("@sutando:s.space"))
+        self.assertEqual((out["server"], out["server_source"], out["verified"], out["agent_mxid"], out["owner_mxid"]),
+                         ("s.space", "identity", True, "@sutando:s.space", "@owner:s.space"))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_S_SPACE"], "https://chat.s.space|secret-s-rotated")
+        self.assertEqual(self.spawned, [("s-space", "https://chat.s.space|secret-s-rotated")])
+
+    def test_a_code_for_another_server_is_refused_and_touches_nothing(self):
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        with self.assertRaises(C.TokenServerMismatch) as cm:
+            self.update("beta-fixture-net", "https://chat.alpha-fixture.net|secret-alpha-2",
+                        fetch=agents("@sutando:alpha-fixture.net"))
+        self.assertTrue(str(cm.exception).startswith("token_server_mismatch"))
+        self.assertEqual(cm.exception.CODE, "token_server_mismatch")
+        self.assertIsInstance(cm.exception, C.TokenMismatch)
+        self.assertNotIn("secret-alpha", str(cm.exception))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], TOKEN_B, "the vault is untouched")
+        self.assertEqual(self.spawned, [], "no launch")
+        self.assertEqual((self.beta()["disabled"], self.beta()["gateway_url"]), (True, "https://relay.beta-fixture.net:8443"))
+
+    def test_a_code_for_another_agent_is_refused(self):
+        with self.assertRaises(C.TokenAgentMismatch) as cm:
+            self.update("beta-fixture-net", self.NEW_B, fetch=agents("@other:beta-fixture.net"))
+        self.assertTrue(str(cm.exception).startswith("token_agent_mismatch"))
+        self.assertIn("@other:beta-fixture.net", str(cm.exception))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], TOKEN_B, "the vault is untouched")
+        self.assertEqual((self.spawned, self.beta()["agent_mxid"]), ([], "@s:beta-fixture.net"))
+
+    def test_unknown_instance_rejected_code_and_vault_failure(self):
+        with self.assertRaises(C.UnknownConnection):
+            self.update("nope", self.NEW_B, fetch=lambda *a: self.fail("an unknown instance is never probed"))
+        with self.assertRaises(C.TokenRejected):
+            self.update("beta-fixture-net", self.NEW_B, fetch=http_error(401))
+        self.vault.fail_set = True
+        with self.assertRaises(C.VaultUnavailable):
+            self.update("beta-fixture-net", self.NEW_B)
+        self.assertEqual((self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.spawned), (TOKEN_B, []))
+        self.assertEqual(self.beta()["gateway_url"], "https://relay.beta-fixture.net:8443", "the row is unchanged")
+
+    def test_the_running_bridge_is_stopped_before_the_relaunch(self):
+        locks = self.ws / "state" / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        lock = locks / "gateway-bridge.beta-fixture-net.lock"
+        lock.write_text("888\n")
+        fd = os.open(str(lock), os.O_RDWR)
+        from file_lock import lock_fd, unlock_fd
+        lock_fd(fd)
+        killed = []
+
+        def kill(pid, sig):
+            killed.append((pid, sig))
+            unlock_fd(fd)
+        try:
+            out = self.update("beta-fixture-net", self.NEW_B, kill=kill)
+        finally:
+            os.close(fd)
+        self.assertEqual((killed, out["stopped_pid"]), ([(888, 15)], 888))
+        self.assertEqual(self.spawned, [("beta-fixture-net", self.NEW_B)])
+
+    def test_a_failed_relaunch_is_the_rows_state_and_the_legacy_row_is_not_launched_here(self):
+        def boom(argv, env, log_path):
+            raise OSError("no interpreter")
+        out = self.update("beta-fixture-net", self.NEW_B, spawn=boom)
+        self.assertEqual((out["launch"]["ok"], out["launch"]["reason"]), (False, "launch_failed"))
+        self.assertEqual(self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.NEW_B, "the secret is replaced anyway")
+        self.assertEqual(C.status_for(self.beta(), self.ws)["state"], "failed")
+        C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.s.space|legacy"}, workspace=self.ws, vault=self.vault)
+        out = self.update("", "https://chat.s.space|legacy-rotated", fetch=unreachable)
+        self.assertEqual((out["instance"], out["launch"], out["stopped_pid"]), ("", None, 0))
+        self.assertEqual(self.vault.store["REMOTE_TASK_TOKEN"], "https://chat.s.space|legacy-rotated")
+        self.assertEqual(self.spawned, [])
+
+
 class KnownServers(Base):
     INSTANCES = [dotspace.DotSpace(server="alpha-fixture.net", gateway_host="chat.alpha-fixture.net"),
                  dotspace.DotSpace(server="beta-fixture.net", gateway_host="relay.beta-fixture.net"),
