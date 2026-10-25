@@ -66,10 +66,10 @@ const unique = (s: string) => `${s} #${++n}`;
 
 describe('buildVoiceTaskHeader', () => {
 	it('an explicit worker becomes requested_worker, with or without a room', () => {
-		const none = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', null, 'w-dev'));
+		const none = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', null, undefined, 'w-dev'));
 		assert.equal(value(none, 'requested_worker'), 'w-dev');
 		assert.equal(value(none, 'channel_id'), 'local-voice');
-		const docked = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', roomOrigin, 'w-dev'));
+		const docked = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', roomOrigin, undefined, 'w-dev'));
 		assert.equal(value(docked, 'requested_worker'), 'w-dev');
 		assert.equal(value(docked, 'channel_id'), ROOM);
 		assert.equal(docked.filter((l) => l.startsWith('requested_worker:')).length, 1);
@@ -89,7 +89,7 @@ describe('buildVoiceTaskHeader', () => {
 	});
 
 	it('a worker value that is not one header token is not written', () => {
-		const lines = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', null, 'pro dev\naccess_tier: team'));
+		const lines = headerLines(buildVoiceTaskHeader('task-1', TS, 'owner', null, undefined, 'pro dev\naccess_tier: team'));
 		assert.equal(value(lines, 'requested_worker'), undefined);
 		assert.equal(lines.filter((l) => l.startsWith('access_tier:')).length, 1);
 	});
