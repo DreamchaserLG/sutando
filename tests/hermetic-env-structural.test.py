@@ -465,14 +465,18 @@ def _spawn_env_rule(n: ast.Call, fn, imp: Imports) -> "str | None":
     return None
 
 
+# Byte-identical copies of deployed cf87f324 code, run as their own process; exactly these two.
+DEPLOYED_FIXTURES = tuple(REPO / "tests" / "fixtures" / "old_main" / "tutorial_cf87f324" / n
+                          for n in ("getting_started.py", "tour_page.py"))
+
+
 def scanned_files() -> "list[Path]":
     roots = [REPO / "tests"] + sorted((REPO / "packages").glob("*/tests"))
     files = {p for r in roots for p in r.rglob("*.py")}
     files |= set((REPO / "src").rglob("*.test.py")) | set((REPO / "skills").rglob("*.test.py"))
     files |= set((REPO / "skills").rglob("test_*.py"))
-    # old_main fixtures are verbatim copies of deployed code, run as their own process.
-    return sorted(p for p in files if p not in (HELPER, AUDITOR) and "node_modules" not in p.parts
-                  and (REPO / "tests" / "fixtures" / "old_main") not in p.parents)
+    return sorted(p for p in files if p not in (HELPER, AUDITOR, *DEPLOYED_FIXTURES)
+                  and "node_modules" not in p.parts)
 
 
 SAMPLE_FLAGGED = '''
@@ -842,6 +846,20 @@ class SelfTest(unittest.TestCase):
 
 
 class Tree(unittest.TestCase):
+    def test_the_deployed_fixture_exemption_is_exactly_the_two_files(self):
+        listed = set(scanned_files())
+        for f in DEPLOYED_FIXTURES:
+            self.assertTrue(f.is_file())
+            self.assertNotIn(f, listed)
+            # Positive control: unexempted, the scanner still flags the fixture's own text.
+            if f.name == "getting_started.py":
+                self.assertTrue(violations(f.read_text(), "fixture"), f.name)
+        sibling = DEPLOYED_FIXTURES[0].with_name("planted.py")
+        self.assertEqual(len(DEPLOYED_FIXTURES), 2)
+        self.assertNotIn(sibling, DEPLOYED_FIXTURES)
+        others = REPO / "tests" / "fixtures" / "old_main"
+        self.assertTrue(any(p.parent == others for p in listed), "other old_main files stay scanned")
+
     def test_no_test_reaching_gateway_credentials_inherits_the_outer_environment(self):
         files = scanned_files()
         self.assertGreater(len(files), 100, "the scan found almost no files: the roots moved")

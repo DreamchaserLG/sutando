@@ -433,7 +433,26 @@ class CreateExclusive(unittest.TestCase):
                                  "destination must hold the winner's bytes")
 
 
+def deployed_fixtures(repo):
+    # Byte-identical copies of deployed cf87f324 code, run as their own process; exactly these two.
+    d = repo / "tests" / "fixtures" / "old_main" / "tutorial_cf87f324"
+    return {d / "getting_started.py", d / "tour_page.py"}
+
+
 class ReconcileSignatureAgreesWithContract(unittest.TestCase):
+    def test_the_deployed_fixture_exemption_is_exactly_the_two_files(self):
+        repo = Path(__file__).resolve().parent.parent
+        fx = deployed_fixtures(repo)
+        self.assertEqual(len(fx), 2)
+        for f in fx:
+            self.assertTrue(f.is_file())
+        self.assertNotIn(repo / "tests" / "fixtures" / "old_main" / "planted.py", fx)
+        # Positive control: unexempted, the old writer's own reconcile def is flagged.
+        tree = ast.parse((next(iter(fx)).parent / "getting_started.py").read_text())
+        bad = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "reconcile"
+               and [a.arg for a in n.args.args if a.arg != "self"] != ["attempt"]]
+        self.assertTrue(bad)
+
     """Every `reconcile` in the tree takes the DeliveryAttempt the contract declares.
 
     A Protocol check cannot catch this: `isinstance(obj, DeliveryProvider)`
@@ -450,8 +469,7 @@ class ReconcileSignatureAgreesWithContract(unittest.TestCase):
         offenders, scanned = [], 0
         for root in roots:
             for path in root.rglob("*.py"):
-                # old_main fixtures are verbatim copies of deployed code.
-                if (repo / "tests" / "fixtures" / "old_main") in path.parents:
+                if path in deployed_fixtures(repo):
                     continue
                 try:
                     tree = ast.parse(path.read_text(encoding="utf-8"))
