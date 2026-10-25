@@ -5791,7 +5791,7 @@ def _place_snapshot(data: bytes, dest: Path, stem: str) -> bool:
         return False
 
 
-_DECIDED_SEEN: "dict[tuple[int, int], tuple[int, int, int]]" = {}
+_DECIDED_SEEN: "dict[tuple[int, int], tuple]" = {}
 
 
 def _reconcile_changed_decided() -> None:
@@ -5806,10 +5806,14 @@ def _reconcile_changed_decided() -> None:
             continue
         key, seen = (st.st_dev, st.st_ino), (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         present.add(key)
-        if _DECIDED_SEEN.get(key) == seen:
-            continue
+        cached = _DECIDED_SEEN.get(key)
+        if cached is not None and cached[0] == seen and (
+                cached[1] is None or receipt(_proactive_outbox_root(), cached[1]) == cached[2]):
+            continue  # same bytes and the same item state and epoch: nothing to do
+        item = _retained_item(r)  # its receipt is read before the reconcile, so a change during it is seen next pass
+        state = receipt(_proactive_outbox_root(), item) if item else None
         if _reconcile_decided(r):  # the stat taken first is recorded: a write during the read is seen next pass
-            _DECIDED_SEEN[key] = seen
+            _DECIDED_SEEN[key] = (seen, item, state)
     for gone in _DECIDED_SEEN.keys() - present:
         del _DECIDED_SEEN[gone]
 
@@ -5836,10 +5840,12 @@ def _reconcile_decided(retained: Path) -> bool:
         if data is None or hashlib.sha256(data).hexdigest() != generation:
             return False  # still being written: the next pass reads it again
         claim = None
-        if state not in ("DELIVERED", "PARKED") and not _own_snapshot_exists(stem, data):  # terminal: its item owns them
-            claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
-            if not _place_snapshot(data, claim, stem):
-                return False
+        if state not in ("DELIVERED", "PARKED"):  # terminal: its own item already owns these bytes
+            claim = _take_matching_snapshot(stem, data)  # owned through the commit below, never only probed
+            if claim is None:
+                claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
+                if not _place_snapshot(data, claim, stem):
+                    return False
         recorded = True
         try:  # recorded only once its snapshot exists: a crash between re-finds that copy
             undelivered_quarantine.rename_noreplace(
@@ -5892,16 +5898,52 @@ def _retry_pending_snapshots() -> None:
         pid = int(m.group("pid"))
         if pid != os.getpid() and _pid_alive(pid):
             continue
-        _decide_orphan_claim(c)
+        taken = _take_snapshot(c)
+        if taken is not None:
+            _decide_orphan_claim(taken)
 
 
-def _own_snapshot_exists(stem: str, data: bytes) -> bool:
-    """These bytes already sit in a snapshot claim for `stem`: only ours are immutable proof."""
+def _take_snapshot(c: Path) -> "Path | None":
+    """Own snapshot claim `c` before relying on it: ours as is, a dead owner's renamed to our pid so no
+    other drainer can move it meanwhile. None when another drainer took it first."""
+    m = _SNAPSHOT_RE.fullmatch(c.name)
+    if m is None:
+        return None
+    if int(m.group("pid")) == os.getpid():
+        return c if os.path.lexists(c) else None
+    mine = RESULTS_DIR / f"{m.group('stem')}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
+    try:
+        undelivered_quarantine.rename_noreplace(c, mine)
+        return mine
+    except OSError:
+        return None
+
+
+def _take_matching_snapshot(stem: str, data: bytes) -> "Path | None":
+    """A snapshot claim of exactly these bytes for `stem`, now owned by this process; None if there is
+    none we could take. A live other process's is left alone."""
     for c in RESULTS_DIR.glob(f"{glob.escape(stem)}.sending.*.s*"):
         m = _SNAPSHOT_RE.fullmatch(c.name)
-        if m and m.group("stem") == stem and _read_claim_bytes(c) == data:
-            return True
-    return False
+        if m is None or m.group("stem") != stem or _read_claim_bytes(c) != data:
+            continue
+        pid = int(m.group("pid"))
+        if pid != os.getpid() and _pid_alive(pid):
+            continue
+        taken = _take_snapshot(c)
+        if taken is not None and _read_claim_bytes(taken) == data:
+            return taken
+    return None
+
+
+def _retained_item(retained: Path) -> "str | None":
+    """The outbox item a retained original's current bytes would be sent as, or None."""
+    m = _DECIDED_RE.fullmatch(retained.name)
+    data = _read_claim_bytes(retained) if m else None
+    try:
+        route, _, body = _proactive_route(data.decode("utf-8")) if data is not None else ("", None, "")
+    except UnicodeDecodeError:
+        return None
+    return _proactive_item_id(m.group("stem"), body.strip()) if route == "send" and body.strip() else None
 
 
 def _owned(directory: Path, stem: str) -> "list[Path]":
@@ -6281,7 +6323,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             # Hidden, never live and never unlinked: no bridge globs it; a later pass archives it.
             _log(f"delivered proactive {f.name} could not be archived ({diagnostics.describe(e)}); kept hidden")
             try:
-                claim.rename(f.with_name(f".{f.stem}{_DELIVERED_INFIX}{time.time_ns()}"))
+                hidden = time.time_ns()  # never over an earlier hidden witness of this stem
+                undelivered_quarantine.place_as(claim, RESULTS_DIR, (
+                    f".{f.stem}{_DELIVERED_INFIX}{hidden + i}" for i in range(64)))
             except OSError as e2:
                 _log(f"delivered proactive {f.name} could not be hidden either ({diagnostics.describe(e2)}); "
                      f"it stays as {claim}; if a restart's orphan recovery returns it to its live "

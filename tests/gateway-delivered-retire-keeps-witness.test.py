@@ -1093,6 +1093,73 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         archived = sorted(p.read_text() for p in (lane.results / "archive").glob("proactive-1-*.txt"))
         self.assertEqual(archived, ["B\n", "C\n"], "C never replaced B's archive")
 
+    def test_a_competing_drainer_cannot_move_a_snapshot_between_its_proof_and_the_commit(self):
+        """A dead owner's snapshot of B is the proof the reconcile relies on. Right before the new
+        digest is committed, a competing drainer moves the dead owner's snapshot live and a newer C
+        replaces it there. The reconcile must own that snapshot first, so B is still sent once."""
+        lane = Lane(gb, scratch("gw-snapshot-race-"))
+        dead = lane.results / f"proactive-1.sending.{_dead_pid()}.s1"
+        dead.write_text("UNSENT B\n")
+        (lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1").write_text("UNSENT B\n")
+        real, raced = gb.undelivered_quarantine.rename_noreplace, []
+
+        def competitor_before_the_commit(src, dst):
+            if gb._DECIDED_INFIX in Path(dst).name and not raced:
+                raced.append(True)
+                if dead.exists():  # the competing drainer's real retry, then C published over the live name
+                    real(dead, lane.results / "proactive-1.txt")
+                    __import__("ag2_sparrow.result_publish", fromlist=["x"]).publish_text(
+                        lane.results / "proactive-1.txt", "NEWER C\n")
+            return real(src, dst)
+        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", competitor_before_the_commit), \
+                mock.patch.object(gb, "_retry_pending_snapshots", lambda: None):  # only the reconcile's proof runs
+            lane.drain()
+        for _ in range(4):
+            lane.drain()
+        lane.restart()
+        lane.drain()
+        self.assertTrue(raced)
+        self.assertIn("UNSENT B", [p.get("body") for p in lane.posts], "B is never lost behind the race")
+        self.assertEqual([p.get("body") for p in lane.posts].count("UNSENT B"), 1)
+
+    def test_an_operator_requeue_of_a_settled_original_is_handed_back_by_a_drain(self):
+        """PARKED e0 settles and is cached; the operator's requeue makes it QUEUED e1 without touching
+        the retained file. A later ordinary drain, not only a restart, hands it back and sends it once."""
+        lane = Lane(gb, scratch("gw-cached-requeue-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        body = b"parked body\n"
+        digest = __import__("hashlib").sha256(body).hexdigest()
+        (lane.results / f".proactive-1{gb._DECIDED_INFIX}{digest[:32]}-e0.1").write_bytes(body)
+        item_id = gb._proactive_item_id("proactive-1", "parked body")
+        outbox._write_item(root, item_id, {**self._sent_record("parked body\n"), "status": "PARKED",
+                                           "resend_epoch": 0})
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(lane.posts, [])
+        self.assertEqual(outbox.requeue_item_with_epoch(root, item_id)[:2],
+                         (outbox.RequeueOutcome.REQUEUED, 1))
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], ["parked body"], "handed back by a drain")
+        self.assertEqual(outbox.receipt(root, item_id), ("DELIVERED", 1))
+
+    def test_a_persistently_failing_archive_never_replaces_a_hidden_witness(self):
+        lane = Lane(gb, scratch("gw-hidden-collision-"))
+        real = gb.undelivered_quarantine.place_as
+
+        def archive_full(src, directory, names, *a, **k):
+            if Path(directory).name == "archive":
+                raise OSError(28, "No space left on device")
+            return real(src, directory, names, *a, **k)
+        with mock.patch.object(gb.undelivered_quarantine, "place_as", archive_full), \
+                mock.patch.object(gb.time, "time_ns", return_value=1792900000000000000):
+            for body in ("B\n", "C\n"):
+                lane.write("proactive-1.txt", body)
+                lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], ["B", "C"])
+        hidden = sorted(p.read_text() for p in lane.results.glob(".proactive-1.delivered-*"))
+        self.assertEqual(hidden, ["B\n", "C\n"], "C never replaced B's hidden witness")
+
     def test_an_unchanged_retained_original_costs_a_drain_only_a_stat(self):
         lane = Lane(gb, scratch("gw-decided-cost-"))
         r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"

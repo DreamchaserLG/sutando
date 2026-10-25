@@ -89,11 +89,12 @@ def die_as_restart(lane, item_id: str) -> None:
 
 
 def archive_moves_through(rename):
-    """The delivered archive is a no-replace placement: route its moves through the test's `rename`."""
+    """The delivered archive and its hidden fallback are no-replace placements: route them through `rename`."""
     real = gb.undelivered_quarantine.rename_noreplace
 
     def move(src, dst):
-        return rename(Path(src), dst) if Path(dst).parent.name == "archive" else real(src, dst)
+        to_archive = Path(dst).parent.name == "archive" or gb._DELIVERED_INFIX in Path(dst).name
+        return rename(Path(src), dst) if to_archive else real(src, dst)
     return mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move)
 
 
