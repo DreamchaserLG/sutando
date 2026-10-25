@@ -1309,6 +1309,40 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts], [(self.ROOM_TWO, "SAME BODY")])
         self._one_item_end_to_end(root, self._item_for(self.ROOM_TWO))
 
+    def test_a_thread_marked_claim_mid_send_at_upgrade_whose_task_thread_won_is_not_sent_twice(self):
+        """Before the route joined the key, a thread-marked file about a task was sent under its body-only
+        item, in the task's thread (which replaces the marker's). Orphan recovery after the upgrade must
+        match that delivered item through the resolved thread and never post again."""
+        lane = Lane(gb, scratch("gw-legacy-thread-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        tid = "task-1792900000000"
+        stem = f"proactive-about-{tid}--1792900000"
+        (lane.tasks / f"{tid}.txt").write_text(
+            f"source_room_id: {lane.owner_dm}\nthread_root: $TaskThread\ntask: asked\n")
+        text = "[thread: $MarkerThread]\nSAME BODY\n"
+        legacy = gb._proactive_item_id(stem, "SAME BODY")
+        payload = json.dumps({"body": "SAME BODY", "room_id": lane.owner_dm, "thread_root": "$TaskThread",
+                              "task_id": tid}, sort_keys=True)
+        outbox._write_item(root, legacy, {"item_id": legacy, "status": "DELIVERED", "payload": payload,
+                                          "provider_ref": "$sent", "attempts": 1})
+        claim = lane.results / f"{stem}.sending.{_dead_pid()}.1"
+        claim.write_text(text)
+        routing = {"owner_dm": lane.owner_dm, "loaded": True, "next": __import__("time").time() + 3600}
+        with mock.patch.object(gb, "TASKS_DIR", lane.tasks), mock.patch.dict(gb._ROUTING, routing):
+            lane.restart()
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual(lane.posts, [], "the delivered send is matched, never repeated")
+        self.assertFalse((lane.results / f"{stem}.txt").exists(), "never handed back live")
+
+    def test_the_marker_key_and_the_send_read_a_thread_marker_the_same_way(self):
+        """A malformed [thread:] before a valid one: the send posts top level, and the item key agrees."""
+        for text in ("[thread: not-an-event]\n[thread: $Valid]\nbody\n", "[thread: $Valid]\nbody\n",
+                     "[thread]\nbody\n", "body\n"):
+            with self.subTest(text=text):
+                with mock.patch.object(gb, "_log", lambda *a: None):
+                    self.assertEqual(gb._marked_thread(text), gb._proactive_thread_root(text, "proactive-1.txt"))
+
     def test_an_item_holding_another_payload_never_counts_as_this_generations_park(self):
         """BornParked.EXISTS: the identity is taken by another payload, so this generation is not recorded."""
         lane, root, a_id, write, hidden = self._held_original("DELIVERED")

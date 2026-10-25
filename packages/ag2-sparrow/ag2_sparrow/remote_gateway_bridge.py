@@ -5555,22 +5555,29 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     """The `[thread:]` root a proactive body names, or None (top level). A
     malformed value is logged and posted top level, never into a guessed thread."""
-    actions = parse_markers(body).actions
-    for a in actions:
-        if a.kind == "thread":
-            return a.value
-        if a.kind == "thread-invalid":
-            _log(f"proactive {name} has a malformed [thread: {a.value[:80]!r}] "
-                 "— posting top level")
-            return None
-        if a.kind == "thread-foreign":
-            _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
-                 f"destination room ({a.extra}) — posting top level")
-            return None
-    if any(a.kind == "thread-ask" for a in actions):
+    root, a = _thread_marker(body)
+    if a is not None and a.kind == "thread-invalid":
+        _log(f"proactive {name} has a malformed [thread: {a.value[:80]!r}] "
+             "— posting top level")
+    elif a is not None and a.kind == "thread-foreign":
+        _log(f"proactive {name}: [thread: {a.value[:80]!r}] may not be in the "
+             f"destination room ({a.extra}) — posting top level")
+    elif a is not None and a.kind == "thread-ask":
         _log(f"proactive {name}: a bare [thread] applies only to a task result "
              "— posting top level")
-    return None
+    return root
+
+
+def _thread_marker(text: str):
+    """The one reading of a proactive text's `[thread:]` markers: (root, the deciding action). The first
+    thread marker decides: a valid one gives its root; a malformed or foreign one gives top level."""
+    actions = parse_markers(text).actions
+    for a in actions:
+        if a.kind == "thread":
+            return a.value, a
+        if a.kind in ("thread-invalid", "thread-foreign"):
+            return None, a
+    return None, next((a for a in actions if a.kind == "thread-ask"), None)
 
 
 def _own_homeserver() -> str:
@@ -5641,8 +5648,8 @@ def _proactive_item_id(stem: str, body: str, room: "str | None" = None, thread: 
 
 
 def _marked_thread(text: str) -> "str | None":
-    """The valid `[thread: $root]` a proactive text names itself, or None."""
-    return next((a.value for a in parse_markers(text).actions if a.kind == "thread"), None)
+    """The `[thread: $root]` a proactive text names itself, as `_proactive_thread_root` reads it."""
+    return _thread_marker(text)[0]
 
 
 def _proactive_identity(stem: str, text: str) -> "tuple[str, str, str | None, str | None] | None":
@@ -6105,13 +6112,14 @@ def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None, int | None
     item_id, body, room, thread = identity
     state, epoch = receipt(_proactive_outbox_root(), item_id)
     if state == "absent" and (room, thread) != (None, None):
-        state, epoch = _route_matched_legacy_receipt(stem, body, room, thread)
+        state, epoch = _route_matched_legacy_receipt(stem, data.decode("utf-8"), body, room, thread)
     return state, generation, epoch
 
 
-def _route_matched_legacy_receipt(stem: str, body: str, room, thread) -> "tuple[str, int | None]":
+def _route_matched_legacy_receipt(stem: str, text: str, body: str, room, thread) -> "tuple[str, int | None]":
     """A marked claim written before its route joined the item key: the body-only item counts only
-    when its stored payload names this exact room and thread, so a send there is never repeated."""
+    when its stored payload names this route, as the file marks it or as its send resolved it (a
+    linked task's thread replaces the marker's), so a send there is never repeated."""
     root, legacy = _proactive_outbox_root(), _proactive_item_id(stem, body)
     state, epoch = receipt(root, legacy)
     if state in ("absent", "unknown"):
@@ -6120,7 +6128,13 @@ def _route_matched_legacy_receipt(stem: str, body: str, room, thread) -> "tuple[
         stored = json.loads((read_item(root, legacy) or {}).get("payload") or "{}")
     except ValueError:
         return "unknown", None
-    same = (room is None or stored.get("room_id") == room) and (thread is None or stored.get("thread_root") == thread)
+    try:
+        resolved = _proactive_envelope(f"{stem}.txt", text, room, body)
+    except Exception:  # noqa: BLE001 - no resolution: only the file's own marks can match
+        resolved = {}
+    rooms = {room, resolved.get("room_id")} - {None}
+    threads = {thread, resolved.get("thread_root")} - {None}
+    same = (room is None or stored.get("room_id") in rooms) and (thread is None or stored.get("thread_root") in threads)
     return (state, epoch) if same else ("absent", None)
 
 
