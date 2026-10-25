@@ -31,6 +31,9 @@ PINNED = {"getting_started.py": "43eba3defddcb5592b571b092c0b5100cf9de082216551d
           "tour_page.py": "062f55dc3dda8003c6d6c8fc162ff8d61db08c6a181853ef54107316a2befdc8"}
 WRITES = ("create", "append", "replace", "summon")
 ROOM, ME = "!dm:example.test", "@kai.agent:example.test"
+OWNER = "@owner:example.test"
+# Every run asks for a summon, so a fenced run that summoned would show in the audit.
+SUMMON = ("--owner", OWNER, "--summon")
 
 # Runs the deployed main() with only its two remote seams replaced: the create action and the
 # credential lookup (neither is reachable from a test). Everything else is the deployed code.
@@ -103,7 +106,7 @@ class DeployedFenceTest(unittest.TestCase):
         done = subprocess.run(
             [sys.executable, str(self.tmp / "runner.py"), str(self.script), str(ws), "publish",
              "--room", ROOM, "--name", name, "--core", "codex", "--agent-mxid", by,
-             "--room-commons", str(self.tmp / "room_commons.py")],
+             "--room-commons", str(self.tmp / "room_commons.py"), *SUMMON],
             capture_output=True, text=True, timeout=120, env=env)
         return done.returncode, done.stdout, done.stderr
 
@@ -118,10 +121,14 @@ class DeployedFenceTest(unittest.TestCase):
         code, out, err = self.deployed(ws, name)
         self.assertEqual(code, 0, err + out)
         kind = json.loads(out)["kind"]
+        self.assertIn(["summon", kind, OWNER], self.db()["calls"])
+        self.reset()
+        return kind
+
+    def reset(self):
         db = self.db()
         db["calls"] = []
         self.state.write_text(json.dumps(db))
-        return kind
 
     def edit(self, kind: str) -> str:
         db = self.db()
@@ -196,8 +203,8 @@ class DeployedFenceTest(unittest.TestCase):
         self.assertIn(kind, self.db()["pages"])
 
     def test_mixed_hosts_an_unfenced_host_never_writes_a_v2_page(self):
-        """Host A has the fence; host B still runs the deployed writer on its own marker. B keeps
-        doing what it does today to its own recorded page, and nothing to a v2 candidate."""
+        """Host A has the fence; host B still runs the deployed writer on its own marker. Each host
+        is audited on its own: A writes nothing, B writes only its own recorded page."""
         host_a, host_b = self.tmp / "host-a", self.tmp / "host-b"
         legacy = self.seed(host_b)
         fence(host_a)
@@ -209,15 +216,22 @@ class DeployedFenceTest(unittest.TestCase):
         db.setdefault("by", {})[candidate] = ME
         self.state.write_text(json.dumps(db))
         v2_page = db["pages"][candidate]
-        for ws in (host_a, host_b):
-            self.deployed(ws, "Green")
-        self.assertEqual(self.db()["pages"][candidate], v2_page)
+        self.reset()
+        code, out, _ = self.deployed(host_a, "Green")
+        self.assertEqual((code, self.writes()), (4, []), out)
+        code, out, err = self.deployed(host_b, "Green")
+        self.assertEqual(code, 0, err + out)
+        self.assertTrue(self.writes(), "host B refreshes its own page")
         self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
+        self.assertEqual(self.db()["pages"][candidate], v2_page)
         # Host B with its marker lost: it adopts only a page carrying its exact deployed tag.
         shutil.rmtree(host_b / "state")
-        self.assertEqual(self.deployed(host_b, "Blue")[0], 0)
-        self.assertEqual(self.db()["pages"][candidate], v2_page)
+        self.reset()
+        code, out, err = self.deployed(host_b, "Blue")
+        self.assertEqual(code, 0, err + out)
+        self.assertTrue(json.loads(out).get("adopted"), out)
         self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
+        self.assertEqual(self.db()["pages"][candidate], v2_page)
 
     def test_the_head_writer_is_fenced_too(self):
         ws = self.tmp / "ws"
@@ -229,7 +243,7 @@ class DeployedFenceTest(unittest.TestCase):
         done = subprocess.run(
             [sys.executable, str(self.tmp / "runner.py"), str(base.SCRIPT), str(ws), "publish",
              "--room", ROOM, "--name", "Green", "--core", "codex", "--agent-mxid", ME,
-             "--room-commons", str(self.tmp / "room_commons.py")],
+             "--room-commons", str(self.tmp / "room_commons.py"), *SUMMON],
             capture_output=True, text=True, timeout=120, env=env)
         self.assertEqual(done.returncode, 4, done.stdout + done.stderr)
         self.assertEqual(self.writes(), [])
