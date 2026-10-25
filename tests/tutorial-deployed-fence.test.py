@@ -204,34 +204,39 @@ class DeployedFenceTest(unittest.TestCase):
 
     def test_mixed_hosts_an_unfenced_host_never_writes_a_v2_page(self):
         """Host A has the fence; host B still runs the deployed writer on its own marker. Each host
-        is audited on its own: A writes nothing, B writes only its own recorded page."""
-        host_a, host_b = self.tmp / "host-a", self.tmp / "host-b"
-        legacy = self.seed(host_b)
-        fence(host_a)
-        db = self.db()
-        candidate = "html-p%d" % db["next"]
-        db["next"] += 1
-        db["pages"][candidate] = ('<!doctype html><html><head><meta name="sutando-tutorial" '
-                                  f'content="{ME}" data-revision="tutorial.2026-10-23.1"></head></html>')
-        db.setdefault("by", {})[candidate] = ME
-        self.state.write_text(json.dumps(db))
-        v2_page = db["pages"][candidate]
-        self.reset()
-        code, out, _ = self.deployed(host_a, "Green")
-        self.assertEqual((code, self.writes()), (4, []), out)
-        code, out, err = self.deployed(host_b, "Green")
-        self.assertEqual(code, 0, err + out)
-        self.assertTrue(self.writes(), "host B refreshes its own page")
-        self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
-        self.assertEqual(self.db()["pages"][candidate], v2_page)
-        # Host B with its marker lost: it adopts only a page carrying its exact deployed tag.
-        shutil.rmtree(host_b / "state")
-        self.reset()
-        code, out, err = self.deployed(host_b, "Blue")
-        self.assertEqual(code, 0, err + out)
-        self.assertTrue(json.loads(out).get("adopted"), out)
-        self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
-        self.assertEqual(self.db()["pages"][candidate], v2_page)
+        is audited on its own, in both orders: A writes nothing, B writes only its own recorded page."""
+        for order in ("fenced first", "unfenced first"):
+            with self.subTest(order):
+                self.state.write_text(json.dumps({"pages": {}, "calls": [], "next": 1}))
+                host_a, host_b = self.tmp / order / "host-a", self.tmp / order / "host-b"
+                legacy = self.seed(host_b)
+                fence(host_a)
+                db = self.db()
+                candidate = "html-p%d" % db["next"]
+                db["next"] += 1
+                db["pages"][candidate] = ('<!doctype html><html><head><meta name="sutando-tutorial" '
+                                          f'content="{ME}" data-revision="tutorial.2026-10-23.1"></head></html>')
+                db.setdefault("by", {})[candidate] = ME
+                self.state.write_text(json.dumps(db))
+                v2_page = db["pages"][candidate]
+                for host in ((host_a, host_b) if order == "fenced first" else (host_b, host_a)):
+                    self.reset()
+                    code, out, err = self.deployed(host, "Green")
+                    if host is host_a:
+                        self.assertEqual((code, self.writes()), (4, []), out)
+                    else:
+                        self.assertEqual(code, 0, err + out)
+                        self.assertTrue(self.writes(), "host B refreshes its own page")
+                        self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
+                    self.assertEqual(self.db()["pages"][candidate], v2_page)
+                # Host B with its marker lost: it adopts only a page carrying its exact deployed tag.
+                shutil.rmtree(host_b / "state")
+                self.reset()
+                code, out, err = self.deployed(host_b, "Blue")
+                self.assertEqual(code, 0, err + out)
+                self.assertTrue(json.loads(out).get("adopted"), out)
+                self.assertEqual({c[1] for c in self.writes()}, {legacy}, self.writes())
+                self.assertEqual(self.db()["pages"][candidate], v2_page)
 
     def test_the_head_writer_is_fenced_too(self):
         ws = self.tmp / "ws"
