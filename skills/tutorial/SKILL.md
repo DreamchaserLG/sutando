@@ -150,15 +150,18 @@ each room's entry.
   way it was made, in place (the replaced page replaced back, an appended piece removed); when that
   call cannot fit, nothing more is written and the result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
   before it reads its own name, list, prompts or media. It summons no one. Every engine launch runs it in every room with an entry, an update included,
-  so an owner's page gains the steps a release added: `src/agent/start-cli.sh`, the dispatcher both
-  `src/startup.sh` and the desktop app launch through, starts `scripts/refresh-on-start.sh`, which
-  runs `--all-rooms` detached. That is one `--if-newer` run per room the marker records; a room that
-  fails leaves the others refreshed, and the result lists each room's outcome (log:
-  `logs/tutorial-refresh.log` in the workspace). Each page is rebuilt in the audience recorded for
-  its room (`dm` or `room`). An entry written before audiences were recorded is rewritten only in
-  the setup app's DM room; elsewhere it is reported `skipped` ("audience unknown") and left as is.
-  A room whose recorded page was deleted is `skipped` ("page deleted"); a refresh never creates a
-  page. By hand:
+  so an owner's page gains the steps a release added: the manifest's `on_launch` hook
+  (`scripts/on_launch.py`, started detached by the core launcher on every launch, desktop included;
+  skills/MANIFEST.md) runs `--all-rooms`. That is one `--if-newer` run per room the marker records;
+  a room whose record is already current makes no room call, a room that fails (an unexpected error
+  included) leaves the others refreshed, and the result lists each room's outcome (log:
+  `logs/launch-hook-tutorial.log` in the workspace). Each page is rebuilt in the audience recorded
+  for its room (`dm` or `room`). An entry written before audiences were recorded is rewritten only
+  in the setup app's DM room; elsewhere it is reported `skipped` ("audience unknown") and left as is.
+  **A refresh never creates a page**, only an explicit `publish` does: a room whose recorded page
+  was deleted, even while its creation was still pending, is `skipped` ("page deleted"), and a
+  creation cut short before its page existed waits for the next explicit `publish` ("creation
+  pending"). By hand:
 
   ```bash
   python3 skills/tutorial/scripts/getting_started.py publish --all-rooms --if-newer

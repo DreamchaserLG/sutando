@@ -30,6 +30,7 @@ OP_STATES = ("ready", "send-unknown", "landed", "failed")
 OUTCOMES = (None, "unknown", "acked", "timeout", "error")
 TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 V1_SOURCES = ("v1-complete", "v1-foreign", "v1-interrupted", "v1-previous", "v1-updating")
+AUDIENCES = ("dm", "room")
 
 
 class Invalid(Exception):
@@ -101,7 +102,7 @@ PROPOSED = {"revision", "name", "core", "audience", "agent_mxid", "prompts", "ro
 def proposed(p, where="proposed") -> None:
     closed(p, PROPOSED, where=where)
     need(is_str(p["revision"]) and p["revision"], f"{where}: revision")
-    need(all(is_str(p[k]) for k in ("name", "core", "audience", "agent_mxid")), f"{where}: strings")
+    need(all(is_str(p[k]) for k in ("name", "core", "agent_mxid")) and p["audience"] in AUDIENCES, f"{where}: strings")
     need(all(isinstance(p[k], list) and all(map(is_str, p[k])) for k in ("prompts", "roles")), f"{where}: lists")
     need(isinstance(p["media"], dict) and all(is_str(v) for v in p["media"].values()), f"{where}: media")
     need(is_hex(p["list_sha256"]) and is_hex(p["target_sha256"]) and opt(is_kind, p["kind"]), f"{where}: digests")
@@ -119,8 +120,10 @@ def current(c, where="current") -> None:
         need(is_id(c["accepted_review_id"]) and is_hex(c["accepted_review_snapshot_sha256"])
              and is_hex(c["accepted_observed_sha256"]), f"{where}: acceptance")
         return
-    closed(c, {"opaque", "kind", "revision", "proposed", "source", "review_id"}, {"v1_entry_sha256"}, where)
+    closed(c, {"opaque", "kind", "revision", "proposed", "source", "review_id", "audience"}, {"v1_entry_sha256"}, where)
     need(is_kind(c["kind"]) and opt(is_str, c["revision"]) and c["proposed"] is None, f"{where}: opaque fields")
+    # The audience the page was written for, which a later refresh renders in; null when no record says.
+    need(c["audience"] in (None,) + AUDIENCES, f"{where}: audience")
     if c["source"] == "manual-selection":
         need(is_id(c["review_id"]) and "v1_entry_sha256" not in c, f"{where}: manual-selection")
     else:
@@ -505,35 +508,43 @@ def v1_revision(e):
     return e["revision"] if isinstance(e, dict) and isinstance(e.get("revision"), str) else None
 
 
+def v1_audience(e, where: str):
+    """The audience a v1 entry recorded (`dm` or `room`); None for an entry from before it did."""
+    a = e.get("audience") if isinstance(e, dict) else None
+    refuse_unless(a is None or a in AUDIENCES, f"{where}: audience")
+    return a
+
+
 def classify(key: str, e):
-    """A.9 for one v1 room entry: (current as (kind, source, revision) or None,
+    """A.9 for one v1 room entry: (current as (kind, source, revision, audience) or None,
     legacy-in-flight as (kind, op_id, v1_state) or None), or Refused."""
     refuse_unless(isinstance(key, str) and key, f"room {key!r}: not a room key")
     refuse_unless(isinstance(e, dict), f"room {key}: not an object")
     prev = e.get("previous")
     if prev is not None:
         complete_source(prev, f"room {key}: previous")
+    prev_audience = v1_audience(prev, f"room {key}: previous")
     state = e.get("state", "complete")
     if state == "complete":
-        return (e.get("kind"), complete_source(e, f"room {key}"), v1_revision(e)), None
+        return (e.get("kind"), complete_source(e, f"room {key}"), v1_revision(e), v1_audience(e, f"room {key}")), None
     if state in ("creating", "pending"):
         op_id = e.get("operation_id")
         if state == "creating":
             refuse_unless(e.get("kind") is None and isinstance(op_id, str), f"room {key}: creating")
         else:
             refuse_unless(is_kind(e.get("kind")) and opt(is_str, op_id), f"room {key}: pending")
-        cur = None if prev is None else (prev["kind"], "v1-previous", v1_revision(prev))
+        cur = None if prev is None else (prev["kind"], "v1-previous", v1_revision(prev), prev_audience)
         return cur, (e.get("kind"), op_id, state)
     if state == "updating":
         refuse_unless(is_kind(e.get("kind")), f"room {key}: updating")
-        return (e["kind"], "v1-updating", v1_revision(prev)), (e["kind"], None, "updating")
+        return (e["kind"], "v1-updating", v1_revision(prev), prev_audience), (e["kind"], None, "updating")
     raise Refused(f"room {key}: unknown state {state!r}")
 
 
 def opaque_entry(cur, digest: str) -> dict:
-    kind, source, revision = cur
+    kind, source, revision, audience = cur
     return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
-            "review_id": None, "v1_entry_sha256": digest}
+            "review_id": None, "v1_entry_sha256": digest, "audience": audience}
 
 
 def convert(key: str, e, digest: str) -> dict:
@@ -600,7 +611,7 @@ TARGET = "Getting started, two chunks"
 
 
 def a_proposed(kind=None, target=TARGET, revision="r1") -> dict:
-    return {"revision": revision, "name": "Blue", "core": "codex", "audience": "owner", "agent_mxid": "@a:x",
+    return {"revision": revision, "name": "Blue", "core": "codex", "audience": "dm", "agent_mxid": "@a:x",
             "prompts": ["p"], "roles": ["r"], "media": {"m": "u"}, "list_sha256": H,
             "target_sha256": sha(target.encode()), "kind": kind}
 
@@ -796,6 +807,7 @@ def select(m, r, reread, choice):
     rm["unselected"] += [{**c, "review_id": v} for c in cs if c["kind"] != chosen]
     rm["current"] = None if choice == "select:none" else {
         "opaque": True, "kind": chosen, "revision": None, "proposed": None, "source": "manual-selection",
+        "audience": None,
         "review_id": v}
     rm["active_review_id"] = None
 
@@ -949,7 +961,6 @@ class SchemaTransitionTest(unittest.TestCase):
                 if path[:2] != ["migrated_from", "v1_rooms"]:
                     yield from ints(v, path + [k])
         found = list(ints(m, []))
-        self.assertTrue(any(v in (0, 1) for _, v in found), "no bool case would run")
         names = {"/".join(str(k) for k in p if not isinstance(k, int)) for p, _ in found}
         self.assertTrue({"version", "migration/source/v1_size", "rooms/!room/journal/operations/index",
                          "rooms/!room/journal/operations/struct_v", "rooms/!room/journal/capture/ranges/op",
@@ -957,7 +968,9 @@ class SchemaTransitionTest(unittest.TestCase):
                          "rooms/!room/journal/failure/op", "rooms/!room/journal/plan",
                          "rooms/!v1/journal/next_op"} <= names, names)
         for path, value in found:
-            for kind, bad in [("float", float(value))] + ([("bool", bool(value))] if value in (0, 1) else []):
+            # Both bools for every field, whatever its value: a field with no equality check
+            # (v1_size, a length) rejects a bool only by its exact-type check.
+            for kind, bad in (("float", float(value)), ("bool", True), ("bool", False)):
                 with self.subTest(path="/".join(map(str, path)), kind=kind):
                     self.assertIs(type(bad), {"float": float, "bool": bool}[kind])
                     self.assertRaises(Invalid, marker, self.mutate(m, path, bad))
@@ -1113,9 +1126,9 @@ class SchemaTransitionTest(unittest.TestCase):
 DELETE = object()
 
 
-def expected_opaque(kind, source, revision, digest):
+def expected_opaque(kind, source, revision, digest, audience=None):
     return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
-            "review_id": None, "v1_entry_sha256": digest}
+            "review_id": None, "v1_entry_sha256": digest, "audience": audience}
 
 
 class ConversionMatrixTest(unittest.TestCase):
@@ -1143,6 +1156,17 @@ class ConversionMatrixTest(unittest.TestCase):
         "pending, head, a previous, no operation_id": (
             {"kind": "html-a", "state": "pending", "revision": "r8", "previous": PREV, "target": "x"},
             ("html-p", "v1-previous", "r6"), ("html-a", None, "pending")),
+        "complete, head, audience room": (
+            {"kind": "html-a", "state": "complete", "hash": "h", "revision": "r9", "audience": "room"},
+            ("html-a", "v1-complete", "r9", "room"), None),
+        "complete, head, audience dm": ({"kind": "html-a", "hash": "h", "revision": "r9", "audience": "dm"},
+                                        ("html-a", "v1-complete", "r9", "dm"), None),
+        "pending, a previous with its audience": (
+            {"kind": "html-a", "state": "pending", "audience": "dm", "previous": {**PREV, "audience": "room"}},
+            ("html-p", "v1-previous", "r6", "room"), ("html-a", None, "pending")),
+        "updating, a previous with its audience": (
+            {"kind": "html-a", "state": "updating", "audience": "dm", "previous": {**PREV, "audience": "room"}},
+            ("html-a", "v1-updating", "r6", "room"), ("html-a", None, "updating")),
         "updating, a previous": ({"kind": "html-a", "state": "updating", "done": 2, "revision": "r8",
                                   "previous": PREV, "target": "x", "before": "y"},
                                  ("html-a", "v1-updating", "r6"), ("html-a", None, "updating")),
@@ -1157,7 +1181,7 @@ class ConversionMatrixTest(unittest.TestCase):
         digest = sha(canonical(entry))
         rm = new_room()
         if cur:
-            rm["current"] = expected_opaque(*cur, digest)
+            rm["current"] = expected_opaque(*cur[:3], digest, *cur[3:])
         if legacy:
             v = got["active_review_id"]
             self.assertTrue(is_id(v))
@@ -1216,6 +1240,10 @@ class ConversionMatrixTest(unittest.TestCase):
             "a previous that isn't complete": {"state": "creating", "operation_id": "op",
                                                "previous": {"kind": "html-p", "state": "pending"}},
             "a previous with a non-html kind": {"kind": "html-a", "state": "updating", "previous": {"kind": "x"}},
+            "an unknown audience": {**ok, "audience": "owner"},
+            "a null-string audience": {**ok, "audience": ""},
+            "a previous with an unknown audience": {"kind": "html-a", "state": "updating",
+                                                    "previous": {**self.PREV, "audience": 1}},
             "a previous with foreign false": {"state": "creating", "operation_id": "op",
                                               "previous": {**self.PREV, "foreign": False}},
             "a previous with a non-object interrupted": {"kind": "html-a", "state": "pending",

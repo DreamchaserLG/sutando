@@ -189,8 +189,24 @@ skill already linked on a host without the opt-in is left in place with a note; 
 it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
 
 Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
-`pending_questions_store`, `documented_for_core`) read `<repo>/skills` directly, past the
+`pending_questions_store`, `documented_for_core`, `on_launch`) read `<repo>/skills` directly, past the
 installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+
+## Launch hook (`on_launch`)
+
+`"on_launch": "scripts/<hook>.py"` declares a script to start once per core launch. The runtime
+dispatcher `src/agent/start-cli.sh`, which every launch goes through (`src/startup.sh` execs it, and
+so does the desktop app on each start, update, watchdog restart and reload), runs
+`src/launch_hooks.py`; that resolves every enabled declarer with `skill_roots.declared_scripts`
+across `<repo>/skills` and `<workspace>/skills` and starts each one, naming no skill. The contract:
+
+- run with no arguments, `<python> <script>` for a `.py` and `bash <script>` otherwise;
+- in its own session, stdin from /dev/null, output appended to `<workspace>/logs/launch-hook-<skill>.log`;
+- nobody waits for it, so it must finish on its own and bound its own I/O; a hook that cannot start
+  is reported on stderr, the others still start, and the launch never fails for it.
+
+Several skills may declare one; each runs on every launch, a restart included, so a hook must be
+cheap when it has nothing to do. `tutorial` declares one: the `--if-newer` refresh of every room.
 
 ## Orphan reaper (`orphan_reaper`)
 

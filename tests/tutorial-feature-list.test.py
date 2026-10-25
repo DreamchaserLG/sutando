@@ -679,7 +679,7 @@ class ListOverrideTest(_Cli):
         other.write_text(json.dumps(data))
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"marketplace": "Show me the Marketplace."}))
-        code, out, _ = self.publish("--if-newer", "--list", str(other), "--prompts", str(prompts))
+        code, out, _ = self.publish("--list", str(other), "--prompts", str(prompts))
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
         self.assertIn("Show me the Marketplace.", self.page_text())
         self.assertNotIn("Install the Notion tool.", self.page_text())

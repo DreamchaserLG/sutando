@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""The Getting started refresh after an engine update: the runtime dispatcher every launch goes
-through (src/agent/start-cli.sh: startup.sh execs it, and so does the desktop app) starts
-skills/tutorial/scripts/refresh-on-start.sh, whose `publish --all-rooms --if-newer` rebuilds the
-page in every room the marker has an entry for, each room on its own, in the audience it was
-written for, and never recreates a page that was deleted."""
+"""The Getting started refresh after an engine update. The runtime dispatcher every launch goes
+through (src/agent/start-cli.sh: startup.sh execs it, and so does the desktop app) starts the
+installed skills' launch hooks (src/launch_hooks.py, manifest `on_launch`) detached and hands off
+at once; the tutorial's hook runs `publish --all-rooms --if-newer`, which rebuilds the page in every
+room the marker has an entry for, each room on its own, in the audience it was written for, and
+never creates a page."""
 from __future__ import annotations
 
 import contextlib
@@ -35,7 +36,8 @@ OLD = "tutorial.2026-10-01.1"
 # names) refuses, as the real room_commons.py does nothing at import.
 ROOMED_STUB = (
     "if __name__ != '__main__':\n    raise ImportError('a CLI stub, not importable')\n"
-    "import os, re, sys\n"
+    "import os, re, sys, time\n"
+    "while os.environ.get('STUB_STALL') and os.path.exists(os.environ['STUB_STALL']):\n    time.sleep(0.05)\n"
     "_a = [a for a in sys.argv[1:] if a != '--json']\n"
     "_a = _a[2:] if _a[0] == '--kind' else _a\n"
     "os.environ['STUB_STATE'] = os.path.join(os.environ['STUB_ROOMS'], re.sub(r'\\W', '_', _a[1]) + '.json')\n"
@@ -115,7 +117,7 @@ class AllRoomsTest(_Rooms):
         store(self.rooms_dir, ROOMS[1]).write_text(json.dumps(db))
         code, out, err = self.refresh()
         got = json.loads(out)
-        self.assertEqual((code, got["ok"], got["action"], sorted(got["rooms"])), (0, True, "refreshed", sorted(ROOMS)))
+        self.assertEqual((code, got["ok"], got["action"], sorted(got["rooms"])), (0, True, "refreshed", sorted(ROOMS)), out + err)
         self.assertEqual({r: got["rooms"][r]["action"] for r in ROOMS},
                          {ROOMS[0]: "updated", ROOMS[1]: "kept", ROOMS[2]: "updated"}, err)
         self.assertEqual([self.revision(r) for r in ROOMS], [tp.FEATURES.revision, OLD, tp.FEATURES.revision])
@@ -153,6 +155,69 @@ class AllRoomsTest(_Rooms):
         self.assertEqual(self.entries()[ROOMS[1]], before)
         self.assertEqual([got[r]["action"] for r in (ROOMS[0], ROOMS[2])], ["updated", "updated"])
 
+    def test_a_page_deleted_while_its_creation_was_pending_is_not_created_again(self):
+        self.seed(ROOMS[:1])
+        inputs = gs.inputs_path(self.ws)
+        inputs.parent.mkdir(parents=True, exist_ok=True)
+        inputs.write_text(json.dumps({"room": ROOMS[0], "owner": "@owner:example.test"}))
+        marker = gs.marker_path(self.ws)
+        rooms = gs.load_marker(marker)
+        page = self.page(ROOMS[0])
+        rooms[ROOMS[0]] = {**rooms[ROOMS[0]], "state": "pending", "operation_id": "op-1", "target": page,
+                           "before": "", "source": gs.content_hash(""), "done": 1, "mode": "fill"}
+        gs.save_marker(marker, rooms)
+        db = json.loads(store(self.rooms_dir, ROOMS[0]).read_text())
+        db["pages"], db["calls"] = {}, []
+        store(self.rooms_dir, ROOMS[0]).write_text(json.dumps(db))
+        code, out, err = self.refresh()
+        got = json.loads(out)["rooms"][ROOMS[0]]
+        self.assertEqual((code, got["action"], got["reason"], got["summoned"]), (0, "skipped", "page deleted", False))
+        db = json.loads(store(self.rooms_dir, ROOMS[0]).read_text())
+        self.assertEqual(db["pages"], {})
+        self.assertNotIn("summon", [c[0] for c in db["calls"]])
+        # A creation whose create never answered is the explicit publish's to finish, not a refresh's.
+        rooms = gs.load_marker(marker)
+        rooms[ROOMS[0]] = {"state": "creating", "operation_id": "op-2", "target": page, "before": "",
+                           "source": gs.content_hash(""), "hash": gs.content_hash(page), "done": 0, "mode": "fill",
+                           "kind": None}
+        gs.save_marker(marker, rooms)
+        code, out, _ = self.refresh()
+        got = json.loads(out)["rooms"][ROOMS[0]]
+        self.assertEqual((code, got["action"], got["reason"]), (0, "skipped", "creation pending"))
+        self.assertEqual(json.loads(store(self.rooms_dir, ROOMS[0]).read_text())["pages"], {})
+        code, out, _ = self.main("publish", "--room", "!new:example.test", "--if-newer", "--name", "Blue", "--core",
+                                 "codex", "--room-commons", str(self.stub), "--agent-mxid", ME)
+        self.assertEqual((code, json.loads(out)["action"], json.loads(out)["reason"]), (0, "skipped", "no page"))
+
+    def test_an_unexpected_error_in_one_room_leaves_the_others_refreshed(self):
+        self.seed()
+        real = gs.Commons.read
+
+        def read(commons, kind):
+            if commons.room == ROOMS[0]:
+                raise RuntimeError("token=secret-value")
+            return real(commons, kind)
+        with mock.patch.object(gs.Commons, "read", read):
+            code, out, err = self.refresh()
+        got = json.loads(out)
+        self.assertEqual((code, got["ok"]), (4, False))
+        self.assertEqual(got["rooms"][ROOMS[0]], {"code": 4, "ok": False, "reason": "unexpected RuntimeError"})
+        self.assertEqual([got["rooms"][r]["action"] for r in ROOMS[1:]], ["updated", "updated"])
+        self.assertNotIn("secret-value", out + err)
+
+    def test_a_room_current_by_its_record_makes_no_room_call(self):
+        self.seed()
+        self.refresh()
+        for r in ROOMS:
+            db = json.loads(store(self.rooms_dir, r).read_text())
+            db["calls"] = []
+            store(self.rooms_dir, r).write_text(json.dumps(db))
+        code, out, _ = self.refresh()
+        got = json.loads(out)["rooms"]
+        self.assertEqual({r: (v["action"], v.get("checked")) for r, v in got.items()},
+                         {r: ("unchanged", "marker") for r in ROOMS})
+        self.assertEqual([json.loads(store(self.rooms_dir, r).read_text())["calls"] for r in ROOMS], [[], [], []])
+
     def test_each_page_is_rebuilt_in_the_audience_it_was_written_for(self):
         self.seed(ROOMS[:1], "--audience", "room")
         self.seed(ROOMS[1:2])
@@ -187,20 +252,13 @@ class AllRoomsTest(_Rooms):
                          (tp.render_page("Blue", "codex", "dm", ME), "dm"))
 
 
-TRIGGER = 'bash "$REPO/skills/tutorial/scripts/refresh-on-start.sh"'
+FAKE_LAUNCHER = "#!/bin/bash\necho \"$*\" > \"$LAUNCH_STAMP\"\n"
 
 
-class LaunchTriggerTest(_Rooms):
-    def test_every_launch_path_starts_the_refresh_and_it_rebuilds_every_room(self):
-        dispatcher = (REPO / "src" / "agent" / "start-cli.sh").read_text()
-        lines = [ln for ln in dispatcher.splitlines() if TRIGGER in ln]
-        self.assertEqual(len(lines), 1, "the dispatcher starts the refresh exactly once")
-        self.assertLess(dispatcher.index(lines[0]), dispatcher.index('exec bash "$launcher"'))
-        startup = (REPO / "src" / "startup.sh").read_text()
-        self.assertTrue(startup.rstrip().endswith('exec bash "$REPO/src/agent/start-cli.sh"'))
-        self.assertNotIn("getting_started.py", startup, "one entry point: startup.sh reaches it via the dispatcher")
-        self.seed(ROOMS[:2])
-        # A copy of the engine, so the run finds the stub room_commons beside the skill and this workspace.
+class LaunchTest(_Rooms):
+    """The real dispatcher, with a stand-in runtime launcher: it hands off while the hook still runs."""
+
+    def engine(self):
         repo = self.tmp / "repo"
         ignore = shutil.ignore_patterns("__pycache__", "node_modules")
         for tree in ("src", "shared", "scripts"):
@@ -209,12 +267,31 @@ class LaunchTriggerTest(_Rooms):
         (repo / "skills" / "room-commons" / "scripts").mkdir(parents=True)
         shutil.copy(self.stub, repo / "skills" / "room-commons" / "scripts" / "room_commons.py")
         (repo / "sutando.config.json").write_text(json.dumps({"workspace": {"path": str(self.ws)}}))
-        env = {**self.env, "AGENT_MXID": ME, "SUTANDO_PY": sys.executable, "REPO": str(repo)}
-        run = subprocess.run(["bash", "-c", "set -euo pipefail\n" + lines[0] + "\necho launched\n"], env=env,
-                             capture_output=True, text=True, timeout=60)
-        self.assertEqual((run.returncode, run.stdout), (0, "launched\n"), run.stderr)
-        log, got = self.ws / "logs" / "tutorial-refresh.log", None
-        deadline = time.monotonic() + 120
+        launcher = repo / "src" / "agent" / "claude" / "cli" / "start-cli.sh"
+        launcher.write_text(FAKE_LAUNCHER)
+        launcher.chmod(0o755)
+        return repo
+
+    def test_a_launch_starts_the_hook_detached_and_hands_off_while_it_stalls(self):
+        self.seed(ROOMS[:2])
+        repo, stall, stamp = self.engine(), self.tmp / "stall", self.tmp / "launched"
+        stall.touch()
+        self.addCleanup(lambda: stall.unlink(missing_ok=True))
+        env = {k: v for k, v in self.env.items() if k != "SUTANDO_PY"}
+        env.update({"AGENT_MXID": ME, "SUTANDO_CORE_RUNTIME": "claude", "STUB_STALL": str(stall),
+                    "LAUNCH_STAMP": str(stamp), "SUTANDO_TMUX_SOCKET": str(self.tmp / "tmux.sock")})
+        try:
+            run = subprocess.run(["bash", str(repo / "src" / "agent" / "start-cli.sh")], env=env,
+                                 capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the dispatcher waited on the launch hook instead of handing off")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertTrue(stamp.exists(), "the runtime launcher was never reached\n" + run.stderr)
+        self.assertIn("launch-hooks: started tutorial", run.stderr)
+        log = self.ws / "logs" / "launch-hook-tutorial.log"
+        self.assertNotIn('"refreshed"', log.read_text() if log.exists() else "", "the hook should still be stalled")
+        stall.unlink()
+        got, deadline = None, time.monotonic() + 120
         while got is None and time.monotonic() < deadline:
             last = log.read_text().strip().splitlines()[-1:] if log.exists() else []
             with contextlib.suppress(ValueError):
@@ -224,6 +301,12 @@ class LaunchTriggerTest(_Rooms):
         self.assertEqual({r: v["action"] for r, v in got["rooms"].items()},
                          {ROOMS[0]: "updated", ROOMS[1]: "updated"})
         self.assertEqual([self.revision(r) for r in ROOMS[:2]], [tp.FEATURES.revision] * 2)
+
+    def test_the_dispatcher_names_no_skill(self):
+        dispatcher = (REPO / "src" / "agent" / "start-cli.sh").read_text()
+        self.assertNotIn("tutorial", dispatcher)
+        self.assertNotIn("skills/", dispatcher.replace('"$REPO/scripts/', ""))
+        self.assertNotIn("tutorial", (REPO / "src" / "launch_hooks.py").read_text())
 
 
 if __name__ == "__main__":

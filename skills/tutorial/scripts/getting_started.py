@@ -12,11 +12,13 @@
   getting_started.py publish --all-rooms --if-newer [options as above, but no --room or --audience]
       -> {"ok": every room's run succeeded, "action": "refreshed", "rooms": {room: {"code": exit code,
           ...that room's result}}}: one --if-newer run per room the marker has an entry for, in the
-          audience recorded for it. refresh-on-start.sh starts it from src/agent/start-cli.sh, the
-          dispatcher every launch goes through (startup.sh and the desktop app), so an update's newer
-          list reaches every page. A refresh never recreates a deleted page ("skipped", "page
-          deleted"), and never rewrites a legacy entry with no recorded audience outside the setup
-          app's DM ("skipped", "audience unknown").
+          audience recorded for it; a room whose record is already current makes no room call. The
+          skill's launch hook (manifest `on_launch`, scripts/on_launch.py) runs it on every core
+          launch, so an update's newer list reaches every page. A refresh (any --if-newer run) never
+          creates a page: a deleted one is "skipped" ("page deleted"), a creation cut short is left to
+          the next explicit publish ("creation pending"). It never rewrites a legacy entry with no
+          recorded audience outside the setup app's DM ("audience unknown"). One room's failure,
+          an unexpected error included, leaves the others refreshed.
 
 The page (tour_page.py) is a short interactive AG2 Space tour rendered from the skill's feature
 list (feature-list.json: nine steps for every core, plus the Claude Code history import step when
@@ -843,8 +845,9 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             summon: bool = False, core: str = "unknown", audience: Optional[str] = "dm",
             agent: Optional[str] = None, prompts: object = None, roles: object = None,
             features: Optional[FeatureList] = None, if_newer: bool = False,
-            media: object = None, dm_room: Optional[str] = None) -> dict:
-    """`audience` None means the room's recorded one; a refresh skips a page it can't place."""
+            media: object = None, dm_room: Optional[str] = None, had_entry: bool = False) -> dict:
+    """`audience` None means the room's recorded one; a refresh skips a page it can't place, and
+    never creates one: only an explicit publish does. `had_entry`: the room had one before recovery."""
     features = features or tour_page.FEATURES
     slots = tour_page.prompt_slots(features)
     with _locked(marker):
@@ -876,8 +879,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         entry = _entry(None, page, features, prompts, roles, media, audience)
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
-        if if_newer and known and step["action"] in ("reconcile", "create"):
-            return skipped("page deleted")  # its recorded page is gone: a refresh never recreates it
+        if if_newer and step["action"] == "resume":
+            return skipped("creation pending")  # re-issuing the create is the explicit publish's to do
         adopted = upgrade = False
         if step["action"] == "reconcile":
             found = commons.reconcile(pages, agent)
@@ -897,6 +900,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 step, adopted = {"action": "update", "kind": found, "pending": False}, True
             else:
                 step = {"action": "create", "kind": None, "pending": False}
+        if if_newer and step["action"] == "create":
+            return skipped("page deleted" if known or had_entry else "no page")
         kind = step["kind"]
         if step["action"] in ("create", "resume"):
             op = step.get("operation_id") or f"tutorial-{uuid.uuid4().hex}"
@@ -1009,11 +1014,24 @@ def publish_all_rooms(args: argparse.Namespace, raw: List[str]) -> int:
               "its own)", file=sys.stderr)
         return 2
     rest = [a for a in raw if a != "--all-rooms"]
+    features, _ = resolve_list(args.feature_list, lambda s: print(s, file=sys.stderr))
     results, worst = {}, 0
-    for room in sorted(load_marker(marker_path(_workspace()))):
+    for room, entry in sorted(load_marker(marker_path(_workspace())).items()):
+        if entry.get("state") == "complete" and entry.get("revision") and not newer(features.revision,
+                                                                                     entry["revision"]):
+            # Current by its record: nothing a run could write, so no room call is made.
+            results[room] = {"code": 0, "ok": True, "action": "unchanged", "kind": entry.get("kind"),
+                             "revision": features.revision, "checked": "marker"}
+            continue
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            code = main(rest + ["--room", room])
+        try:
+            with contextlib.redirect_stdout(out):
+                code = main(rest + ["--room", room])
+        except Exception as exc:  # noqa: BLE001 — one room's failure must not stop the others
+            print(f"getting_started: {room}: unexpected {type(exc).__name__}; the other rooms go on",
+                  file=sys.stderr)
+            results[room], worst = {"code": 4, "ok": False, "reason": f"unexpected {type(exc).__name__}"}, 4
+            continue
         lines = out.getvalue().strip().splitlines()
         try:
             got = json.loads(lines[-1]) if lines else {}
@@ -1107,6 +1125,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                                                  "(@localpart:server); nothing was published"}))
         return 4
     commons, marker = Commons(script, args.room, env), marker_path(_workspace())
+    had_entry = args.room in load_marker(marker)
     try:
         # A run cut short in this room is settled first, before this run's name, list, prompts or
         # media are even looked at; settling it is then this run's whole work.
@@ -1126,7 +1145,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             result = publish(commons, marker, name, args.owner, args.summon,
                              detect_core() if args.core == "auto" else args.core, args.audience,
-                             agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"))
+                             agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"),
+                             had_entry)
         except (PublishError, ValueError) as exc:
             print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
             return 4
