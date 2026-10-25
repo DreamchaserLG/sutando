@@ -8,6 +8,11 @@ both take the runner from the module, so neither can drift.
 
 Run: python3 tests/sandbox-runner.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 import asyncio
 import importlib.util
 import itertools
@@ -22,11 +27,6 @@ import types
 import unittest
 from unittest import mock
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
-
-isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
