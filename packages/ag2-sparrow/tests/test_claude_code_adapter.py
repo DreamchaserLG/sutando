@@ -2389,6 +2389,39 @@ class ConnectCode(AgentRootBase):
             self.assertNotIn(BEARER, " ".join(map(str, cmd)))
 
 
+class RedeemEdges(unittest.TestCase):
+    """connect_common.redeem_code's answers that never reach a seat."""
+
+    def test_an_unreachable_backend_a_bad_answer_and_an_unreadable_error_body(self):
+        def refused(req, timeout=None):
+            raise urllib.error.URLError("connection refused")
+        got, why = cm.redeem_code(BASE, CODE, opener=refused)
+        self.assertEqual(got, None)
+        self.assertIn("the code is still valid until it expires", why)
+        for body in (b"[]", b"not json", json.dumps({"relay_url": RELAY, "agent_id": AGENT}).encode()):
+            with self.subTest(body=body):
+                got, why = cm.redeem_code(BASE, CODE, opener=lambda req, timeout=None, b=body: _Resp(200, b))
+                self.assertEqual(got, None)
+                self.assertIn("the code is spent, make a new one", why)
+
+        class Unreadable(urllib.error.HTTPError):
+            def read(self, *a):
+                raise OSError("reset")
+
+        def gone(req, timeout=None):
+            raise Unreadable(req.full_url, 404, "x", {}, io.BytesIO(b""))
+        self.assertIn("already used or has expired", cm.redeem_code(BASE, CODE, opener=gone)[1])
+        teapot = lambda req, timeout=None: (_ for _ in ()).throw(
+            urllib.error.HTTPError(req.full_url, 418, "x", {}, io.BytesIO(b"")))
+        self.assertEqual(cm.redeem_code(BASE, CODE, opener=teapot)[1], "AG2 Space refused the code (HTTP 418)")
+
+    def test_retry_after_is_bounded_and_ignored_when_not_a_number(self):
+        self.assertEqual(cm._retry_after({"retry_after": 0}, 4), 1.0)
+        self.assertEqual(cm._retry_after({"retry_after": True}, 4), 4)
+        self.assertEqual(cm._retry_after({"retry_after": "5"}, 4), 4)
+        self.assertEqual(cm._retry_after({"retry_after": float("nan")}, 4), 4)
+
+
 class ConnectAgentRoot(AgentRootBase):
     """With no explicit root the root is the agent's own, named by its id, and install wires the agent's
     bridge to exactly that root: its own unit here, a declaration under a host supervisor."""
