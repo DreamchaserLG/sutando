@@ -109,8 +109,7 @@ ROWS: "list[tuple[str, dict[str, tuple[str, list[tuple[str, str]]]]]]" = [
                     [(DISCORD, r"import outbox_log")]),
         "ag2space": ("gateway `event_id` when present; bare `ok` trusted as "
                      "delivered; `record_delivered` via the vendored outbox",
-                     [(AG2, r"from .outbox import DeliveryOutcome, "
-                            r"record_delivered")]),
+                     [(AG2, r"from \.outbox import [^\n]*\brecord_delivered\b")]),
         "slack": ("none persisted for replies (failures printed); proactive "
                   "marked delivered in `slack_proactive_receipts`",
                   [(SLACK, r"mark_delivered as mark_proactive_delivered"),
