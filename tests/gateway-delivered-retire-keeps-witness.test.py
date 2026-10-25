@@ -269,70 +269,11 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual(claim.read_text(), "UNSENT BODY B\n", "kept for an operator")
 
     def test_a_claim_that_vanishes_or_is_a_symlink_has_no_generation_and_is_unknown(self):
-        self.assertIsNone(gb._file_generation(self.lane.results / "missing"))
         target = self.lane.results / "elsewhere"
         target.write_text("x\n")
         link = self.lane.results / "proactive-1.sending.1.1"
         link.symlink_to(target)
         self.assertEqual(gb._claim_receipt(link, "proactive-1"), ("unknown", None, None))
-
-    def test_a_parked_claim_swapped_in_flight_and_unrestorable_is_kept_for_an_operator(self):
-        item_id = gb._proactive_item_id("proactive-1", "parked")
-        outbox._write_item(self.lane.results / ".outbox-ag2space-proactive", item_id,
-                           {"item_id": item_id, "status": "PARKED", "attempts": 0, "payload": "parked\n"})
-        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
-        claim.write_text("parked\n")
-        calls = []
-        real = gb.undelivered_quarantine.rename_noreplace
-
-        def move_then_refuse_the_way_back(src, dst):
-            calls.append(src)
-            if len(calls) == 2:
-                raise OSError(5, "Input/output error")
-            real(src, dst)
-            Path(dst).write_text("a different generation\n")
-
-        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move_then_refuse_the_way_back):
-            self.lane.restart()
-        self.assertFalse((self.lane.results / "proactive-1.txt").exists())
-        self.assertEqual(len(calls), 2, "the way back failed, so the file stays under its staged claim")
-        kept = list(self.lane.results.glob("proactive-1.sending.*"))
-        self.assertEqual([p.read_text() for p in kept], ["a different generation\n"])
-        self.assertEqual(list((self.lane.results / "undelivered").glob("proactive-1-*.txt")), [])
-        self.assertEqual(len(self.lane.posts), 0)
-
-    def test_a_replaced_claim_whose_way_back_is_retaken_is_never_archived_as_delivered(self):
-        item_id = gb._proactive_item_id("proactive-1", "delivered")
-        outbox.record_delivered(self.lane.results / ".outbox-ag2space-proactive", item_id)
-        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
-        claim.write_text("delivered\n")
-        real_receipt, real_move = gb._claim_receipt, gb.undelivered_quarantine.rename_noreplace
-        calls = []
-
-        def read_then_replace(*a, **kw):
-            got = real_receipt(*a, **kw)
-            tmp = claim.with_name(".swap")
-            tmp.write_text("UNSENT B\n")
-            os.replace(tmp, claim)
-            return got
-
-        def retake_before_the_way_back(src, dst):
-            calls.append(src)
-            if len(calls) == 2:
-                Path(dst).write_text("CONCURRENT C\n")
-            real_move(src, dst)
-
-        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
-                mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", retake_before_the_way_back):
-            self.lane.restart()
-        self.lane.drain()
-        self.assertEqual(claim.read_text(), "CONCURRENT C\n")
-        self.assertEqual(list(self.lane.results.glob(".proactive-1.delivered-*")), [])
-        kept = [p for p in self.lane.results.glob("proactive-1.sending.*") if p != claim]
-        self.assertEqual([p.read_text() for p in kept], ["UNSENT B\n"], "kept as a claim, re-decided later")
-        archived = list((self.lane.results / "archive").glob("proactive-1*"))
-        self.assertFalse(any("UNSENT B" in p.read_text() for p in archived), "B was never delivered")
-        self.assertEqual(len(self.lane.posts), 0)
 
     def test_an_operator_requeue_between_the_parked_receipt_and_the_move_keeps_the_body_live(self):
         root = self.lane.results / ".outbox-ag2space-proactive"
@@ -425,8 +366,10 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
 
         with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
                 mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", die_after_first_rename):
-            with self.assertRaises(Killed):
+            try:  # a replaced claim is never renamed now, so there may be no rename to die after
                 self.lane.restart()
+            except Killed:
+                pass
         dead = _dead_pid()
         for c in self.lane.results.glob("proactive-1.sending.*"):  # its owner died with the crash
             rest = c.name.split(".sending.", 1)[1].split(".", 1)
@@ -635,69 +578,170 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                          "no scanner, recovery or retry path moved A or B")
         self.assertEqual(lane.where("proactive-1"), "archived")
 
-    def test_a_replacement_at_every_durable_boundary_is_neither_archived_unsent_nor_lost(self):
-        faults = (("stage", "crash-after"), ("stage", "fail"), ("stage", "replace-at-target"),
-                  ("rollback", "crash-after"), ("rollback", "fail"))
+    def _settled_once(self, lane, a_body: str, kind: str) -> None:
+        """After the owner's death: a restart and real drains send B once under its own key, A keeps
+        its terminal state and every placed copy of A is A's exact bytes; a further pass moves nothing."""
+        dead = _dead_pid()
+        for c in lane.results.glob("proactive-1.sending.*"):
+            rest = c.name.split(".sending.", 1)[1].split(".", 1)
+            c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
+        lane.restart()
+        root = lane.results / ".outbox-ag2space-proactive"
+        a_id, b_id = gb._proactive_item_id("proactive-1", a_body), gb._proactive_item_id("proactive-1", "UNSENT B")
+        for _ in range(2):
+            lane.drain()
+        bodies = [p.get("body") for p in lane.posts]
+        self.assertEqual(bodies, ["UNSENT B"], f"B sent once, A never ({bodies})")
+        self.assertEqual((outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id)), (kind, "DELIVERED"))
+        placed = [p.read_text() for p in list(lane.results.glob(".proactive-1.delivered-*"))
+                  + list((lane.results / "undelivered").glob("proactive-1-*"))]
+        archived = [p.read_text() for p in (lane.results / "archive").glob("proactive-1*")]
+        self.assertNotIn("UNSENT B\n", placed, "B never hidden as delivered or parked")
+        self.assertEqual(archived.count("UNSENT B\n"), 1, "B archived once, after its POST")
+        self.assertTrue(all(t == a_body + "\n" for t in placed + [a for a in archived if a != "UNSENT B\n"]),
+                        f"every placed copy of A is A's bytes ({placed}, {archived})")
+        lane.restart()
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], bodies, "a fresh restart and drains send nothing")
+        self.assertEqual((outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id)), (kind, "DELIVERED"))
+
+    def test_a_writer_holding_the_claims_descriptor_never_reaches_a_placed_copy(self):
+        """B written through a descriptor opened before recovery, at each cut of the placement
+        protocol (check -> semantic rename of a private copy -> retain), with and without a crash."""
+        cuts = (("before-placement", False), ("after-placement", False), ("after-placement", True),
+                ("after-retain", False), ("after-retain", True))
         for kind in ("DELIVERED", "PARKED"):
-            for boundary, fault in faults:
-                with self.subTest(kind=kind, boundary=boundary, fault=fault):
-                    lane = Lane(gb, scratch("gw-boundary-"))
+            for cut, crash in cuts:
+                with self.subTest(kind=kind, cut=cut, crash=crash):
+                    lane = Lane(gb, scratch("gw-retained-fd-"))
                     root = lane.results / ".outbox-ag2space-proactive"
                     a_body = f"{kind.lower()} A"
-                    item_id = gb._proactive_item_id("proactive-1", a_body)
-                    outbox._write_item(root, item_id, {"item_id": item_id, "status": kind, "attempts": 0,
-                                                       "payload": a_body + "\n"})
+                    a_id = gb._proactive_item_id("proactive-1", a_body)
+                    outbox._write_item(root, a_id, {"item_id": a_id, "status": kind, "attempts": 0,
+                                                    "payload": a_body + "\n"})
                     claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
                     claim.write_text(a_body + "\n")
-                    real_receipt, real_move = gb._claim_receipt, gb.undelivered_quarantine.rename_noreplace
-                    calls = []
+                    writer = os.open(claim, os.O_WRONLY)  # retained before recovery stages anything
+                    self.addCleanup(os.close, writer)
 
-                    def read_then_replace(*a, **kw):
-                        got = real_receipt(*a, **kw)
-                        if got[0] == kind and not calls and fault != "replace-at-target":
-                            tmp = claim.with_name(".swap")
-                            tmp.write_text("UNSENT B\n")
-                            os.replace(tmp, claim)
-                        return got
+                    def write_b():
+                        os.ftruncate(writer, 0)
+                        os.pwrite(writer, b"UNSENT B\n", 0)
+                    real_move = gb.undelivered_quarantine.rename_noreplace
+                    real_publish = getattr(gb, "_publish_text_whole", None)
+
+                    def around(dst: Path, commit):
+                        semantic = dst.parent.name == "undelivered" or ".delivered-" in dst.name
+                        if semantic and cut == "before-placement":
+                            write_b()  # the check has returned; the semantic commit has not run
+                        out = commit()
+                        if (semantic and cut == "after-placement") or (".decided-" in dst.name and cut == "after-retain"):
+                            write_b()
+                            if crash:
+                                raise Killed(f"killed {cut}")
+                        return out
 
                     def move(src, dst):
-                        calls.append(src)
-                        n = len(calls)
-                        at = 1 if boundary == "stage" else 2
-                        if fault == "fail" and (n == at or (boundary == "rollback" and n > at)):
-                            raise FileExistsError(17, "File exists")  # a failed rollback: every way out fails
-                        real_move(src, dst)
-                        if n == 1 and fault == "replace-at-target":
-                            tmp = Path(dst).with_name(".swap")
-                            tmp.write_text("UNSENT B\n")
-                            os.replace(tmp, dst)
-                        if n == at and fault == "crash-after":
-                            raise Killed(f"killed after the {boundary} rename")
+                        return around(Path(dst), lambda: real_move(src, dst))
 
-                    logs = []
-                    with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
-                            mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move), \
-                            mock.patch.object(gb, "_log", logs.append):
+                    def publish(dst, *a, **k):
+                        return around(Path(dst), lambda: real_publish(dst, *a, **k))
+                    publish_patch = (mock.patch.object(gb, "_publish_text_whole", publish) if real_publish
+                                     else contextlib.nullcontext())
+                    with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move), publish_patch:
                         try:
                             lane.restart()
                         except Killed:
                             pass
-                    if fault == "fail" and boundary == "rollback":
-                        self.assertTrue(any("changed after its receipt was read" in m for m in logs),
-                                        f"an un-neutralized rollback is reported ({logs})")
-                    outside = [p.name for p in list(lane.results.glob(".proactive-1*"))
-                               + list((lane.results / "archive").glob("proactive-1*"))
-                               + list((lane.results / "undelivered").glob("proactive-1*"))
-                               if "UNSENT B" in p.read_text()]
-                    self.assertEqual(outside, [], "B is only ever under a claim name, which no delivered scanner reads")
-                    with mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", lane.results / "archive"):
-                        self.assertFalse(gb._delivered_copy_exists("proactive-1"))
-                    dead = _dead_pid()
-                    for c in lane.results.glob("proactive-1.sending.*"):  # its owner died
-                        rest = c.name.split(".sending.", 1)[1].split(".", 1)
-                        c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
-                    lane.restart()
-                    self._b_survives(lane, a_body, kind)
+                    self._settled_once(lane, a_body, kind)
+
+    def _sent_record(self, body: str) -> dict:
+        """The outbox record a real drain writes for `body`, as the item a later park would keep."""
+        lane = Lane(gb, scratch("gw-record-"))
+        lane.write("proactive-1.txt", body)
+        lane.drain()
+        root = lane.results / ".outbox-ag2space-proactive"
+        record = outbox.read_item(root, gb._proactive_item_id("proactive-1", body.strip()))
+        return {k: v for k, v in record.items() if k not in ("provider_ref", "delivered_at", "provider")}
+
+    def _requeue_by_cli(self, lane, item_id: str) -> "subprocess.CompletedProcess":
+        root = lane.results / ".outbox-ag2space-proactive"
+        cmd = gb._proactive_requeue_command(root, item_id, __import__("hashlib").sha256(b"parked body\n").hexdigest())
+        argv = [sys.executable if c == "python3" else c for c in __import__("shlex").split(cmd)]
+        from _helpers.hermetic_env import isolated_child_env
+        return subprocess.run(argv, cwd=REPO, env=isolated_child_env(), capture_output=True, text=True, timeout=60)
+
+    def test_an_acknowledged_requeue_of_a_body_being_parked_is_sent_once_after_any_crash(self):
+        """The real CLI requeues the item after recovery read PARKED (epoch 0) and before it moves the
+        only body; a crash right after that move, or after the newer epoch is seen but before the hand
+        back, must still end in exactly one POST under epoch 1 after a restart and real drains."""
+        for cut in ("after-the-move", "before-the-hand-back"):
+            with self.subTest(cut=cut):
+                lane = Lane(gb, scratch("gw-requeue-crash-"))
+                root = lane.results / ".outbox-ag2space-proactive"
+                item_id = gb._proactive_item_id("proactive-1", "parked body")
+                outbox._write_item(root, item_id, {**self._sent_record("parked body\n"), "status": "PARKED"})
+                (lane.results / f"proactive-1.sending.{_dead_pid()}.1").write_text("parked body\n")
+                real, cli = gb._claim_receipt, []
+
+                def read_then_requeue(claim, stem):
+                    got = real(claim, stem)
+                    if not cli:
+                        cli.append(self._requeue_by_cli(lane, item_id))
+                    return got
+                real_move, logs = gb.undelivered_quarantine.rename_noreplace, []
+
+                def die_after_the_move(src, dst):
+                    real_move(src, dst)
+                    if Path(dst).parent.name == "undelivered":
+                        raise Killed("killed after the move")
+
+                real_publish = getattr(gb, "_publish_text_whole", None)
+
+                def die_after_publishing_into_undelivered(dst, *a, **k):
+                    out = real_publish(dst, *a, **k)
+                    if Path(dst).parent.name == "undelivered":
+                        raise Killed("killed after the move")
+                    return out
+
+                def die_before_the_hand_back(*a, **k):
+                    raise Killed("killed before the hand back")
+                def after_the_move():
+                    stack = contextlib.ExitStack()  # patches apply on entry, so build it only when used
+                    stack.enter_context(
+                        mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", die_after_the_move))
+                    if real_publish:
+                        stack.enter_context(
+                            mock.patch.object(gb, "_publish_text_whole", die_after_publishing_into_undelivered))
+                    return stack
+                fault = (after_the_move()
+                         if cut == "after-the-move" else
+                         mock.patch.object(gb, "_hand_back_decided" if hasattr(gb, "_hand_back_decided")
+                                           else "_hand_back", die_before_the_hand_back))
+                with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_requeue), fault, \
+                        mock.patch.object(gb, "_log", logs.append):
+                    with self.assertRaises(Killed):
+                        lane.restart()
+                self.assertEqual(cli[0].returncode, 0, cli[0].stderr)
+                self.assertIn("result: requeued", cli[0].stdout)
+                self.assertIn("body: nothing-quarantined", cli[0].stdout, "the only body was still a claim")
+                self.assertFalse(any("handed back" in m for m in logs), "no success logged before the hand back")
+                self.assertEqual(outbox.receipt(root, item_id), ("QUEUED", 1))
+                dead = _dead_pid()
+                for c in lane.results.glob("proactive-1.sending.*"):
+                    rest = c.name.split(".sending.", 1)[1].split(".", 1)
+                    c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
+                lane.restart()
+                for _ in range(4):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["parked body"], "exactly one POST")
+                self.assertEqual(outbox.receipt(root, item_id), ("DELIVERED", 1), "delivered under epoch 1")
+                self.assertEqual(list((lane.results / "undelivered").glob("proactive-1-*.txt")), [])
+                lane.restart()
+                for _ in range(2):
+                    lane.drain()
+                self.assertEqual(len(lane.posts), 1, "a further restart and drains send nothing")
 
     def test_a_staged_claim_is_invisible_to_every_delivered_scanner(self):
         """Each reader of results/ names that could take a staged claim for a delivered (or drained)
@@ -716,6 +760,10 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         res = self.lane.results
         staged = res / f"proactive-1.sending.{os.getpid()}.{1 << 60}"
         staged.write_text("UNSENT B\n")
+        retained = res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-e0.1"
+        snapshot = res / f".proactive-1.txt.{os.getpid()}.{'0' * 16}.tmp"  # result_publish's staging
+        for hidden in (retained, snapshot):
+            hidden.write_text("UNSENT B\n")
         with mock.patch.object(gb, "RESULTS_DIR", res), \
                 mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", res / "archive"):
             gb._reap_hidden_delivered()
@@ -723,7 +771,10 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual(staged.read_text(), "UNSENT B\n", "the reaper left it")
         self.assertEqual(list((res / "archive").iterdir()), [], "nothing archived")
         for mod in (src_recovery, vendored_recovery):
-            self.assertIsNone(mod._recovery_target(staged.name), f"{mod.__name__} sweep ignores it")
+            for name in (staged.name, retained.name, snapshot.name):
+                self.assertIsNone(mod._recovery_target(name), f"{mod.__name__} sweep ignores {name}")
+        for hidden in (retained, snapshot):
+            self.assertEqual(hidden.read_text(), "UNSENT B\n", f"the reaper left {hidden.name}")
         self.assertFalse(ask.drained(res, "proactive-1.txt"), "pending-questions reads it as not yet drained")
         self.lane.drain()
         self.assertEqual(self.lane.posts, [], "the drain reads only live .txt files")
@@ -743,21 +794,15 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         def delivered(root, item_id, parked):
             outbox.record_delivered(root, item_id)
 
-        def other_generation(root, item_id, parked):
-            outbox.requeue_item_with_epoch(root, item_id)
-            tmp = parked.with_name(".swap")
-            tmp.write_text("parked body\n")
-            os.replace(tmp, parked)
-
-        def other_item(root, item_id, parked):
+        def other_item_in_the_same_inode(root, item_id, retained):
             other = gb._proactive_item_id("proactive-1", "other body")
-            outbox._write_item(root, other, {"item_id": other, "status": "QUEUED", "attempts": 0,
+            outbox._write_item(root, other, {"item_id": other, "status": "PARKED", "attempts": 0,
                                              "resend_epoch": 1, "payload": "other body\n"})
-            tmp = parked.with_name(".swap")
-            tmp.write_text("other body\n")
-            os.replace(tmp, parked)
+            with open(retained, "r+b") as fh:  # a writer's retained descriptor: same inode, new bytes
+                fh.truncate(0)
+                fh.write(b"other body\n")
 
-        for interleave in (delete, corrupt, queued_without_a_requeue, delivered, other_generation, other_item):
+        for interleave in (delete, corrupt, queued_without_a_requeue, delivered, other_item_in_the_same_inode):
             with self.subTest(interleave=interleave.__name__):
                 lane = Lane(gb, scratch("gw-parked-proof-"))
                 root = lane.results / ".outbox-ag2space-proactive"
@@ -769,7 +814,7 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 seen = []
 
                 def interleaved(claim, stem):
-                    if seen:
+                    if len(seen) == 1:
                         interleave(root, item_id, Path(claim))
                     got = real(claim, stem)
                     seen.append(got[0])
@@ -778,12 +823,13 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 with mock.patch.object(gb, "_claim_receipt", side_effect=interleaved):
                     lane.restart()
                 self.assertEqual(seen[0], "PARKED")
-                self.assertEqual(len(seen), 2, "re-read once after parking")
                 for _ in range(2):
                     lane.drain()
+                lane.restart()
+                lane.drain()
                 self.assertFalse((lane.results / "proactive-1.txt").exists(), "never handed back live")
-                self.assertEqual(len(list((lane.results / "undelivered").glob("proactive-1-*.txt"))), 1,
-                                 "kept parked for an operator")
+                parked = [p.read_text() for p in (lane.results / "undelivered").glob("proactive-1-*.txt")]
+                self.assertEqual(parked.count("parked body\n"), 1, f"A kept parked once for an operator ({parked})")
                 self.assertEqual(lane.posts, [], "a PARKED send is never repeated on doubt")
 
 
