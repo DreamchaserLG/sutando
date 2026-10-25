@@ -93,6 +93,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`discord_rest_client.py`** — Alias of `channels.discord.client` (phase-1a restructure); one transition window.
 - **`discord_result_delivery.py`** — Discord result-delivery state, bound to the shared outbox (#3279 action 2).
 - **`dm-result.py`** — Send a task result to Discord DM if voice client is disconnected.
+- **`dotspace.py`** — DotSpaces: the agent-native Matrix homeservers AG2 operates, and what each one looks like.
 - **`emit-call-tiers.ts`** — Emit the core's advertisable *direct* call tiers to `state/call-tiers.json` — the runtime-authored half of the availability-driven call-tier menu (Track 9).
 - **`entrance_links.py`** — EntranceLink records — verified provider-identity ↔ Stand bindings (I2).
 - **`event_log.py`** — Structured event log for Sutando — JSONL events for post-mortem debugging.
@@ -222,6 +223,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
+- **`status_ack_policy.py`** — Whether to send one task's initial status acknowledgement, what it says, and where it goes.
 - **`stop.sh`** — Stop all Sutando services (shortcut for restart.sh --stop-only)
 - **`stop_hook_repeat.py`** — The Stop hook's same-queue repeat counter, per runtime instance.
 - **`stop_hook_unwatched.py`** — The Stop hook's consecutive-unwatched-turn-end counter, per runtime instance.
