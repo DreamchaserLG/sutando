@@ -2973,12 +2973,13 @@ class StartSparrow(Base):
             old.terminate()
             successor(fake, t0)
             return subprocess.CompletedProcess(cmd, 0, "", "")
-        self.cli("install", "--mxid", AGENT, "--no-service")
+        if not getattr(self, "installed", False):
+            self.installed = self.cli("install", "--mxid", AGENT, "--no-service").returncode == 0
         want = keepalive.health_command(str(self.reply_stub))
         if sync_second:  # the action then falls in the same whole second as `t0`
             time.sleep(1.02 - time.time() % 1)
         t0 = time.time()
-        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 1.5), \
+        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 0.5), \
                 mock.patch.object(keepalive, "sparrow_env", return_value={"REMOTE_HEALTH_COMMAND": want}):
             r = self.cli("keepalive", "keepawake")
         self.done_with(old)
