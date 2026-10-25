@@ -164,7 +164,8 @@ def parse_iso(value: str) -> float | None:
     return dt.timestamp()
 
 
-def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]:
+def task_queued_at(headers: dict, task_id: str, path: Path,
+                   mtime: float | None = None) -> tuple[float, str]:
     """(epoch, how) — header timestamp, else id epoch-ms, else mtime.
 
     Callers pass the STRICT (pre-`task:`) headers and the physical filename
@@ -177,6 +178,8 @@ def task_queued_at(headers: dict, task_id: str, path: Path) -> tuple[float, str]
     m = _EPOCH_MS_RE.search(task_id)
     if m:
         return int(m.group(1)) / 1000.0, "id"
+    if mtime is not None:
+        return mtime, "mtime"
     try:
         return path.stat().st_mtime, "mtime"
     except OSError:
@@ -382,10 +385,12 @@ def preview(body: str) -> str:
     return " ".join(neutralize(ask).split())[:PREVIEW_CHARS]
 
 
-def classify_task(path: Path, workspace: Path, now: float, as_name: str | None = None) -> dict:
+def classify_task(path: Path, workspace: Path, now: float, as_name: str | None = None,
+                  content: "tuple[bytes, float] | None" = None) -> dict:
     """`as_name` judges the bytes at `path` as the task file of that name (a
-    claim of it, read while held)."""
-    text = path.read_text(errors="replace")
+    claim of it, read while held); `content` (bytes, mtime) judges bytes already
+    read instead of reopening `path`."""
+    text = content[0].decode("utf-8", errors="replace") if content else path.read_text(errors="replace")
     named = path.with_name(as_name) if as_name else path
     # Shape-union parser: this pass classifies files from every writer and
     # era (the desktop's import writer is task-mid, the bridges' are task-last).
@@ -399,7 +404,8 @@ def classify_task(path: Path, workspace: Path, now: float, as_name: str | None =
     # Nothing in the task's own content can forge this. Every lookup that can
     # archive, suppress, or bind a task uses it, never the header `task_id`.
     physical_id = named.stem
-    queued_at, age_from = task_queued_at(strict_headers, physical_id, path)
+    queued_at, age_from = task_queued_at(strict_headers, physical_id, path,
+                                         content[1] if content else None)
     age_s = max(0, int(now - queued_at))
     source = (headers.get("source") or "").strip()
     # Same split for the silent-archive gate: only a header found before
@@ -669,15 +675,16 @@ def _unanswered(workspace: Path, landed: dict) -> dict:
 
 def _render_recovered(workspace: Path, now: float | None):
     """An interrupted pass's notice by today's rules, from each landed file's archived
-    copy. Only a current `done` (or a voice/phone orphan) is silent; every verdict the
-    ordinary plan would report is rendered. A read failure raises, so the journal stays."""
+    copy as the transition read and bound it. Only a current `done` (or a voice/phone
+    orphan) is silent; every verdict the ordinary plan would report is rendered."""
     groups_for = {"import-stalled": "stalled", "import-unbound": "unbound", "unknown": "unknown"}
 
-    def render(landed: dict) -> str | None:
+    def render(landed: dict, contents: dict) -> str | None:
         groups: dict = {"deferred": [], "stalled": [], "unbound": [], "unknown": []}
         for name, where in sorted(landed.items()):
             row = classify_task(workspace / "tasks" / "archive" / where, workspace,
-                                time.time() if now is None else now, as_name=name)
+                                time.time() if now is None else now, as_name=name,
+                                content=contents[name])
             verdict = row.get("verdict")
             if verdict == "done":
                 continue

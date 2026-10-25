@@ -5701,38 +5701,66 @@ def _recover_orphan_proactive() -> None:
             except OSError:
                 continue
         target = f.with_name(name.split(".sending")[0] + ".txt")
-        receipt = _claim_receipt(f, target.stem)
-        if receipt == "DELIVERED":  # sent before its archive failed: hidden like any delivered file
-            try:
-                f.rename(f.with_name(f".{target.stem}{_DELIVERED_INFIX}{time.time_ns()}"))
-            except OSError as e:
-                _log(f"delivered proactive claim {f.name} could not be hidden ({diagnostics.describe(e)}); "
-                     "kept as its claim, never re-queued")
-            continue
-        if receipt == "unknown":  # it may have been sent: never re-queued on a guess
+        receipt, generation = _claim_receipt(f, target.stem)
+        if receipt == "absent":  # never an outbox item: the next drain decides, never over a newer file
+            _log(f"recovering orphan proactive claim {f.name}")
+            _hand_back(f, target)
+        elif receipt == "DELIVERED":  # sent before its archive failed: hidden like any delivered file
+            _move_decided(f, f.with_name(f".{target.stem}{_DELIVERED_INFIX}{time.time_ns()}"), generation,
+                          "hidden as delivered")
+        elif receipt == "PARKED":  # terminal: never resent, kept where parked files go
+            _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+                          / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
+        else:  # QUEUED / READY / CLAIMED / unknown: it may be in flight or sent; never re-queued on a guess
             _log_backoff(("proactive-orphan-receipt", f.name),
-                         f"proactive claim {f.name}: its outbox record cannot be read cleanly; kept as "
-                         "its claim for an operator, not re-queued")
-            continue
-        if target.exists():
-            continue  # collision — leave for an operator, never clobber
-        try:
-            f.rename(target)
-            _log(f"recovered orphan proactive claim {f.name}")
-        except OSError:
-            pass
+                         f"proactive claim {f.name}: its outbox item is {receipt}; kept as its claim for an "
+                         "operator, not re-queued")
 
 
-def _claim_receipt(claim: Path, stem: str) -> str:
-    """The outbox state of the item a claimed proactive file was sent as (`receipt_state`):
-    "absent" when it was never an outbox item, "unknown" when that cannot be told."""
+def _move_decided(claim: Path, dest: Path, generation: str, what: str) -> None:
+    """Move `claim` to `dest` only as the generation its receipt was read from: a
+    no-replace rename, then a check; a file that replaced the claim goes back."""
     try:
-        route, _, body = _proactive_route(claim.read_text(encoding="utf-8"))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        undelivered_quarantine.rename_noreplace(claim, dest)
+    except OSError as e:
+        _log(f"proactive claim {claim.name} could not be {what} ({diagnostics.describe(e)}); kept as its "
+             "claim, never re-queued")
+        return
+    if _file_generation(dest) == generation:
+        return
+    try:  # not the bytes the receipt was read for: never hidden or parked under their item
+        undelivered_quarantine.rename_noreplace(dest, claim)
+        where = claim.name
+    except OSError:
+        where = dest.name
+    _log(f"proactive claim {claim.name} changed after its receipt was read; it was not {what} and is kept "
+         f"as {where} for an operator")
+
+
+def _file_generation(path: Path) -> "str | None":
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+
+def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None]":
+    """(`receipt_state` of the item a claimed proactive file was sent as, the generation
+    that state was read for), from one descriptor that follows no symlink: "absent" when
+    it was never an outbox item, "unknown" when that cannot be told."""
+    try:
+        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            route, _, body = _proactive_route(fh.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError):
-        return "unknown"
+        return "unknown", None
+    generation = f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
     if route != "send" or not body.strip():
-        return "absent"  # dropped, foreign or empty: the drain never made it an item
-    return receipt_state(_proactive_outbox_root(), _proactive_item_id(stem, body.strip()))
+        return "absent", generation  # dropped, foreign or empty: the drain never made it an item
+    return receipt_state(_proactive_outbox_root(), _proactive_item_id(stem, body.strip())), generation
 
 
 def _hand_back(claim: Path, original: Path) -> None:

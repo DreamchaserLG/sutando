@@ -11,6 +11,7 @@ Run: python3 tests/gateway-delivered-retire-keeps-witness.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -62,13 +63,26 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         """Renames into the archive or to a hidden name fail; the drain's own claim still works."""
         real = Path.rename
 
-        def rename(src, dst):
+        def blocked(dst) -> bool:
             dst = Path(dst)
-            if dst.parent == self.archive or dst.name.startswith("."):
+            return dst.parent == self.archive or dst.name.startswith(".")
+
+        def rename(src, dst):
+            if blocked(dst):
                 raise OSError(5, "Input/output error")
             return real(src, dst)
 
-        return mock.patch.object(Path, "rename", rename)
+        real_noreplace = gb.undelivered_quarantine.rename_noreplace
+
+        def noreplace(src, dst, *a, **kw):
+            if blocked(dst):
+                raise OSError(5, "Input/output error")
+            return real_noreplace(src, dst, *a, **kw)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(Path, "rename", rename))
+        stack.enter_context(mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", noreplace))
+        return stack
 
     def test_a_delivered_notice_that_cannot_be_archived_is_not_sent_again(self):
         (self.lane.tasks / "task-a.txt").write_text("timestamp: 2026-09-11T13:25:00Z\nsource: chat\ntask: A\n")
@@ -176,6 +190,44 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         claim.write_text("[no-send]\n")
         self.lane.restart()
         self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "[no-send]\n")
+
+    def test_every_recorded_lifecycle_state_but_absent_keeps_the_claim_off_its_live_name(self):
+        root = self.lane.results / ".outbox-ag2space-proactive"
+        for status in ("QUEUED", "READY", "CLAIMED", "PARKED"):
+            with self.subTest(status=status):
+                stem = f"proactive-{status.lower()}"
+                item_id = gb._proactive_item_id(stem, status)
+                outbox._write_item(root, item_id, {"item_id": item_id, "status": status, "attempts": 0})
+                claim = self.lane.results / f"{stem}.sending.{_dead_pid()}.1"
+                claim.write_text(f"{status}\n")
+                self.lane.restart()
+                self.assertFalse((self.lane.results / f"{stem}.txt").exists(), f"{status} is not resent")
+                if status == "PARKED":
+                    parked = list((self.lane.results / "undelivered").glob(f"{stem}-*.txt"))
+                    self.assertEqual([p.read_text() for p in parked], ["PARKED\n"])
+                else:
+                    self.assertEqual(claim.read_text(), f"{status}\n")
+
+    def test_a_claim_replaced_after_its_receipt_was_read_is_not_hidden_as_delivered(self):
+        item_id = gb._proactive_item_id("proactive-1", "delivered")
+        outbox.record_delivered(self.lane.results / ".outbox-ag2space-proactive", item_id)
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered\n")
+        real = gb._claim_receipt
+
+        def read_then_replace(*a, **kw):
+            got = real(*a, **kw)
+            tmp = claim.with_name(".swap")
+            tmp.write_text("UNSENT BODY B\n")
+            os.replace(tmp, claim)
+            return got
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace):
+            self.lane.restart()
+        hidden = list(self.lane.results.glob(".proactive-1.delivered-*"))
+        self.assertFalse(any("UNSENT BODY B" in h.read_text() for h in hidden), "B was never sent")
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists())
+        self.assertEqual(claim.read_text(), "UNSENT BODY B\n", "kept for an operator")
 
     def test_a_claim_with_no_record_at_all_is_still_requeued(self):
         claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"

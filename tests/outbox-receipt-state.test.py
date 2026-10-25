@@ -77,6 +77,51 @@ class ReceiptState(unittest.TestCase):
                 root.write_text("not a directory")
                 self.assertEqual(mod.receipt_state(root, "proactive-1"), "unknown")
 
+    def test_a_non_string_status_is_unknown_and_never_raises(self):
+        for mod in MODULES:
+            root = self.root / f"types-{mod.__name__}"
+            mod.record_delivered(root, "proactive-1", provider="p")
+            (path,) = (root / mod.ITEMS_DIR).iterdir()
+            for body in ('{"status": []}', '{"status": {}}', '{"status": null}'):
+                with self.subTest(mod=mod.__name__, body=body):
+                    path.write_text(body)
+                    self.assertEqual(mod.receipt_state(root, "proactive-1"), "unknown")
+
+    def test_a_record_swapped_for_a_symlink_while_it_is_read_is_unknown(self):
+        from unittest import mock
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                root = self.root / f"swap-{mod.__name__}"
+                mod.record_delivered(root, "proactive-1", provider="p")
+                (path,) = (root / mod.ITEMS_DIR).iterdir()
+                path.write_text('{"status": "QUEUED"}')
+                elsewhere = self.root / f"elsewhere-{mod.__name__}.json"
+                elsewhere.write_text('{"status": "DELIVERED"}')
+                real_lstat, real_open, done = os.lstat, os.open, []
+
+                def swap():
+                    if not done:
+                        done.append(1)
+                        path.unlink()
+                        path.symlink_to(elsewhere)
+
+                def lstat(p, *a, **kw):
+                    st = real_lstat(p, *a, **kw)
+                    if str(p) == str(path):
+                        swap()  # after the check
+                    return st
+
+                def open_(p, *a, **kw):
+                    if str(p) == str(path):
+                        swap()  # before the read
+                    return real_open(p, *a, **kw)
+
+                with mock.patch.object(os, "lstat", side_effect=lstat), \
+                        mock.patch.object(os, "open", side_effect=open_):
+                    got = mod.receipt_state(root, "proactive-1")
+                self.assertTrue(done)
+                self.assertEqual(got, "unknown")
+
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
     def test_an_unreadable_record_is_unknown_not_absent(self):
         for mod in MODULES:

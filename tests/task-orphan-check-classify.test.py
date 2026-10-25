@@ -2051,6 +2051,45 @@ class TestRound11RecoveredNotice(ClassifyBase):
         self.assertEqual((self.notices(), len(self.journals())), ([], 1))
 
 
+class TestRound12RenderBinding(ClassifyBase):
+    """A landing replaced after recovery checked it, while its notice is rendered,
+    keeps the journal: the notice is never built from the replacement."""
+
+    def test_a_landing_replaced_at_render_entry_keeps_the_journal(self):
+        tt = self.mod.task_transition
+        self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+        real_set = tt._Journal.set
+
+        def die_once_placed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "placed":
+                raise KeyboardInterrupt("killed before the notice")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_placed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        archived = self.ws.root / "tasks" / "archive" / "task-a.txt"
+        real_render = self.mod._render_recovered
+
+        def swapping_render(workspace, now):
+            render = real_render(workspace, now)
+
+            def at_entry(*a, **kw):
+                tmp = archived.with_name(".swap")
+                tmp.write_text("timestamp: 2026-09-11T13:25:00Z\nsource: chat\ntask: REPLACEMENT ASK\n")
+                os.replace(tmp, archived)
+                return render(*a, **kw)
+            return at_entry
+
+        with unittest.mock.patch.object(self.mod, "_render_recovered", side_effect=swapping_render):
+            out = self.apply()
+        notices = sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+        self.assertTrue(out["errors"], out)
+        self.assertFalse(any("REPLACEMENT ASK" in n.read_text() for n in notices))
+        self.assertEqual(notices, [])
+        self.assertEqual(len(list((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))), 1)
+
+
 class TestWorkerHeld(ClassifyBase):
     """A task the router delegated is a worker's, not a core orphan (2026-09-18 boot: four
     ag2.space owner DMs held by two worker seats were archived and reported as orphans)."""

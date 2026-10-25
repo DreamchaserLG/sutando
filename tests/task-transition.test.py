@@ -1847,6 +1847,8 @@ class TestRound11(Base):
             if where == "after_link" and not fired:
                 fired.append(name)
                 _replace(self.tasks / name, "REPLACEMENT BYTES")
+            elif where == "after_retire" and fired and name == fired[0]:
+                raise Crash("killed right after the claim name was retired")
 
         def rename_then_die(src, dst, *a, **kw):
             real_rename(src, dst, *a, **kw)
@@ -1970,6 +1972,56 @@ class TestRound11(Base):
             self.run_transition(["task-a.txt"], _naming)
         self.assertTrue(any(x.is_file() and "SECOND REPLACEMENT" in x.read_text()
                             for x in self.tasks.rglob("*")), "the replacement is kept somewhere")
+
+
+class TestRound12(Base):
+    """Twelfth round (#4399): the late windows after each check."""
+
+    recover = TestJournalRecovery.recover
+
+    def test_a_dead_claim_rewritten_in_place_at_its_retirement_is_not_left_live(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: APPROVED BYTES\n")
+        self.archive.mkdir()
+        approved = tt.recovery_effects(self.tasks, self.archive)
+        done = []
+
+        def at(where, name):
+            if where == "before_retire" and name == stray.name and not done:
+                done.append(1)
+                with open(self.tasks / name, "r+") as fh:  # after the live check, same inode
+                    fh.write("task: UNAPPROVED AFTER VALIDATION\n")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at):
+            out = tt.transition(self.tasks, self.results, self.archive, moves={}, render=_notice(None),
+                                prefix=PREFIX, authorized=approved)
+        self.assertTrue(done)
+        self.assertEqual(out["swept"], [])
+        self.assertTrue(out["errors"], out)
+        live = self.tasks / "task-z.txt"
+        self.assertFalse(live.exists() and "UNAPPROVED" in live.read_text(), "the rewrite is not live")
+
+    def test_a_retired_name_taken_between_choice_and_placement_is_never_overwritten(self):
+        self.archive.mkdir()
+        dfd, afd = os.open(self.tasks, os.O_RDONLY), os.open(self.archive, os.O_RDONLY)
+        self.addCleanup(os.close, dfd)
+        self.addCleanup(os.close, afd)
+        (self.tasks / "x.claim-1-ab").write_text("NEWLY RETIRED\n")
+        retired = self.archive / getattr(tt.task_archive, "RETIRED_DIR", ".retired")
+        done = []
+
+        def at(where, name):
+            if where == "before_retire" and not done:
+                done.append(1)
+                retired.mkdir(exist_ok=True)
+                (retired / "x.claim-1-ab").write_text("EARLIER EVIDENCE\n")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), \
+                tt.task_archive.retired_dir(afd) as rfd:
+            tt.task_archive.retire("x.claim-1-ab", src_dir_fd=dfd, retired_fd=rfd, expect=None)
+        self.assertTrue(done)
+        self.assertEqual(sorted(x.read_text() for x in retired.iterdir()),
+                         ["EARLIER EVIDENCE\n", "NEWLY RETIRED\n"])
 
 
 if __name__ == "__main__":

@@ -962,23 +962,24 @@ LIFECYCLE_STATUSES = frozenset({"QUEUED", "READY", "CLAIMED", "DELIVERED", "PARK
 def receipt_state(root: Path, item_id: str) -> str:
     """An item's status only when its record reads cleanly; "absent" only when no
     directory entry exists, and "unknown" for anything else present — unreadable,
-    malformed, not a regular file, or a status no writer stores."""
+    malformed, not a regular file, or not a status a writer stores. Judged and read
+    through one descriptor that follows no symlink, so it validates what it reads."""
     import stat as _stat
-    path = _item_path(Path(root), item_id)
     try:
-        st = os.lstat(path)
+        fd = os.open(_item_path(Path(root), item_id), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return "absent"
     except OSError:
         return "unknown"
-    if not _stat.S_ISREG(st.st_mode):
-        return "unknown"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with os.fdopen(fd, "rb") as fh:
+            if not _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return "unknown"
+            data = json.loads(fh.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
         return "unknown"
     status = data.get("status") if isinstance(data, dict) else None
-    return status if status in LIFECYCLE_STATUSES else "unknown"
+    return status if isinstance(status, str) and status in LIFECYCLE_STATUSES else "unknown"
 
 
 def item_status(root: Path, item_id: str) -> Optional[str]:

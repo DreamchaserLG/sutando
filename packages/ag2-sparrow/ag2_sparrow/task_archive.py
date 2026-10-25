@@ -269,24 +269,34 @@ def retired_names(name: str, retired_fd: int) -> "list[str]":
                                  for m in [tail.fullmatch(e)] if m)]
 
 
-def retire(name: str, *, src_dir_fd: "int | None", retired_fd: int, expect: "str | None") -> "str | None":
+def retire(name: str, *, src_dir_fd: int, retired_fd: int, expect: "str | None") -> "str | None":
     """The one way this module removes a task-bearing name: rename it into
     `.retired/` under `name` (or the first free `name.N`, so a re-entry never
     overwrites), sync both directories, and judge what moved. Nothing is unlinked.
     Returns None when the retired file is the `expect` generation, else its retired
     name, kept for the operator. FileNotFoundError when `name` is gone."""
+    import errno
     import os
-    taken = set(retired_names(name, retired_fd))
-    as_name, n = name, 0
-    while as_name in taken:
+    try:
+        from . import undelivered_quarantine as _uq
+    except ImportError:
+        import undelivered_quarantine as _uq
+    taken, n = set(retired_names(name, retired_fd)), 0
+    while True:
+        as_name = name if n == 0 else f"{name}.{n}"
         n += 1
-        as_name = f"{name}.{n}"
-    _checkpoint("before_retire", name)
-    os.rename(name, as_name, src_dir_fd=src_dir_fd, dst_dir_fd=retired_fd)
+        if as_name in taken:
+            continue
+        _checkpoint("before_retire", name)
+        try:  # atomic no-replace: a name taken since the listing is skipped, never overwritten
+            _uq.renameat_noreplace(name, as_name, src_dir_fd=src_dir_fd, dst_dir_fd=retired_fd)
+            break
+        except FileExistsError as exc:
+            if exc.errno != errno.EEXIST:
+                raise OSError(errno.ENOTSUP, f"cannot retire {name} without overwriting: {exc}") from exc
     _checkpoint("after_retire", name)
     _fsync_dir(retired_fd)
-    if src_dir_fd is not None:
-        _fsync_dir(src_dir_fd)
+    _fsync_dir(src_dir_fd)
     if expect is not None and file_generation(os.lstat(as_name, dir_fd=retired_fd)) == expect:
         return None
     return as_name

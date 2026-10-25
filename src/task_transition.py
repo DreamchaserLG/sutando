@@ -575,6 +575,11 @@ def _sweep_dead_claims(dirs: _Dirs, journaled: set[str], out: dict,
                                      f"not made live (that link is kept as {_retired(moved)})")
                 continue
             stray = task_archive.retire(entry, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=generation)
+            if stray and _same_file(stray, rfd, live, dirs.tasks_fd):  # rewritten in place: live shares it
+                moved = task_archive.retire(live, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=None)
+                out["errors"].append(f"orphaned claim tasks/{entry} was rewritten while it was given back; "
+                                     f"it is not made live (kept as {_retired(stray)} and {_retired(moved)})")
+                continue
         if stray:
             out["errors"].append(f"orphaned claim tasks/{entry} was given back as {live!r}, but a file "
                                  f"that replaced it is kept as {_retired(stray)}")
@@ -660,6 +665,24 @@ def _finish_return(dirs: _Dirs, name: str, claim: str, generation: str) -> "str 
         return (f"lost track of {name!r}: it is back under its name, but a file that replaced its "
                 f"claim is kept as {_retired(stray)}")
     return None
+
+
+class _LandingChanged(OSError):
+    """An archived landing changed between its check and its notice."""
+
+
+def _read_landing(dirs: _Dirs, where: str) -> "tuple[str, bytes, float] | None":
+    """(generation, bytes, mtime) of a landing read through one descriptor that follows
+    no symlink; None when it is gone."""
+    try:
+        fd = os.open(where, os.O_RDONLY | _NOFOLLOW, dir_fd=dirs.archive_fd)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return _generation(st), fh.read(), st.st_mtime
 
 
 def _barriers(dirs: _Dirs) -> None:
@@ -753,20 +776,30 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict,
                                     "— check tasks/archive/")
         j.set(claims=claims, landed=landed, quarantined=quarantined)
     report["landed"] = landed
-    for name, where in sorted(landed.items()):  # the notice describes these bytes: they must be the planned ones
-        try:
-            now = _generation(os.lstat(where, dir_fd=dirs.archive_fd))
-        except FileNotFoundError:
-            now = None
-        if now != d["moves"].get(name):
+    contents = {}  # the notice describes these bytes: read once, bound to the planned generation
+    for name, where in sorted(landed.items()):
+        got = _read_landing(dirs, where)
+        if got is None or got[0] != d["moves"].get(name):
             unresolved = True
             report["errors"].append(f"{name!r} was archived as tasks/archive/{where}, but that file is "
                                     "now missing or another generation; the journal waits for the operator")
+        else:
+            contents[name] = got[1:]
     if unresolved:  # a notice now would omit it, and a later pass would adopt that notice
         j.release()
         return
     if landed or d.get("result"):
-        if not _publish_recovered(j, results_dir, landed, report, render_recovered):
+        bound = None
+        if render_recovered is not None:
+            def bound(now_landed, contents=contents):
+                body = render_recovered(now_landed, contents)
+                for name, where in now_landed.items():  # still the bytes just rendered
+                    got = _read_landing(dirs, where)
+                    if got is None or got[0] != d["moves"].get(name):
+                        raise _LandingChanged(f"{name!r}: tasks/archive/{where} changed while its notice "
+                                              "was rendered; the journal waits for the operator")
+                return body
+        if not _publish_recovered(j, results_dir, landed, report, bound):
             return
     j.remove()
     _drop_witness(results_dir, d.get("result"), d.get("txn"))
@@ -807,7 +840,7 @@ def _publish_recovered(j: _Journal, results_dir: Path, landed: dict, report: dic
     d = j.data
     txn = d.get("txn")
     if render_recovered is not None and not _committed(d, results_dir):
-        body = render_recovered(dict(landed))
+        body = render_recovered(dict(landed))  # bound to the bytes read and re-checked after
         if body is None:
             return True  # nothing landed is still the owner's to hear about
         txn = txn if isinstance(txn, str) and txn else secrets.token_hex(8)
@@ -980,8 +1013,10 @@ def transition(tasks_dir: Path, results_dir: Path, archive_dir: Path, *,
     refuses that file. `arbitrate(name)` is held around that check-claim-check,
     the lock a task's other owners (the worker router) take. `authorized` is the
     `recovery_effects()` a caller approved: anything else refuses the pass whole.
-    `render_recovered(landed)` renders an interrupted pass's notice by the
-    caller's current rules (None: nothing to report); without it the journal's is used.
+    `render_recovered(landed, contents)` renders an interrupted pass's notice by the
+    caller's current rules from `contents` ({name: (bytes, mtime)} read through one
+    descriptor each and bound to the planned generation; None: nothing to report);
+    without it the journal's is used.
     One pass at a time holds the transition lock. Returns `result` (the notice's path or None), `body`,
     `archived` ({name: landed name}), `quarantined` ({name: claim name}),
     `recovered` (interrupted passes finished first), `swept` (dead passes'
