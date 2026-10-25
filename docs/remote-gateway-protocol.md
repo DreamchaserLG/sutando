@@ -172,11 +172,15 @@ above `task:`, then uses the existing stamping, atomic publication, dispatch and
 acknowledgement paths. Named gateway instances project the validated broker task ID
 to the same local task ID in both packet objects, so subsequent readers compare it
 exactly to the canonical local `id:`. This local mapping adds no authority.
-Dedup recovery applies the same local projection to a replacement task ID only
-after the original packet passes validation. Only `task_id` changes in the packet
-and binding; identity, room, anchor, policy, membership, visibility and timestamps
-remain unchanged. Invalid or expired packets are never repaired or renewed, and
-the validated view still checks the replacement task's exact binding and expiry.
+Dedup recovery creates a replacement local execution ID for the original broker
+lease and question; it is not a new authenticated broker delivery. Every
+context-managed requeue drops the earlier packet and binding, preserves the ask,
+and records `room_context_status: requeue_refresh_required`. It neither rebinds
+the earlier grant nor restores the unconditional history-read prelude. Context
+availability on that local retry requires an authoritative refreshed packet bound
+to the replacement task, with current identity, membership and policy checks.
+No refresh endpoint or producer integration is supplied by this consumer patch;
+failed or unavailable refresh must never fall back to the earlier packet.
 `room_context_status` is a bridge-generated status header; it is never accepted as a
 wire attestation. All three header names are confined in user-authored content.
 

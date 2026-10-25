@@ -38,6 +38,12 @@ UNAVAILABLE_NOTE = (
     "tools authorized for this same agent under the current room policy; do not bulk-fetch "
     "history or recover withheld context using other credentials."
 )
+REQUEUE_STATUS = "requeue_refresh_required"
+REQUEUE_NOTE = (
+    " The local task was requeued without its earlier briefing. A fresh packet requires "
+    "authoritative identity, membership and policy checks bound to the replacement task. "
+    "Do not reuse an earlier packet or treat its unexpired timestamp as current authorization."
+)
 
 
 class InvalidContext(ValueError):
@@ -168,20 +174,12 @@ def from_headers(headers, now=None):
                     agent_id=headers.get("receiving_instance") or "", now=now)
 
 
-def rebind_for_requeue(text, task_id, now=None):
-    """Rebind only a validated local task projection; this does not renew its grant."""
+def omit_for_requeue(text):
+    """Discard an earlier packet at the new local execution boundary."""
     parsed = _parse(text)
     reserved = ("room_context_status", "room_context_binding", "room_context")
     if not any(key in parsed.headers for key in reserved):
         return text
-    context, binding, reason = from_headers(parsed.headers, now)
-    if context is not None:
-        context["task_id"] = binding["task_id"] = task_id
-        projected = dict(parsed.headers, id=task_id, room_context=context, room_context_binding=binding)
-        context, binding, reason = from_headers(projected, now)
-    updates = {"room_context_status": reason if reason != "absent" else parsed.headers.get("room_context_status", "unavailable")}
-    if context is not None:
-        updates.update(room_context_binding=dumps(binding), room_context=dumps(context))
     lines, before_task, replaced = [], True, False
     for line in text.split("\n"):
         trusted = before_task or parsed.headers.get("task_layout") == "mid"
@@ -190,7 +188,7 @@ def rebind_for_requeue(text, task_id, now=None):
         key = line.partition(":")[0]
         if trusted and key in reserved:
             if not replaced:
-                lines.extend(key + ": " + value for key, value in updates.items())
+                lines.append("room_context_status: " + REQUEUE_STATUS)
                 replaced = True
         else:
             lines.append(line)
@@ -208,6 +206,8 @@ def render(headers, now=None, max_chars=None):
     context, _, reason = from_headers(headers, now)
     if reason == "absent":
         block = UNAVAILABLE_NOTE if headers.get("room_context_status") else ""
+        if headers.get("room_context_status") == REQUEUE_STATUS:
+            block += " Reason: " + REQUEUE_STATUS + "." + REQUEUE_NOTE
     elif context is None:
         block = UNAVAILABLE_NOTE + " Reason: " + reason + "."
     else:

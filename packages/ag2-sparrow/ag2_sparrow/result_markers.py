@@ -617,7 +617,7 @@ def build_requeued_task(
             from . import room_context
         except ImportError:
             import room_context
-        orig_text = room_context.rebind_for_requeue(orig_text, new_task_id)
+        orig_text = room_context.omit_for_requeue(orig_text)
     lines = []
     seen_count = False
     had_prelude = False
