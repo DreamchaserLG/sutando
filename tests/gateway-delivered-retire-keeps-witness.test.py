@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
-"""A delivered proactive notice whose archive rename fails keeps its inode linked.
+"""A delivered proactive notice keeps its inode linked and is never sent twice.
 
 The orphan-check publisher (src/task_transition.py) proves a commit by a witness link
-of the notice's inode. The gateway's confirmed-delivery path used to unlink the claimed
-result when it could not move it into results/archive/, which dropped that link: the
-publisher's recovery then read the already-delivered notice as never committed and sent
-it again. This drives the real `_post_proactive` drain and the real recovery.
+of the notice's inode, so a delivered notice must never be unlinked. And a claimed
+notice whose outbox item says DELIVERED, or whose record cannot be read cleanly, must
+never be re-queued by the restart's orphan recovery. Drives the real gateway drain
+(`_post_proactive`), its outbox lane, the real orphan recovery, and the real transition.
 
 Run: python3 tests/gateway-delivered-retire-keeps-witness.test.py
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_gateway import isolate_then_import  # noqa: E402
 
-isolate_os_environ()
+gb, _IMPORT_READS = isolate_then_import()
 
-REPO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+from _helpers.proactive_lane import Lane, scratch  # noqa: E402
+
+REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-_ISOLATED = tempfile.mkdtemp(prefix="gw-delivered-witness-")
-os.environ["CLAUDE_CONFIG_DIR"] = _ISOLATED
-os.environ["REMOTE_PROACTIVE_ROOM"] = ""
-
-from ag2_sparrow import remote_gateway_bridge as gb  # noqa: E402
 import task_transition as tt  # noqa: E402
+from ag2_sparrow import outbox  # noqa: E402
 
-ROOM = "!OwnerDmAbCdEf:ag2.space"
 PREFIX = "proactive-orphan-recovery-"
 
 
@@ -40,45 +37,41 @@ class Crash(RuntimeError):
     """The publisher dies here."""
 
 
+def _dead_pid() -> int:
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
+
+
 @unittest.skipIf(os.geteuid() == 0, "root renames into a mode-555 directory")
-class DeliveredRetireKeepsTheWitness(unittest.TestCase):
+class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        ws = Path(tmp.name)
-        self.tasks, self.results = ws / "tasks", ws / "results"
-        self.tasks.mkdir()
-        self.results.mkdir()
-        (self.tasks / "task-a.txt").write_text("timestamp: 2026-09-11T13:25:00Z\nsource: chat\ntask: A\n")
+        self.lane = Lane(gb, scratch("gw-delivered-witness-"))
+        self.archive = self.lane.results / "archive"
 
-    def transition(self, **kw):
-        moves = {n: tt.generation_of(self.tasks / n) for n in kw.pop("names", [])}
-        return tt.transition(self.tasks, self.results, self.tasks / "archive", moves=moves,
-                             render=kw.pop("render", lambda landed: "archived: A\n" if landed else None),
-                             prefix=PREFIX)
+    def transition(self, names=()):
+        moves = {n: tt.generation_of(self.lane.tasks / n) for n in names}
+        return tt.transition(self.lane.tasks, self.lane.results, self.lane.tasks / "archive", moves=moves,
+                             render=lambda landed: "archived: A\n" if landed else None, prefix=PREFIX)
 
-    def drain(self, archive: Path) -> list:
-        posts = []
+    def unwritable_archive(self):
+        self.archive.chmod(0o555)
+        self.addCleanup(self.archive.chmod, 0o755)
 
-        def fake_req(method, path, payload=None, timeout=None):
-            if method == "POST":
-                posts.append(payload)
-            return {"ok": True, "event_id": "$evt"}
+    def no_hiding(self):
+        """Renames into the archive or to a hidden name fail; the drain's own claim still works."""
+        real = Path.rename
 
-        saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE)
-        gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, archive
-        gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE = ROOM, fake_req, None
-        gb._ROUTING.update(owner_dm=ROOM, loaded=True, next=gb.time.time() + 3600)
-        try:
-            with mock.patch.object(gb, "_record_proactive_receipt"):
-                gb._post_proactive()
-        finally:
-            (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
-             gb._req, gb.PROACTIVE_CLAIM_GATE) = saved
-            gb._ROUTING.update(owner_dm="", loaded=False, next=0.0)
-        return posts
+        def rename(src, dst):
+            dst = Path(dst)
+            if dst.parent == self.archive or dst.name.startswith("."):
+                raise OSError(5, "Input/output error")
+            return real(src, dst)
+
+        return mock.patch.object(Path, "rename", rename)
 
     def test_a_delivered_notice_that_cannot_be_archived_is_not_sent_again(self):
+        (self.lane.tasks / "task-a.txt").write_text("timestamp: 2026-09-11T13:25:00Z\nsource: chat\ntask: A\n")
         real_publish = tt._publish_at
 
         def publish_then_die(*a, **kw):
@@ -86,102 +79,84 @@ class DeliveredRetireKeepsTheWitness(unittest.TestCase):
             raise Crash("killed after the commit, before the journal went")
 
         with mock.patch.object(tt, "_publish_at", side_effect=publish_then_die), self.assertRaises(Crash):
-            self.transition(names=["task-a.txt"])
-        (notice,) = sorted(self.results.glob(f"{PREFIX}*.txt"))
-        archive = self.results / "archive"
-        archive.mkdir(mode=0o555)
-        self.addCleanup(archive.chmod, 0o755)
-        posts = self.drain(archive)
-        self.assertEqual(len(posts), 1, "delivered once")
+            self.transition(["task-a.txt"])
+        (notice,) = sorted(self.lane.results.glob(f"{PREFIX}*.txt"))
+        self.unwritable_archive()
+        self.lane.drain()
+        self.assertEqual(len(self.lane.posts), 1, "delivered once")
         self.assertFalse(notice.exists(), "retired from the live name")
-        witness = next(self.results.glob(".*.witness"))
+        witness = next(self.lane.results.glob(".*.witness"))
         self.assertEqual(os.stat(witness).st_nlink, 2, "the delivered inode is still linked")
         out = self.transition()
         self.assertEqual(out["errors"], [], out)
-        self.assertEqual(sorted(self.results.glob(f"{PREFIX}*.txt")), [], "no second notice")
-        self.assertEqual(self.drain(archive), [], "nothing more to deliver")
-        self.assertEqual(sorted((self.tasks / "archive").glob(".notice-*.json")), [])
+        self.assertEqual(sorted(self.lane.results.glob(f"{PREFIX}*.txt")), [], "no second notice")
+        self.lane.drain()
+        self.assertEqual(len(self.lane.posts), 1, "nothing more is sent")
 
-    def patched_dirs(self):
-        saved = (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR)
-        gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = self.results, self.results / "archive"
-        self.addCleanup(lambda: setattr(gb, "RESULTS_DIR", saved[0]) or setattr(gb, "ARCHIVE_RESULTS_DIR", saved[1]))
+    def test_a_dead_owners_delivered_claim_is_not_read_as_absent_and_requeued(self):
+        """Mini's probe: the item id is #5857's `<stem>~<body digest>`, and its record says DELIVERED."""
+        self.lane.write("proactive-1.txt", "hello owner\n")
+        self.unwritable_archive()
+        with self.no_hiding():
+            self.lane.drain()
+        self.assertEqual(len(self.lane.posts), 1)
+        (claim,) = self.lane.results.glob("proactive-1.sending.*")
+        item_id = gb._proactive_item_id("proactive-1", "hello owner")
+        self.assertEqual(outbox.receipt_state(self.lane.results / ".outbox-ag2space-proactive", item_id),
+                         "DELIVERED")
+        dead = claim.with_name(f"proactive-1.sending.{_dead_pid()}.1")
+        claim.rename(dead)
+        self.lane.restart()
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists(), "not re-queued")
+        (hidden,) = self.lane.results.glob(".proactive-1.delivered-*")
+        self.assertEqual(hidden.read_text(), "hello owner\n")
+        self.archive.chmod(0o755)
+        self.lane.drain()
+        self.assertEqual(len(self.lane.posts), 1, "never sent twice")
+        self.assertEqual([p.read_text() for p in self.archive.iterdir()], ["hello owner\n"])
+        self.assertEqual(list(self.lane.results.glob(".proactive-1.delivered-*")), [])
 
-    def test_with_no_rename_possible_the_delivered_claim_is_kept_not_unlinked(self):
-        self.patched_dirs()
-        claim = self.results / f"{PREFIX}1.sending.{os.getpid()}"
-        claim.write_text("delivered\n")
-        with mock.patch.object(Path, "rename", side_effect=OSError(5, "Input/output error")):
-            gb._retire_delivered_proactive(claim, self.results / f"{PREFIX}1.txt")
-        self.assertEqual(claim.read_text(), "delivered\n", "the delivered inode keeps a name")
+    def test_with_no_rename_possible_a_delivered_claim_keeps_its_name(self):
+        self.lane.write("proactive-1.txt", "hello owner\n")
+        self.unwritable_archive()
+        with self.no_hiding():
+            self.lane.drain()
+        (claim,) = self.lane.results.glob("proactive-1.sending.*")
+        self.assertEqual(claim.read_text(), "hello owner\n", "the delivered inode keeps a name")
 
-    def test_a_dead_owners_delivered_claim_is_retired_never_requeued_and_later_reaped(self):
-        import subprocess
-        self.patched_dirs()
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
-        claim.write_text("delivered\n")
-        ino = os.stat(claim).st_ino
-        gb.record_delivered(self.results / ".outbox-ag2space-proactive", f"{PREFIX}1",
-                            provider="ag2space-proactive")  # the receipt the delivery path writes
-        archive = self.results / "archive"
-        archive.mkdir(mode=0o555)
-        self.addCleanup(archive.chmod, 0o755)
-        gb._recover_orphan_proactive()
-        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "a delivered nudge is never re-queued")
-        (hidden,) = self.results.glob(f".{PREFIX}1.delivered-*")
-        self.assertEqual(os.stat(hidden).st_ino, ino)
-        gb._reap_delivered_proactive()
-        self.assertTrue(hidden.exists(), "still unmovable: it waits")
-        archive.chmod(0o755)
-        gb._reap_delivered_proactive()
-        (archived,) = archive.iterdir()
-        self.assertEqual((os.stat(archived).st_ino, archived.read_text()), (ino, "delivered\n"))
-        self.assertEqual(list(self.results.glob(".*.delivered-*")), [])
-
-    def dead_owner_claim_with_receipt(self, spoil):
-        import subprocess
-        self.patched_dirs()
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
-        claim.write_text("delivered\n")
-        receipts = self.results / ".outbox-ag2space-proactive"
-        gb.record_delivered(receipts, f"{PREFIX}1", provider="ag2space-proactive")
-        (record,) = (receipts / ".items").iterdir()
+    def dead_claim_with_record(self, spoil) -> Path:
+        item_id = gb._proactive_item_id("proactive-1", "delivered")
+        root = self.lane.results / ".outbox-ag2space-proactive"
+        outbox.record_delivered(root, item_id, provider="ag2space-proactive")
+        record = outbox._item_path(root, item_id)
         spoil(record)
-        gb._recover_orphan_proactive()
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered\n")
+        self.lane.restart()
         return claim
+
+    def assert_kept(self, claim: Path) -> None:
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists(), "not re-queued for a second send")
+        self.assertEqual(claim.read_text(), "delivered\n")
 
     def test_an_unreadable_delivered_receipt_never_requeues_the_claim(self):
         def unreadable(record):
             record.chmod(0)
             self.addCleanup(record.chmod, 0o644)
 
-        claim = self.dead_owner_claim_with_receipt(unreadable)
-        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
-        self.assertEqual(claim.read_text(), "delivered\n")
+        self.assert_kept(self.dead_claim_with_record(unreadable))
 
     def test_a_torn_delivered_receipt_never_requeues_the_claim(self):
-        claim = self.dead_owner_claim_with_receipt(lambda record: record.write_text('{"status": "DELIV'))
-        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
-        self.assertEqual(claim.read_text(), "delivered\n")
+        self.assert_kept(self.dead_claim_with_record(lambda r: r.write_text('{"status": "DELIV')))
 
     def test_a_record_claiming_to_be_absent_never_requeues_the_claim(self):
-        claim = self.dead_owner_claim_with_receipt(lambda record: record.write_text('{"status": "absent"}'))
-        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
-        self.assertEqual(claim.read_text(), "delivered\n")
+        self.assert_kept(self.dead_claim_with_record(lambda r: r.write_text('{"status": "absent"}')))
 
-    def test_a_claim_with_no_receipt_at_all_is_still_requeued(self):
-        import subprocess
-        self.patched_dirs()
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        claim = self.results / f"{PREFIX}1.sending.{child.pid}"
+    def test_a_claim_with_no_record_at_all_is_still_requeued(self):
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
         claim.write_text("never sent\n")
-        gb._recover_orphan_proactive()
-        self.assertEqual((self.results / f"{PREFIX}1.txt").read_text(), "never sent\n")
+        self.lane.restart()
+        self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "never sent\n")
 
 
 if __name__ == "__main__":
