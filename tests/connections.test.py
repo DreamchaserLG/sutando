@@ -108,9 +108,25 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.ws = Path(self.tmp.name)
         self.vault = FakeVault()
+        self.children = []
 
     def tearDown(self):
+        for proc in self.children:
+            bridge_lease.stop(proc)
         self.tmp.cleanup()
+
+    def bridge_spawn(self, note=None):
+        """A spawn whose child takes the env's bridge lease through the production writer and holds it."""
+        def spawn(argv, env, log_path):
+            if note is not None:
+                note(argv, env, log_path)
+            proc = bridge_lease.start(self.ws, env["GATEWAY_INSTANCE"], wait=False)
+            self.children.append(proc)
+            return proc
+        return spawn
+
+    def child(self, n=-1):
+        return self.children[n].pid
 
     def add(self, token=TOKEN_A, *, fetch=agents("@sutando:alpha-fixture.net"), expected=None, **kw):
         kw.setdefault("added_by", "owner")
@@ -512,10 +528,8 @@ class Primary(Base):
         self.assertFalse(C.set_primary("alpha-fixture-net", workspace=self.ws)["relaunch_needed"], "already primary")
         beta = bridge_lease.start(self.ws, "beta-fixture-net")
         spawned = []
-
-        def spawn(argv, env, log_path):
-            spawned.append((env["GATEWAY_INSTANCE"], env["REMOTE_PROACTIVE_ROOM"]))
-            return DEAD_PID
+        spawn = self.bridge_spawn(lambda argv, env, log_path: spawned.append((env["GATEWAY_INSTANCE"],
+                                                                             env["REMOTE_PROACTIVE_ROOM"])))
         environ = {"REMOTE_PROACTIVE_ROOM": "!nudges:beta-fixture.net"}
         try:
             out = C.set_primary("beta-fixture-net", workspace=self.ws)
@@ -910,11 +924,7 @@ class Launching(Base):
     def setUp(self):
         super().setUp()
         self.spawned = []
-
-        def spawn(argv, env, log_path):
-            self.spawned.append((argv, env, log_path))
-            return DEAD_PID
-        self.spawn = spawn
+        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.spawned.append((argv, env, log_path)))
         self.repo = self.ws / "repo"
         self.logs = self.ws / "logs"
 
@@ -961,8 +971,8 @@ class Launching(Base):
         self.assertEqual(argv, ["py3", str(self.repo / "src" / "remote-gateway-bridge.py")])
         self.assertEqual(env["GATEWAY_INSTANCE"], "beta-fixture-net")
         self.assertEqual(log_path, self.logs / "remote-gateway-bridge.beta-fixture-net.log")
-        self.assertEqual((record["ok"], record["pid"], record["lease"]), (True, DEAD_PID, "exited"))
-        self.assertEqual(json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())["pid"], DEAD_PID)
+        self.assertEqual((record["ok"], record["pid"], record["lease"]), (True, self.child(), "held"))
+        self.assertEqual(json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())["pid"], self.child())
         self.assertEqual(C.status_for(self.rows()[0], self.ws)["launched_at"], record["ts"])
 
     def test_launch_failures_are_recorded_as_failed_with_a_reason(self):
@@ -998,7 +1008,7 @@ class Launching(Base):
         finally:
             bridge_lease.stop(bridge)
         self.assertEqual(killed, [(bridge.pid, 15)])
-        self.assertEqual((record["stopped_pid"], record["pid"]), (bridge.pid, DEAD_PID))
+        self.assertEqual((record["stopped_pid"], record["pid"]), (bridge.pid, self.child()))
         self.assertEqual(len(self.spawned), 1)
 
     def test_reconnect_learns_the_identity_and_rekeys(self):
@@ -1007,14 +1017,14 @@ class Launching(Base):
         record = C.reconnect("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={},
                              workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None,
                              fetch=agents("@sutando:beta-fixture.net"))
-        self.assertEqual(record["pid"], DEAD_PID)
+        self.assertEqual(record["pid"], self.child())
         after = self.rows()[0]
         self.assertEqual((after["server"], after["server_source"], after["instance"], after["agent_mxid"]),
                          ("beta-fixture.net", "identity", "beta-fixture-net", "@sutando:beta-fixture.net"))
         self.assertEqual(self.spawned[0][1]["GATEWAY_INSTANCE"], "beta-fixture-net")
         # A probe that fails leaves the row as it was and still launches.
         C.reconnect("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={}, workspace=self.ws,
-                    vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+                    vault=self.vault, spawn=self.spawn, fetch=unreachable)
         self.assertEqual(self.rows()[0]["server_source"], "identity")
         self.assertEqual(len(self.spawned), 2)
 
@@ -1029,7 +1039,7 @@ class Launching(Base):
                      workspace=self.ws, vault=self.vault, spawn=self.spawn)
         record = C.launch("dev", repo=self.repo, logs_dir=self.logs, environ={"AG2_REMOTE_TOKEN_DEV": TOKEN_B},
                           workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True)
-        self.assertEqual(record["pid"], DEAD_PID)
+        self.assertEqual(record["pid"], self.child())
         env = self.spawned[0][1]
         self.assertEqual((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"], env["REMOTE_PROACTIVE_ROOM"]),
                          ("dev", TOKEN_B, ""))
@@ -1055,12 +1065,12 @@ class Launching(Base):
             finally:
                 os.close(fd)
             order.append(("spawn", held))
-            t = threading.Thread(target=lambda: (C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None),
+            t = threading.Thread(target=lambda: (C.disconnect("beta-fixture-net", workspace=self.ws),
                                                  order.append("disconnected"), disconnected.set()))
             t.start()
             time.sleep(0.4)
             order.append(("during spawn, disabled", self.rows()[0].get("disabled")))
-            return DEAD_PID
+            return self.bridge_spawn()(argv, env, log_path)
         record = C.launch("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={}, workspace=self.ws,
                           vault=self.vault, spawn=spawn)
         self.assertTrue(disconnected.wait(5))
@@ -1179,11 +1189,7 @@ class Disconnect(Base):
     def setUp(self):
         super().setUp()
         self.spawned = []
-
-        def spawn(argv, env, log_path):
-            self.spawned.append(env["GATEWAY_INSTANCE"])
-            return DEAD_PID
-        self.spawn = spawn
+        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.spawned.append(env["GATEWAY_INSTANCE"]))
         self.add()  # alpha is primary
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
         C._record_launch("beta-fixture-net", self.ws, ok=True, pid=1)
@@ -1281,12 +1287,13 @@ class Disconnect(Base):
         lock = self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
         host = workspace_lock._host_label()
+        bound = {"role": "gateway-bridge.beta-fixture-net", "workspace": str(self.ws), "schema_version": 1}
         sleeper = __import__("subprocess").Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
             cases = {"not-a-lease\n": "not a lease record",
                      json.dumps({"pid": "x", "host": host}): "no valid pid",
-                     json.dumps({"pid": sleeper.pid, "host": host, "heartbeat_at": int(time.time())}): "records no start time",
-                     json.dumps({"pid": sleeper.pid, "host": "elsewhere", "heartbeat_at": int(time.time())}): "host 'elsewhere'"}
+                     json.dumps(dict(bound, pid=sleeper.pid, host=host, heartbeat_at=int(time.time()))): "records no start time",
+                     json.dumps(dict(bound, pid=sleeper.pid, host="elsewhere", heartbeat_at=int(time.time()))): "host 'elsewhere'"}
             for body, cause in cases.items():
                 lock.write_text(body)
                 with self.assertRaises(C.BridgeLeaseIndeterminate, msg=cause) as cm:
@@ -1295,14 +1302,14 @@ class Disconnect(Base):
                 self.assertTrue(str(cm.exception).startswith("bridge_lease_indeterminate"))
                 self.assertFalse(self.beta()["disabled"], cause)
             with unittest.mock.patch.object(workspace_lock, "proc_start", lambda pid: None):
-                lock.write_text(json.dumps({"pid": sleeper.pid, "host": host, "proc_start": "x:1"}))
+                lock.write_text(json.dumps(dict(bound, pid=sleeper.pid, host=host, proc_start="x:1")))
                 with self.assertRaises(C.BridgeLeaseIndeterminate) as cm:
                     C.stop_bridge("beta-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("signalled"))
                 self.assertIn("cannot be read", str(cm.exception))
         finally:
             sleeper.kill()
             sleeper.wait()
-        lock.write_text(json.dumps({"pid": sleeper.pid, "host": host, "proc_start": "x:1"}))
+        lock.write_text(json.dumps(dict(bound, pid=sleeper.pid, host=host, proc_start="x:1")))
         self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0, "a writer proven gone holds nothing")
 
     def beta(self):
@@ -1382,7 +1389,7 @@ class Disconnect(Base):
         C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
         record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
                              workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
-        self.assertEqual((record["ok"], record["pid"], record["stopped_pid"]), (True, DEAD_PID, 0))
+        self.assertEqual((record["ok"], record["pid"], record["stopped_pid"]), (True, self.child(), 0))
         self.assertEqual(self.spawned, ["beta-fixture-net"])
         row = C.status_for(self.rows()[1], self.ws)
         self.assertEqual((row["disabled"], row["state"]), (False, "pending"))
@@ -1391,11 +1398,11 @@ class Disconnect(Base):
         self.vault.store.pop("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET")
         with self.assertRaises(C.LaunchFailed):
             C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
-                        workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+                        workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)
         self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], "failed")
         self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
         record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
-                             workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+                             workspace=self.ws, vault=self.vault, spawn=self.spawn, fetch=unreachable)
         self.assertTrue(record["ok"])
 
     def test_old_records_without_the_flag_load_as_enabled(self):
@@ -1425,10 +1432,8 @@ class UpdateToken(Base):
         super().setUp()
         self.spawned = []
 
-        def spawn(argv, env, log_path):
-            self.spawned.append((env["GATEWAY_INSTANCE"], env["REMOTE_TASK_TOKEN"]))
-            return DEAD_PID + 1
-        self.spawn = spawn
+        self.spawn = self.bridge_spawn(lambda argv, env, log_path: self.spawned.append((env["GATEWAY_INSTANCE"],
+                                                                                         env["REMOTE_TASK_TOKEN"])))
         self.add()  # alpha is primary
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
         C._record_launch("beta-fixture-net", self.ws, ok=False, reason="no_token")
@@ -1459,7 +1464,7 @@ class UpdateToken(Base):
                           "@s:beta-fixture.net"))
         self.assertEqual((after["disabled"], after["gateway_url"]), (False, "https://relay.beta-fixture.net:8443/relay2"))
         self.assertEqual(self.spawned, [("beta-fixture-net", self.NEW_B)], "launched once, on the new code")
-        self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["stopped_pid"]), (True, DEAD_PID + 1, 0))
+        self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["stopped_pid"]), (True, self.child(), 0))
         self.assertEqual(C.status_for(after, self.ws)["state"], "pending", "the failed launch record is replaced")
         self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
         self.assertNotIn("secret-beta", json.dumps(out))
@@ -1701,11 +1706,6 @@ class LeaseFence(Base):
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
         self.repo, self.logs = self.ws / "repo", self.ws / "logs"
 
-    def tearDown(self):
-        for proc in getattr(self, "children", []):
-            bridge_lease.stop(proc)
-        super().tearDown()
-
     def race(self, *, wait_for_lease=True):
         """launch beta with a child that takes its lease 0.6 s after the spawn; a disconnect starts
         as soon as the spawn returned. The disconnect's outcome and the child."""
@@ -1722,7 +1722,7 @@ class LeaseFence(Base):
         def run_launch():
             result["launch"] = C.launch("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={},
                                         workspace=self.ws, vault=self.vault, spawn=spawn)
-        patch = (unittest.mock.patch.object(C, "_await_lease", lambda *a: "exited") if not wait_for_lease
+        patch = (unittest.mock.patch.object(C, "_await_lease", lambda instance, pid, *a: ("held", pid)) if not wait_for_lease
                  else unittest.mock.patch.object(C, "LEASE_TIMEOUT_S", C.LEASE_TIMEOUT_S))
         with patch:
             t = threading.Thread(target=run_launch)
@@ -2056,7 +2056,7 @@ class Edges(Base):
         row, _ = self.add(TOKEN_B, fetch=unreachable)
         private = lambda h, p, **k: [(2, 1, 6, "", ("127.0.0.1", p))]  # noqa: E731
         C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
-                    vault=self.vault, spawn=lambda a, e, l: DEAD_PID, kill=lambda *a: None,
+                    vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
                     fetch=lambda *a: self.fail("probed a private address"), getaddrinfo=private)
         self.assertEqual(self.rows()[0]["server_source"], "resolver", "nothing learned, bridge launched anyway")
 
@@ -2116,9 +2116,398 @@ class Edges(Base):
         row, _ = self.add(TOKEN_B, fetch=unreachable)
         self.vault.store[row["token_ref"]] = "opaque-bearer"
         record = C.reconnect(row["instance"], repo=self.ws, logs_dir=self.ws / "logs", environ={},
-                             workspace=self.ws, vault=self.vault, spawn=lambda a, e, l: DEAD_PID, kill=lambda *a: None, fetch=unreachable)
-        self.assertEqual(record["pid"], DEAD_PID)
+                             workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(), kill=lambda *a: None,
+                             fetch=unreachable)
+        self.assertEqual(record["pid"], self.child())
         self.assertEqual(self.rows()[0]["server_source"], "resolver")
+
+
+def plant_lease(ws, instance, **fields):
+    """A lease record at `instance`'s path: the writer's own fields, overridden by `fields`."""
+    lock = ws / "state" / "locks" / f"{C._bridge_role(instance)}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    record = {"role": C._bridge_role(instance), "pid": os.getpid(), "host": workspace_lock._host_label(),
+              "workspace": str(ws), "acquired_at": now, "heartbeat_at": now, "schema_version": 1}
+    record.update(fields)
+    lock.write_text(json.dumps(record))
+    return lock
+
+
+class LeaseBinding(Base):
+    """A lease proves a holder only for the role and workspace it was written for, and only while
+    its pid is still the process (the same start time) that wrote it."""
+
+    def setUp(self):
+        super().setUp()
+        self.add()  # alpha is primary
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.repo, self.logs = self.ws / "repo", self.ws / "logs"
+
+    def test_a_copied_lease_never_attributes_another_bridges_pid(self):
+        alpha = bridge_lease.start(self.ws, "alpha-fixture-net")
+        self.children.append(alpha)
+        locks = self.ws / "state" / "locks"
+        (locks / "gateway-bridge.beta-fixture-net.lock").write_text(
+            (locks / "gateway-bridge.alpha-fixture-net.lock").read_text())
+        with self.assertRaises(C.BridgeLeaseIndeterminate) as cm:
+            C.bridge_pid("beta-fixture-net", self.ws)
+        self.assertIn("for role 'gateway-bridge.alpha-fixture-net'", str(cm.exception))
+        with self.assertRaises(C.BridgeLeaseIndeterminate):
+            C.stop_bridge("beta-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("signalled alpha"))
+        with self.assertRaises(C.BridgeLeaseIndeterminate):
+            C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("signalled alpha"))
+        self.assertIsNone(alpha.poll(), "alpha still runs")
+        self.assertFalse({r["instance"]: r for r in self.rows()}["beta-fixture-net"]["disabled"])
+
+    def delayed_launch(self, planted):
+        """launch beta with a child that takes its lease 0.6 s after the spawn, `planted` written at
+        the child's pid the moment it is spawned; a disconnect starts once the spawn returned."""
+        spawned = threading.Event()
+        inner = bridge_lease.spawner(self.ws, delay=0.6, started=self.children)
+
+        def spawn(argv, env, log_path):
+            proc = inner(argv, env, log_path)
+            plant_lease(self.ws, "beta-fixture-net", pid=proc.pid, **planted)
+            spawned.set()
+            return proc
+        result = {}
+
+        def run():
+            try:
+                result["launch"] = C.launch("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={},
+                                            workspace=self.ws, vault=self.vault, spawn=spawn)
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+        t = threading.Thread(target=run)
+        t.start()
+        self.assertTrue(spawned.wait(10))
+        try:
+            result["disconnect"] = C.disconnect("beta-fixture-net", workspace=self.ws)
+        except Exception as e:  # noqa: BLE001
+            result["disconnect_error"] = e
+        t.join(30)
+        return result, self.children[0]
+
+    def test_a_same_pid_record_with_another_start_time_is_not_the_childs_lease(self):
+        result, child = self.delayed_launch({"proc_start": "another-generation:1"})
+        self.assertEqual((result["launch"]["ok"], result["launch"]["lease"]), (True, "held"),
+                         "launch waited for the child's own lease")
+        self.assertEqual((result["disconnect"]["disabled"], result["disconnect"]["stopped_pid"]), (True, child.pid),
+                         "the disconnect waited for the launch and stopped the bridge it started")
+        self.assertEqual(child.wait(timeout=5), 0)
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0, "no bridge under the disabled row")
+
+    def test_a_same_pid_record_from_another_host_is_not_the_childs_lease(self):
+        result, child = self.delayed_launch({"host": "elsewhere"})
+        self.assertIsInstance(result.get("error"), C.LaunchFailed, "never read as held")
+        self.assertIn("rc 75", str(result["error"]))
+        self.assertEqual(child.wait(timeout=5), 75, "the child deferred to the other host's lease")
+        self.assertIsInstance(result.get("disconnect_error"), C.BridgeLeaseIndeterminate)
+        self.assertFalse({r["instance"]: r for r in self.rows()}["beta-fixture-net"]["disabled"])
+
+
+class ChildExit(Base):
+    """A child that exits is a launch failure unless another process is proven to hold the lease."""
+
+    def setUp(self):
+        super().setUp()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.repo, self.logs = self.ws / "repo", self.ws / "logs"
+
+    def launch(self, spawn):
+        return C.launch("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=spawn)
+
+    def test_a_child_that_exits_before_any_lease_fails_the_launch(self):
+        def spawn(argv, env, log_path):
+            proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(2)"], env=isolated_child_env())
+            self.children.append(proc)
+            return proc
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.launch(spawn)
+        self.assertIn("exited (rc 2)", str(cm.exception))
+        record = json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())
+        self.assertEqual((record["ok"], record["reason"], record["rc"]), (False, "exited", 2))
+        self.assertEqual(C.status_for({"instance": "beta-fixture-net"}, self.ws)["state"], "failed")
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), 0)
+
+    def retained(self):
+        old = bridge_lease.start(self.ws, "beta-fixture-net", mode="retain")
+        old.terminate()
+        self.assertEqual(old.wait(timeout=5), 0)
+        bridge_lease.stop(old)
+        lease = workspace_lock.read_lease("gateway-bridge.beta-fixture-net", self.ws)
+        self.assertTrue(lease["retained"])
+        return lease
+
+    def test_a_retained_lease_that_outlasts_the_bound_is_refused_by_name(self):
+        self.retained()
+        t0 = time.monotonic()
+        with self.assertRaises(C.LaunchFailed) as cm:
+            self.launch(bridge_lease.spawner(self.ws, started=self.children))
+        self.assertLess(time.monotonic() - t0, C.LEASE_TIMEOUT_S / 2, "refused at once, not after the bound")
+        self.assertIn("retained lease", str(cm.exception))
+        self.assertEqual(self.children[0].returncode, 75)
+        record = json.loads(C.launch_record_path("beta-fixture-net", self.ws).read_text())
+        self.assertEqual((record["ok"], record["reason"]), (False, "retained_lease"))
+
+    def test_a_retained_lease_that_goes_stale_within_the_bound_is_waited_out(self):
+        lease = self.retained()
+        lease["heartbeat_at"] = int(time.time()) - workspace_lock.DEFAULT_STALE_SECONDS + 1
+        (self.ws / "state" / "locks" / "gateway-bridge.beta-fixture-net.lock").write_text(json.dumps(lease))
+        record = self.launch(bridge_lease.spawner(self.ws, started=self.children))
+        self.assertEqual(len(self.children), 2, "the first child stood down, the second took the lease")
+        self.assertEqual(self.children[0].returncode, 75)
+        self.assertEqual((record["ok"], record["lease"], record["pid"]), (True, "held", self.children[1].pid))
+        self.assertEqual(C.bridge_pid("beta-fixture-net", self.ws), self.children[1].pid)
+
+
+class GatedVault(FakeVault):
+    """A vault whose first read from thread B waits for `gate`: B is paused at its snapshot."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate, self.b_reading = threading.Event(), threading.Event()
+
+    def get(self, key):
+        value = super().get(key)
+        if threading.current_thread().name == "B" and not self.b_reading.is_set():
+            self.b_reading.set()
+            self.gate.wait(10)
+        return value
+
+
+class TokenConcurrency(Base):
+    """The snapshot an update restores from is taken under the record lock, so another writer that
+    commits in between is never undone (production `_transaction`, real threads)."""
+
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+    A = "https://relay.beta-fixture.net:8443/a|secret-beta-A"
+    B = "https://relay.beta-fixture.net:8443/b|secret-beta-B"
+
+    def setUp(self):
+        super().setUp()
+        self.vault = GatedVault()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+
+    def update(self, token):
+        return C.update_token("beta-fixture-net", token, repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                              workspace=self.ws, vault=self.vault, spawn=self.bridge_spawn(), kill=os.kill,
+                              fetch=agents("@s:beta-fixture.net"))
+
+    def interleave(self, other):
+        """B pauses at its snapshot; `other` runs (given 1 s), then B resumes and its row write fails."""
+        real_write = C._write
+        errors = {}
+
+        def write(path, record):
+            if threading.current_thread().name == "B":
+                raise OSError("disk full")
+            real_write(path, record)
+
+        def run_b():
+            try:
+                self.update(self.B)
+            except Exception as e:  # noqa: BLE001
+                errors["B"] = e
+        with unittest.mock.patch.object(C, "_write", write):
+            b = threading.Thread(target=run_b, name="B")
+            b.start()
+            self.assertTrue(self.vault.b_reading.wait(10))
+            o = threading.Thread(target=other, name="other")
+            o.start()
+            o.join(1.0)
+            self.vault.gate.set()
+            b.join(30)
+            o.join(30)
+        return errors.get("B")
+
+    def test_a_failed_update_never_restores_over_a_committed_rotation(self):
+        error = self.interleave(lambda: self.update(self.A))
+        self.assertIsInstance(error, OSError)
+        row = {r["instance"]: r for r in self.rows()}["beta-fixture-net"]
+        self.assertEqual(row["gateway_url"], "https://relay.beta-fixture.net:8443/a", "A's row is committed")
+        self.assertEqual(self.vault.store[self.REF], self.A, "and the vault holds A's code, not B's stale snapshot")
+
+    def test_a_failed_update_never_restores_over_a_remove_and_re_add(self):
+        readded = "https://relay.beta-fixture.net:8443|secret-beta-readded"
+
+        def remove_and_re_add():
+            C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault)
+            self.add(readded, fetch=agents("@s:beta-fixture.net"))
+        error = self.interleave(remove_and_re_add)
+        self.assertIsInstance(error, (OSError, C.UnknownConnection))
+        self.assertIn("beta-fixture-net", {r["instance"] for r in self.rows()})
+        self.assertEqual(self.vault.store[self.REF], readded, "the re-added row's code survives B's failure")
+
+
+class Keychain:
+    """`security` for vault_intercept: add/find/delete-generic-password over a dict, with faults."""
+
+    def __init__(self, items):
+        self.items, self.fail_add_after, self.fail_find = dict(items), None, False
+        self.adds = 0
+
+    def __call__(self, argv, capture_output=True, timeout=None, **kw):
+        verb, key = argv[1], argv[argv.index("-s") + 1]
+        if verb == "add-generic-password":
+            self.adds += 1
+            if self.fail_add_after is not None and self.adds > self.fail_add_after:
+                return subprocess.CompletedProcess(argv, 1, b"", b"locked")
+            self.items[key] = argv[argv.index("-w") + 1]
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        if verb == "find-generic-password":
+            if self.fail_find:
+                return subprocess.CompletedProcess(argv, 51, b"", b"")
+            if key not in self.items:
+                return subprocess.CompletedProcess(argv, 44, b"", b"")
+            return subprocess.CompletedProcess(argv, 0, self.items[key].encode() + b"\n", b"")
+        return subprocess.CompletedProcess(argv, 0 if self.items.pop(key, None) is not None else 44, b"", b"")
+
+
+class VaultPartialWrite(Base):
+    """update_token over the real vault_intercept (Keychain then manifest): once the write began, what
+    the vault holds is read back, never assumed."""
+
+    REF = "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"
+    NEW = "https://relay.beta-fixture.net:8443|secret-beta-rotated"
+
+    def setUp(self):
+        super().setUp()
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        import vault_intercept
+        self.vi = vault_intercept
+        self.keychain = Keychain(self.vault.store)
+        self.spawned = []
+        manifest = self.ws / "vault-keys.json"
+        self.patches = [unittest.mock.patch.object(vault_intercept.subprocess, "run", self.keychain),
+                        unittest.mock.patch.object(vault_intercept, "_manifest_path", lambda: str(manifest))]
+        for p in self.patches:
+            p.start()
+        self.vault = C._VaultIntercept()
+        self.bridge = bridge_lease.start(self.ws, "beta-fixture-net")
+        self.children.append(self.bridge)
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        super().tearDown()
+
+    def update(self):
+        spawn = self.bridge_spawn(lambda argv, env, log_path: self.spawned.append(env["REMOTE_TASK_TOKEN"]))
+        return C.update_token("beta-fixture-net", self.NEW, repo=self.ws / "repo", logs_dir=self.ws / "logs",
+                              environ={}, workspace=self.ws, vault=self.vault, spawn=spawn, kill=os.kill,
+                              fetch=agents("@s:beta-fixture.net"))
+
+    def test_keychain_written_then_manifest_failing_is_put_back_and_read_back(self):
+        """Both directions fail after the Keychain write: the NEW code's and the restore's."""
+        with unittest.mock.patch.object(self.vi, "_register_key", side_effect=OSError("manifest read-only")):
+            with self.assertRaises(C.VaultUnavailable) as cm:
+                self.update()
+        self.assertEqual(self.keychain.items[self.REF], TOKEN_B, "read back as the previous secret")
+        self.assertEqual(self.spawned, [TOKEN_B], "relaunched on the code the vault really holds")
+        self.assertIn("relaunched on the unchanged code", str(cm.exception))
+        self.assertEqual({r["instance"]: r for r in self.rows()}["beta-fixture-net"]["gateway_url"],
+                         "https://relay.beta-fixture.net:8443")
+
+    def test_a_restore_that_fails_says_the_read_back_found_the_new_code(self):
+        self.keychain.fail_add_after = 1
+        with unittest.mock.patch.object(C, "_write", side_effect=OSError("disk full")):
+            with self.assertRaises(C.TokenRestoreFailed) as cm:
+                self.update()
+        self.assertEqual(self.keychain.items[self.REF], self.NEW)
+        self.assertIn("read back, AG2_REMOTE_TOKEN_BETA_FIXTURE_NET holds the NEW code", str(cm.exception))
+        self.assertNotIn("secret-beta", str(cm.exception))
+        self.assertEqual(self.spawned, [], "never relaunched")
+
+    def test_a_read_back_that_cannot_tell_is_token_state_unknown(self):
+        def write(path, record):
+            self.keychain.fail_find = True
+            raise OSError("disk full")
+        with unittest.mock.patch.object(C, "_write", write):
+            with self.assertRaises(C.TokenStateUnknown) as cm:
+                self.update()
+        message = str(cm.exception)
+        self.assertEqual(cm.exception.CODE, "token_state_unknown")
+        self.assertIsInstance(cm.exception, C.Refusal)
+        self.assertTrue(message.startswith("token_state_unknown"))
+        for claim in ("NEW code", "unchanged code", "previous secret is back", "secret-beta"):
+            self.assertNotIn(claim, message)
+        self.assertIn("not known which secret", message)
+        self.assertEqual(self.spawned, [], "no relaunch on an assumed code")
+
+
+class LegacyCarrier(Base):
+    """Exactly one bridge carries the proactive room: the legacy bridge settles it under the record
+    lock right after its lease, and a named promotion is refused while it runs."""
+
+    SCRIPT = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import workspace_lock as wl, connections as C\n"
+        "ws = Path(sys.argv[2])\n"
+        "print('read', C.primary_instance(ws), flush=True)\n"
+        "sys.stdin.readline()\n"
+        "assert wl.acquire('gateway-bridge', ws).status != 'deferred'\n"
+        "print('keep', C.legacy_keeps_proactive_room(ws), flush=True)\n"
+        "time.sleep(30)\n")
+
+    def setUp(self):
+        super().setUp()
+        C.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.s.space|legacy"}, workspace=self.ws, vault=self.vault)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+
+    def launcher(self):
+        proc = subprocess.Popen([sys.executable, "-c", self.SCRIPT, str(ROOT / "src"), str(self.ws)],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=isolated_child_env(), text=True)
+        self.children.append(proc)
+        return proc
+
+    def carriers(self, keep):
+        named = C.primary_instance(self.ws)
+        return (["legacy"] if keep else []) + ([named] if named else [])
+
+    def test_no_primary_with_a_live_legacy_lease_refuses_a_named_promotion(self):
+        self.add(fetch=agents("@a:alpha-fixture.net"))
+        C.set_primary("alpha-fixture-net", workspace=self.ws)
+        C.remove_connection("alpha-fixture-net", force=True, workspace=self.ws, vault=self.vault)
+        self.assertIsNone(C.primary_instance(self.ws))
+        legacy = bridge_lease.start(self.ws, "")
+        self.children.append(legacy)
+        with self.assertRaises(C.LegacyPrimaryRunning) as cm:
+            C.set_primary("beta-fixture-net", workspace=self.ws)
+        self.assertEqual(cm.exception.pid, legacy.pid)
+        self.assertIsNone(C.primary_instance(self.ws), "nothing changed")
+
+    def test_a_launcher_that_read_before_the_promotion_drops_the_room_after_its_lease(self):
+        launcher = self.launcher()
+        self.assertEqual(launcher.stdout.readline().strip(), "read", "it read no named primary: room passed on")
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        launcher.stdin.write("\n")
+        launcher.stdin.flush()
+        line = launcher.stdout.readline().strip()
+        self.assertEqual(line, "keep False", "settled after the lease, it drops the room")
+        self.assertEqual(self.carriers(line == "keep True"), ["beta-fixture-net"], "exactly one proactive carrier")
+
+    def test_a_legacy_bridge_that_kept_the_room_blocks_the_promotion(self):
+        launcher = self.launcher()
+        launcher.stdout.readline()
+        launcher.stdin.write("\n")
+        launcher.stdin.flush()
+        keep = launcher.stdout.readline().strip() == "keep True"
+        self.assertTrue(keep)
+        with self.assertRaises(C.LegacyPrimaryRunning):
+            C.set_primary("beta-fixture-net", workspace=self.ws)
+        self.assertEqual(self.carriers(keep), ["legacy"], "exactly one proactive carrier")
+
+    def test_an_unreadable_record_keeps_the_room(self):
+        C.record_path(self.ws).write_text("{broken")
+        self.assertTrue(C.legacy_keeps_proactive_room(self.ws), "fail-open, as the env-only launch")
 
 
 if __name__ == "__main__":

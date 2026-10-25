@@ -24,8 +24,9 @@ record `launch` leaves, into one `state`: pending, connected, disconnected or fa
 
 Which process runs a bridge is read only from the bridge's own lease, through `workspace_lock`'s
 reader (`bridge_pid`): a lease that proves no holder is a refusal, never pid 0, and only a pid
-proven to be the lease's writer is ever signalled. `launch` keeps the record lock until its child
-holds that lease or has exited.
+proven to be the lease's writer is ever signalled; a record written for another role, workspace or
+schema proves nothing. `launch` keeps the record lock until its child is proven, by that same check,
+to hold the lease or has exited; an exit is a success only when another holder is proven live.
 
 `disconnect` stops a row's bridge and then marks it `disabled`, keeping the row, the vault secret
 and the launch record: the plan skips a disabled row, so a restart leaves it down until
@@ -189,14 +190,14 @@ class BridgeLeaseIndeterminate(Refusal):
 
 
 class LegacyPrimaryRunning(Refusal):
-    """The legacy bridge is primary and running; it re-reads the primary only when it is spawned."""
+    """The legacy bridge runs and may carry the proactive room; it decides that only when it starts."""
 
     CODE = "legacy_primary_running"
 
     def __init__(self, instance: str, pid: int):
         super().__init__(
-            f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is primary and carries the proactive room, and "
-            "its launchers read the primary only when they spawn it; stop it (bash src/restart.sh --stop-only), "
+            f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is running and may carry the proactive room, "
+            "which it decides only when it starts; stop it (bash src/restart.sh --stop-only), "
             f"make {instance} primary, then start again (bash src/startup.sh) so the legacy bridge comes up "
             f"without the room and {instance} with it; nothing changed")
         self.pid = pid
@@ -210,9 +211,16 @@ class VaultUnreadable(Refusal):
 
 class TokenRestoreFailed(Refusal):
     """A write after the vault took the new code failed, and so did putting the previous secret back:
-    the vault holds the NEW code while the row is unchanged."""
+    read back, the vault holds the NEW code while the row is unchanged."""
 
     CODE = "token_restore_failed"
+
+
+class TokenStateUnknown(Refusal):
+    """An update failed after the vault write began and reading the key back could not establish
+    whether it holds the previous secret or the new code; the bridge is not relaunched on a guess."""
+
+    CODE = "token_state_unknown"
 
 
 class TokenSourceShadowed(Refusal):
@@ -938,20 +946,31 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
     return None
 
 
+def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
+    """Asked by the legacy bridge right after it takes its lease: whether it may keep the proactive
+    room. Under the record lock, so a `set_primary` either committed first (False here) or runs
+    after and sees this bridge's lease (refused); an unreadable record keeps it (env-only fail-open)."""
+    try:
+        with locked_file(_lock_path(workspace), create_mode=0o600):
+            rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return True
+    return not any(r["primary"] and r["instance"] for r in rows)
+
+
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
     Refused before anything is written: a disabled row (`DisabledCannotBePrimary`: it never
-    launches); a move off the legacy row while the legacy bridge runs (`LegacyPrimaryRunning`: its
-    launchers read the primary only on spawn, so it would keep the room); a lease that proves no
-    holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
+    launches); any named promotion while the legacy bridge runs, whatever the record's primary
+    (`LegacyPrimaryRunning`: it settles the room once, at start, so it may hold it); a lease that
+    proves no holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
     new primary's bridge is running, since it keeps its launch environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("disabled"):
             raise DisabledCannotBePrimary(instance)
         promoted = not row["primary"]
-        current = next((r for r in rec["rows"] if r["primary"]), None)
-        if promoted and instance and current is not None and not current["instance"]:
+        if promoted and instance:
             legacy = bridge_pid("", workspace)
             if legacy:
                 raise LegacyPrimaryRunning(instance, legacy)
@@ -1266,23 +1285,45 @@ def _bridge_role(instance: str) -> str:
     return "gateway-bridge" + (f".{instance}" if instance else "")
 
 
-def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: float) -> str:
-    """'held' once `pid` holds a live lease for `instance`, 'exited' when it ended without one,
-    'timeout' when neither happened in `timeout_s`."""
-    ws = _workspace(workspace)
+def _proven_holder(instance: str, workspace: Optional[Path]) -> int:
+    """The pid proven, by the same check the stop path uses, to hold a live lease bound to
+    `instance`'s role and this workspace; 0 when no such holder is proven."""
+    try:
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        pid = workspace_lock.lease_process(holder) if holder else 0
+    except workspace_lock.LeaseIndeterminate:
+        return 0
+    return pid if pid and workspace_lock.lease_is_live(holder) else 0
+
+
+def _retained_wait(instance: str, workspace: Optional[Path]) -> Optional[float]:
+    """Seconds until a retained lease whose writer has exited goes stale; None for any other lease."""
+    try:
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        if not holder or not holder.get("retained") or workspace_lock.lease_process(holder):
+            return None
+    except workspace_lock.LeaseIndeterminate:
+        return None
+    return workspace_lock.lease_stale_in(holder)
+
+
+def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: float) -> "tuple[str, int]":
+    """('held', pid) once `pid` is proven to hold a live lease for `instance`; ('exited', holder)
+    when it ended first, holder the other process proven to hold it or 0; ('timeout', 0)."""
     deadline = time.monotonic() + timeout_s
     while True:
-        try:
-            holder = workspace_lock.read_lease(_bridge_role(instance), ws)
-        except workspace_lock.LeaseIndeterminate:
-            holder = None
-        if holder and holder["pid"] == pid and workspace_lock.lease_is_live(holder):
-            return "held"
+        if _proven_holder(instance, workspace) == pid:
+            return "held", pid
         if _exited(pid):
-            return "exited"
+            return "exited", _proven_holder(instance, workspace)
         if time.monotonic() >= deadline:
-            return "timeout"
+            return "timeout", 0
         time.sleep(0.05)
+
+
+def _exit_code(child) -> Optional[int]:
+    poll = getattr(child, "poll", None)
+    return poll() if poll is not None else None
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
@@ -1290,9 +1331,13 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
            env_only: bool = False) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
-    plan read until the child holds its lease or has exited (`lease` in the record), so a
-    `disconnect` or `remove` always finds the bridge it must stop. A child still without a lease
-    after `LEASE_TIMEOUT_S` is killed when it is ours and the launch fails (`lease_timeout`)."""
+    plan read until the child is proven to hold its lease or has exited (`lease` in the record),
+    so a `disconnect` or `remove` always finds the bridge it must stop. A child that exits is a
+    success only when another process is proven to hold the lease (`holder_pid`: it stood down to
+    a live duplicate); one that stood down to a retained lease whose writer is gone is spawned
+    again once that lease goes stale, if that fits in `LEASE_TIMEOUT_S` (else `retained_lease`);
+    any other exit fails (`exited`, with the child's rc). A child still without a lease by the
+    deadline is killed when it is ours and the launch fails (`lease_timeout`)."""
     environ = os.environ if environ is None else environ
     # Holding the lock to the lease is safe: the bridge's startup never reads this record.
     with locked_file(_lock_path(workspace), create_mode=0o600):
@@ -1304,26 +1349,42 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
             raise LaunchFailed(str(e)) from None
         argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
         log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
-        try:
-            child = (spawn or _spawn)(argv, env, log_path)
-        except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
-            _record_launch(instance, workspace, ok=False, reason="launch_failed")
-            raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
-        pid = int(getattr(child, "pid", child))
-        if hasattr(child, "poll"):
-            _CHILDREN[pid] = child
-        if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
-            return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
-        lease = _await_lease(instance, pid, workspace, LEASE_TIMEOUT_S)
-        if lease == "timeout":
-            mine = _CHILDREN.pop(pid, None)
-            if mine is not None:
-                mine.kill()
-                mine.wait()
-            _record_launch(instance, workspace, ok=False, reason="lease_timeout", pid=pid)
-            raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
-                               + ("; it was stopped" if mine is not None else ""))
-        return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
+        deadline = time.monotonic() + LEASE_TIMEOUT_S
+        for attempt in (1, 2):
+            try:
+                child = (spawn or _spawn)(argv, env, log_path)
+            except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
+                _record_launch(instance, workspace, ok=False, reason="launch_failed")
+                raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
+            pid = int(getattr(child, "pid", child))
+            if hasattr(child, "poll"):
+                _CHILDREN[pid] = child
+            if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
+            lease, holder = _await_lease(instance, pid, workspace, max(0.0, deadline - time.monotonic()))
+            if lease == "held":
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
+            if lease == "timeout":
+                mine = _CHILDREN.pop(pid, None)
+                if mine is not None:
+                    mine.kill()
+                    mine.wait()
+                _record_launch(instance, workspace, ok=False, reason="lease_timeout", pid=pid)
+                raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
+                                   + ("; it was stopped" if mine is not None else ""))
+            if holder:
+                return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease, holder_pid=holder)
+            rc = _exit_code(child)
+            wait = _retained_wait(instance, workspace) if rc in (None, 75) else None
+            if wait is not None and attempt == 1 and time.monotonic() + wait + 0.1 < deadline:
+                time.sleep(wait + 0.1)
+                continue
+            break
+        reason = "retained_lease" if wait is not None else "exited"
+        _record_launch(instance, workspace, ok=False, reason=reason, pid=pid, rc=rc)
+        detail = (f"it stood down to a retained lease that goes stale in {wait:.0f}s; retry then" if wait is not None
+                  else "no other process is proven to hold its lease")
+        raise LaunchFailed(f"the bridge for {instance} (pid {pid}) exited (rc {rc}): {detail}")
 
 
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
@@ -1406,11 +1467,13 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     (`TokenServerMismatch`); a row naming an agent whose preview did not confirm that same agent:
     unconfirmed (`TokenUnverified`) or another agent (`TokenAgentMismatch`); a bridge that will
     not stop (`BridgeStillRunning`); a vault that cannot say whether it holds the current secret
-    (`VaultUnreadable`, read before any effect). The new row is built and validated before the
-    bridge is stopped or the vault written; a failure after the vault write puts the previous
-    secret back, and when that also fails the error is `TokenRestoreFailed` naming both (the vault
-    then holds the new code, the row the old). A bridge stopped for an update that then failed is
-    relaunched on the unchanged code, and the error says whether that worked.
+    (`VaultUnreadable`). The row, its token_ref and the previous secret are read inside the record
+    transaction, right before the stop and the vault write, so a concurrent update or a remove and
+    re-add is never undone by a stale snapshot. Once the vault write has begun, a failure is
+    reconciled by reading the key back (`_reconcile_vault`): the previous secret is put back when it
+    is not there; read back as the previous secret, the stopped bridge is relaunched on it and the
+    error says whether that worked; read back as the new code, `TokenRestoreFailed`; anything else,
+    or a read that fails, `TokenStateUnknown`. Neither of those relaunches.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
     is that record (and the row's state), not an exception."""
     environ = os.environ if environ is None else environ
@@ -1423,30 +1486,35 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     if seen.get("authenticated") is False:
         raise TokenRejected()
     vault = _vault(vault)
-    ref = current["token_ref"]
-    previous = _vault_snapshot(vault, ref)
-    stored = False
-    stopped = 0
+    new = token.strip()
+    ref, previous, mutating, stopped = "", None, False, 0
     try:
         with _transaction(workspace) as rec:
             row = _find(rec["rows"], instance)
+            ref = row["token_ref"]
+            if (environ.get(ref) or "").strip():
+                raise TokenSourceShadowed(instance, ref)
             candidate = _updated_row(rec, row, seen, instance)
+            previous = _vault_snapshot(vault, ref)
             stopped = stop_bridge(instance, workspace=workspace, kill=kill)
-            _vault_store(vault, ref, token.strip())
-            stored = True
+            mutating = True
+            _vault_store(vault, ref, new)
             row.clear()
             row.update(candidate)
     except Exception as e:
-        if stored:
-            # The row still names the old secret; put it back so the next launch finds it.
-            try:
-                vault.set(ref, previous) if previous is not None else vault.delete(ref)
-            except Exception as restore:  # noqa: BLE001
+        if mutating:
+            found, restore = _reconcile_vault(vault, ref, previous, new)
+            cause = f"{type(e).__name__}: {e}"
+            if found == "new":
                 raise TokenRestoreFailed(
-                    f"{TokenRestoreFailed.CODE}: the update of {instance} failed after the vault took the new code "
-                    f"({type(e).__name__}: {e}) and restoring the previous secret failed too "
-                    f"({type(restore).__name__}); {ref} holds the NEW code while the row is unchanged"
-                    + ("; the bridge was left stopped" if stopped else "")) from None
+                    f"{TokenRestoreFailed.CODE}: the update of {instance} failed after the vault write began "
+                    f"({cause}) and restoring the previous secret failed ({restore}); read back, {ref} holds the NEW code "
+                    "while the row is unchanged" + ("; the bridge was left stopped" if stopped else "")) from None
+            if found != "previous":
+                raise TokenStateUnknown(
+                    f"{TokenStateUnknown.CODE}: the update of {instance} failed after the vault write began ({cause}) "
+                    f"and reading {ref} back {found}, so it is not known which secret it holds; the bridge was "
+                    "not relaunched; run update-token again with the code you want") from None
         if not stopped:
             raise
         try:
@@ -1466,6 +1534,37 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     except LaunchFailed:
         out["launch"] = _read_json(launch_record_path(instance, workspace))
     return out
+
+
+def _digest(value: Optional[str]) -> Optional[str]:
+    return None if value is None else hashlib.sha256(value.encode()).hexdigest()
+
+
+def _reconcile_vault(vault, ref: str, previous: Optional[str], new: str) -> "tuple[str, str]":
+    """After a failed write under `ref`: ('previous', ...) once a read-back shows the previous secret (put
+    back if needed), ('new', ...) when it still shows the new code, else why it could not tell; the second
+    item names the restore's own error. Values are compared by digest and never logged."""
+    def read_back() -> "tuple[bool, Optional[str]]":
+        try:
+            return True, _digest(_vault_snapshot(vault, ref))
+        except VaultUnreadable:
+            return False, None
+
+    want, fresh = _digest(previous), _digest(new)
+    ok, got = read_back()
+    if ok and got == want:
+        return "previous", "none"
+    restore = "none"
+    try:
+        vault.set(ref, previous) if previous is not None else vault.delete(ref)
+    except Exception as e:  # noqa: BLE001 - the read-back below decides what the vault holds
+        restore = type(e).__name__
+    ok, got = read_back()
+    if not ok:
+        return "failed", restore
+    if got == want:
+        return "previous", restore
+    return ("new" if got == fresh else "showed neither secret"), restore
 
 
 def _with_note(error: ConnectionsError, note: str) -> ConnectionsError:

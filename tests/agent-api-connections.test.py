@@ -35,7 +35,7 @@ from pathlib import Path
 # channel env file can be imported into the temp record by an empty list.
 _WS = tempfile.mkdtemp(prefix="agent-api-connections-")
 isolate_os_environ(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=_WS, SUTANDO_TELEMETRY="0",
-                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1", SUTANDO_BRIDGE_LOCK="0")  # the spawn fake takes no lease
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -384,6 +384,17 @@ check("a token_ref set in the environment is 409 token_source_shadowed", (s, b) 
 check("a refused code changed nothing", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == TOKEN_B and SPAWNED == [], SPAWNED)
 s, b, _ = req("GET", "/api/v1/connections")
 check("the refused row is still disabled", [r["disabled"] for r in b["connections"]] == [False, True], b)
+
+
+def _unknown(*a, **k):
+    raise C.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
+
+
+_saved_update, api._connections.update_token = api._connections.update_token, _unknown
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+api._connections.update_token = _saved_update
+check("a vault that cannot be read back is 409 token_state_unknown, no secret",
+      (s, b) == (409, {"error": "token_state_unknown"}), f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
 check("the same connection's new code is 200 with the row", s == 200 and (b["connection"]["instance"], b["connection"]["token_ref"],
       b["connection"]["disabled"], b["connection"]["state"]) == ("beta-fixture-net", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", False, "pending"), f"{s} {b}")

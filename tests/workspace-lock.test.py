@@ -400,5 +400,118 @@ class LeaseReaderTest(unittest.TestCase):
             self.assertIn(cause, str(cm.exception))
 
 
+class LeaseBindingTest(unittest.TestCase):
+    """A lease names the role, workspace and schema it was written for, and its writer's generation."""
+
+    setUp, tearDown, _lock_path, _plant = LockTest.setUp, LockTest.tearDown, LockTest._lock_path, LockTest._plant
+
+    def _written(self, role="r"):
+        self.mod.acquire(role, self.ws)
+        return json.loads(self._lock_path(role).read_text())
+
+    def test_a_record_for_another_role_workspace_or_schema_is_indeterminate(self):
+        rec = self._written("alpha")
+        beta = self._lock_path("beta")
+        for change, cause in (({}, "for role 'alpha', not 'beta'"),
+                              ({"role": "beta", "workspace": str(self.ws / "other")}, "another workspace"),
+                              ({"role": "beta", "workspace": None}, "another workspace"),
+                              ({"role": "beta", "schema_version": 2}, "not schema_version 1")):
+            beta.write_text(json.dumps(dict(rec, **change)))
+            with self.assertRaises(self.mod.LeaseIndeterminate, msg=cause) as cm:
+                self.mod.read_lease("beta", self.ws)
+            self.assertIn(cause, str(cm.exception))
+        beta.write_text(json.dumps(dict(rec, role="beta")))
+        self.assertEqual(self.mod.read_lease("beta", self.ws)["pid"], os.getpid(), "bound to beta, it reads")
+        linked = Path(self._tmp.name + "-link")
+        os.symlink(self.ws, linked)
+        try:
+            self.assertEqual(self.mod.read_lease("alpha", linked)["pid"], os.getpid(), "the same directory by another path")
+        finally:
+            linked.unlink()
+
+    def test_an_unreadable_lease_file_is_indeterminate(self):
+        self._lock_path("r").mkdir(parents=True)
+        with self.assertRaises(self.mod.LeaseIndeterminate) as cm:
+            self.mod.read_lease("r", self.ws)
+        self.assertIn("unreadable", str(cm.exception))
+
+    def test_ownership_needs_the_writers_start_time_not_just_its_pid(self):
+        if not self.mod.proc_start(os.getpid()):
+            self.skipTest("no start time on this platform")
+        rec = self._written()
+        self._lock_path("r").write_text(json.dumps(dict(rec, proc_start="another-generation:1")))
+        self.assertFalse(self.mod.heartbeat("r", self.ws), "an earlier process with our pid wrote it")
+        self.assertFalse(self.mod.retain("r", self.ws))
+        self.mod.release("r", self.ws)
+        self.assertTrue(self._lock_path("r").exists(), "release leaves another generation's lease")
+        self.assertEqual(self.mod.lease_process(self.mod.read_lease("r", self.ws)), 0, "not the writer")
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped", "a reused pid's lease is a dead holder's")
+        self.assertTrue(self.mod.heartbeat("r", self.ws))
+
+    def test_a_same_pid_record_from_another_host_is_never_ours(self):
+        rec = self._written()
+        self._lock_path("r").write_text(json.dumps(dict(rec, host="otherhost")))
+        self.assertFalse(self.mod.heartbeat("r", self.ws))
+        self.assertFalse(self.mod.retain("r", self.ws))
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "fresh on another host")
+        with self.assertRaises(self.mod.LeaseIndeterminate):
+            self.mod.lease_process(self.mod.read_lease("r", self.ws))
+
+    def test_a_live_pid_with_another_start_time_is_reaped_at_once(self):
+        live = _live_pid()
+        if not self.mod.proc_start(live):
+            self.skipTest("no start time on this platform")
+        self._plant("r", live, 1)
+        rec = json.loads(self._lock_path("r").read_text())
+        self._lock_path("r").write_text(json.dumps(dict(rec, proc_start="another-generation:1")))
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped")
+
+    def test_lease_stale_in(self):
+        self.assertEqual(self.mod.lease_stale_in({"heartbeat_at": int(time.time()) - 500}), 0.0)
+        self.assertEqual(self.mod.lease_stale_in({}), 0.0)
+        self.assertAlmostEqual(self.mod.lease_stale_in({"heartbeat_at": time.time()}, 30), 30, delta=1)
+
+
+class WindowsIdentityTest(unittest.TestCase):
+    """On Windows the writer and the reader both take the start token from outbox.process_identity."""
+
+    setUp, tearDown, _lock_path = LockTest.setUp, LockTest.tearDown, LockTest._lock_path
+
+    def _stub(self, table):
+        sys.path.insert(0, str(SCRIPT.parent))
+        import outbox
+        self.mod._IS_WINDOWS = True
+        self.mod._OWN_START.clear()
+        self.mod._windows_identity = lambda pid: outbox.ProcessIdentity(pid, outbox.OwnerState(table.get(pid, ("DEAD",))[0]),
+                                                                        *table.get(pid, ("DEAD",))[1:])
+        self.mod.os = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith("__")})
+        self.mod.os.kill = lambda *a: self.fail("os.kill terminates a process on Windows")
+
+    def test_writer_and_reader_compare_the_same_birth_token(self):
+        me, other = os.getpid(), _live_pid()
+        table = {me: ("ALIVE", 1111), other: ("ALIVE", 2222)}
+        self._stub(table)
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "acquired")
+        rec = self.mod.read_lease("r", self.ws)
+        self.assertEqual(rec["proc_start"], "win-1111")
+        self.assertEqual(self.mod.lease_process(rec), me, "proven by the same primitive that wrote it")
+        self.assertTrue(self.mod.heartbeat("r", self.ws))
+        table[me] = ("ALIVE", 9999)
+        self.assertEqual(self.mod.lease_process(rec), 0, "a later process under that pid")
+        table[me] = ("DEAD",)
+        self.assertEqual(self.mod.lease_process(rec), 0)
+        table[me] = ("UNKNOWN",)
+        with self.assertRaises(self.mod.LeaseIndeterminate):
+            self.mod.lease_process(rec)
+        table[me] = ("ALIVE", None)
+        with self.assertRaises(self.mod.LeaseIndeterminate):
+            self.mod.lease_process(rec)
+        self._lock_path("r").write_text(json.dumps(dict(rec, pid=other, proc_start="win-1")))
+        table[me] = ("ALIVE", 1111)
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "reaped", "another process under the holder's pid")
+        self._lock_path("r").write_text(json.dumps(dict(rec, pid=other, proc_start="win-2222")))
+        self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "the live writer keeps it")
+
+
 if __name__ == "__main__":
     unittest.main()

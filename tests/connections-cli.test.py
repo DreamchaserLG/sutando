@@ -66,6 +66,7 @@ class CliTests(unittest.TestCase):
             PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
             FAKE_KEYCHAIN=str(self.keychain),
             SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1",
+            SUTANDO_BRIDGE_LOCK="0",  # the fake bridge scripts take no lease
             # The vault manifest resolves the workspace; keep it in the box.
             SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(self.ws),
         )
@@ -382,6 +383,13 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(args, update_token=boom)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("connections: token_agent_mismatch: ", err)
+
+        def unknown(*a, **k):
+            raise self.cli.connections.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
+        rc, out, err = self.run_main(args, update_token=unknown)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: token_state_unknown: ", err)
+        self.assertNotIn("relaunched", err)
 
     def test_update_token_help_documents_stdin_as_the_form_that_hides_the_code(self):
         with self.assertRaises(SystemExit) as cm:

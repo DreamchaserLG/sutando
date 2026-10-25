@@ -1888,6 +1888,9 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
 # Host-injected (task_id, item_id) -> veto reason or None, asked for the same message with its item id.
 PROACTIVE_ACK_GATE: Callable[[str, str], "str | None"] | None = None
+# Host-injected () -> bool, asked once right after the poller lease is taken: False drops
+# PROACTIVE_ROOM, so a bridge spawned before another became primary never carries it too.
+PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
@@ -7742,6 +7745,21 @@ def _acquire_singleton() -> bool:
     return True
 
 
+def _settle_proactive_room() -> None:
+    """Ask the host whether this bridge keeps PROACTIVE_ROOM now that it holds the lease."""
+    global PROACTIVE_ROOM
+    if not PROACTIVE_ROOM or PROACTIVE_ROOM_KEEP is None:
+        return
+    try:
+        keep = PROACTIVE_ROOM_KEEP()
+    except Exception as e:  # noqa: BLE001 — the room stays as launched
+        _log(f"proactive room: keep check failed ({diagnostics.describe(e)}) — keeping it")
+        return
+    if not keep:
+        PROACTIVE_ROOM = ""
+        _log("proactive room: another bridge is primary — this one carries no proactive room")
+
+
 def _react_sender(timeout: int = 10):
     """The 👀 receipt's room-verb call. Lives here because the room-verb
     endpoint surface is frozen to this adapter edge, not to sparrow modules."""
@@ -7865,6 +7883,7 @@ def main() -> None:
         # A live bridge already polls this workspace: stand down. 75 tells a
         # supervising wrapper not to relaunch; a plain exit would loop it.
         sys.exit(75)
+    _settle_proactive_room()
     _start_lock_heartbeat()
     inflight: set[str] = _load_inflight()
     _recover_orphan_proactive()

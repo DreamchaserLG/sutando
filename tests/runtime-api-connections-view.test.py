@@ -13,7 +13,8 @@ Run: python3 tests/runtime-api-connections-view.test.py
 from _helpers.hermetic_env import isolate_os_environ
 
 # Before anything reads the environment: no outer credential selector survives.
-isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+# The spawn fake takes no bridge lease, as a bridge run with the lock off does.
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1", SUTANDO_BRIDGE_LOCK="0")
 
 import asyncio
 import json
@@ -275,6 +276,17 @@ class ViewTests(unittest.TestCase):
             self.call("connection.update_token", instance="nope", token=TOKEN_B)
         self.assertEqual(cm.exception.code, -32602)
         self.assertIn("nope", str(cm.exception))
+
+    def test_token_state_unknown_is_a_conflict_with_the_same_code(self):
+        self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        refusal = connections.TokenStateUnknown("token_state_unknown: the update of dev failed after the vault write began (OSError: disk full) and reading AG2_REMOTE_TOKEN_DEV back failed, so it is not known which secret it holds")
+        with mock.patch.object(connections, "update_token", side_effect=refusal):
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("token_state_unknown"))
+        self.assertNotIn("rotated", str(cm.exception))
 
     def test_every_coded_refusal_is_a_conflict_on_this_surface_too(self):
         """The same class answers CONFLICT here and 409 over HTTP: a rejected code (was -32602), a
