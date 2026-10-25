@@ -2501,10 +2501,16 @@ class StartSparrow(Base):
     def setUp(self):
         super().setUp()
         self.seen = self.home / "sparrow-seen"
-        # Stands in for ag2-sparrow: reports itself connected, records its env, stays up.
+        # Stands in for ag2-sparrow: takes the lock, reports itself connected, records its env,
+        # stays up.
+        lock = ('{"role": "gateway-bridge", "pid": %s, "host": "' + hatch_cli.workspace_lock._host_label()
+                + '", "workspace": "%s", "acquired_at": %s, "heartbeat_at": %s, "schema_version": 1}')
         executable(self.bin / hatch_cli.SPARROW_COMMAND,
                    '#!/bin/sh\necho "$REMOTE_HEALTH_COMMAND" > ' + str(self.seen) + "\n"
-                   'printf \'{"connected": true, "ts": %s, "error": null}\' "$(date +%s)" > '
+                   'mkdir -p "$AGENT_CONNECT_STATE_DIR/locks"\nnow=$(date +%s)\n'
+                   f"printf '{lock}' $$ \"$(dirname \"$AGENT_CONNECT_STATE_DIR\")\" $now $now > "
+                   '"$AGENT_CONNECT_STATE_DIR/locks/gateway-bridge.lock"\n'
+                   'printf \'{"connected": true, "ts": %s, "error": null}\' "$now" > '
                    '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
         for name, value in (("SPAWN_SETTLE_S", 0.3), ("START_WAIT_S", 5.0), ("STOP_WAIT_S", 5.0)):
             p = mock.patch.object(keepalive, name, value)
@@ -2639,19 +2645,114 @@ class StartSparrow(Base):
         self.assertEqual(old.wait(5), -signal.SIGTERM)
         self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
 
-    def test_keepawake_restarts_the_unit_that_runs_a_sparrow_from_before_the_send_lock(self):
-        log = self.home / "keepalive-probe.log"
-        with mock.patch.object(keepalive, "listener_up", return_value=True), \
-                mock.patch.object(keepalive, "unmanaged_health_problem", return_value=(None, None)), \
-                mock.patch.object(keepalive, "drain_predates_send_lock", return_value=4242), \
-                mock.patch.object(keepalive, "_unit_owner", return_value="ours"), \
-                mock.patch.object(keepalive, "restart_listener", return_value=(True, "unit")) as restart, \
-                mock.patch.object(keepalive, "replace_sparrow") as replace, \
-                mock.patch.object(keepalive, "_refresh_setup"), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(keepalive.keepawake({}, log), 0)
-        restart.assert_called_once()
-        replace.assert_not_called()
-        self.assertTrue(log.read_text().strip().endswith("restarted=1 reason=drain-predates-send-lock"))
+    def unit_successor(self, fake):
+        """What `systemctl restart` of our unit does: a new Sparrow, the unit's MainPID, takes the
+        lock and connects."""
+        proc = subprocess.Popen([str(self.bin / hatch_cli.SPARROW_COMMAND)],
+                                env={**py_env(self.home), "AGENT_CONNECT_STATE_DIR": str(self.state)})
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        threading.Thread(target=proc.wait, daemon=True).start()
+        fake.state, fake.main_pid = "active", proc.pid
+        return proc
+
+    def keepawake_unit(self, fake, on_restart=None):
+        want = keepalive.health_command(str(self.reply_stub))
+        with self.service(fake, on_restart=on_restart), \
+                mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop:
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        return r, line, stop
+
+    def restarted_unit(self, fake, before=None):
+        def restart(cmd):
+            fake.calls.append(cmd[1:])
+            if before:
+                before()
+            successor = self.unit_successor(fake)
+            self.successors.append(successor.pid)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.successors = []
+        return restart
+
+    def test_keepawake_stops_an_outside_legacy_holder_before_starting_the_inactive_unit(self):
+        # Reviewer's repro: an installed, inactive unit does not run the detached legacy holder.
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="inactive")
+        r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake))
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder is stopped first")
+        stop.assert_called_once()
+        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(hatch_cli.live_lock_holder(hatch_cli._lock_record(self.state, "")),
+                         self.successors[0], "the unit's new Sparrow owns the lock")
+
+    def test_keepawake_restarts_the_unit_that_runs_the_legacy_holder_in_place(self):
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+        r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake, before=old.terminate))
+        stop.assert_not_called()
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "systemd stopped its own MainPID")
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_reports_no_success_until_a_successor_owns_the_lock(self):
+        old, _rec = self.legacy()
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+        with mock.patch.object(keepalive, "START_WAIT_S", 1.0):
+            r, line, stop = self.keepawake_unit(fake, lambda cmd: subprocess.CompletedProcess(cmd, 0, "", ""))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no successor holds the lock", r.stderr)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+        self.done_with(old)
+
+    def test_replace_old_drain_fails_closed_wherever_the_unit_or_the_holder_is_unproven(self):
+        cfg = self.cfg()
+        for owner, props, stopped, restart, why in (
+                ("other", None, True, (True, ""), "hand-made unit"),
+                (keepalive.UNIT_UNREACHABLE, None, True, (True, ""), "did not answer"),
+                ("ours", None, True, (True, ""), "well-formed state"),
+                ("ours", {"ActiveState": "inactive", "MainPID": 0}, False, (True, ""), "was not stopped"),
+                ("ours", {"ActiveState": "inactive", "MainPID": 0}, True, (False, "restart failed"),
+                 "restart failed")):
+            with self.subTest(why), mock.patch.object(keepalive, "_unit_owner", return_value=owner), \
+                    mock.patch.object(hatch_cli, "_unit_props", return_value=props), \
+                    mock.patch.object(keepalive, "drain_predates_send_lock", return_value=4242), \
+                    mock.patch.object(keepalive, "_stop", return_value=stopped), \
+                    mock.patch.object(keepalive, "restart_listener", return_value=restart) as rl, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                ok, how = keepalive.replace_old_drain(cfg, 4242)
+            self.assertIs(ok, False)
+            self.assertIn(why, how)
+            if why != "restart failed":
+                rl.assert_not_called()
+
+    def test_keepawake_leaves_a_generation_that_rolled_before_its_action(self):
+        # Reviewer's probe: the selected legacy holder hands the lock to a live generation that
+        # declares protocol 3 between keepawake's choice and its action.
+        old, rec = self.legacy()
+        new = self.old_sparrow()  # writes its own canonical lock; rewritten below as declaring
+        self.lock_path().write_text(json.dumps(rec))
+        real, calls = keepalive.drain_predates_send_lock, []
+
+        def choose_then_roll(cfg, now=None):
+            picked = real(cfg, now)
+            if not calls:
+                self.lock_path().write_text(json.dumps({
+                    **rec, "pid": new.pid, "send_lock": delivery_destination.SEND_LOCK_PROTOCOL,
+                    "start": task_io.start_time(new.pid), "acquired_at": int(time.time())}))
+            calls.append(picked)
+            return picked
+        fake = FakeSystemd(state="active", main_pid=new.pid)
+        with mock.patch.object(keepalive, "drain_predates_send_lock", side_effect=choose_then_roll):
+            r, line, stop = self.keepawake_unit(fake)
+        self.assertEqual(calls[0], old.pid, "the legacy holder was selected")
+        stop.assert_not_called()
+        self.assertEqual(fake.ran("restart"), [], "the current generation is not restarted")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("left untouched", r.stdout)
+        self.assertTrue(line.endswith(" listener=up restarted=0 reason=drain-predates-send-lock"), line)
+        self.assertIsNone(old.poll())
+        self.assertIsNone(new.poll())
+        self.done_with(old)
+        self.done_with(new)
 
     def acquired(self, proc, ago):
         """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back by

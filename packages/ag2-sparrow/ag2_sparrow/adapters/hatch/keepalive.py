@@ -537,17 +537,23 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
     return _await_connected(state, instance, started if start else since)
 
 
+def _connected_since(state: Path, instance: str, since: "float | None") -> "tuple[bool, str]":
+    """Whether Sparrow reports running and connected (after `since`, when given), and its detail."""
+    code, detail = _cli.check_sparrow(state, instance=instance)
+    try:
+        ts = bounded_number(json.loads(_cli.sparrow_status_path(state, instance).read_text(
+            encoding="utf-8"))["ts"], 0, 1e11)
+    except (OSError, ValueError, KeyError, TypeError):
+        ts = None
+    return code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))), detail
+
+
 def _await_connected(state: Path, instance: str, since: "float | None") -> int:
     """0 once Sparrow reports running and connected (after `since`, when given), else 1."""
-    path = _cli.sparrow_status_path(state, instance)
     deadline = time.monotonic() + START_WAIT_S
     while True:
-        code, detail = _cli.check_sparrow(state, instance=instance)
-        try:
-            ts = bounded_number(json.loads(path.read_text(encoding="utf-8"))["ts"], 0, 1e11)
-        except (OSError, ValueError, KeyError, TypeError):
-            ts = None
-        if code == _cli.SPARROW_OK and (since is None or (ts is not None and ts >= int(since))):
+        ok, detail = _connected_since(state, instance, since)
+        if ok:
             print(f"sparrow: {detail}")
             return 0
         if time.monotonic() >= deadline:
@@ -555,6 +561,58 @@ def _await_connected(state: Path, instance: str, since: "float | None") -> int:
                   f"{detail}", file=sys.stderr)
             return 1
         time.sleep(0.5)
+
+
+def _await_successor(cfg: dict, old: int, since: float) -> "tuple[bool, str]":
+    """True once a live Sparrow other than `old` holds this workspace's lock and reports
+    connected after `since`; False after START_WAIT_S, saying what holds it."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    deadline = time.monotonic() + START_WAIT_S
+    while True:
+        holder = _cli.live_lock_holder(_cli._lock_record(state, instance))
+        connected, detail = _connected_since(state, instance, since)
+        if holder not in (None, old) and connected:
+            return True, f"Sparrow pid {holder} now holds the lock and is connected"
+        if time.monotonic() >= deadline:
+            return False, (f"no successor holds the lock and reports connected {START_WAIT_S:g}s "
+                           f"later (lock holder: {holder or 'none'}; {detail})")
+        time.sleep(0.5)
+
+
+def replace_old_drain(cfg: dict, old: int) -> "tuple[bool | None, str]":
+    """Replace `old`, the legacy drain keepawake selected, re-proving it at the action: None when
+    the lock no longer names it (the generation rolled: nothing is touched). The unit is
+    restarted in place only when it is active with `old` as its MainPID; otherwise `old` is an
+    outside holder, stopped through _stop's own proof first. True only once a successor holds
+    the lock and is connected."""
+    owner = _unit_owner()
+    if owner == "other":
+        return False, "a hand-made unit runs it; restart that unit"
+    if owner == UNIT_UNREACHABLE:
+        return False, f"{_cli.service_path()} is installed but systemctl --user did not answer; nothing was restarted"
+    props = _cli._unit_props() if owner == "ours" else None
+    if owner == "ours" and props is None:
+        return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
+                       "nothing was restarted")
+    since = time.time()
+    if drain_predates_send_lock(cfg) != old:
+        return None, f"the lock no longer names the legacy drain (pid {old}); it was left untouched"
+    runs_it = props is not None and props["ActiveState"] in ("active", "reloading") \
+        and props["MainPID"] == old
+    if runs_it:
+        ok, how = restart_listener(cfg)
+    elif owner == "ours":
+        print(f"replacing: Sparrow (pid {old}) predates the hold-line send lock and runs outside "
+              f"{_cli.SERVICE_NAME} (ActiveState={props['ActiveState']}, MainPID={props['MainPID']})")
+        if not _stop(cfg, old):
+            return False, f"the old Sparrow (pid {old}) was not stopped; the unit was not restarted"
+        ok, how = restart_listener(cfg)
+    else:
+        ok, how = replace_sparrow(cfg, old, "predates the hold-line send lock")
+    if not ok:
+        return False, how
+    ok, detail = _await_successor(cfg, old, since)
+    return ok, f"{how}; {detail}"
 
 
 def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
@@ -574,13 +632,12 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
         if reason == NO_HEALTH_COMMAND or old is not None:
             if old is not None:
                 reason = OLD_DRAIN
-                owner = _unit_owner()
-                ok, how = (restart_listener(cfg) if owner in ("ours", UNIT_UNREACHABLE) else
-                           (False, "a hand-made unit runs it; restart that unit") if owner else
-                           replace_sparrow(cfg, old, "predates the hold-line send lock"))
+                ok, how = replace_old_drain(cfg, old)
             else:
                 ok, how = replace_sparrow(cfg, pid)
-            if ok:
+            if ok is None:
+                print(f"not replaced: {how}")
+            elif ok:
                 restarted = 1
                 print(f"restarted: {how}")
             else:
