@@ -5601,10 +5601,29 @@ def _payload_room(payload) -> "str | None":
         return None
 
 
-def _proactive_item_id(stem: str, body: str) -> str:
-    """One item per file name and body: a new body under a delivered name is a new send. The
-    room and thread are left out, since they are re-resolved on every pass."""
-    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+def _proactive_item_id(stem: str, body: str, room: "str | None" = None, thread: "str | None" = None) -> str:
+    """One item per file name, body and the route the file itself names: a new body, or the same body
+    marked for another room or thread, is a new send. A default (owner) room and a task's thread are
+    left out, since they are re-resolved on every pass; an unmarked file keeps its original key."""
+    if room is None and thread is None:
+        return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+    key = json.dumps([body, room, thread], ensure_ascii=False)
+    return f"{stem}~r{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _marked_thread(text: str) -> "str | None":
+    """The valid `[thread: $root]` a proactive text names itself, or None."""
+    return next((a.value for a in parse_markers(text).actions if a.kind == "thread"), None)
+
+
+def _proactive_identity(stem: str, text: str) -> "tuple[str, str, str | None, str | None] | None":
+    """(item id, body, room, thread) a proactive text is sent as, or None when it sends nothing here."""
+    route, room, routed = _proactive_route(text)
+    body = routed.strip() if route == "send" else ""
+    if not body:
+        return None
+    thread = _marked_thread(text)
+    return _proactive_item_id(stem, body, room, thread), body, room, thread
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
@@ -5883,17 +5902,17 @@ def _park_generation(stem: str, data: bytes, state: str) -> "int | None | bool":
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    route, room_override, routed_body = _proactive_route(text)
-    body = routed_body.strip() if route == "send" else ""
-    if not body or state in ("DELIVERED", "QUEUED", "READY", "CLAIMED"):
-        return None
+    identity = _proactive_identity(stem, text)
+    if identity is None or state in ("DELIVERED", "QUEUED", "READY", "CLAIMED"):
+        return None  # nothing to send, or this generation's own item already owns it
+    item_id, body, room_override, _ = identity
     envelope = _proactive_envelope(f"{stem}.txt", text, room_override, body)
     if not envelope.get("room_id"):
         return False  # no destination resolved yet: retried
     copy = _park_intent_copy(stem, data)
     if copy is None:
         return False
-    root, item_id = _proactive_outbox_root(), _proactive_item_id(stem, body)
+    root = _proactive_outbox_root()
     try:
         outcome = publish_parked(root, item_id, json.dumps(envelope, sort_keys=True), _UNCONFIRMED,
                                  source_ready_sha256=source_digest(body))
@@ -5901,11 +5920,15 @@ def _park_generation(stem: str, data: bytes, state: str) -> "int | None | bool":
         _log_backoff(("proactive-park-generation", item_id), f"proactive {stem}: a changed generation "
                      f"could not be parked ({diagnostics.describe(e)}); retried")
         return False
-    if outcome is not BornParked.EXISTS:
-        _log_backoff(("proactive-parked-generation", item_id),
-                     f"proactive {stem}: a retained original changed after it was decided; its new bytes "
-                     f"were parked as {copy.name}, not sent. To send them: "
-                     f"{_proactive_requeue_command(root, item_id, hashlib.sha256(data).hexdigest())}")
+    if outcome is BornParked.EXISTS:  # another payload holds this identity: never this generation's park
+        _log_backoff(("proactive-park-generation", item_id),
+                     f"proactive {stem}: a changed generation's item {item_id} already holds another payload; "
+                     f"its bytes stay parked as {copy.name} and unrecorded until that item settles")
+        return False
+    _log_backoff(("proactive-parked-generation", item_id),
+                 f"proactive {stem}: a retained original changed after it was decided; its new bytes "
+                 f"were parked as {copy.name}, not sent. To send them: "
+                 f"{_proactive_requeue_command(root, item_id, hashlib.sha256(data).hexdigest())}")
     after = receipt(root, item_id)
     return after[1] if after[0] == "PARKED" else None
 
@@ -5969,10 +5992,10 @@ def _retained_item(retained: Path) -> "str | None":
     m = _DECIDED_RE.fullmatch(retained.name)
     data = _read_claim_bytes(retained) if m else None
     try:
-        route, _, body = _proactive_route(data.decode("utf-8")) if data is not None else ("", None, "")
+        identity = _proactive_identity(m.group("stem"), data.decode("utf-8")) if data is not None else None
     except UnicodeDecodeError:
         return None
-    return _proactive_item_id(m.group("stem"), body.strip()) if route == "send" and body.strip() else None
+    return identity[0] if identity else None
 
 
 def _owned(directory: Path, stem: str) -> "list[Path]":
@@ -6042,14 +6065,32 @@ def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None, int | None
     if data is None:
         return "unknown", None, None
     try:
-        route, _, body = _proactive_route(data.decode("utf-8"))
+        identity = _proactive_identity(stem, data.decode("utf-8"))
     except UnicodeDecodeError:
         return "unknown", None, None
     generation = hashlib.sha256(data).hexdigest()
-    if route != "send" or not body.strip():
+    if identity is None:
         return "absent", generation, None  # dropped, foreign or empty: the drain never made it an item
-    state, epoch = receipt(_proactive_outbox_root(), _proactive_item_id(stem, body.strip()))
+    item_id, body, room, thread = identity
+    state, epoch = receipt(_proactive_outbox_root(), item_id)
+    if state == "absent" and (room, thread) != (None, None):
+        state, epoch = _route_matched_legacy_receipt(stem, body, room, thread)
     return state, generation, epoch
+
+
+def _route_matched_legacy_receipt(stem: str, body: str, room, thread) -> "tuple[str, int | None]":
+    """A marked claim written before its route joined the item key: the body-only item counts only
+    when its stored payload names this exact room and thread, so a send there is never repeated."""
+    root, legacy = _proactive_outbox_root(), _proactive_item_id(stem, body)
+    state, epoch = receipt(root, legacy)
+    if state in ("absent", "unknown"):
+        return state, epoch
+    try:
+        stored = json.loads((read_item(root, legacy) or {}).get("payload") or "{}")
+    except ValueError:
+        return "unknown", None
+    same = (room is None or stored.get("room_id") == room) and (thread is None or stored.get("thread_root") == thread)
+    return (state, epoch) if same else ("absent", None)
 
 
 def _hand_back(claim: Path, original: Path) -> None:
@@ -6300,7 +6341,8 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         envelope = _proactive_envelope(f.name, claimed_text, room_override, body)
-        _send_proactive(claim, f, envelope, room_override is None, noticed)
+        _send_proactive(claim, f, envelope, room_override is None, noticed,
+                        item_id=_proactive_item_id(f.stem, body, room_override, _marked_thread(claimed_text)))
 
 
 def _proactive_envelope(name: str, text: str, room_override, body: str) -> dict:
@@ -6315,11 +6357,11 @@ def _proactive_envelope(name: str, text: str, room_override, body: str) -> dict:
             **({"task_id": about} if about else {})}
 
 
-def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
+def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set, *,
+                    item_id: str) -> None:
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = _proactive_item_id(f.stem, envelope["body"])
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()

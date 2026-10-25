@@ -1196,6 +1196,134 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
             lane.drain()
         self.assertEqual([p.get("body") for p in lane.posts].count("UNSENT B"), 1, "B is never lost")
 
+    ROOM_ONE, ROOM_TWO = "!RoomOne:ag2.space", "!RoomTwo:ag2.space"
+
+    def _routed(self, room: str) -> bytes:
+        return f"[channel: {room}]\nSAME BODY\n".encode()
+
+    def _item_for(self, room: "str | None", thread: "str | None" = None) -> str:
+        try:
+            return gb._proactive_item_id("proactive-1", "SAME BODY", room, thread)
+        except TypeError:  # a head whose item key leaves the route out
+            return gb._proactive_item_id("proactive-1", "SAME BODY")
+
+    def _release_digest(self, lane, item_id: str, raw: bytes):
+        run = self._requeue_by_cli(lane, item_id, raw)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        for _ in range(3):
+            lane.drain()
+
+    def test_the_same_body_routed_elsewhere_while_the_first_is_parked_is_its_own_parked_item(self):
+        """Two generations, one visible body, two [channel:] routes: each is its own PARKED item, and
+        releasing the second by its raw digest posts to the second room, once."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        one, two = self._routed(self.ROOM_ONE), self._routed(self.ROOM_TWO)
+        write(one)
+        lane.drain()
+        write(two)
+        lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._release_digest(lane, self._item_for(self.ROOM_TWO), two)
+        self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts], [(self.ROOM_TWO, "SAME BODY")],
+                         "released by RoomTwo's digest, posted to RoomTwo")
+        ids = {self._item_for(self.ROOM_ONE), self._item_for(self.ROOM_TWO)}
+        self.assertEqual(len(ids), 2, "distinct routes are distinct items")
+        self.assertEqual(outbox.receipt_state(root, self._item_for(self.ROOM_ONE)), "PARKED", "RoomOne stays parked")
+        self._one_item_end_to_end(root, self._item_for(self.ROOM_TWO))
+        lane.restart()
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(len(lane.posts), 1, "no repeat")
+
+    def test_the_same_body_routed_elsewhere_after_the_first_was_delivered_is_still_parked(self):
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        one, two = self._routed(self.ROOM_ONE), self._routed(self.ROOM_TWO)
+        write(one)
+        lane.drain()
+        self._release_digest(lane, self._item_for(self.ROOM_ONE), one)
+        self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts], [(self.ROOM_ONE, "SAME BODY")])
+        write(two)
+        for _ in range(6):
+            lane.drain()
+        self.assertEqual(len(lane.posts), 1, "RoomTwo is not sent automatically")
+        self.assertEqual([p for p in gb._owned(lane.results / "undelivered", "proactive-1") if p.read_bytes() == two]
+                         .__len__(), 1, "RoomTwo has its own parked copy")
+        self._release_digest(lane, self._item_for(self.ROOM_TWO), two)
+        self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts],
+                         [(self.ROOM_ONE, "SAME BODY"), (self.ROOM_TWO, "SAME BODY")], "each room once")
+        for room in (self.ROOM_ONE, self.ROOM_TWO):
+            self._one_item_end_to_end(root, self._item_for(room))
+
+    def _one_item_end_to_end(self, root, item_id: str) -> None:
+        """The item born PARKED is the one the release claimed, sent and marked DELIVERED: no body-only
+        item appeared beside it and no requeued item was left behind."""
+        self.assertEqual(outbox.receipt(root, item_id), ("DELIVERED", 1), f"{item_id} itself was delivered")
+        self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", "SAME BODY")), "absent",
+                         "no body-only item")
+        left = [i for i in outbox.list_items(root) if i.get("status") in ("QUEUED", "READY", "CLAIMED")]
+        self.assertEqual(left, [], "no orphaned requeued item")
+
+    def test_the_same_body_in_another_thread_is_its_own_parked_item(self):
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        one, two = b"[thread: $ThreadOne]\nSAME BODY\n", b"[thread: $ThreadTwo]\nSAME BODY\n"
+        write(one)
+        lane.drain()
+        write(two)
+        lane.drain()
+        self.assertEqual(lane.posts, [])
+        two_id = self._item_for(None, "$ThreadTwo")
+        self.assertNotEqual(two_id, self._item_for(None, "$ThreadOne"))
+        self._release_digest(lane, two_id, two)
+        self.assertEqual([(p.get("body"), p.get("thread_root") or p.get("thread")) for p in lane.posts],
+                         [("SAME BODY", "$ThreadTwo")], "posted once, in ThreadTwo")
+        self.assertEqual(outbox.receipt(root, two_id), ("DELIVERED", 1))
+        self.assertEqual(outbox.receipt_state(root, self._item_for(None, "$ThreadOne")), "PARKED")
+
+    def test_a_crash_after_parked_and_a_second_drainer_both_settle_through_already_parked(self):
+        """ALREADY_PARKED with this generation's exact key and payload is an idempotent success."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        two = self._routed(self.ROOM_TWO)
+        write(two)
+        real, outcomes = gb.publish_parked, []
+
+        def watch(*a, **k):
+            out = real(*a, **k)
+            outcomes.append(out)
+            return out
+        stack, fired = self._crash_once("before-commit")
+        with stack:
+            try:
+                lane.drain()
+            except Killed:
+                pass
+        with mock.patch.object(gb, "publish_parked", watch):
+            lane.drain()
+        self.assertEqual(outcomes, [outbox.BornParked.ALREADY_PARKED], "the retry settles through ALREADY_PARKED")
+        digest = __import__("hashlib").sha256(two).hexdigest()[:32]
+        self.assertEqual(len(list(lane.results.glob(f".proactive-1{gb._DECIDED_INFIX}{digest}-*"))), 1)
+        self._release_digest(lane, self._item_for(self.ROOM_TWO), two)
+        self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts], [(self.ROOM_TWO, "SAME BODY")])
+        self._one_item_end_to_end(root, self._item_for(self.ROOM_TWO))
+
+    def test_an_item_holding_another_payload_never_counts_as_this_generations_park(self):
+        """BornParked.EXISTS: the identity is taken by another payload, so this generation is not recorded."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        item = gb._proactive_item_id("proactive-1", "UNSENT B")
+        outbox.publish_parked(root, item, json.dumps({"body": "UNSENT B", "room_id": "!Elsewhere:ag2.space"}),
+                              "held")
+        write(b"UNSENT B\n")
+        for _ in range(2):
+            lane.drain()
+        digest = __import__("hashlib").sha256(b"UNSENT B\n").hexdigest()[:32]
+        self.assertEqual(list(lane.results.glob(f".proactive-1{gb._DECIDED_INFIX}{digest}-*")), [],
+                         "not recorded as parked")
+        self.assertEqual(lane.posts, [])
+
     def test_an_unchanged_retained_original_costs_a_drain_only_a_stat(self):
         lane = Lane(gb, scratch("gw-decided-cost-"))
         r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
