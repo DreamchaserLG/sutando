@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import stat
 import subprocess
 import sys
-import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +42,27 @@ class Crash(RuntimeError):
 
 class Killed(BaseException):
     """The process dies here: no handler in the code under test may absorb it."""
+
+
+class Blocked(BaseException):
+    """The deadline passed while the code under test was still blocked."""
+
+
+@contextlib.contextmanager
+def _deadline(seconds: float):
+    """Interrupt a blocked syscall in the main thread (coverage traces only that thread here)."""
+    def fire(*_):
+        raise Blocked()
+    old = signal.signal(signal.SIGALRM, fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+_LIMIT = getattr(gb, "_CLAIM_READ_LIMIT", 1 << 20)
 
 
 def _dead_pid() -> int:
@@ -360,14 +381,11 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
     def test_a_dead_owners_fifo_claim_never_wedges_the_restart(self):
         fifo = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
         os.mkfifo(fifo)
-        restart = threading.Thread(target=self.lane.restart, daemon=True)
-        restart.start()
-        restart.join(2.0)
-        wedged = restart.is_alive()
-        if wedged:  # supply a writer so the blocked reader returns and the suite can go on
-            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
-            restart.join(5.0)
-        self.assertFalse(wedged, "the restart blocked opening a FIFO claim")
+        try:
+            with _deadline(2.0):
+                self.lane.restart()
+        except Blocked:
+            self.fail("the restart blocked opening a FIFO claim")
         self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode), "kept as its claim for an operator")
         self.assertFalse((self.lane.results / "proactive-1.txt").exists())
 
@@ -458,72 +476,137 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual(self.lane.posts, [], "a PARKED send is never repeated")
 
 
-    def _open_fds(self) -> int:
-        return len(os.listdir("/dev/fd"))
+    def _bad_claim(self, make, fault=contextlib.nullcontext):
+        """The reader on one bad input: it returns "unknown" within a deadline, closes every
+        descriptor, reads at most the bound, and a real restart keeps the claim and its bytes."""
+        lane = Lane(gb, scratch("gw-claim-reader-"))
+        claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        after = make(lane.results, claim)
+        read = []
+        before = len(os.listdir("/dev/fd"))
+        try:
+            with _deadline(1.0), fault():
+                real_read = os.read  # the fault's, when it replaces os.read
 
-    def _read_unblocked(self, claim: Path, unblock=None):
-        """The reader's state, whether it blocked, and the fds it left open."""
-        got, before = [], self._open_fds()
-        reader = threading.Thread(target=lambda: got.append(gb._claim_receipt(claim, "proactive-1")[0]),
-                                  daemon=True)
-        reader.start()
-        reader.join(1.0)
-        blocked = reader.is_alive()
-        if blocked and unblock:
-            unblock()
-            reader.join(5.0)
-        return (got or [None])[0], blocked, self._open_fds() - before
+                def counted(fd, n):
+                    got = real_read(fd, n)
+                    read.append(len(got))
+                    return got
+                with mock.patch.object(os, "read", counted):
+                    state = gb._claim_receipt(claim, "proactive-1")[0]
+        except Blocked:
+            self.fail("the reader blocked")
+        self.assertEqual(state, "unknown", "fails closed")
+        self.assertEqual(len(os.listdir("/dev/fd")), before, "every branch closes its descriptor")
+        self.assertLessEqual(sum(read), _LIMIT + 1, "the read is bounded")
+        if callable(after):
+            after()
+        return lane, claim, read
 
-    def test_the_claim_reader_fails_closed_on_every_input_it_cannot_trust(self):
-        limit = getattr(gb, "_CLAIM_READ_LIMIT", 1 << 20)
+    def _restart_keeps(self, lane, claim):
+        try:
+            with _deadline(2.0):
+                lane.restart()
+        except Blocked:
+            self.fail("the restart blocked")
+        self.assertTrue(os.path.lexists(claim), "kept as its claim for an operator")
+        self.assertFalse((lane.results / "proactive-1.txt").exists(), "never handed back live")
+
+    def test_claim_reader_fifo_without_a_writer(self):
+        lane, claim, _ = self._bad_claim(lambda res, c: os.mkfifo(c))
+        self._restart_keeps(lane, claim)
+
+    def test_claim_reader_fifo_with_queued_bytes_consumes_none(self):
+        holder = []
+
+        def make(res, c):
+            os.mkfifo(c)
+            holder.append(os.open(c, os.O_RDWR | os.O_NONBLOCK))
+            os.write(holder[0], b"queued bytes")
+
+            def after():
+                self.assertEqual(os.read(holder[0], 64), b"queued bytes", "no byte was consumed")
+            return after
+        try:
+            self._bad_claim(make)
+        finally:
+            for fd in holder:
+                os.close(fd)
+
+    def test_claim_reader_directory(self):
+        lane, claim, read = self._bad_claim(lambda res, c: c.mkdir())
+        self.assertEqual(read, [], "nothing is read")
+        self._restart_keeps(lane, claim)
+
+    def test_claim_reader_device(self):
         real_fstat = os.fstat
 
         def as_device(fd):
             st = list(real_fstat(fd))
             st[0] = stat.S_IFCHR | 0o600
             return os.stat_result(st)
+        _, _, read = self._bad_claim(lambda res, c: c.write_text("never sent\n"),
+                                     lambda: mock.patch.object(os, "fstat", as_device))
+        self.assertEqual(read, [], "nothing is read")
 
-        def make(res, case):
-            claim = res / f"proactive-1.sending.{_dead_pid()}.{case}"
-            if case.startswith("fifo"):
-                os.mkfifo(claim)
-            elif case == "directory":
-                claim.mkdir()
-            elif case == "symlink":
-                (res / "elsewhere").write_text("delivered\n")
-                claim.symlink_to(res / "elsewhere")
-            elif case == "oversized":
-                claim.write_bytes(b"x" * (limit + 1))
-            else:
-                claim.write_text("never sent\n")
-            return claim
+    def test_claim_reader_symlink_to_a_regular_file_leaves_the_target_untouched(self):
+        def make(res, c):
+            target = res / "elsewhere"
+            target.write_text("never sent\n")
+            mtime = target.stat().st_mtime_ns
+            c.symlink_to(target)
+            return lambda: self.assertEqual((target.read_text(), target.stat().st_mtime_ns), ("never sent\n", mtime))
+        lane, claim, read = self._bad_claim(make)
+        self.assertEqual(read, [], "nothing is read")
+        self._restart_keeps(lane, claim)
 
-        for case in ("fifo", "fifo-with-bytes", "directory", "device", "symlink", "oversized", "read-error"):
-            with self.subTest(case=case):
-                lane = Lane(gb, scratch("gw-claim-reader-"))  # each case alone: a failed one leaves no FIFO behind
-                res = lane.results
-                claim = make(res, case)
-                holder = []
-                if case == "fifo-with-bytes":
-                    holder.append(os.open(claim, os.O_RDWR | os.O_NONBLOCK))
-                    os.write(holder[0], b"queued bytes")
-                unblock = {"fifo": lambda c=claim: os.close(os.open(c, os.O_WRONLY | os.O_NONBLOCK)),
-                           "fifo-with-bytes": lambda: os.close(holder.pop())}.get(case)
-                fault = (mock.patch.object(os, "fstat", as_device) if case == "device"
-                         else mock.patch.object(os, "read", side_effect=OSError(5, "Input/output error"))
-                         if case == "read-error" else contextlib.nullcontext())
-                with fault:
-                    state, blocked, leaked = self._read_unblocked(claim, unblock)
-                self.assertFalse(blocked, "the reader blocked")
-                self.assertEqual(state, "unknown", "fails closed")
-                self.assertEqual(leaked, 0, "every branch closes its descriptor")
-                if holder:
-                    self.assertEqual(os.read(holder[0], 64), b"queued bytes", "no byte was consumed")
-                    os.close(holder.pop())
-                if case not in ("device", "read-error", "fifo", "fifo-with-bytes"):
-                    lane.restart()
-                    self.assertTrue(os.path.lexists(claim), "kept as its claim for an operator")
-                    self.assertFalse((res / "proactive-1.txt").exists(), "never handed back live")
+    def test_claim_reader_symlink_to_a_fifo_leaves_its_writer_and_bytes_untouched(self):
+        holder = []
+
+        def make(res, c):
+            target = res / "elsewhere.fifo"
+            os.mkfifo(target)
+            holder.append(os.open(target, os.O_RDWR | os.O_NONBLOCK))
+            os.write(holder[0], b"writer bytes")
+            c.symlink_to(target)
+
+            def after():
+                self.assertEqual(os.read(holder[0], 64), b"writer bytes", "the writer's bytes are untouched")
+                os.write(holder[0], b"still open")  # the writer end is intact
+                self.assertEqual(os.read(holder[0], 64), b"still open")
+            return after
+        try:
+            lane, claim, _ = self._bad_claim(make)
+            self._restart_keeps(lane, claim)
+        finally:
+            for fd in holder:
+                os.close(fd)
+
+    def test_claim_reader_oversized_consumes_nothing(self):
+        lane, claim, read = self._bad_claim(lambda res, c: c.write_bytes(b"x" * (_LIMIT + 1)))
+        self.assertEqual(read, [], "refused from fstat() before any read")
+        self._restart_keeps(lane, claim)
+
+    def test_claim_reader_bounds_a_file_that_grew_after_fstat(self):
+        real_fstat = os.fstat
+
+        def stale(fd):
+            st = list(real_fstat(fd))
+            st[6] = 12  # st_size as fstat() saw it before the file grew
+            return os.stat_result(st)
+        _, _, read = self._bad_claim(lambda res, c: c.write_bytes(b"x" * (_LIMIT + 4096)),
+                                     lambda: mock.patch.object(os, "fstat", stale))
+        self.assertEqual(sum(read), _LIMIT + 1, "reads exactly one byte past the bound, then stops")
+
+    def test_claim_reader_read_error(self):
+        def failing(*a):
+            raise OSError(5, "Input/output error")
+        self._bad_claim(lambda res, c: c.write_text("never sent\n"),
+                        lambda: mock.patch.object(os, "read", failing))
+
+    def test_claim_reader_without_a_no_follow_primitive(self):
+        self._bad_claim(lambda res, c: c.write_text("never sent\n"),
+                        lambda: mock.patch.object(os, "O_NOFOLLOW", 0))
 
     def _b_survives(self, lane, a_body: str) -> None:
         """B was never sent, so it is neither archived as delivered nor lost; A is never resent."""
@@ -535,9 +618,8 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         archived = [p.read_text() for p in (lane.results / "archive").glob("proactive-1*")]
         self.assertEqual(archived.count("UNSENT B\n"), bodies.count("UNSENT B"), "B archived unsent")
         self.assertNotIn(a_body, bodies, "A is never resent")
-        kept = [p.read_text() for p in list(lane.results.glob("proactive-1*")) + list(lane.results.glob(".proactive-1*"))
-                + list((lane.results / "undelivered").glob("proactive-1*")) if p.is_file()]
-        self.assertTrue(bodies.count("UNSENT B") == 1 or "UNSENT B\n" in kept, f"B was lost ({bodies}, {kept})")
+        self.assertEqual(bodies.count("UNSENT B"), 1, f"B stayed eligible and was sent once ({bodies})")
+        self.assertFalse(any((lane.results / "undelivered").glob("proactive-1*")), "B was never parked")
 
     def test_a_replacement_at_every_durable_boundary_is_neither_archived_unsent_nor_lost(self):
         faults = (("stage", "crash-after"), ("stage", "fail"), ("stage", "replace-at-target"),
@@ -589,6 +671,13 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                     if fault == "fail" and boundary == "rollback":
                         self.assertTrue(any("changed after its receipt was read" in m for m in logs),
                                         f"an un-neutralized rollback is reported ({logs})")
+                    outside = [p.name for p in list(lane.results.glob(".proactive-1*"))
+                               + list((lane.results / "archive").glob("proactive-1*"))
+                               + list((lane.results / "undelivered").glob("proactive-1*"))
+                               if "UNSENT B" in p.read_text()]
+                    self.assertEqual(outside, [], "B is only ever under a claim name, which no delivered scanner reads")
+                    with mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", lane.results / "archive"):
+                        self.assertFalse(gb._delivered_copy_exists("proactive-1"))
                     dead = _dead_pid()
                     for c in lane.results.glob("proactive-1.sending.*"):  # its owner died
                         rest = c.name.split(".sending.", 1)[1].split(".", 1)

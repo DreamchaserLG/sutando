@@ -184,6 +184,10 @@ class ReceiptState(unittest.TestCase):
                     self.assertEqual(mod.receipt(root, "proactive-1"), ("QUEUED", None), f"epoch {bad!r}")
                 mod._item_path(root, "proactive-1").write_text('{"status": "QUEU')
                 self.assertEqual(mod.receipt(root, "proactive-1"), ("unknown", None))
+                path = mod._item_path(root, "proactive-1")
+                path.unlink()
+                os.mkfifo(path)  # O_NONBLOCK opens it at once, so no deadline is needed in-process
+                self.assertEqual(mod.receipt(root, "proactive-1"), ("unknown", None))
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
