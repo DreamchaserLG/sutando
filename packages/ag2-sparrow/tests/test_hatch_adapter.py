@@ -4742,6 +4742,43 @@ class Hold(Base):
         self.assertFalse(self.notice.exists())
         self.assertIsNone(task_hold.read(self.results, self.TID))
 
+    def test_hold_finds_a_hold_a_peer_placed_while_it_waited_for_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def peer_holds_first(*a, **k):
+            with real(*a, **k):
+                task_hold.place(self.results, self.TID, task_hold.OWNER_GO)
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", peer_holds_first):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertIn("already held", r.stdout)
+        self.assertFalse(self.notice.exists(), "the peer's hold posts nothing here")
+
+    def test_hold_reports_a_marker_it_cannot_read_under_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def marker_breaks(*a, **k):
+            with real(*a, **k), mock.patch.object(task_hold, "read", side_effect=ValueError("bad marker")):
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", marker_breaks):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("bad marker", r.stderr)
+        self.assertFalse(self.notice.exists())
+
+    def test_reply_after_the_line_was_delivered_says_it_was_already_posted(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("was already posted before this answer", self.reply_now().stderr)
+
     def test_hold_refuses_when_the_drain_is_swapped_after_the_line_is_queued(self):
         self.add_task(self.TID, "$ev1")
         lock = self.home / "state" / "locks" / "gateway-bridge.lock"
