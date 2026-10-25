@@ -23,11 +23,17 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from policy import sandbox_runner as sr  # noqa: E402
 from policy import guardrail  # noqa: E402
+
 
 
 
@@ -182,7 +188,7 @@ class Invocations(unittest.TestCase):
                        check=True, capture_output=True)
         out = subprocess.run(
             [sys.executable, "-c", "from ag2_sparrow import sandbox_runner as s; print(s.context_preamble())"],
-            env=dict(os.environ, PYTHONPATH=str(pyz)), cwd="/", capture_output=True, text=True)
+            env=isolated_child_env(PYTHONPATH=str(pyz)), cwd="/", capture_output=True, text=True)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(sr.FAQ_PATH.read_text().strip(), out.stdout)
 
@@ -217,7 +223,7 @@ class Invocations(unittest.TestCase):
         fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         home = Path(tempfile.mkdtemp())
         line = sr.shell_command(sr.RUNNERS["claude"], '"hello world"', out_path=str(out))
-        env = dict(os.environ, PATH=f"{bindir}:{os.environ.get('PATH', '')}", HOME=str(home))
+        env = isolated_child_env(PATH=f"{bindir}:{os.environ.get('PATH', '')}", HOME=str(home))
         rc = subprocess.run(["bash", "-c", line], env=env, cwd=REPO).returncode
         self.assertEqual(rc, 7, "the runner's exit code reaches the core")
         got = out.read_text().splitlines()
