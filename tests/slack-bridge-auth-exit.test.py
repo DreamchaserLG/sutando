@@ -42,7 +42,11 @@ sys.modules.update({"slack_bolt": _bolt, "slack_bolt.adapter": _adapter,
                     "slack_bolt.adapter.socket_mode": _socket})
 
 os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp()
-os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp()
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-slack-authexit-")
+os.environ.pop("CLAUDE_HOME", None)
+_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_cfg.mkdir(parents=True, exist_ok=True)
+(_cfg / "access.json").write_text('{"allowFrom": []}', encoding="utf-8")
 os.environ["SUTANDO_TEST_MODE"] = "1"
 os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
 os.environ["SLACK_APP_TOKEN"] = "xapp-test-not-real"
