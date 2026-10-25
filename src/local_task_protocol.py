@@ -178,6 +178,8 @@ KNOWN_HEADER_KEYS = (
     # them, and the guard defangs forged body copies of the same names.
     "thread_ts", "reply_thread_ts", "reply_to_event", "reply_to_me", "reply_to_sender",
     "addressed_to", "callSid", "caller",
+    # The relay's judgement of a voice task: quick or long; the core dispatches on it.
+    "lane",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -221,6 +223,8 @@ KNOWN_HEADER_KEYS = (
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
+    "local_time",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -335,6 +339,17 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
                 return None, text
             reply = {"sender": sender, "body": body, "label": m.group(2).strip() or None}
     return (reply, rest) if reply is not None else (None, text)
+
+
+def reply_action_text(text: str) -> str:
+    """The answer after broker context and the leading Matrix reply quote."""
+    body = split_reply_context(text)[1].lstrip()
+    # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not (line.startswith(("> ", ">\t")) or line.rstrip("\r") == ">"):
+            return "\n".join(lines[i:]).strip()
+    return ""
 
 
 def parse_task_headers(text: str) -> TaskHeaders:
@@ -710,10 +725,9 @@ def index_result_candidates(results_dir: Path, task_ids) -> dict[str, list[Path]
                 if not name.endswith(".txt"):
                     continue
                 stem = name[:-4]
-                if stem in wanted:
-                    if e.is_file():
-                        out[stem].append(directory / name)
-                    continue
+                # One file can be one id's exact result AND another queued id's epoch re-archive.
+                if stem in wanted and e.is_file():
+                    out[stem].append(directory / name)
                 if epoch_forms:
                     cut = stem.rfind("-")
                     if cut > 0 and stem[:cut] in wanted and _EPOCH_SUFFIX_RE.match(stem[cut + 1:]) and e.is_file():
@@ -871,6 +885,51 @@ def _has_task_line(path: Path) -> bool:
                    path.read_text(errors="replace").split("\n"))
     except OSError:
         return False
+
+
+# ── Owner-local time (the `local_time:` header) ──────────────────────────────
+
+def host_zone_name(localtime_path: str = "/etc/localtime") -> "str | None":
+    """IANA zone of this host: `TZ` when it names one, else the `/etc/localtime`
+    symlink target below a `zoneinfo*/` directory; None when neither loads."""
+    from zoneinfo import ZoneInfo
+    candidates = [os.environ.get("TZ", "").lstrip(":")]
+    for resolve in (os.readlink, os.path.realpath):
+        try:
+            m = re.search(r"/zoneinfo[^/]*/(.+)$", resolve(localtime_path))
+        except OSError:
+            continue
+        if m:
+            candidates.append(m.group(1))
+    for name in candidates:
+        if not name or name.startswith("/"):
+            continue
+        try:
+            ZoneInfo(name)
+        except Exception:
+            continue
+        return name
+    return None
+
+
+def local_time_value(now=None, zone: "str | None" = None) -> str:
+    """`2026-10-08T13:35:44-07:00 America/Los_Angeles`; the bare offset form when
+    no zone resolves. `now` is an aware datetime (default: the current instant)."""
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    if now is None:
+        now = datetime.now(timezone.utc)
+    name = zone or host_zone_name()
+    local = None
+    if name:
+        try:
+            local = now.astimezone(ZoneInfo(name))
+        except Exception:
+            name = None
+    if local is None:
+        local = now.astimezone()
+    stamp = local.replace(microsecond=0).isoformat()
+    return f"{stamp} {name}" if name else stamp
 
 
 # ── Write side (task-last, the convergence shape) ────────────────────────────
