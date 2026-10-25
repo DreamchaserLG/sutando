@@ -3011,10 +3011,15 @@ class StartSparrow(Base):
 
     def test_keepawake_takes_success_only_from_the_lock_holders_own_status_after_the_action(self):
         # Negative controls beside the probe; the legitimate successor is the positive one.
+        script = self.home / "successor" / hatch_cli.SPARROW_COMMAND
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("import time\ntime.sleep(30)\n")
+
         def sparrow_successor():
-            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            argv = [sys.executable, str(script)]  # Sparrow's command line, in /proc and ps alike
+            proc = subprocess.Popen(argv)
             self.addCleanup(lambda: proc.poll() is None and proc.kill())
-            self.argvs[proc.pid] = [sys.executable, str(self.bin / hatch_cli.SPARROW_COMMAND)]
+            self.argvs[proc.pid] = argv
             return proc, task_io.start_time(proc.pid)
         cases = {
             "a status naming another process": lambda p, st: dict(pid=p + 1, start=st, written_at=time.time()),
