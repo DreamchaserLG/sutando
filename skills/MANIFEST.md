@@ -189,8 +189,9 @@ skill already linked on a host without the opt-in is left in place with a note; 
 it. `skills/refresh-skill.sh` only refreshes links that already exist, so it needs no check.
 
 Runtime scans (`tools`, `hooks`, `claude_plugin`, `supervised_worker`,
-`pending_questions_store`, `documented_for_core`, `on_launch`) read `<repo>/skills` directly, past the
-installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
+`pending_questions_store`, `documented_for_core`, `on_launch`) read the skill roots themselves
+(`<repo>/skills` and `<workspace>/skills`; see `src/skill_roots.py`), past
+the installers, so `scripts/lint-skill.py` refuses those fields on a developer-only skill.
 
 ## Launch hook (`on_launch`)
 
