@@ -1834,6 +1834,9 @@ for _old, _new in _FOUND.deprecated:
               file=sys.stderr, flush=True)
 if _FOUND.token_source == "file":
     _announce_file_token(_FOUND.source_file, _FOUND.source_file_values)
+elif _FOUND.token_source == "token_file":
+    print(f"[remote-gateway-bridge] token loaded from REMOTE_TASK_TOKEN_FILE {_FOUND.token_file}",
+          file=sys.stderr, flush=True)
 elif _FOUND.token_source == "vault":
     _announce_vault_token()
 _RAW, TOKEN, URL = _FOUND.raw, _FOUND.token, _FOUND.url
