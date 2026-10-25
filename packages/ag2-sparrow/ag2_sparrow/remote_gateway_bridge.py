@@ -21,6 +21,8 @@ Full spec: docs/remote-gateway-protocol.md
                "capabilities": ["voice-outcome-v1"], "dm_only": false}  → 200 on accepted
   POST {REMOTE_TASK_URL}/v1/heartbeat
        → body {"client": "...", "inflight": N, ...}  → 200 on accepted
+  GET  {REMOTE_TASK_URL}/v1/setup
+       → 200 the agent's own agent.setup.steps result (when a heartbeat announces a new revision)
 
 Each task object uses the same schema Sutando's other bridges write, so this
 client just serializes it to `tasks/task-<id>.txt` and the core handles it like
@@ -82,8 +84,10 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-# Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
-# publishes AAAA records, but some hosts have IPv6 black-holed at the network
+from .dotspace import NO_FETCH as _NO_FETCH, dotspace_for as _dotspace_for
+
+# Prefer IPv4 for connections to any DotSpace gateway/relay (e.g. chat.ag2.space): they
+# publish AAAA records, but some hosts have IPv6 black-holed at the network
 _DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
 _PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
 # Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
@@ -274,6 +278,13 @@ def _is_ip_literal(host):
     return False
 
 
+def _prefer_v4_for(host) -> bool:
+    """Whether `host` (str or bytes) is a DotSpace host whose instance asks for IPv4 first."""
+    name = host.decode("ascii", "replace") if isinstance(host, bytes) else str(host)
+    d = _dotspace_for(name, fetch=_NO_FETCH)
+    return bool(d.operator and d.prefer_ipv4)
+
+
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
     try:
         infos = _resolve_bounded(host, *args, **kwargs)
@@ -290,7 +301,7 @@ def _getaddrinfo_prefer_v4(host, *args, **kwargs):
         for ip in ips:
             # A literal IP never touches DNS: this only shapes the tuples.
             infos.extend(_orig_getaddrinfo(ip, *args, **kwargs))
-    if _PREFER_V4 and host and "ag2.space" in str(host):
+    if _PREFER_V4 and host and _prefer_v4_for(host):
         v4 = [i for i in infos if i[0] == socket.AF_INET]
         return v4 or infos
     return infos
@@ -306,12 +317,13 @@ from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
-               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations)
+               gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
+               setup_fetch)
 from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
-from .proactive_routing import about_task, proactive_filename
+from .proactive_routing import PROACTIVE_OUTBOX_DIRNAME, about_task, proactive_filename, proactive_item_id
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -1860,6 +1872,7 @@ OWNER_DM_UPGRADED_NOTIFY: Callable[[str, str], None] | None = None
 # Host-injected task_id -> veto reason or None, asked right before a message about that task
 # is sent; None (standalone default) checks only the task's own result.
 PROACTIVE_DISPATCH_GATE: Callable[[str], "str | None"] | None = None
+PROACTIVE_ROUTE_GATE: Callable[[str, str, "str | None"], "str | None"] | None = None
 # Routing state belongs to the gateway (owner 2026-09-07): the agent row's owner_dm_room is read at
 # connect and on a slow cadence and kept while offline; the pinned room is bootstrap, never authority.
 _ROUTING: dict = {"owner_dm": "", "persisted": "", "identity": "", "gateway": "", "next": 0.0,
@@ -3635,6 +3648,7 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
+        _refresh_served_setup(reply)
         return True
     except urllib.error.HTTPError as e:
         if e.code in (404, 405):
@@ -3675,6 +3689,27 @@ def _record_setup_hint(reply) -> None:
         return
     if not _durable_write(SETUP_HINT_FILE, text):
         _log("setup hint not recorded")
+
+
+_SETUP_REFRESHER: "setup_fetch.Refresher | None" = None
+
+
+def _refresh_served_setup(reply) -> None:
+    """Fetch the served setup when the reply announces a revision Sparrow does not hold; never
+    raises, and a failed fetch keeps the last good copy (setup_fetch.Refresher)."""
+    global _SETUP_REFRESHER
+    if not isinstance(reply, dict):
+        return
+    if _SETUP_REFRESHER is None:
+        _SETUP_REFRESHER = setup_fetch.Refresher(
+            lambda path, t: _req("GET", path, timeout=t, deadline=time.monotonic() + t),
+            _durable_write, _STATE, GATEWAY_INSTANCE, log=_log, gateway_url=URL)
+    try:
+        agent = _reenroll_identity()
+    except Exception as e:  # noqa: BLE001 - an unread identity only skips the agent_mxid check
+        _log(f"served setup: identity unread ({diagnostics.describe(e)})")
+        agent = ""
+    _SETUP_REFRESHER.maybe_refresh(diagnostics.revision_field(reply.get("setup_revision"), URL), agent)
 
 
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
@@ -5602,13 +5637,7 @@ def _payload_room(payload) -> "str | None":
 
 
 def _proactive_item_id(stem: str, body: str, room: "str | None" = None, thread: "str | None" = None) -> str:
-    """One item per file name, body and the route the file itself names: a new body, or the same body
-    marked for another room or thread, is a new send. A default (owner) room and a task's thread are
-    left out, since they are re-resolved on every pass; an unmarked file keeps its original key."""
-    if room is None and thread is None:
-        return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
-    key = json.dumps([body, room, thread], ensure_ascii=False)
-    return f"{stem}~r{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
+    return proactive_item_id(stem, body, room, thread)
 
 
 def _marked_thread(text: str) -> "str | None":
@@ -5633,7 +5662,7 @@ def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
 
 
 def _proactive_outbox_root() -> Path:
-    return RESULTS_DIR / ".outbox-ag2space-proactive"
+    return RESULTS_DIR / PROACTIVE_OUTBOX_DIRNAME
 
 
 def _record_proactive_receipt(item_id: str, event_id: str) -> None:
@@ -5678,17 +5707,19 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
     """Asked by the outbox right before the send: a message about a task that has been
     answered, has ended, waits on the owner or is being cancelled is withdrawn."""
     try:
-        tid = json.loads(payload.decode("utf-8")).get("task_id")
+        env = json.loads(payload.decode("utf-8"))
+        tid = env.get("task_id")
     except (UnicodeDecodeError, ValueError, AttributeError):
         return None
     if not tid:
         return None
     if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
         return "the task has been answered"
-    if PROACTIVE_DISPATCH_GATE is None:
-        return None
     try:
-        return PROACTIVE_DISPATCH_GATE(tid)
+        veto = PROACTIVE_DISPATCH_GATE(tid) if PROACTIVE_DISPATCH_GATE is not None else None
+        if veto is None and PROACTIVE_ROUTE_GATE is not None:
+            veto = PROACTIVE_ROUTE_GATE(tid, env.get("room_id"), env.get("thread_root"))
+        return veto
     except Exception as exc:  # noqa: BLE001 - an unchecked task is never messaged
         return f"the task could not be checked ({diagnostics.describe(exc)})"
 

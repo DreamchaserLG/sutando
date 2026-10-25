@@ -174,6 +174,7 @@ def restore_by_generation() -> None:
 def gate_unreadable_task() -> None:
     ws = Path(tempfile.mkdtemp(dir=ISO))
     (ws / "tasks" / "task-unreadable.txt").mkdir(parents=True)
+    (ws / "tasks" / "task-1.txt").write_text("id: task-1\ntask: hi\n", encoding="utf-8")
     check(proactive_dispatch_gate.dispatch_veto("task-1", ws) is None, "an unreadable task file is skipped")
 
 
@@ -268,6 +269,16 @@ def bridge_edges() -> None:
         gb.undelivered_quarantine.rename_noreplace = real_noreplace
     check(any("could not be handed back" in m for m in lane.logs), "a failed hand-back is logged loudly")
     check(gb._payload_room("not json") is None, "an unreadable stored payload names no room")
+
+    lane = pl.Lane(gb, ISO, refuse(429))
+    lane.write("proactive-torn.txt", "nudge\n")
+    lane.drain()
+    [torn] = lane.items()
+    src_outbox._item_path(lane.results / ".outbox-ag2space-proactive", torn["item_id"]).write_text('{"payl')
+    lane.drain()
+    check(len(lane.posts) == 1 and lane.where("proactive-torn") == "undelivered",
+          f"an item record corrupt before the pass is parked, not sent again ({len(lane.posts)} POSTs, "
+          f"{lane.where('proactive-torn')})")
 
     lane = pl.Lane(gb, ISO, refuse(429))
     lane.write("proactive-moved.txt", "nudge\n")
