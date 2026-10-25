@@ -3372,6 +3372,7 @@ class StartSparrow(Base):
                     t.join(10)
                 self.assertFalse(t.is_alive(), "the reread blocked")
                 kill.assert_not_called()
+                self.assertIsNone(old.poll(), "nor signalled through a handle")
         self.lock_path().unlink()
         for began in (rec["acquired_at"], rec["acquired_at"] - 30):  # same second, and earlier
             with self.subTest(began=began):
@@ -3424,9 +3425,11 @@ class StartSparrow(Base):
                 self.lock_path().write_text(json.dumps({**rec, "acquired_at": acquired}))
                 self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid,
                                                          hatch_cli._lock_record(self.state, "")))
-                with mock.patch.object(keepalive.os, "kill", side_effect=ProcessLookupError) as kill:
+                with mock.patch.object(keepalive, "_stop", return_value=True) as stop:
                     self.assertTrue(keepalive.stop_holder(self.cfg(), old.pid))
-                kill.assert_called_once_with(old.pid, signal.SIGTERM)
+                stop.assert_called_once()
+                self.assertEqual(stop.call_args.args[0], old.pid)
+                self.assertIsNotNone(stop.call_args.args[1], "signalled through the handle")
         want = keepalive.health_command(str(self.reply_stub))
         with mock.patch.object(keepalive, "stop_holder", wraps=keepalive.stop_holder) as stop:
             r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
