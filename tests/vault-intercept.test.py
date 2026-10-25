@@ -133,6 +133,24 @@ class TestHermeticManifest(unittest.TestCase):
         self.assertEqual(before, after, f"suite wrote the real manifest at {real}")
 
 
+class TestLookupVaultKey(unittest.TestCase):
+    """Only errSecItemNotFound reads as absent; any other failure raises, never None."""
+
+    def test_present_absent_and_unreadable(self):
+        found = MagicMock(returncode=0, stdout=b"sk-value\n")
+        with patch("vault_intercept.subprocess.run", return_value=found):
+            self.assertEqual(vault_intercept.lookup_vault_key("K"), "sk-value")
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=44, stdout=b"")):
+            self.assertIsNone(vault_intercept.lookup_vault_key("K"))
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=51, stdout=b"")):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
+        import subprocess
+        with patch("vault_intercept.subprocess.run", side_effect=subprocess.TimeoutExpired("security", 5)):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
+
+
 class TestNoVaultCommands(unittest.TestCase):
     def test_empty_string(self):
         result = intercept_vault_commands("")

@@ -215,6 +215,25 @@ def get_vault_key(key: str) -> str:
     return result.stdout.decode().strip()
 
 
+def lookup_vault_key(key: str) -> str | None:
+    """The secret under `key`, or None only when Keychain reports the item absent. A read that
+    times out or fails any other way raises RuntimeError: a caller replacing a secret must not
+    take an unreadable one for an absent one."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+            capture_output=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"vault: key '{key}' not read — security gave no answer "
+                           f"within {_KEYCHAIN_READ_TIMEOUT_S}s") from None
+    if result.returncode == _ERRSEC_ITEM_NOT_FOUND:
+        return None
+    if result.returncode != 0:
+        raise RuntimeError(f"vault: key '{key}' not read (rc={result.returncode})")
+    return result.stdout.decode().strip()
+
+
 # Keys double as env-var names via the `env` verb / get_vault_key consumers, so
 # the public setter holds them to env-var-safe naming (the chat-interception
 # path has its own, looser matching + FP guards above).

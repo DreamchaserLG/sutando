@@ -51,6 +51,8 @@ Python API (bridge/supervisor import this directly):
     heartbeat("gateway-bridge")          # call ~every 30s while holding
     release("gateway-bridge")            # on shutdown
     retain("gateway-bridge")             # exiting but keep the role until stale
+    read_lease("gateway-bridge")         # the holder record; LeaseIndeterminate if malformed
+    lease_process(holder)                # its pid only when proven to be the writer, else 0/raise
 
 CLI (bash consumers, e.g. supervisor):
     workspace_lock.py acquire   --role R [--workspace W] [--stale-seconds N]
@@ -327,6 +329,71 @@ def retain(role: str, workspace: Path | str | None = None) -> bool:
         holder["retained"] = True
         _write_atomic(path, holder)
         return True
+
+
+class LeaseIndeterminate(Exception):
+    """A lease file exists but does not show which process holds the role."""
+
+
+def read_lease(role: str, workspace: Path | str | None = None) -> dict | None:
+    """The lease as its holder wrote it; None only when no lease file exists. Unlike `acquire`,
+    which takes a corrupt lease as free, an unreadable or malformed one is LeaseIndeterminate."""
+    ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
+    path = _lock_path(ws, role)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise LeaseIndeterminate(f"{path.name} is unreadable ({type(e).__name__})") from None
+    try:
+        holder = json.loads(text)
+    except ValueError:
+        raise LeaseIndeterminate(f"{path.name} is not a lease record") from None
+    if not isinstance(holder, dict):
+        raise LeaseIndeterminate(f"{path.name} is not a lease record")
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise LeaseIndeterminate(f"{path.name} names no valid pid")
+    if not isinstance(holder.get("host"), str) or not holder["host"]:
+        raise LeaseIndeterminate(f"{path.name} names no host")
+    return holder
+
+
+def lease_is_live(holder: dict, stale_seconds: int = DEFAULT_STALE_SECONDS) -> bool:
+    """Whether `acquire` would defer to `holder` rather than take the role."""
+    return _is_fresh(holder, stale_seconds) and not _holder_is_dead(holder, _host_label())
+
+
+def lease_process(holder: dict) -> int:
+    """The holder's pid when that process provably wrote the lease (this host, same `proc_start`),
+    0 when it provably no longer runs, else LeaseIndeterminate: never a pid that is not proven."""
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        raise LeaseIndeterminate("the lease names no valid pid")
+    if holder.get("host") != _host_label():
+        raise LeaseIndeterminate(f"the lease is held on host {holder.get('host')!r}, not this one")
+    if os.name == "nt":
+        raise LeaseIndeterminate("process identity is not checked on this platform")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return 0
+    except OSError:  # EPERM: the pid exists under another uid
+        pass
+    current = proc_start(pid)
+    if current is None:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return 0
+        except OSError:
+            pass
+        raise LeaseIndeterminate(f"the start time of pid {pid} cannot be read")
+    recorded = holder.get("proc_start")
+    if not isinstance(recorded, str) or not recorded:
+        raise LeaseIndeterminate(f"the lease for pid {pid} records no start time")
+    return pid if current == recorded else 0
 
 
 def read_holder(role: str, workspace: Path | str | None = None) -> dict | None:

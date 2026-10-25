@@ -356,5 +356,49 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(self._lock_path().read_text())["acquired_at"], gen1)
 
 
+class LeaseReaderTest(unittest.TestCase):
+    """read_lease / lease_is_live / lease_process: who holds a role, for a caller about to signal it."""
+
+    setUp, tearDown, _lock_path, _plant = LockTest.setUp, LockTest.tearDown, LockTest._lock_path, LockTest._plant
+
+    def test_read_lease_distinguishes_absent_from_malformed(self):
+        self.assertIsNone(self.mod.read_lease("r", self.ws))
+        p = self._lock_path("r")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        for body, cause in (("garbage", "not a lease record"), ("[1]", "not a lease record"),
+                            (json.dumps({"pid": True, "host": HOST}), "no valid pid"),
+                            (json.dumps({"pid": 5}), "no host")):
+            p.write_text(body)
+            with self.assertRaises(self.mod.LeaseIndeterminate, msg=body) as cm:
+                self.mod.read_lease("r", self.ws)
+            self.assertIn(cause, str(cm.exception))
+        p.unlink()
+        self.mod.acquire("r", self.ws)
+        self.assertEqual(self.mod.read_lease("r", self.ws)["pid"], os.getpid(), "the writer's own record")
+
+    def test_lease_is_live_is_acquires_decision(self):
+        for pid, age, host in ((_live_pid(), 0, HOST), (_live_pid(), 10_000, HOST), (_dead_pid(), 0, HOST),
+                               (_dead_pid(), 0, "otherhost")):
+            self._plant("r", pid, age, host)
+            live = self.mod.lease_is_live(self.mod.read_lease("r", self.ws))
+            self.assertEqual(live, self.mod.acquire("r", self.ws).status == "deferred", (pid, age, host))
+            self._lock_path("r").unlink()
+
+    def test_lease_process_proves_the_writer_or_refuses(self):
+        self.mod.acquire("r", self.ws)
+        self.assertEqual(self.mod.lease_process(self.mod.read_lease("r", self.ws)), os.getpid(), "start time matches")
+        self.assertEqual(self.mod.lease_process({"pid": _dead_pid(), "host": HOST}), 0, "gone")
+        live = _live_pid()
+        if self.mod.proc_start(live):
+            self.assertEqual(self.mod.lease_process({"pid": live, "host": HOST, "proc_start": "other-boot:1"}), 0,
+                             "a reused pid is not the writer")
+        for holder, cause in (({"pid": live, "host": HOST}, "records no start time"),
+                              ({"pid": live, "host": "otherhost", "proc_start": "x"}, "host 'otherhost'"),
+                              ({"pid": 0, "host": HOST}, "no valid pid")):
+            with self.assertRaises(self.mod.LeaseIndeterminate) as cm:
+                self.mod.lease_process(holder)
+            self.assertIn(cause, str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,11 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
+Which process runs a bridge is read only from the bridge's own lease, through `workspace_lock`'s
+reader (`bridge_pid`): a lease that proves no holder is a refusal, never pid 0, and only a pid
+proven to be the lease's writer is ever signalled. `launch` keeps the record lock until its child
+holds that lease or has exited.
+
 `disconnect` stops a row's bridge and then marks it `disabled`, keeping the row, the vault secret
 and the launch record: the plan skips a disabled row, so a restart leaves it down until
 `reconnect` clears the flag. A bridge that will not stop leaves the row as it was
@@ -64,7 +69,8 @@ from typing import Callable, Iterator, Mapping, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from file_lock import locked_file, try_lock_fd, unlock_fd  # noqa: E402
+import workspace_lock  # noqa: E402
+from file_lock import locked_file  # noqa: E402
 
 STATE_NAME = "connections.json"
 LOCK_NAME = "connections.lock"
@@ -91,6 +97,8 @@ IDENTITY_FIELDS = ("agent_mxid", "agent_display_name", "agent_avatar_url", "owne
 AVATAR_SCHEME = "mxc://"
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
+# How long `launch` holds the record lock waiting for its child to take the bridge lease.
+LEASE_TIMEOUT_S = 20
 # Names that never belong to a public homeserver; a probe there would scan the operator's own network.
 RESERVED_SUFFIXES = (".localhost", ".local", ".internal", ".test", ".example", ".invalid", ".onion", ".home.arpa")
 # The host's own resolver unless a test injects one.
@@ -168,6 +176,43 @@ class BridgeStillRunning(Refusal):
         super().__init__(f"{self.CODE}: the bridge for {instance or '<primary>'} (pid {pid}) is still running"
                          + (f" ({detail})" if detail else "") + "; nothing changed")
         self.pid = pid
+
+
+class BridgeLeaseIndeterminate(Refusal):
+    """The bridge's lease does not show which process holds it; nothing is signalled or written."""
+
+    CODE = "bridge_lease_indeterminate"
+
+    def __init__(self, instance: str, detail: str):
+        super().__init__(f"{self.CODE}: the bridge lease of {instance or '<primary>'} does not prove its holder "
+                         f"({detail}); restart that bridge (bash src/restart.sh) and retry; nothing changed")
+
+
+class LegacyPrimaryRunning(Refusal):
+    """The legacy bridge is primary and running; it re-reads the primary only when it is spawned."""
+
+    CODE = "legacy_primary_running"
+
+    def __init__(self, instance: str, pid: int):
+        super().__init__(
+            f"{self.CODE}: the legacy unsuffixed bridge (pid {pid}) is primary and carries the proactive room, and "
+            "its launchers read the primary only when they spawn it; stop it (bash src/restart.sh --stop-only), "
+            f"make {instance} primary, then start again (bash src/startup.sh) so the legacy bridge comes up "
+            f"without the room and {instance} with it; nothing changed")
+        self.pid = pid
+
+
+class VaultUnreadable(Refusal):
+    """The vault could not say whether it holds the row's current secret; nothing was touched."""
+
+    CODE = "vault_unreadable"
+
+
+class TokenRestoreFailed(Refusal):
+    """A write after the vault took the new code failed, and so did putting the previous secret back:
+    the vault holds the NEW code while the row is unchanged."""
+
+    CODE = "token_restore_failed"
 
 
 class TokenSourceShadowed(Refusal):
@@ -515,6 +560,9 @@ class _VaultIntercept:
     def get(self, key: str) -> str:
         return self._m.get_vault_key(key)
 
+    def lookup(self, key: str) -> Optional[str]:
+        return self._m.lookup_vault_key(key)
+
     def set(self, key: str, value: str) -> None:
         self._m.set_vault_key(key, value)
 
@@ -538,6 +586,24 @@ def _vault_get(vault, key: str) -> str:
         return str(vault.get(key) or "")
     except Exception:  # noqa: BLE001 - a miss and a failure both read as absent
         return ""
+
+
+def _vault_snapshot(vault, key: str) -> Optional[str]:
+    """The secret under `key`, None when the vault says it holds none; VaultUnreadable when it
+    cannot tell, so a caller never mistakes a failed read for an absent secret."""
+    lookup = getattr(vault, "lookup", None)
+    try:
+        if lookup is not None:
+            value = lookup(key)
+        else:
+            try:
+                value = vault.get(key)
+            except KeyError:
+                return None
+    except Exception as e:  # noqa: BLE001 - the vault's own error types vary; the cause is named
+        raise VaultUnreadable(f"{VaultUnreadable.CODE}: could not read {key} from the secret vault "
+                              f"({type(e).__name__}); nothing changed") from None
+    return str(value) if value else None
 
 
 def _vault_delete(vault, key: str) -> None:
@@ -874,19 +940,26 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
-    A disabled row is refused (`DisabledCannotBePrimary`): it never launches, so nothing would
-    carry the proactive room. The returned row carries `relaunch_needed`: true when the new
-    primary's bridge is running, since it was launched without the room and keeps that
-    environment until `reconnect`; the previous primary's bridge keeps the room until its own."""
+    Refused before anything is written: a disabled row (`DisabledCannotBePrimary`: it never
+    launches); a move off the legacy row while the legacy bridge runs (`LegacyPrimaryRunning`: its
+    launchers read the primary only on spawn, so it would keep the room); a lease that proves no
+    holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
+    new primary's bridge is running, since it keeps its launch environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("disabled"):
             raise DisabledCannotBePrimary(instance)
         promoted = not row["primary"]
+        current = next((r for r in rec["rows"] if r["primary"]), None)
+        if promoted and instance and current is not None and not current["instance"]:
+            legacy = bridge_pid("", workspace)
+            if legacy:
+                raise LegacyPrimaryRunning(instance, legacy)
+        relaunch = bool(promoted and instance and bridge_pid(instance, workspace))
         for r in rec["rows"]:
             r["primary"] = r is row
     out = dict(row)
-    out["relaunch_needed"] = bool(promoted and instance and bridge_pid(instance, workspace))
+    out["relaunch_needed"] = relaunch
     return out
 
 
@@ -1106,7 +1179,8 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
-    if any(r["instance"] == instance and r.get("disabled") for r in list_connections(workspace)):
+    # The record as read, never list_connections: launch calls this under the record lock.
+    if any(r["instance"] == instance and r.get("disabled") for r in _read(record_path(workspace))):
         raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
     raise UnknownConnection(f"no connection {instance!r} to launch")
 
@@ -1151,12 +1225,57 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
     return record
 
 
-def _spawn(argv: list, env: dict, log_path: Path) -> int:
+# Children this process spawned, kept so their exit is observed and reaped, never guessed from a pid.
+_CHILDREN: dict = {}
+
+
+def _spawn(argv: list, env: dict, log_path: Path) -> "subprocess.Popen":
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
-    return proc.pid
+    return proc
+
+
+def _exited(pid: int) -> bool:
+    """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
+    child = _CHILDREN.get(pid)
+    if child is not None:
+        if child.poll() is None:
+            return False
+        _CHILDREN.pop(pid, None)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _bridge_role(instance: str) -> str:
+    """The bridge's own lease role (`_LOCK_ROLE` in remote_gateway_bridge)."""
+    return "gateway-bridge" + (f".{instance}" if instance else "")
+
+
+def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: float) -> str:
+    """'held' once `pid` holds a live lease for `instance`, 'exited' when it ended without one,
+    'timeout' when neither happened in `timeout_s`."""
+    ws = _workspace(workspace)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            holder = workspace_lock.read_lease(_bridge_role(instance), ws)
+        except workspace_lock.LeaseIndeterminate:
+            holder = None
+        if holder and holder["pid"] == pid and workspace_lock.lease_is_live(holder):
+            return "held"
+        if _exited(pid):
+            return "exited"
+        if time.monotonic() >= deadline:
+            return "timeout"
+        time.sleep(0.05)
 
 
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
@@ -1164,8 +1283,9 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
            env_only: bool = False) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
-    plan read to the spawn, so a `disconnect` or `remove` cannot commit between them and have
-    the bridge come up against a row that says it is down."""
+    plan read until the child holds its lease or has exited (`lease` in the record), so a
+    `disconnect` or `remove` always finds the bridge it must stop. A child still without a lease
+    after `LEASE_TIMEOUT_S` is killed when it is ours and the launch fails (`lease_timeout`)."""
     environ = os.environ if environ is None else environ
     with locked_file(_lock_path(workspace), create_mode=0o600):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
@@ -1177,36 +1297,43 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
         argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
         log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
         try:
-            pid = (spawn or _spawn)(argv, env, log_path)
+            child = (spawn or _spawn)(argv, env, log_path)
         except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
             _record_launch(instance, workspace, ok=False, reason="launch_failed")
             raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
-        return _record_launch(instance, workspace, ok=True, pid=pid)
+        pid = int(getattr(child, "pid", child))
+        if hasattr(child, "poll"):
+            _CHILDREN[pid] = child
+        if env.get("SUTANDO_BRIDGE_LOCK", "1") == "0":
+            return _record_launch(instance, workspace, ok=True, pid=pid, lease="disabled")
+        lease = _await_lease(instance, pid, workspace, LEASE_TIMEOUT_S)
+        if lease == "timeout":
+            mine = _CHILDREN.pop(pid, None)
+            if mine is not None:
+                mine.kill()
+                mine.wait()
+            _record_launch(instance, workspace, ok=False, reason="lease_timeout", pid=pid)
+            raise LaunchFailed(f"the bridge for {instance} (pid {pid}) took no lease within {LEASE_TIMEOUT_S}s"
+                               + ("; it was stopped" if mine is not None else ""))
+        return _record_launch(instance, workspace, ok=True, pid=pid, lease=lease)
 
 
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
-    """The pid in the bridge's held singleton lock, 0 when no process holds it."""
-    path = _workspace(workspace) / "state" / "locks" / f"gateway-bridge.{instance}.lock"
+    """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
+    and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
     try:
-        fd = os.open(str(path), os.O_RDWR)
-    except OSError:
-        return 0
-    try:
-        if try_lock_fd(fd):
-            unlock_fd(fd)
-            return 0
-        return int((os.read(fd, 32).decode() or "0").strip() or 0)
-    except (OSError, ValueError):
-        return 0
-    finally:
-        os.close(fd)
+        holder = workspace_lock.read_lease(_bridge_role(instance), _workspace(workspace))
+        return workspace_lock.lease_process(holder) if holder else 0
+    except workspace_lock.LeaseIndeterminate as e:
+        raise BridgeLeaseIndeterminate(instance, str(e)) from None
 
 
 def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
                 timeout_s: Optional[float] = None) -> int:
-    """SIGTERM the bridge holding `instance`'s lock and wait for the lock to free; the pid, or 0
-    when none held it. A lock still held at the deadline, or a signal the process refuses, is
-    `BridgeStillRunning`: the caller writes nothing over a bridge that is still up."""
+    """SIGTERM the process proven to hold `instance`'s lease and wait until no process holds it;
+    the pid, or 0 when none held it. A holder still running at the deadline, or a signal the process
+    refuses, is `BridgeStillRunning`; a lease that proves no holder is `BridgeLeaseIndeterminate`
+    and nothing is signalled. Either way the caller writes nothing over a bridge that may be up."""
     timeout_s = STOP_TIMEOUT_S if timeout_s is None else timeout_s
     pid = bridge_pid(instance, workspace)
     if not pid:
@@ -1214,16 +1341,18 @@ def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
     try:
         (kill or os.kill)(pid, signal.SIGTERM)
     except ProcessLookupError:
-        pass  # gone between the read and the signal; the kernel released its lock
+        pass  # gone between the check and the signal
     except OSError as e:
         raise BridgeStillRunning(instance, pid, f"signal refused: {type(e).__name__}") from None
     deadline = time.monotonic() + timeout_s
-    while bridge_pid(instance, workspace) and time.monotonic() < deadline:
+    while True:
+        _exited(pid)  # reaps our own child, so it stops reading as alive
+        holder = bridge_pid(instance, workspace)
+        if not holder:
+            return pid
+        if time.monotonic() >= deadline:
+            raise BridgeStillRunning(instance, holder, "lease still held after the stop deadline")
         time.sleep(0.1)
-    holder = bridge_pid(instance, workspace)
-    if holder:
-        raise BridgeStillRunning(instance, holder, "lock still held after the stop deadline")
-    return pid
 
 
 def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
@@ -1268,8 +1397,12 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     not this connection's, or whose verified server is already another row's
     (`TokenServerMismatch`); a row naming an agent whose preview did not confirm that same agent:
     unconfirmed (`TokenUnverified`) or another agent (`TokenAgentMismatch`); a bridge that will
-    not stop (`BridgeStillRunning`). The new row is built and validated before the bridge is
-    stopped or the vault written; a failure after the vault write puts the previous secret back.
+    not stop (`BridgeStillRunning`); a vault that cannot say whether it holds the current secret
+    (`VaultUnreadable`, read before any effect). The new row is built and validated before the
+    bridge is stopped or the vault written; a failure after the vault write puts the previous
+    secret back, and when that also fails the error is `TokenRestoreFailed` naming both (the vault
+    then holds the new code, the row the old). A bridge stopped for an update that then failed is
+    relaunched on the unchanged code, and the error says whether that worked.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
     is that record (and the row's state), not an exception."""
     environ = os.environ if environ is None else environ
@@ -1283,8 +1416,9 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
         raise TokenRejected()
     vault = _vault(vault)
     ref = current["token_ref"]
-    previous = _vault_get(vault, ref)
+    previous = _vault_snapshot(vault, ref)
     stored = False
+    stopped = 0
     try:
         with _transaction(workspace) as rec:
             row = _find(rec["rows"], instance)
@@ -1294,14 +1428,28 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
             stored = True
             row.clear()
             row.update(candidate)
-    except Exception:
+    except Exception as e:
         if stored:
             # The row still names the old secret; put it back so the next launch finds it.
             try:
-                vault.set(ref, previous) if previous else vault.delete(ref)
-            except Exception:  # noqa: BLE001
-                pass
-        raise
+                vault.set(ref, previous) if previous is not None else vault.delete(ref)
+            except Exception as restore:  # noqa: BLE001
+                raise TokenRestoreFailed(
+                    f"{TokenRestoreFailed.CODE}: the update of {instance} failed after the vault took the new code "
+                    f"({type(e).__name__}: {e}) and restoring the previous secret failed too "
+                    f"({type(restore).__name__}); {ref} holds the NEW code while the row is unchanged"
+                    + ("; the bridge was left stopped" if stopped else "")) from None
+        if not stopped:
+            raise
+        try:
+            relaunched = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                                vault=vault, spawn=spawn, python=python)
+            note = f"the bridge was relaunched on the unchanged code (pid {relaunched['pid']})"
+        except Exception as again:  # noqa: BLE001 - reported in the error below
+            note = f"the bridge stays stopped: relaunching it failed ({type(again).__name__})"
+        if isinstance(e, ConnectionsError):
+            raise _with_note(e, note) from None
+        raise ConnectionsError(f"could not update the token of {instance} ({type(e).__name__}); {note}") from e
     out = dict(row)
     out["stopped_pid"] = stopped
     try:
@@ -1310,6 +1458,12 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     except LaunchFailed:
         out["launch"] = _read_json(launch_record_path(instance, workspace))
     return out
+
+
+def _with_note(error: ConnectionsError, note: str) -> ConnectionsError:
+    """`error` with `note` appended to its message, same class and attributes."""
+    error.args = (f"{error.args[0] if error.args else error}; {note}",) + tuple(error.args[1:])
+    return error
 
 
 def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str) -> dict:

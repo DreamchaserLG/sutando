@@ -92,9 +92,13 @@ def fetch(url, token, address=None):
     return {"agents": [{"id": i} for i in GATEWAY.get(url, [])]}
 
 
+# Above any pid_max: the spawn fake's pid never runs, so launch sees it exit at once.
+DEAD_PID = 4_194_404
+
+
 def spawn(argv, env, log_path):
     SPAWNED.append(env["GATEWAY_INSTANCE"])
-    return 99
+    return DEAD_PID
 
 
 # The route calls connections_http with the module defaults; bind the fakes there.
@@ -339,19 +343,16 @@ s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})
 check("a disabled row made primary is 409 disabled_cannot_be_primary", (s, b) == (409, {"error": "disabled_cannot_be_primary"}), f"{s} {b}")
 s, b, _ = req("GET", "/api/v1/connections")
 check("the primary did not move", [r["primary"] for r in b["connections"]] == [True, False], b)
-# A bridge that keeps its lock: the route's kill fake signals nothing, so the stop deadline passes.
-_lock = WS / "state" / "locks" / "gateway-bridge.alpha-fixture-net.lock"
-_lock.parent.mkdir(parents=True, exist_ok=True)
-_lock.write_text("4321\n")
-_fd = os.open(str(_lock), os.O_RDWR)
-import file_lock  # noqa: E402
-file_lock.lock_fd(_fd)
+# A bridge that keeps its lease (the production writer): the route's kill fake signals nothing,
+# so the stop deadline passes.
+from _helpers import bridge_lease  # noqa: E402
+_holder = bridge_lease.start(WS, "alpha-fixture-net")
 C.STOP_TIMEOUT_S, _saved_timeout = 0.3, C.STOP_TIMEOUT_S
 s, b, _ = req("DELETE", "/api/v1/connections/alpha-fixture-net?force=1")
 check("removing a row whose bridge will not stop is 409 bridge_still_running",
       (s, b) == (409, {"error": "bridge_still_running"}), f"{s} {b}")
 C.STOP_TIMEOUT_S = _saved_timeout
-os.close(_fd)
+bridge_lease.stop(_holder)
 s, b, _ = req("GET", "/api/v1/connections")
 check("the row and its key stayed", [r["instance"] for r in b["connections"]] == ["alpha-fixture-net", "beta-fixture-net"]
       and "AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET" in FakeVault.store, b)
@@ -408,7 +409,7 @@ check("set primary is 200", s == 200 and b["connection"]["primary"] is True, f"{
 s, b, _ = req("GET", "/api/v1/connections")
 check("exactly one primary after the move", [r["primary"] for r in b["connections"]] == [False, True])
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/reconnect", {})
-check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == 99, f"{s} {b}")
+check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == DEAD_PID, f"{s} {b}")
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
 s, b, _ = req("DELETE", "/api/v1/connections/beta-fixture-net")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")

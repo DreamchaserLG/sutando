@@ -82,6 +82,10 @@ class _Store:
         return []
 
 
+# Above any pid_max: the spawn fake's pid never runs, so launch sees it exit at once.
+DEAD_PID = 4_194_404
+
+
 class ViewTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -99,7 +103,7 @@ class ViewTests(unittest.TestCase):
 
     def _spawn(self, argv, env, log_path):
         self.spawned.append(env["GATEWAY_INSTANCE"])
-        return 7
+        return DEAD_PID
 
     def call(self, method, **params):
         return asyncio.run(self.disp.handle(method, params))
@@ -143,6 +147,22 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(again["connection"]["token_ref"], row["token_ref"])
         self.assertEqual(self.vault.store[row["token_ref"]], TOKEN_A, "an existing server is left as is")
         self.assertEqual(len(self.call("connection.list")["connections"]), 1)
+
+    def test_promoting_off_a_running_legacy_primary_is_a_conflict_naming_the_restart(self):
+        from _helpers import bridge_lease
+        connections.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.call("connection.add", token="https://relay.beta-fixture.net|secret-beta", confirm=True,
+                  expected_server="beta-fixture.net")
+        legacy = bridge_lease.start(self.ws, "")
+        try:
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.set_primary", instance="beta-fixture-net")
+        finally:
+            bridge_lease.stop(legacy)
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("legacy_primary_running"))
+        self.assertIn("restart.sh --stop-only", str(cm.exception))
+        self.assertEqual(connections.primary_instance(self.ws), "", "nothing moved")
 
     def test_confirm_against_a_moved_identity_is_a_conflict(self):
         preview = self.call("connection.add", token=TOKEN_A)["preview"]
@@ -192,7 +212,7 @@ class ViewTests(unittest.TestCase):
         self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
         self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
         out = self.call("connection.reconnect", instance="beta-fixture-net")
-        self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["launch"]["stopped_pid"]), (True, 7, 0))
+        self.assertEqual((out["launch"]["ok"], out["launch"]["pid"], out["launch"]["stopped_pid"]), (True, DEAD_PID, 0))
         self.assertEqual(self.spawned, ["beta-fixture-net"])
         with self.assertRaises(ProtocolError):
             self.call("connection.reconnect", instance="nope")

@@ -32,19 +32,23 @@ there, so `add` refuses it (400, CLI exit 1) and nothing is written.
 Every refusal that comes from a row's or a code's state is a `connections.Refusal` whose
 `CODE` each surface returns as is: HTTP **409** `{"error": "<code>"}`, runtime API
 **CONFLICT** with the module's message, CLI exit 1 with `connections: <code>: ...` on
-stderr. Nothing is written when one is raised.
+stderr. Nothing is written when one is raised, except `token_restore_failed`, which says what was.
 
 | Code | Raised by | Meaning |
 |---|---|---|
 | `primary_cannot_disconnect` | `disconnect` | The row is primary; make another row primary first. |
 | `disabled_cannot_be_primary` | `set_primary` | The row is disconnected; a disabled primary never launches, so no bridge would carry the proactive room. Reconnect it first. |
 | `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead. |
-| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token` | The bridge kept its singleton lock past the stop deadline, or refused the signal; the message names the pid. The row is as it was: `disabled` is never written over a running bridge. |
+| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token` | The bridge still held its lease past the stop deadline, or refused the signal; the message names the pid. The row is as it was: `disabled` is never written over a running bridge. |
+| `bridge_lease_indeterminate` | `disconnect`, `remove`, `reconnect`, `update_token`, `set_primary` | The bridge's lease file exists but does not prove which process holds it (unreadable or malformed, another host's, no recorded start time, or a start time that cannot be checked); the message names which. Nothing is signalled or written. Restart that bridge (`bash src/restart.sh`) so it writes a current lease. |
+| `legacy_primary_running` | `set_primary` | The legacy unsuffixed row is primary and its bridge is running. Its launchers read the primary only when they spawn it, so it would keep the proactive room. Stop it (`bash src/restart.sh --stop-only`), make the new row primary, then start again (`bash src/startup.sh`). |
 | `token_source_shadowed` | `update_token` | The row's `token_ref` (`AG2_REMOTE_TOKEN_<INST>`) is set in the environment, which the bridge reads before the vault; the new secret would be stored and never used. Unset the variable (or let `import-env` own that row) and retry. |
 | `token_server_mismatch` | `update_token` | The code previews as another server, or as a server another row already holds. |
 | `token_agent_mismatch` | `update_token` | The row names an agent and the code's gateway names another; that agent is its own connection. |
 | `token_unverified` | `update_token` | The row names an agent and the preview did not confirm it (gateway unreachable, an error, a listing naming none or several); the code is not shown to be this connection's. |
 | `token_rejected` | `add`, `update_token` | The gateway answered 401/403 on the preview. |
+| `vault_unreadable` | `update_token` | The vault could not say whether it holds the row's current secret (a read error, not a miss). Refused before the stop and the write, because a rollback to "absent" would delete a working code. |
+| `token_restore_failed` | `update_token` | Not a clean refusal: a write after the vault took the new code failed, and so did putting the previous secret back. The message names both failures; the vault holds the **new** code while the row is unchanged. |
 | `vault_key_in_use` | `add` | The vault already holds a secret under the new row's key and no row owns it. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
@@ -120,6 +124,14 @@ handoff order is therefore **promote B, reconnect B, then disconnect A**: after 
 reconnect B's launch carries `REMOTE_PROACTIVE_ROOM`, and A's next launch does not. Promoting
 and disconnecting A straight away would stop the only bridge that had the room.
 
+When A is the **legacy** row (`instance: ""`) the order differs, because its launchers (the
+launchd wrapper and the bare launch in `startup-runtime.sh`) re-read `primary` only when they
+spawn it: a running legacy bridge never learns that it lost the room. `set_primary(B)` is
+therefore refused while the legacy bridge holds its lease (`legacy_primary_running`), before
+anything is written. The handoff is **stop the legacy bridge** (`bash src/restart.sh
+--stop-only`), **promote B**, **start again** (`bash src/startup.sh`): the legacy bridge comes
+up with `REMOTE_PROACTIVE_ROOM` empty and B's launch carries it.
+
 ## State
 
 `status_for(row)` joins the row with the bridge's own
@@ -133,19 +145,24 @@ under `state/connections-launch/<instance>.json`:
 | `disconnected` | The sidecar says `connected: false` for a non-auth reason; or, with `reason: disabled`, the row was disconnected by the owner (whatever a stale sidecar still says). |
 | `failed` | With `reason`: `no_token`, `launch_failed`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
 
-`disconnect(instance)` stops the one bridge holding that instance's singleton lock (the
+Which process runs a bridge is read from the bridge's own lease, `state/locks/gateway-bridge.<instance>.lock`, the JSON record `workspace_lock` writes and heartbeats: `bridge_pid` reads it with `workspace_lock.read_lease` and accepts a pid only when `workspace_lock.lease_process` proves it is the process that wrote the record (this host, same recorded start time), so no unproven pid is ever signalled and a lease that proves nothing is `bridge_lease_indeterminate`, never "no bridge".
+
+`disconnect(instance)` stops the one bridge holding that instance's lease (the
 same stop `remove_connection` and `reconnect` use) and **then** marks the row `disabled`; the
 row, its vault key and its launch record stay, so the owner can come back without a new
-token. The stop is SIGTERM, then a wait of `STOP_TIMEOUT_S` for the lock to free; a bridge
-that still holds it (or refuses the signal) is `bridge_still_running` with its pid, and the
-row is not touched, so `disabled` never masks a live sidecar. The launch plan omits a
+token. The stop is SIGTERM, then a wait of `STOP_TIMEOUT_S` until no process holds the lease
+(released, or its writer gone); a bridge that still holds it (or refuses the signal) is
+`bridge_still_running` with its pid, and the row is not touched, so `disabled` never masks a
+live sidecar. The launch plan omits a
 disabled row, so a core restart leaves it down. The primary cannot be disconnected while it
 is primary (`primary_cannot_disconnect`): make another row primary first. The legacy
 unsuffixed row cannot be disconnected here at all (`legacy_row_unmanaged`): the legacy
 launchers start it from `REMOTE_TASK_TOKEN` and never read the flag. Disconnecting a
-disabled row is a no-op. `launch` holds the record lock from the plan read to the spawn, so
-a disconnect or remove that starts in between waits for the spawn and then stops the bridge
-it started; a bridge never comes up against a row that already says it is down.
+disabled row is a no-op. `launch` holds the record lock from the plan read until its child
+holds the lease or has exited (`lease: held | exited` in the launch record), so a disconnect
+or remove that starts in between waits and then stops the bridge it started; a bridge never
+comes up against a row that already says it is down. A child still without a lease after
+`LEASE_TIMEOUT_S` is killed and the launch fails (`failed`, reason `lease_timeout`).
 `reconnect(instance)` clears the flag, stops the bridge if one is
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
@@ -165,8 +182,11 @@ preview (gateway unreachable, an error, a listing naming none or several agents)
 connection, never pasted over this row). A provisional row with no agent keeps its earlier
 behaviour and learns the identity. The new row is built and validated **before** any
 external effect; only then is the bridge stopped (`bridge_still_running` if it will not) and
-the vault written; a failure after the vault write (the record write, say) puts the previous
-secret back. Otherwise it replaces the secret under the row's existing
+the vault written. The previous secret is read before any effect with a read that tells a
+miss from a failure (`vault_unreadable` on a failure); a failure after the vault write (the
+record write, say) puts it back, and when that restore fails too the error is
+`token_restore_failed`. A bridge stopped for an update that then fails is relaunched on the
+unchanged code, and the error says whether that worked. Otherwise it replaces the secret under the row's existing
 `token_ref`, keeps the instance, primary flag, `added_at` and launch record, updates
 `gateway_url` and the identity fields from the preview, clears `disabled` and relaunches the
 bridge the way `reconnect` does, so a disconnected or failed row comes back on the new code;
@@ -239,10 +259,10 @@ not here.
   | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
   | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "connection": row}`; 200 `{"created": false, ...}` for an existing row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
   | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 409 `bridge_still_running`; 404 |
-  | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`; 404 |
+  | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`, `legacy_primary_running` or `bridge_lease_indeterminate` (nothing moved); 404 |
   | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}` or `bridge_still_running` (row unchanged); 404 |
   | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled`; 409 `bridge_still_running` |
-  | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "<code>"}` for `token_source_shadowed`, `token_server_mismatch`, `token_agent_mismatch`, `token_unverified`, `token_rejected`, `bridge_still_running` (nothing changed); 400 without a token; 404 |
+  | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "<code>"}` for `token_source_shadowed`, `token_server_mismatch`, `token_agent_mismatch`, `token_unverified`, `token_rejected`, `bridge_still_running`, `vault_unreadable` (nothing changed), `token_restore_failed`; 400 without a token; 404 |
 
   The legacy row (`instance: ""`) has no HTTP address (an empty segment is no segment); its
   refusals (`legacy_row_unmanaged`) are the CLI's and the runtime API's.
