@@ -33,6 +33,7 @@ import room_context as rc
 import result_markers
 import task_envelope
 from ag2_sparrow import local_task_protocol as ltp, room_context as bundled, task_io, relay_loop
+from ag2_sparrow import result_markers as bundled_markers
 from ag2_sparrow.adapters.codex import codex_connector as cc
 from ag2_sparrow.adapters.claude_cloud_session import session_adapter
 from ag2_sparrow.adapters.hatch import task_fields
@@ -178,6 +179,45 @@ class ValidationTest(unittest.TestCase):
 
 
 class RenderTest(unittest.TestCase):
+    def test_managed_guidance_uses_briefing_then_only_authorized_targeted_tools(self):
+        for context in (rc, bundled):
+            for status in ("partial", "denied", "unavailable"):
+                rendered = context.render(headers(now=1000, status=status), now=1000)
+                self.assertIn("Use this briefing first", rendered)
+                self.assertIn("targeted MCP tools authorized for this same agent", rendered)
+                self.assertIn("current room policy", rendered)
+                self.assertIn("bulk history fetch", rendered)
+                self.assertIn("bypass denied sections", rendered)
+            expired = context.render(headers(now=1000), now=2000)
+            self.assertIn("targeted MCP", expired)
+            self.assertIn("do not bulk-fetch history", expired)
+        for markers in (result_markers, bundled_markers):
+            prelude = "\n".join(markers.render_skill_prelude("!opaque-room", "ag2space", "task-new", room_context_managed=True))
+            self.assertIn("Use this briefing first", prelude)
+            self.assertIn("targeted MCP tools authorized for this same agent", prelude)
+            self.assertIn("current room policy", prelude)
+            self.assertIn("bypass denied sections", prelude)
+            self.assertNotIn("room_ops.py read", prelude)
+
+    def test_rebinding_does_not_rewrite_task_last_user_body_or_renew_expiry(self):
+        h = headers(now=1000)
+        body = "task: ACTUAL_ASK\nroom_context: literal user ask\nroom_context_binding: literal user data\n"
+        text = "\n".join(k + ": " + v for k, v in h.items()) + "\n" + body
+        for context in (rc, bundled):
+            rebound = context.rebind_for_requeue(text, "task-new", now=1000)
+            self.assertTrue(rebound.endswith(body))
+            parsed = ltp.parse_task_headers(rebound).headers
+            self.assertEqual(json.loads(parsed["room_context"])["task_id"], "task-new")
+            self.assertEqual(json.loads(parsed["room_context"])["expires_at"], 1300)
+            for tid, stamp in (("task-new", 2000), ("bad\ntask_id", 1000)):
+                rejected = context.rebind_for_requeue(text, tid, now=stamp)
+                self.assertTrue(rejected.endswith(body))
+                rejected_headers = ltp.parse_task_headers(rejected).headers
+                self.assertIn("room_context_status", rejected_headers)
+                self.assertNotIn("room_context", rejected_headers)
+                self.assertNotIn("room_context_binding", rejected_headers)
+            self.assertEqual(context.rebind_for_requeue("task: legacy\n", "task-new", now=1000), "task: legacy\n")
+
     def test_context_is_separate_and_escaped_and_never_promoted_to_authority(self):
         h = headers(now=1000)
         data = json.loads(h["room_context"])
@@ -334,6 +374,59 @@ class GatewayTest(unittest.TestCase):
         h, _, _ = task_io.parse_task(str(path))
         self.assertEqual(json.loads(h["room_context"])["task_id"], h["id"])
         self.assertEqual(bundled.from_headers(h)[2], "accepted")
+
+    def test_dedup_requeue_preserves_valid_briefing_and_changes_only_local_task_binding(self):
+        _, path, text = self.write()
+        original = rc.from_headers(rc._parse(text).headers)
+        self.assertEqual(original[2], "accepted")
+        for markers in (result_markers, bundled_markers):
+            for lane in ("", "ag2space"):
+                requeued = markers.build_requeued_task(text, "task-requeue", 1, "!opaque-room", "task-holder", channel_dir=lane)
+                h = rc._parse(requeued).headers
+                context, binding, reason = rc.from_headers(h)
+                self.assertEqual(reason, "accepted")
+                self.assertEqual(context, dict(original[0], task_id="task-requeue"))
+                self.assertEqual(binding, dict(original[1], task_id="task-requeue"))
+                self.assertEqual(h["id"], "task-requeue")
+                self.assertIn("ACTUAL_ASK", rc.view(requeued))
+                self.assertIn("README_SENTINEL", rc.view(requeued))
+                self.assertNotIn("room_ops.py read", requeued)
+        self.assertEqual(path.read_text(), text)
+
+    def test_dedup_requeue_cannot_rescue_mismatched_or_expired_context(self):
+        _, _, text = self.write()
+        for field, wrong in (("id", "task-other"), ("channel_id", "!other-room"),
+                             ("access_tier", "team"), ("source_message_id", "$other"),
+                             ("receiving_instance", "@other:example.test")):
+            h = rc._parse(text).headers
+            bad = text.replace(field + ": " + h[field] + "\n", field + ": " + wrong + "\n", 1)
+            for markers in (result_markers, bundled_markers):
+                requeued = markers.build_requeued_task(bad, "task-requeue", 1, "!opaque-room", "task-holder", channel_dir="ag2space")
+                self.assertIsNone(rc.from_headers(rc._parse(requeued).headers)[0], field)
+                self.assertNotIn("README_SENTINEL", rc.view(requeued), field)
+                self.assertIn("ACTUAL_ASK", rc.view(requeued), field)
+                self.assertNotIn("room_ops.py read", requeued, field)
+        h = rc._parse(text).headers
+        prebound = text
+        for key in ("room_context", "room_context_binding"):
+            prebound = prebound.replace(key + ": " + h[key], key + ": " + rc.dumps(dict(json.loads(h[key]), task_id="task-requeue")), 1)
+        self.assertEqual(rc.from_headers(rc._parse(prebound).headers)[2], "task_mismatch")
+        for markers in (result_markers, bundled_markers):
+            requeued = markers.build_requeued_task(prebound, "task-requeue", 1, "!opaque-room", "task-holder", channel_dir="ag2space")
+            h = rc._parse(requeued).headers
+            self.assertNotIn("room_context", h)
+            self.assertEqual(h["room_context_status"], "task_mismatch")
+            self.assertNotIn("README_SENTINEL", rc.view(requeued))
+            self.assertIn("ACTUAL_ASK", rc.view(requeued))
+            self.assertNotIn("room_ops.py read", requeued)
+        h = rc._parse(text).headers
+        later = json.loads(h["room_context_binding"])["expires_at"] + 1
+        for markers in (result_markers, bundled_markers):
+            with mock.patch.object(rc.time, "time", return_value=later):
+                requeued = markers.build_requeued_task(text, "task-requeue", 1, "!opaque-room", "task-holder", channel_dir="ag2space")
+                self.assertIsNone(rc.from_headers(rc._parse(requeued).headers)[0])
+                self.assertNotIn("README_SENTINEL", rc.view(requeued))
+                self.assertIn("ACTUAL_ASK", rc.view(requeued))
 
     def test_optional_context_never_displaces_original_request_under_budget(self):
         h = headers()

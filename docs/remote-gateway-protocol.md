@@ -172,6 +172,11 @@ above `task:`, then uses the existing stamping, atomic publication, dispatch and
 acknowledgement paths. Named gateway instances project the validated broker task ID
 to the same local task ID in both packet objects, so subsequent readers compare it
 exactly to the canonical local `id:`. This local mapping adds no authority.
+Dedup recovery applies the same local projection to a replacement task ID only
+after the original packet passes validation. Only `task_id` changes in the packet
+and binding; identity, room, anchor, policy, membership, visibility and timestamps
+remain unchanged. Invalid or expired packets are never repaired or renewed, and
+the validated view still checks the replacement task's exact binding and expiry.
 `room_context_status` is a bridge-generated status header; it is never accepted as a
 wire attestation. All three header names are confined in user-authored content.
 
@@ -189,6 +194,11 @@ The Claude and Codex standby notifier prompts direct context-enabled tasks throu
 this view. Optional Codex and Claude cloud/routine renderers also revalidate before
 rendering. Codex connector sessions include actor, room, tier, policy, membership,
 visibility and status in their context-enabled session key; legacy routing is kept.
+Managed views and owner-task guidance say to use the briefing first. Missing or
+fresh facts and actions may use targeted MCP tools as the same acting agent under
+the current room policy. They forbid bulk history replacement and bypassing denied
+sections with other credentials. These instructions do not grant tool access or
+enforce authorization; the tool backend must enforce current permissions.
 
 **Current limits:** no authoritative context producer or authenticated join-to-reply
 round trip is established by these consumers. A model that directly reads a canonical
