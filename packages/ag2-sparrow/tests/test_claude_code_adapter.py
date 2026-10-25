@@ -2279,9 +2279,6 @@ class ConnectCode(AgentRootBase):
         class Tty(io.StringIO):
             def isatty(self):
                 return True
-        with mock.patch.object(cm.getpass, "getpass", return_value=CODE) as asked:
-            rc, _out, err = self.connect(Backend(), stdin=Tty(""), code_args=())
-        self.assertEqual((rc, asked.call_count), (0, 1), err)
         backend = Backend()
         rc, _out, err = self.connect(backend, stdin=io.StringIO(""), code_args=())
         self.assert_code_unspent(backend, rc, err)
@@ -2290,6 +2287,9 @@ class ConnectCode(AgentRootBase):
         rc, _out, err = self.connect(backend, stdin=io.StringIO(""))
         self.assert_code_unspent(backend, rc, err)
         self.assertIn("not an agent code", err, "an empty stdin is no code")
+        with mock.patch.object(cm.getpass, "getpass", return_value=CODE) as asked:
+            rc, _out, err = self.connect(Backend(), stdin=Tty(""), code_args=())
+        self.assertEqual((rc, asked.call_count), (0, 1), err)
 
     def test_a_plain_http_base_is_refused_unless_it_is_loopback(self):
         backend = Backend()
