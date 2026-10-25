@@ -1556,5 +1556,71 @@ class DecidedClaimEdges(unittest.TestCase):
         claim.write_bytes(b"\xff\xfe not text\n")
         self.assertEqual(gb._claim_receipt(claim, "proactive-1"), ("unknown", None, None))
 
+
+class ParkAndIdentityEdges(unittest.TestCase):
+    """Refusal paths of parking, identity and snapshot ownership, each called directly on one lane."""
+
+    def setUp(self):
+        self.lane = Lane(gb, scratch("gw-park-edges-"))
+        self.res = self.lane.results
+        self.root = self.res / ".outbox-ag2space-proactive"
+        for name, value in (("RESULTS_DIR", self.res), ("ARCHIVE_RESULTS_DIR", self.res / "archive")):
+            patcher = mock.patch.object(gb, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(gb, "_log", lambda *a: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_bytes_that_are_not_utf8_are_neither_parked_nor_keyed(self):
+        self.assertIs(gb._park_generation("proactive-1", b"\xff\xfe body", "absent"), False)
+        r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
+        r.write_bytes(b"\xff\xfe body")
+        self.assertIsNone(gb._retained_item(r))
+
+    def test_a_legacy_item_with_an_unreadable_payload_or_no_resolution_never_matches_blindly(self):
+        legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
+        outbox._write_item(self.root, legacy, {"item_id": legacy, "status": "DELIVERED", "payload": "not json"})
+        self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !R:s]\nSAME BODY\n",
+                                                          "SAME BODY", "!R:s", None), ("unknown", None))
+        outbox._write_item(self.root, legacy, {"item_id": legacy, "status": "DELIVERED",
+                                               "payload": json.dumps({"room_id": "!R:s", "body": "SAME BODY"})})
+        with mock.patch.object(gb, "_proactive_envelope", side_effect=RuntimeError("no routing")):
+            self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !R:s]\nSAME BODY\n",
+                                                              "SAME BODY", "!R:s", None)[0], "DELIVERED",
+                             "the file's own room still matches")
+            self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !Other:s]\nSAME BODY\n",
+                                                              "SAME BODY", "!Other:s", None), ("absent", None))
+
+    def test_a_snapshot_name_it_does_not_own_or_cannot_take_is_left_alone(self):
+        self.assertIsNone(gb._take_snapshot(self.res / "proactive-1.txt"))
+        dead = self.res / f"proactive-1.sending.{_dead_pid()}.s1"
+        dead.write_text("B\n")
+        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", side_effect=FileExistsError(17, "x")):
+            self.assertIsNone(gb._take_snapshot(dead))
+        self.assertTrue(dead.exists())
+        odd = self.res / "proactive-1.sending.notapid.s1"
+        odd.write_text("B\n")
+        gb._retry_pending_snapshots()
+        self.assertTrue(odd.exists(), "a name the snapshot grammar does not match is never decided")
+
+    def test_a_superseded_parked_copy_is_retained_at_the_requeued_epoch(self):
+        body = b"parked body\n"
+        claim = self.res / "proactive-1.sending.1.1"
+        claim.write_bytes(body)
+        (self.res / "undelivered").mkdir()
+        copy = self.res / "undelivered" / "proactive-1-5.txt"
+        copy.write_bytes(body)
+        digest = __import__("hashlib").sha256(body).hexdigest()
+        gb._retire_superseded_parked_copy(claim, "proactive-1", digest, 1)
+        self.assertFalse(copy.exists(), "no parked copy left for an item that is going back live")
+        (kept,) = self.res.glob(f".proactive-1{gb._DECIDED_INFIX}{digest[:32]}-e1.*")
+        self.assertEqual(kept.read_bytes(), body)
+
+    def test_an_existing_placed_copy_is_reused(self):
+        hidden = self.res / f".proactive-1{gb._DELIVERED_INFIX}1"
+        hidden.write_bytes(b"A\n")
+        self.assertEqual(gb._ensure_placed("proactive-1", b"A\n", "DELIVERED"), hidden)
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
