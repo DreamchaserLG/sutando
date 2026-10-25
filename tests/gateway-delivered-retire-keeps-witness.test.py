@@ -152,6 +152,31 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
     def test_a_record_claiming_to_be_absent_never_requeues_the_claim(self):
         self.assert_kept(self.dead_claim_with_record(lambda r: r.write_text('{"status": "absent"}')))
 
+    def test_a_delivered_claim_that_cannot_be_hidden_keeps_its_claim_name(self):
+        item_id = gb._proactive_item_id("proactive-1", "delivered")
+        outbox.record_delivered(self.lane.results / ".outbox-ag2space-proactive", item_id)
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered\n")
+        with self.no_hiding():
+            self.lane.restart()
+        self.assert_kept(claim)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_claim_is_never_requeued(self):
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered\n")
+        claim.chmod(0)
+        self.addCleanup(claim.chmod, 0o644)
+        self.lane.restart()
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists(), "it may have been sent")
+        self.assertTrue(claim.exists())
+
+    def test_a_skip_marker_claim_was_never_an_item_and_is_requeued(self):
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("[no-send]\n")
+        self.lane.restart()
+        self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "[no-send]\n")
+
     def test_a_claim_with_no_record_at_all_is_still_requeued(self):
         claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
         claim.write_text("never sent\n")

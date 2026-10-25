@@ -70,6 +70,13 @@ class ReceiptState(unittest.TestCase):
                 self.assertEqual(mod.receipt_state(self.root, "proactive-1"), "unknown")
                 path.rmdir()
 
+    def test_a_root_that_is_not_a_directory_is_unknown_not_absent(self):
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                root = self.root / f"file-{mod.__name__}"
+                root.write_text("not a directory")
+                self.assertEqual(mod.receipt_state(root, "proactive-1"), "unknown")
+
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
     def test_an_unreadable_record_is_unknown_not_absent(self):
         for mod in MODULES:
