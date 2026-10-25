@@ -1464,6 +1464,85 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 self.assertEqual([p.get("body") for p in lane.posts], ["another nudge"],
                                  "every other claim is still recovered and sent")
 
+    def test_a_landed_old_key_send_whose_envelope_is_unusable_is_kept_and_never_resent(self):
+        """The pre-upgrade sender's POST landed; its record's payload is then an object that is not a
+        complete envelope for this body. Recovery keeps the claim and never posts again or makes a
+        new-key item, at both receipt cuts."""
+        one = "!RoomOne:ag2.space"
+        payloads = ({}, {"room_id": one}, {"body": "OTHER", "room_id": one}, {"body": 5, "room_id": one},
+                    {"body": "SAME BODY"}, {"body": "SAME BODY", "room_id": 5}, {"body": "SAME BODY", "room_id": ""},
+                    {"body": "SAME BODY", "room_id": one, "thread_root": 7},
+                    {"body": "SAME BODY", "room_id": one, "thread_root": ""})
+        for cut in ("before-receipt", "after-receipt"):
+            for bad in payloads:
+                with self.subTest(cut=cut, payload=bad):
+                    lane = Lane(gb, scratch("gw-legacy-envelope-"))
+                    root = lane.results / ".outbox-ag2space-proactive"
+                    legacy = self._old_key_sender_dies(lane, f"[channel: {one}]\nSAME BODY\n", cut)
+                    record = outbox._read_item(root, legacy)
+                    outbox._write_item(root, legacy, {**record, "payload": json.dumps(bad)})
+                    lane.restart()
+                    for _ in range(3):
+                        lane.drain()
+                    self.assertEqual(len(lane.posts), 1, "never posted again")
+                    self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id(
+                        "proactive-1", "SAME BODY", one, None)), "absent", "no new-key item")
+                    self.assertTrue(list(lane.results.glob("proactive-1.sending.*")), "kept as its claim")
+
+    def test_a_legacy_item_that_is_not_a_regular_file_never_blocks_or_stops_recovery(self):
+        for kind in ("fifo", "directory"):
+            with self.subTest(kind=kind):
+                lane = Lane(gb, scratch("gw-legacy-nonregular-"))
+                root = lane.results / ".outbox-ag2space-proactive"
+                item = outbox._item_path(root, gb._proactive_item_id("proactive-1", "SAME BODY"))
+                item.parent.mkdir(parents=True, exist_ok=True)
+                os.mkfifo(item) if kind == "fifo" else item.mkdir()
+                claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+                claim.write_text("[channel: !RoomOne:ag2.space]\nSAME BODY\n")
+                (lane.results / f"proactive-2.sending.{_dead_pid()}.1").write_text("healthy sibling\n")
+                try:
+                    with _deadline(2.0):
+                        lane.restart()
+                        for _ in range(2):
+                            lane.drain()
+                except Blocked:
+                    self.fail("recovery blocked on a non-regular legacy item")
+                self.assertTrue(claim.exists(), "kept as its claim")
+                self.assertEqual([p.get("body") for p in lane.posts], ["healthy sibling"])
+
+    def test_an_ordinary_drain_isolates_each_retained_original_and_snapshot(self):
+        """A retained original whose legacy item is a directory, and two items whose handling raises,
+        never stop the drain: the healthy live sibling is sent, the uncertain ones stay for later."""
+        lane = Lane(gb, scratch("gw-drain-isolation-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        item = outbox._item_path(root, gb._proactive_item_id("proactive-1", "SAME BODY"))
+        item.parent.mkdir(parents=True, exist_ok=True)
+        item.mkdir()
+        (lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1").write_text(
+            "[channel: !RoomOne:ag2.space]\nSAME BODY\n")
+        bad_original = lane.results / f".proactive-3{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
+        bad_original.write_text("three\n")
+        bad_snapshot = lane.results / f"proactive-4.sending.{os.getpid()}.s1"
+        bad_snapshot.write_text("four\n")
+        lane.write("proactive-2.txt", "healthy sibling\n")
+        real_reconcile, real_decide = gb._reconcile_decided, gb._decide_orphan_claim
+
+        def reconcile(r):
+            if r.name.startswith(".proactive-3"):
+                raise RuntimeError("an uncertain original")
+            return real_reconcile(r)
+
+        def decide(c):
+            if Path(c).name.startswith("proactive-4"):
+                raise RuntimeError("an uncertain snapshot")
+            return real_decide(c)
+        with mock.patch.object(gb, "_reconcile_decided", reconcile), \
+                mock.patch.object(gb, "_decide_orphan_claim", decide):
+            for _ in range(2):
+                lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], ["healthy sibling"])
+        self.assertTrue(bad_original.exists() and bad_snapshot.exists(), "kept for a later drain")
+
     def test_the_marker_key_and_the_send_read_a_thread_marker_the_same_way(self):
         """A malformed [thread:] before a valid one: the send posts top level, and the item key agrees."""
         for text in ("[thread: not-an-event]\n[thread: $Valid]\nbody\n", "[thread: $Valid]\nbody\n",

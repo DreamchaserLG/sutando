@@ -331,7 +331,7 @@ from . import __version__ as _PACKAGE_VERSION
 from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
-from .outbox import BornParked, publish_parked, receipt
+from .outbox import BornParked, publish_parked, receipt, receipt_record
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -5884,9 +5884,20 @@ def _reconcile_changed_decided() -> None:
         if cached is not None and cached[0] == seen and (
                 cached[1] is None or receipt(_proactive_outbox_root(), cached[1]) == cached[2]):
             continue  # same bytes and the same item state and epoch: nothing to do
-        item = _retained_item(r)  # its receipt is read before the reconcile, so a change during it is seen next pass
-        state = receipt(_proactive_outbox_root(), item) if item else None
-        if _reconcile_decided(r):  # the stat taken first is recorded: a write during the read is seen next pass
+        try:  # its receipt is read before the reconcile, so a change during it is seen next pass
+            item = _retained_item(r)
+            state = receipt(_proactive_outbox_root(), item) if item else None
+        except Exception as e:  # noqa: BLE001
+            _log_backoff(("proactive-decided", r.name), f"proactive {r.name} could not be read "
+                         f"({diagnostics.describe(e)}); retried")
+            continue
+        try:
+            settled = _reconcile_decided(r)
+        except Exception as e:  # noqa: BLE001 - one original's failure never stops the drain
+            _log_backoff(("proactive-decided", r.name), f"proactive {r.name} could not be reconciled "
+                         f"({diagnostics.describe(e)}); retried")
+            continue
+        if settled:  # the stat taken first is recorded: a write during the read is seen next pass
             _DECIDED_SEEN[key] = (seen, item, state)
     for gone in _DECIDED_SEEN.keys() - present:
         del _DECIDED_SEEN[gone]
@@ -6017,9 +6028,13 @@ def _retry_pending_snapshots() -> None:
         pid = int(m.group("pid"))
         if pid != os.getpid() and _pid_alive(pid):
             continue
-        taken = _take_snapshot(c)
-        if taken is not None:
-            _decide_orphan_claim(taken)
+        try:
+            taken = _take_snapshot(c)
+            if taken is not None:
+                _decide_orphan_claim(taken)
+        except Exception as e:  # noqa: BLE001 - one snapshot's failure never stops the drain
+            _log_backoff(("proactive-snapshot", c.name), f"proactive snapshot {c.name} could not be decided "
+                         f"({diagnostics.describe(e)}); retried")
 
 
 def _take_snapshot(c: Path) -> "Path | None":
@@ -6125,31 +6140,42 @@ def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None, int | None
     item_id, body, room, thread = identity
     root = _proactive_outbox_root()
     state, epoch = receipt(root, item_id)
-    if (state not in ("absent", "unknown") and (room, thread) != (None, None)
-            and item_id == _proactive_item_id(stem, body) and _stored_payload(root, item_id) is None):
-        return "unknown", generation, None  # an adopted legacy record that cannot be read: kept for an operator
+    if ((room, thread) != (None, None) and item_id == _proactive_item_id(stem, body)
+            and _legacy_envelope(root, item_id, body)[1] is None):
+        return "unknown", generation, None  # an adopted legacy record that is not this send's: kept for an operator
     return state, generation, epoch
 
 
-def _stored_payload(root: Path, item_id: str) -> "dict | None":
-    """An item's stored payload as an object, or None when it is missing, not JSON or not an object."""
+def _legacy_envelope(root: Path, legacy: str, body: str) -> "tuple[str, dict | None]":
+    """(state, payload) of the body-only item, from one safe read (`outbox.receipt_record`). The
+    payload is None unless it is a complete envelope for exactly this body: an object whose `body`
+    is this text, `room_id` a non-empty string, and `thread_root` absent or a non-empty string."""
+    state, _, record = receipt_record(root, legacy)
+    if record is None:
+        return state, None
     try:
-        stored = json.loads((read_item(root, item_id) or {}).get("payload") or "")
-    except (ValueError, TypeError, AttributeError):
-        return None
-    return stored if isinstance(stored, dict) else None
+        payload = json.loads(record.get("payload") or "")
+    except (ValueError, TypeError):
+        return state, None
+    if not (isinstance(payload, dict) and payload.get("body") == body
+            and isinstance(payload.get("room_id"), str) and payload["room_id"]
+            and (payload.get("thread_root") is None
+                 or (isinstance(payload.get("thread_root"), str) and payload["thread_root"]))):
+        return state, None
+    return state, payload
 
 
 def _legacy_item_for(stem: str, text: str, body: str, room, thread, envelope=None) -> "str | None":
     """The body-only item a marked file was sent under before its route joined the key, when it is
-    this generation's: its stored payload names exactly the room and thread this send resolves (a
+    this generation's: its stored envelope names exactly the room and thread this send resolves (a
     linked task's thread replaces the marker's; no thread means top level, never "any"). With no
-    resolution, the file's own marks are compared exactly. An unusable record is kept as this item,
-    so it fails closed (it may already have been sent) instead of being sent again under a new key."""
+    resolution, the file's own marks are compared exactly. Only a complete envelope can prove a match
+    or a different route; any other record is kept as this item, so it fails closed (it may already
+    have been sent) instead of being sent again under a new key."""
     root, legacy = _proactive_outbox_root(), _proactive_item_id(stem, body)
-    if receipt(root, legacy)[0] == "absent":
+    state, stored = _legacy_envelope(root, legacy, body)
+    if state == "absent":
         return None
-    stored = _stored_payload(root, legacy)
     if stored is None:
         return legacy
     if envelope is None:
