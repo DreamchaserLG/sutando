@@ -1490,13 +1490,24 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                     self.assertTrue(list(lane.results.glob("proactive-1.sending.*")), "kept as its claim")
 
     def test_a_legacy_item_that_is_not_a_regular_file_never_blocks_or_stops_recovery(self):
-        for kind in ("fifo", "directory"):
+        for kind in ("fifo", "directory", "symlink", "oversized"):
             with self.subTest(kind=kind):
                 lane = Lane(gb, scratch("gw-legacy-nonregular-"))
                 root = lane.results / ".outbox-ag2space-proactive"
                 item = outbox._item_path(root, gb._proactive_item_id("proactive-1", "SAME BODY"))
                 item.parent.mkdir(parents=True, exist_ok=True)
-                os.mkfifo(item) if kind == "fifo" else item.mkdir()
+                real_record = json.dumps({"status": "DELIVERED", "payload": json.dumps(
+                    {"body": "SAME BODY", "room_id": "!RoomOne:ag2.space"})})
+                if kind == "fifo":
+                    os.mkfifo(item)
+                elif kind == "directory":
+                    item.mkdir()
+                elif kind == "symlink":  # a link to a well-formed record must still be refused
+                    target = lane.results / "elsewhere.json"
+                    target.write_text(real_record)
+                    item.symlink_to(target)
+                else:  # past the reader's bound: refused before it is parsed
+                    item.write_text(real_record[:-1] + ', "pad": "' + "x" * (getattr(outbox, "RECEIPT_READ_LIMIT", 4 << 20) + 1) + '"}')
                 claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
                 claim.write_text("[channel: !RoomOne:ag2.space]\nSAME BODY\n")
                 (lane.results / f"proactive-2.sending.{_dead_pid()}.1").write_text("healthy sibling\n")
@@ -1510,38 +1521,56 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 self.assertTrue(claim.exists(), "kept as its claim")
                 self.assertEqual([p.get("body") for p in lane.posts], ["healthy sibling"])
 
-    def test_an_ordinary_drain_isolates_each_retained_original_and_snapshot(self):
-        """A retained original whose legacy item is a directory, and two items whose handling raises,
-        never stop the drain: the healthy live sibling is sent, the uncertain ones stay for later."""
-        lane = Lane(gb, scratch("gw-drain-isolation-"))
+    def test_an_ordinary_drain_isolates_each_retained_original(self):
+        """Retained reconciliation: one original whose legacy item is a directory and one whose reconcile
+        raises never stop the drain; the healthy live sibling is sent and both stay for a later drain."""
+        lane = Lane(gb, scratch("gw-drain-isolation-retained-"))
         root = lane.results / ".outbox-ag2space-proactive"
         item = outbox._item_path(root, gb._proactive_item_id("proactive-1", "SAME BODY"))
         item.parent.mkdir(parents=True, exist_ok=True)
         item.mkdir()
-        (lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1").write_text(
-            "[channel: !RoomOne:ag2.space]\nSAME BODY\n")
+        dir_original = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
+        dir_original.write_text("[channel: !RoomOne:ag2.space]\nSAME BODY\n")
         bad_original = lane.results / f".proactive-3{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
         bad_original.write_text("three\n")
-        bad_snapshot = lane.results / f"proactive-4.sending.{os.getpid()}.s1"
-        bad_snapshot.write_text("four\n")
         lane.write("proactive-2.txt", "healthy sibling\n")
-        real_reconcile, real_decide = gb._reconcile_decided, gb._decide_orphan_claim
+        real = gb._reconcile_decided
 
         def reconcile(r):
             if r.name.startswith(".proactive-3"):
                 raise RuntimeError("an uncertain original")
-            return real_reconcile(r)
+            return real(r)
+        with mock.patch.object(gb, "_reconcile_decided", reconcile):
+            for _ in range(2):
+                try:
+                    lane.drain()
+                except Exception:  # noqa: BLE001 - a head without isolation raises here
+                    pass
+        self.assertEqual([p.get("body") for p in lane.posts], ["healthy sibling"])
+        self.assertTrue(dir_original.exists() and bad_original.exists(), "kept for a later drain")
+
+    def test_an_ordinary_drain_isolates_each_pending_snapshot(self):
+        """Snapshot reconciliation: one snapshot whose decision raises never stops the drain; a sibling
+        snapshot and the live sibling are still sent."""
+        lane = Lane(gb, scratch("gw-drain-isolation-snapshot-"))
+        bad = lane.results / f"proactive-4.sending.{os.getpid()}.s1"
+        bad.write_text("four\n")
+        (lane.results / f"proactive-5.sending.{_dead_pid()}.s1").write_text("five\n")
+        lane.write("proactive-2.txt", "healthy sibling\n")
+        real = gb._decide_orphan_claim
 
         def decide(c):
             if Path(c).name.startswith("proactive-4"):
                 raise RuntimeError("an uncertain snapshot")
-            return real_decide(c)
-        with mock.patch.object(gb, "_reconcile_decided", reconcile), \
-                mock.patch.object(gb, "_decide_orphan_claim", decide):
+            return real(c)
+        with mock.patch.object(gb, "_decide_orphan_claim", decide):
             for _ in range(2):
-                lane.drain()
-        self.assertEqual([p.get("body") for p in lane.posts], ["healthy sibling"])
-        self.assertTrue(bad_original.exists() and bad_snapshot.exists(), "kept for a later drain")
+                try:
+                    lane.drain()
+                except Exception:  # noqa: BLE001
+                    pass
+        self.assertEqual(sorted(p.get("body") for p in lane.posts), ["five", "healthy sibling"])
+        self.assertTrue(bad.exists(), "kept for a later drain")
 
     def test_the_marker_key_and_the_send_read_a_thread_marker_the_same_way(self):
         """A malformed [thread:] before a valid one: the send posts top level, and the item key agrees."""
