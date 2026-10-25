@@ -14,6 +14,8 @@ confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
 
 Run: python3 tests/agent-api-connections.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
 import http.client
 import http.server
 import importlib.util
@@ -26,16 +28,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# Isolated before agent-api.py is imported (its WORKSPACE_DIR is read at import), so no outer
+# channel env file can be imported into the temp record by an empty list.
+_WS = tempfile.mkdtemp(prefix="agent-api-connections-")
+isolate_os_environ(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=_WS, SUTANDO_TELEMETRY="0",
+                   SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
-
-_WS = tempfile.mkdtemp(prefix="agent-api-connections-")
-# Must be set BEFORE agent-api.py is imported: its WORKSPACE_DIR is read at import.
-os.environ["SUTANDO_TEST_MODE"] = "1"
-os.environ["SUTANDO_WORKSPACE"] = _WS
-os.environ.setdefault("SUTANDO_TELEMETRY", "0")
-os.environ["SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER"] = "1"
-os.environ.pop("SUTANDO_API_TOKEN", None)
 
 
 def _load(name: str, path: Path):
@@ -199,7 +199,13 @@ s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost
 check("a loopback Origin with the bearer is echoed", s == 200 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", h)
 check("Vary: Origin accompanies the echo", h.get("Vary") == "Origin", h)
 s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
-check("the 401 to a loopback Origin still has no grant", s == 401 and "Access-Control-Allow-Origin" not in h, h)
+check("the 401 to a loopback Origin is echoed too, so a webview can read it and drop a stale bearer",
+      s == 401 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173" and h.get("Vary") == "Origin", (s, h))
+for origin in ("tauri://localhost", "http://tauri.localhost"):
+    s, b, h = req("GET", "/api/v1/connections", headers={"Origin": origin}, auth="Bearer wrong")
+    check(f"a wrong bearer from the desktop webview {origin} is a readable 401", s == 401 and h.get("Access-Control-Allow-Origin") == origin, (s, h))
+s, b, h = req("GET", "/api/v1/connections", headers={"Origin": "https://evil-fixture.net"}, auth=False)
+check("a refusal to a non-loopback Origin still grants nothing", s == 403 and "Access-Control-Allow-Origin" not in h, (s, h))
 s, b, h = req("OPTIONS", "/api/v1/connections", headers={"Origin": "http://localhost:5173"}, auth=False)
 check("preflight from loopback is 204 echoing the Origin", s == 204 and h.get("Access-Control-Allow-Origin") == "http://localhost:5173", (s, h))
 check("preflight allows DELETE and the bearer header",
@@ -374,6 +380,25 @@ check("a handler without a bound port still gates on host and bearer",
 status, body = _real("GET", "/api/v1/connections", {}, {}, workspace=WS)
 check("a broken record is 500 with the schema error", status == 500 and "connections.json" in body["error"], (status, body))
 (WS / "state" / "connections.json").unlink()
+
+print("== an empty record lists the token the connect flow wrote to the channel env file ==")
+_HOME = Path(tempfile.mkdtemp(prefix="agent-api-claude-home-"))
+(_HOME / "channels" / "ag2space").mkdir(parents=True)
+(_HOME / "channels" / "ag2space" / "relay-client.env").write_text(f"REMOTE_TASK_TOKEN={TOKEN_A}\n")
+os.environ["CLAUDE_CONFIG_DIR"] = str(_HOME)
+try:
+    s, b, _ = req("GET", "/api/v1/connections")
+finally:
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+rows = (b or {}).get("connections") or []
+check("GET on an empty record answers the imported primary row without a restart",
+      s == 200 and [(r["instance"], r["token_ref"], r["primary"], r["added_by"]) for r in rows]
+      == [("", "REMOTE_TASK_TOKEN", True, "env")], f"{s} {b}")
+check("the imported secret went to the vault, never the response",
+      FakeVault.store.get("REMOTE_TASK_TOKEN") == TOKEN_A and no_secret(b))
+check("the row is persisted", (WS / "state" / "connections.json").is_file())
+s, b, _ = req("GET", "/api/v1/connections")
+check("a later GET lists the same row from the record", [r["token_ref"] for r in (b or {}).get("connections", [])] == ["REMOTE_TASK_TOKEN"], b)
 
 server.server_close()
 print()

@@ -199,7 +199,7 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
     parts = [x for x in path[len(CONNECTIONS_PREFIX):].split("/") if x]
     try:
         if method == "GET" and not parts:
-            rows = _connections.list_connections(ws)
+            rows = _connections.list_connections(ws, vault=vault)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
         if method == "POST" and not parts:
             token = body.get("token")
@@ -983,25 +983,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def check_private_history_auth(self) -> bool:
         """Fail closed for browsers and non-loopback clients without a token."""
-        import hmac as _hmac
-
-        if API_TOKEN:
-            token = self.headers.get("Authorization", "").replace("Bearer ", "")
-            if _hmac.compare_digest(token, API_TOKEN):
-                return True
-            self.send_private_json(401, {"error": "unauthorized"})
+        status, why = local_api_gate.private_history_request_allowed(
+            self.client_address[0], self.headers.get("Origin"), self.headers.get("Authorization", ""),
+            configured_token=API_TOKEN)
+        if status != 200:
+            self.send_private_json(status, {"error": why})
             return False
-        try:
-            loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
-        except ValueError:
-            loopback = False
-        # The same-origin web-client proxy and local CLI callers send no
-        # Origin. A browser page always does for cross-origin fetches, so this
-        # also blocks hostile sites from reading localhost history.
-        if loopback and not self.headers.get("Origin"):
-            return True
-        self.send_private_json(403, {"error": "task history requires a local proxy or API token"})
-        return False
+        return True
 
     def do_OPTIONS(self):
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
@@ -1021,12 +1009,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
 
-    def _send_connections(self, status: int, payload: "dict | None", granted: bool = False) -> None:
-        """JSON (or an empty body); a cross-origin grant only for the loopback Origin whose
-        request passed the whole gate, never a wildcard and never on a refusal."""
+    def _send_connections(self, status: int, payload: "dict | None") -> None:
+        """JSON (or an empty body); the cross-origin grant echoes a loopback Origin only, never a
+        wildcard, on refusals too: without it a webview reads a 401 as a network failure and can
+        never drop a stale bearer. A non-loopback Origin gets no grant at any status."""
         self.send_response(status)
         origin = self.headers.get("Origin", "")
-        if granted and origin and local_api_gate.loopback_origin(origin):
+        if origin and local_api_gate.loopback_origin(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
         self.send_header("Cache-Control", "no-store")
@@ -1072,7 +1061,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         from urllib.parse import parse_qs
         status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
-        self._send_connections(status, payload, granted=True)
+        self._send_connections(status, payload)
 
     def do_DELETE(self):
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
@@ -1328,9 +1317,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         """Check API token if configured. Returns True if authorized."""
         if not API_TOKEN:
             return True  # No token = no auth required (local use)
-        import hmac as _hmac
-        token = self.headers.get("Authorization", "").replace("Bearer ", "")
-        if _hmac.compare_digest(token, API_TOKEN):
+        if local_api_gate.bearer_matches(self.headers.get("Authorization", ""), API_TOKEN):
             return True
         self.send_json(401, {"error": "unauthorized"})
         return False
