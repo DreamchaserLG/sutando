@@ -295,21 +295,36 @@ HISTORICAL = {HISTORICAL_FIXTURE: frozenset({
     (375, 19, "subprocess.run(argv, capture_output=True, text=True, timeout=120, env=self.env)")})}
 
 
-def violations(source: str, name: str = "<sample>", permitted: "frozenset | None" = None) -> "list[str]":
-    """Each inheritance site in one file's source, as 'name:line: rule'."""
-    allowed = HISTORICAL.get(name, frozenset()) if permitted is None else permitted
-
-    def historical(n) -> bool:
-        return hasattr(n, "col_offset") and (n.lineno, n.col_offset, ast.unparse(n)) in allowed
-
+@functools.lru_cache(maxsize=None)
+def _in_scope(source: str) -> "bool | None":
+    """Whether the code, not its comments or docstrings, names a gateway reference; None if unparseable."""
     if not REFERENCE.search(source):
-        return []
+        return False
     try:
         tree = ast.parse(source)
     except SyntaxError:
+        return None
+    return bool(REFERENCE.search(code_text(tree)))
+
+
+def violations(source: str, name: str = "<sample>", permitted: "frozenset | None" = None) -> "list[str]":
+    """Each inheritance site in one file's source, as 'name:line: rule'."""
+    allowed = HISTORICAL.get(name, frozenset()) if permitted is None else permitted
+    at = {}
+    for line, col, text in allowed:
+        at.setdefault((line, col), set()).add(text)
+
+    def historical(n) -> bool:
+        # Position first, so ast.unparse runs only on the few nodes at a permitted (line, column).
+        texts = at.get((getattr(n, "lineno", None), getattr(n, "col_offset", None))) if at else None
+        return bool(texts) and ast.unparse(n) in texts
+
+    scope = _in_scope(source)
+    if scope is None:
         return [f"{name}:0: unparseable"]
-    if not REFERENCE.search(code_text(ast.parse(source))):
+    if not scope:
         return []
+    tree = ast.parse(source)
     imp = Imports(tree)
     source = _source_path(name)
     library = HELPERS_DIR in source.parents
@@ -877,13 +892,19 @@ class Tree(unittest.TestCase):
         self.assertEqual(violations(text, elsewhere), [f"{elsewhere}:103: unisolated", f"{elsewhere}:119: copy"])
         for token in HISTORICAL[HISTORICAL_FIXTURE]:
             self.assertTrue(violations(text, HISTORICAL_FIXTURE, HISTORICAL[HISTORICAL_FIXTURE] - {token}), token)
-        # A second real violation on a permitted token's own line is still reported.
+        # A second violation on a permitted line, another node at a permitted position, and the
+        # permitted text at another column or line are all still reported.
         lines = text.split("\n")
         for line, extra, rule in ((119, "; leak = os.environ.copy()", "copy"),
+                                  (119, "; leak = dict(os.environ)", "copy"),
                                   (103, "; subprocess.run(['true'])", "unisolated")):
             planted = lines[:line - 1] + [lines[line - 1] + extra] + lines[line:]
             self.assertEqual(violations("\n".join(planted), HISTORICAL_FIXTURE),
                              [f"{HISTORICAL_FIXTURE}:{line}: {rule}"], extra)
+        swapped = lines[:118] + [lines[118].replace("dict(os.environ)", "os.environ.copy()")] + lines[119:]
+        self.assertEqual(violations("\n".join(swapped), HISTORICAL_FIXTURE), [f"{HISTORICAL_FIXTURE}:119: copy"])
+        moved = text + "\n\ndef planted():\n    return dict(os.environ)\n"
+        self.assertEqual(violations(moved, HISTORICAL_FIXTURE), [f"{HISTORICAL_FIXTURE}:{len(lines) + 3}: copy"])
 
     def test_no_test_reaching_gateway_credentials_inherits_the_outer_environment(self):
         files = scanned_files()
