@@ -608,18 +608,32 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self._bad_claim(lambda res, c: c.write_text("never sent\n"),
                         lambda: mock.patch.object(os, "O_NOFOLLOW", 0))
 
-    def _b_survives(self, lane, a_body: str) -> None:
-        """B was never sent, so it is neither archived as delivered nor lost; A is never resent."""
+    def _b_survives(self, lane, a_body: str, kind: str) -> None:
+        """B was never sent, so a second real drain claims and delivers it once under its own item
+        key, while A keeps its terminal state; a further restart and drain resurrect neither."""
         hidden = [h.read_text() for h in lane.results.glob(".proactive-1.delivered-*")]
         self.assertNotIn("UNSENT B\n", hidden, "unsent B hidden as delivered")
+        root = lane.results / ".outbox-ag2space-proactive"
+        a_id, b_id = gb._proactive_item_id("proactive-1", a_body), gb._proactive_item_id("proactive-1", "UNSENT B")
+        self.assertNotEqual(a_id, b_id)
         for _ in range(2):
             lane.drain()
         bodies = [p.get("body") for p in lane.posts]
         archived = [p.read_text() for p in (lane.results / "archive").glob("proactive-1*")]
         self.assertEqual(archived.count("UNSENT B\n"), bodies.count("UNSENT B"), "B archived unsent")
-        self.assertNotIn(a_body, bodies, "A is never resent")
         self.assertEqual(bodies.count("UNSENT B"), 1, f"B stayed eligible and was sent once ({bodies})")
         self.assertFalse(any((lane.results / "undelivered").glob("proactive-1*")), "B was never parked")
+        settled = (outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id))
+        self.assertEqual(settled[0], kind, f"A ({a_id}) keeps its terminal state")
+        self.assertEqual(settled[1], "DELIVERED", f"B ({b_id}) reached one terminal delivery")
+        lane.restart()
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], bodies, "a fresh restart and drain send nothing")
+        self.assertNotIn(a_body, bodies, "A is never resent")
+        self.assertEqual((outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id)), settled,
+                         "no scanner, recovery or retry path moved A or B")
+        self.assertEqual(lane.where("proactive-1"), "archived")
 
     def test_a_replacement_at_every_durable_boundary_is_neither_archived_unsent_nor_lost(self):
         faults = (("stage", "crash-after"), ("stage", "fail"), ("stage", "replace-at-target"),
@@ -683,7 +697,37 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                         rest = c.name.split(".sending.", 1)[1].split(".", 1)
                         c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
                     lane.restart()
-                    self._b_survives(lane, a_body)
+                    self._b_survives(lane, a_body, kind)
+
+    def test_a_staged_claim_is_invisible_to_every_delivered_scanner(self):
+        """Each reader of results/ names that could take a staged claim for a delivered (or drained)
+        file: the gateway's reaper, its archive probe (which the dispatch veto also asks) and its drain,
+        the other bridges' startup sweep, and the pending-questions drain probe. The task-orphan
+        classifier and dedup probes match only `<id>.txt[.sending]`; outbox state is keyed by item."""
+        import importlib.util
+        from ag2_sparrow import proactive_recovery as vendored_recovery
+        sys.path.insert(0, str(REPO / "skills" / "pending-questions" / "scripts"))
+        spec = importlib.util.spec_from_file_location(
+            "pending_questions_ask", REPO / "skills" / "pending-questions" / "scripts" / "pending_questions_ask.py")
+        ask = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("pending_questions_ask", ask)
+        spec.loader.exec_module(ask)
+        import proactive_recovery as src_recovery
+        res = self.lane.results
+        staged = res / f"proactive-1.sending.{os.getpid()}.{1 << 60}"
+        staged.write_text("UNSENT B\n")
+        with mock.patch.object(gb, "RESULTS_DIR", res), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", res / "archive"):
+            gb._reap_hidden_delivered()
+            self.assertFalse(gb._delivered_copy_exists("proactive-1"), "archive probe")
+        self.assertEqual(staged.read_text(), "UNSENT B\n", "the reaper left it")
+        self.assertEqual(list((res / "archive").iterdir()), [], "nothing archived")
+        for mod in (src_recovery, vendored_recovery):
+            self.assertIsNone(mod._recovery_target(staged.name), f"{mod.__name__} sweep ignores it")
+        self.assertFalse(ask.drained(res, "proactive-1.txt"), "pending-questions reads it as not yet drained")
+        self.lane.drain()
+        self.assertEqual(self.lane.posts, [], "the drain reads only live .txt files")
+        self.assertEqual(staged.read_text(), "UNSENT B\n")
 
     def test_a_parked_claim_goes_back_live_only_on_a_requeues_own_transition(self):
         def delete(root, item_id, parked):
