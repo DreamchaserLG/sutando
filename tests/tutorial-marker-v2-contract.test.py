@@ -3,7 +3,7 @@
 
 - A reference validator for Appendix A.1 to A.8, and every A.10 write as a function building a complete
   record: every state the lifecycle reaches, refusals and terminal outcomes included, validates, and
-  each write the design forbids is rejected.
+  each write the design forbids is rejected. M2 converts the v1 bytes per A.9, refusing what it doesn't list.
 - The load barrier (§9), staged: fixed paths, then validation, then the sidecars validation names. A
   file and directory-entry model shows no power loss leaves a durable record without what it needs.
 
@@ -130,8 +130,10 @@ def operation(op, i: int, op_id: str) -> None:
              "failed": {"failure"}}[op["state"]]
     closed(op, {"index", "client", "root", "start", "end", "wire_sha256", "struct_v", "struct_sha256", "plan_id",
                 "base_ref", "base_sha256", "transmissions", "state"} | extra, where=f"op {i}")
-    need(op["index"] == i and is_int(op["client"], 1, 2 ** 53 - 1) and is_str(op["root"]) and op["root"], f"op {i}")
-    need(op["start"] == 0 and type(op["start"]) is int and is_int(op["end"], 1) and op["struct_v"] == 1, f"op {i}: range")
+    need(is_int(op["index"]) and op["index"] == i and is_int(op["client"], 1, 2 ** 53 - 1)
+         and is_str(op["root"]) and op["root"], f"op {i}")
+    need(op["start"] == 0 and type(op["start"]) is int and is_int(op["end"], 1) and is_int(op["struct_v"])
+         and op["struct_v"] == 1, f"op {i}: range")
     need(all(is_hex(op[k]) for k in ("wire_sha256", "struct_sha256", "plan_id", "base_sha256")), f"op {i}: digests")
     need(op["base_ref"] == f"ops/{op_id}/{i}.base", f"op {i}: base_ref is not canonical")
     t = op["transmissions"]
@@ -164,8 +166,8 @@ def failure(f, where) -> None:
     need(is_int(f["op"], 0) and f["reason"] in REASONS and is_ts(f["at"]), f"{where}: fields")
 
 
-def capture(c, digests: list, where="capture") -> None:
-    """digests: each operation's struct_sha256, in order."""
+def capture(c, digests: list, target_sha256: str, where="capture") -> None:
+    """digests: each operation's struct_sha256, in order; target_sha256: the text the fill wrote."""
     closed(c, {"read_at", "review_token_v", "review_snapshot_sha256", "observed_sha256", "doc_sha256",
                "foreign_text_items", "ranges", "findings"}, where=where)
     need(is_ts(c["read_at"]) and c["review_token_v"] == 1 and type(c["review_token_v"]) is int, f"{where}: header")
@@ -177,7 +179,8 @@ def capture(c, digests: list, where="capture") -> None:
     bad = []
     for i, r in enumerate(c["ranges"]):
         closed(r, {"op", "digest", "struct_ok"}, where=f"{where}.ranges[{i}]")
-        need(r["op"] == i and opt(is_hex, r["digest"]) and type(r["struct_ok"]) is bool, f"{where}.ranges[{i}]")
+        need(is_int(r["op"]) and r["op"] == i and opt(is_hex, r["digest"]) and type(r["struct_ok"]) is bool,
+             f"{where}.ranges[{i}]")
         need(r["struct_ok"] == (r["digest"] == digests[i]), f"{where}.ranges[{i}]: struct_ok")
         if not r["struct_ok"]:
             bad.append(f"struct-mismatch:{i}")
@@ -185,6 +188,8 @@ def capture(c, digests: list, where="capture") -> None:
     need(isinstance(f, list) and f == sorted(set(f)), f"{where}: findings sorted and unique")
     need([x for x in f if x.startswith("struct-mismatch:")] == sorted(bad), f"{where}: struct findings")
     need(set(f) - set(bad) <= {"bytes-differ", "non-empty-after-create"}, f"{where}: unknown finding")
+    # One visible text gives both observed_sha256 and bytes-differ (§5 J4b).
+    need(("bytes-differ" in f) == (c["observed_sha256"] != target_sha256), f"{where}: bytes-differ")
 
 
 J_COMMON = {"state", "op_id", "kind", "prior_current", "proposed", "target", "target_sha256", "plan", "started_at"}
@@ -234,12 +239,12 @@ def journal(j) -> None:
         need(f["op"] == n and len(ops) == n + 1 and ops[n]["state"] == "failed"
              and ops[n]["failure"]["reason"] == f["reason"], "observing failure")
     if j["capture"] is not None:
-        capture(j["capture"], [op["struct_sha256"] for op in ops], "journal.capture")
+        capture(j["capture"], [op["struct_sha256"] for op in ops], j["target_sha256"], "journal.capture")
 
 
 def summary(s, i: int) -> None:
     closed(s, {"index", "client", "end", "struct_sha256", "state", "reserved", "failure_reason"}, where=f"summary {i}")
-    need(s["index"] == i and is_int(s["client"], 1, 2 ** 53 - 1) and is_int(s["end"], 1)
+    need(is_int(s["index"]) and s["index"] == i and is_int(s["client"], 1, 2 ** 53 - 1) and is_int(s["end"], 1)
          and is_hex(s["struct_sha256"]) and s["state"] in OP_STATES and is_int(s["reserved"], 0, 20), f"summary {i}")
     if s["state"] in ("send-unknown", "landed"):
         need(s["reserved"] >= 1, f"summary {i}: a sent operation has a reservation")
@@ -303,7 +308,7 @@ def review(r) -> None:
         need(f is None or ops[-1]["state"] == "failed", f"{where}: failure")
         return
     need(r["capture"] is not None, f"{where}: a captured review without a capture")
-    capture(r["capture"], [s["struct_sha256"] for s in ops], where + ".capture")
+    capture(r["capture"], [s["struct_sha256"] for s in ops], r["target_sha256"], where + ".capture")
     need((f is None) == (reason == "observed") and (f is None or f["reason"] == reason), f"{where}: failure")
     need(all(s["state"] == "landed" for s in (ops if f is None else ops[:-1])), f"{where}: operations landed")
     need(r["findings"] == r["capture"]["findings"], f"{where}: findings")
@@ -326,6 +331,9 @@ def decision(d, room_key: str, r: dict) -> None:
         candidate_vector(d["candidates"], where, empty=choice == "vanished")
         need((d["candidates"] == []) == (choice == "vanished"), f"{where}: vanished iff no candidate")
         need(d["candidates_sha256"] == candidates_digest(d["candidates"]), f"{where}: candidates_sha256")
+        if choice != "vanished":
+            need(d["candidates"] == r["candidates"] and d["candidates_sha256"] == r["candidates_sha256"],
+                 f"{where}: not the reviewed vector C")
         if choice not in ("select:none", "vanished"):
             need(choice[7:] in {c["kind"] for c in d["candidates"]}, f"{where}: kind not a candidate")
     else:
@@ -370,16 +378,21 @@ def room(rm, key: str, v1_entries: dict) -> None:
         need(d is not None and any(d["choice"] == c or (c == "select:" and d["choice"].startswith(c))
                                    for c in choices), f"room: {review_id} has no {choices} decision")
         return d
-    entries = ([rm["current"]] if rm["current"] is not None else []) + list(rm["superseded"])
     need(isinstance(rm["superseded"], list), "superseded")
+    entries = ([rm["current"]] if rm["current"] is not None else []) + rm["superseded"]
     for c in entries:
         current(c)
         if not c["opaque"]:
             d = decided(c["accepted_review_id"], ("keep-new",))
             need(d["review_snapshot_sha256"] == c["accepted_review_snapshot_sha256"]
                  and d["kind"] == c["kind"] and d["op_id"] == c["op_id"], "current: its keep-new decision")
+            r = reviews[c["accepted_review_id"]]
+            need(c["proposed"] == r["proposed"] and c["target_sha256"] == r["target_sha256"]
+                 and c["accepted_observed_sha256"] == r["capture"]["observed_sha256"], "current: copies its review")
         elif c["source"] == "manual-selection":
             need(decided(c["review_id"], ("select:",))["choice"] == "select:" + c["kind"], "current: its selection")
+        else:
+            need(c["v1_entry_sha256"] == v1_entries.get(key), "current: its v1 entry digest")
     need(isinstance(rm["rejected"], list), "rejected")
     for x in rm["rejected"]:
         closed(x, {"kind", "op_id", "revision", "review_id"}, where="rejected")
@@ -394,6 +407,21 @@ def room(rm, key: str, v1_entries: dict) -> None:
         d = decided(x["review_id"], ("select:",))
         need({"kind": x["kind"], "review_snapshot_sha256": x["review_snapshot_sha256"]} in d["candidates"]
              and d["choice"] != "select:" + x["kind"], "unselected: an unchosen candidate of its selection")
+    # The reverse: each decision's §6 room-entry change is present exactly once.
+    for v, d in decisions.items():
+        r, ch = reviews[v], d["choice"]
+        was_active = r["superseded_by"] is None
+        need(was_active or ch == "keep-old", f"decision {v}: {ch} on a stale review")
+        need(sum(not c["opaque"] and c["accepted_review_id"] == v for c in entries) == (ch == "keep-new"),
+             f"decision {v}: keep-new and its promotion")
+        need(sum(x["review_id"] == v for x in rm["rejected"]) == (ch == "keep-old" and was_active and "proposed" in r),
+             f"decision {v}: an active candidate keep-old and its Rejected entry")
+        picked = sum(c["opaque"] and c["source"] == "manual-selection" and c["review_id"] == v for c in entries)
+        need(picked == (ch.startswith("select:") and ch != "select:none"), f"decision {v}: select and its current")
+        left = sorted(({"kind": x["kind"], "review_snapshot_sha256": x["review_snapshot_sha256"]}
+                       for x in rm["unselected"] if x["review_id"] == v), key=lambda c: c["kind"])
+        unpicked = [c for c in d["candidates"] if "select:" + c["kind"] != ch] if ch.startswith("select:") else []
+        need(left == unpicked, f"decision {v}: select and its unselected entries")
 
 
 def marker(m) -> None:
@@ -436,25 +464,88 @@ def mint_id() -> str:
     return f"{next(_ids):032x}"
 
 
-def m2(v1_rooms: "dict | None") -> dict:
-    """M2: the whole file. None is a clean first use (source none)."""
-    if v1_rooms is None:
-        return {"version": 2, "rooms": {}, "migrated_from": {"at": T, "v1_rooms": {}},
-                "migration": {"phase": "converted", "source": {"kind": "none"}, "converted_at": T, "fenced_at": None}}
-    m = {"version": 2, "rooms": {}, "migrated_from": {"at": T, "v1_rooms": {}},
-         "migration": {"phase": "converted", "converted_at": T, "fenced_at": None,
-                       "source": {"kind": "legacy", "v1_sha256": H, "v1_size": 10, "backup": "getting-started.v1.bak"}}}
-    for key, entry in v1_rooms.items():
-        digest = sha(canonical(entry))
-        m["migrated_from"]["v1_rooms"][key] = {"entry_sha256": digest, "entry": entry}
-        rm = m["rooms"][key] = new_room()
-        if entry.get("state") in ("creating", "pending"):
-            mint(rm, {"reason": "legacy-in-flight", "kind": entry.get("kind"), "op_id": entry.get("operation_id"),
-                      "v1_state": entry["state"], "v1_entry_sha256": digest, "findings": ["v1-" + entry["state"]]})
+class Refused(Exception):
+    """M2 refuses: exit 4, nothing written, naming the room."""
+
+
+def refuse_unless(cond, why: str) -> None:
+    if not cond:
+        raise Refused(why)
+
+
+def v1_complete(e) -> bool:
+    """A.9's complete row: an html-* kind, and state complete or absent."""
+    return isinstance(e, dict) and is_kind(e.get("kind")) and e.get("state", "complete") == "complete"
+
+
+def v1_revision(e):
+    return e["revision"] if isinstance(e, dict) and isinstance(e.get("revision"), str) else None
+
+
+def convert(key: str, e, digest: str) -> dict:
+    """A.9: one v1 room entry to its v2 room, or Refused."""
+    refuse_unless(isinstance(key, str) and key, f"room {key!r}: not a room key")
+    refuse_unless(isinstance(e, dict), f"room {key}: not an object")
+    rm = new_room()
+
+    def opaque(kind, source, revision):
+        return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
+                "review_id": None, "v1_entry_sha256": digest}
+
+    def legacy(kind, op_id, state):
+        mint(rm, {"reason": "legacy-in-flight", "kind": kind, "op_id": op_id, "v1_state": state,
+                  "v1_entry_sha256": digest, "findings": ["v1-" + state]})
+
+    prev = e.get("previous")
+    refuse_unless(prev is None or v1_complete(prev), f"room {key}: previous is not a complete entry")
+    state = e.get("state", "complete")
+    if state == "complete":
+        refuse_unless(is_kind(e.get("kind")), f"room {key}: kind")
+        refuse_unless(e.get("foreign", True) is True, f"room {key}: foreign")
+        refuse_unless(isinstance(e.get("interrupted", {}), dict), f"room {key}: interrupted")
+        source = "v1-interrupted" if "interrupted" in e else "v1-foreign" if "foreign" in e else "v1-complete"
+        rm["current"] = opaque(e["kind"], source, v1_revision(e))
+    elif state in ("creating", "pending"):
+        op_id = e.get("operation_id")
+        if state == "creating":
+            refuse_unless(e.get("kind") is None and isinstance(op_id, str), f"room {key}: creating")
         else:
-            rm["current"] = {"opaque": True, "kind": entry["kind"], "revision": None, "proposed": None,
-                             "source": "v1-complete", "review_id": None, "v1_entry_sha256": digest}
+            refuse_unless(is_kind(e.get("kind")) and opt(is_str, op_id), f"room {key}: pending")
+        rm["current"] = None if prev is None else opaque(prev["kind"], "v1-previous", v1_revision(prev))
+        legacy(e.get("kind"), op_id, state)
+    elif state == "updating":
+        refuse_unless(is_kind(e.get("kind")), f"room {key}: updating")
+        rm["current"] = opaque(e["kind"], "v1-updating", v1_revision(prev))
+        legacy(e["kind"], None, "updating")
+    else:
+        raise Refused(f"room {key}: unknown state {state!r}")
+    return rm
+
+
+def m2(v1: "bytes | None") -> dict:
+    """M2: the whole file, from the bytes M1 linked. None is a clean first use (source none)."""
+    m = {"version": 2, "rooms": {}, "migrated_from": {"at": T, "v1_rooms": {}},
+         "migration": {"phase": "converted", "source": {"kind": "none"}, "converted_at": T, "fenced_at": None}}
+    if v1 is None:
+        return m
+    try:
+        doc = json.loads(v1.decode("utf-8"))
+    except ValueError:
+        raise Refused("v1 is not UTF-8 JSON") from None
+    refuse_unless(isinstance(doc, dict) and set(doc) == {"version", "rooms"} and is_int(doc["version"])
+                  and doc["version"] == 1 and isinstance(doc["rooms"], dict), "v1 is not a version 1 file")
+    m["migration"]["source"] = {"kind": "legacy", "v1_sha256": sha(v1), "v1_size": len(v1),
+                                "backup": "getting-started.v1.bak"}
+    for key, entry in doc["rooms"].items():
+        digest = sha(canonical(entry))
+        m["rooms"][key] = convert(key, entry, digest)
+        m["migrated_from"]["v1_rooms"][key] = {"entry_sha256": digest, "entry": entry}
     return m
+
+
+def v1_file(rooms: dict) -> bytes:
+    """The bytes the deployed writer saves."""
+    return json.dumps({"version": 1, "rooms": rooms}, indent=2, sort_keys=True).encode()
 
 
 def m4(m):
@@ -466,13 +557,16 @@ def new_room() -> dict:
             "active_review_id": None, "reviews": {}, "decisions": {}}
 
 
-def a_proposed(kind=None, target="Getting started, two chunks", revision="r1") -> dict:
+TARGET = "Getting started, two chunks"
+
+
+def a_proposed(kind=None, target=TARGET, revision="r1") -> dict:
     return {"revision": revision, "name": "Blue", "core": "codex", "audience": "owner", "agent_mxid": "@a:x",
             "prompts": ["p"], "roles": ["r"], "media": {"m": "u"}, "list_sha256": H,
             "target_sha256": sha(target.encode()), "kind": kind}
 
 
-def j0(m, r, target="Getting started, two chunks", revision="r1"):
+def j0(m, r, target=TARGET, revision="r1"):
     rm = m["rooms"].setdefault(r, new_room())
     data = target.encode()
     rm["journal"] = {"state": "creating", "op_id": mint_id(), "kind": None, "prior_current": copy.deepcopy(rm["current"]),
@@ -537,17 +631,21 @@ def j3_ready(m, r, outcome="timeout"):
     op["transmissions"]["last_outcome"] = outcome
 
 
-def a_capture(digests, token=H, mismatch=()) -> dict:
+def a_capture(digests, target_sha256, visible=TARGET, token=H, mismatch=()) -> dict:
+    """One read: observed_sha256 and bytes-differ both come from the visible text."""
     ranges = [{"op": i, "digest": "d" * 64 if i in mismatch else d, "struct_ok": i not in mismatch}
               for i, d in enumerate(digests)]
-    return {"read_at": T, "review_token_v": 1, "review_snapshot_sha256": token, "observed_sha256": H,
+    observed = sha(visible.encode())
+    return {"read_at": T, "review_token_v": 1, "review_snapshot_sha256": token, "observed_sha256": observed,
             "doc_sha256": H, "foreign_text_items": None if token is None else 0, "ranges": ranges,
-            "findings": sorted(f"struct-mismatch:{i}" for i in mismatch)}
+            "findings": sorted([f"struct-mismatch:{i}" for i in mismatch]
+                               + (["bytes-differ"] if observed != target_sha256 else []))}
 
 
-def j4b(m, r, token=H):
+def j4b(m, r, token=H, visible=None):
     j = m["rooms"][r]["journal"]
-    j["capture"] = a_capture([op["struct_sha256"] for op in j["operations"]], token)
+    j["capture"] = a_capture([op["struct_sha256"] for op in j["operations"]], j["target_sha256"],
+                             j["target"] if visible is None else visible, token)
 
 
 def summaries(ops):
@@ -611,7 +709,7 @@ def keep_old(m, r, v=None):
         rm["active_review_id"] = None
 
 
-def refuse_keep_new(m, r, missing=False):
+def refuse_keep_new(m, r, missing=False, visible=TARGET):
     """§7: the candidate changed or vanished. A fresh active review, and no decision."""
     rm = m["rooms"][r]
     old = rm["reviews"][rm["active_review_id"]]
@@ -619,8 +717,10 @@ def refuse_keep_new(m, r, missing=False):
     if missing:
         rv.update(reason="page-missing", capture=None, findings=["page-missing"])
     else:
-        rv.update(reason=old["failure"]["reason"] if old["failure"] else "observed", findings=[],
-                  capture=a_capture([s["struct_sha256"] for s in rv["operations"]], "e" * 64))
+        rv["capture"] = a_capture([s["struct_sha256"] for s in rv["operations"]], rv["target_sha256"], visible,
+                                  "e" * 64)
+        rv.update(reason=old["failure"]["reason"] if old["failure"] else "observed",
+                  findings=list(rv["capture"]["findings"]))
     return mint(rm, rv)
 
 
@@ -696,7 +796,8 @@ class SchemaTransitionTest(unittest.TestCase):
     def test_a_legacy_migration_then_a_refresh_validates(self):
         v1 = {"!done": {"kind": "html-old", "state": "complete", "hash": "h", "updated_at": T},
               "!lost": {"state": "creating", "operation_id": "o", "updated_at": T}}
-        m = self.walk(m2(v1), [m4, lambda m: fill(m, "!done"), lambda m: j4b(m, "!done"), lambda m: j5(m, "!done"),
+        m = self.walk(m2(v1_file(v1)), [m4, lambda m: fill(m, "!done"), lambda m: j4b(m, "!done"),
+                                        lambda m: j5(m, "!done"),
                                lambda m: keep_new(m, "!done"), lambda m: keep_old(m, "!lost")])
         self.assertEqual(m["rooms"]["!done"]["superseded"][0]["source"], "v1-complete")
         self.assertEqual(m["rooms"]["!lost"]["rejected"], [], "legacy-in-flight rejects no revision")
@@ -737,6 +838,9 @@ class SchemaTransitionTest(unittest.TestCase):
         rm = m["rooms"]["!lost"]
         self.assertEqual((len(rm["reviews"]), rm["decisions"]), (2, {}))
         self.walk(m, [lambda m: select(m, "!lost", ("html-a",), "select:html-a")])
+        m = self.walk(m2(None), [lambda m: marker_lost(m, "!lost"),
+                                 lambda m: select(m, "!lost", ("html-a", "html-b", "html-c"), "select:html-c")])
+        self.assertEqual(m["rooms"]["!lost"]["decisions"], {}, "an extra candidate was never reviewed")
 
     def test_both_selections_and_a_vanished_vector_reach_a_valid_terminal(self):
         for reread, choice in ((("html-a", "html-b"), "select:html-b"), (("html-a", "html-b"), "select:none"),
@@ -760,6 +864,124 @@ class SchemaTransitionTest(unittest.TestCase):
         stale = next(k for k, v in m["rooms"][R]["reviews"].items() if v["superseded_by"])
         m = self.walk(m, [lambda m: keep_old(m, R, stale)])
         self.assertIsNotNone(m["rooms"][R]["active_review_id"])
+
+    def test_a_fill_whose_visible_text_differs_from_its_target_reviews_bytes_differ(self):
+        m = self.walk(m2(None), [fill, lambda m: j4b(m, R, visible=TARGET + " edited"), lambda m: j5(m, R),
+                                 lambda m: refuse_keep_new(m, R, visible=TARGET + " again")])
+        rv = m["rooms"][R]["reviews"][m["rooms"][R]["active_review_id"]]
+        self.assertEqual(rv["findings"], ["bytes-differ"])
+
+    def test_a_capture_cannot_contradict_its_target(self):
+        m = m2(None)
+        fill(m)
+        j4b(m, R)
+        cap = ["rooms", R, "journal", "capture"]
+        self.assertRaises(Invalid, marker, self.mutate(m, cap + ["observed_sha256"], H))
+        self.assertRaises(Invalid, marker, self.mutate(m, cap + ["findings"], ["bytes-differ"]))
+        j4b(m, R, visible="other")
+        self.assertRaises(Invalid, marker, self.mutate(m, cap + ["findings"], []))
+        j5(m, R)
+        rv = ["rooms", R, "reviews", m["rooms"][R]["active_review_id"]]
+        self.assertRaises(Invalid, marker, self.mutate(m, rv + ["capture", "observed_sha256"],
+                                                       sha(TARGET.encode())))
+
+    def test_every_integer_field_rejects_a_bool_and_a_float(self):
+        m = m2(v1_file({"!v1": {"kind": "html-old", "state": "complete", "hash": "h", "updated_at": T}}))
+        fill(m, "!v1")
+        j4b(m, "!v1", token=None)
+        j0(m, R)
+        j1(m, R)
+        j2(m, R)
+        j2p(m, R)
+        j3_failed(m, R)
+        j4b(m, R)
+        fill(m, "!rv", ops=1)
+        j2(m, "!rv")
+        j2p(m, "!rv")
+        j3_failed(m, "!rv")
+        j4b(m, "!rv")
+        j5(m, "!rv")
+        marker(m)
+
+        def ints(x, path):
+            if type(x) is int:
+                yield path, x
+            for k, v in (x.items() if isinstance(x, dict) else enumerate(x) if isinstance(x, list) else ()):
+                if path[:2] != ["migrated_from", "v1_rooms"]:
+                    yield from ints(v, path + [k])
+        found = list(ints(m, []))
+        names = {"/".join(str(k) for k in p if not isinstance(k, int)) for p, _ in found}
+        self.assertTrue({"version", "migration/source/v1_size", "rooms/!room/journal/operations/index",
+                         "rooms/!room/journal/operations/struct_v", "rooms/!room/journal/capture/ranges/op",
+                         "rooms/!rv/reviews/" + m["rooms"]["!rv"]["active_review_id"] + "/operations/index",
+                         "rooms/!room/journal/failure/op", "rooms/!room/journal/plan",
+                         "rooms/!v1/journal/next_op"} <= names, names)
+        for path, value in found:
+            for bad in {float(value), *([bool(value)] if value in (0, 1) else [])}:
+                with self.subTest(path="/".join(map(str, path)), value=bad):
+                    self.assertRaises(Invalid, marker, self.mutate(m, path, bad))
+
+    def test_decisions_and_their_room_effects_are_bound_to_the_reviews_they_cite(self):
+        new = m2(None)
+        fill(new)
+        j4b(new, R)
+        j5(new, R)
+        keep_new(new, R)
+        cur = ["rooms", R, "current"]
+        old = m2(None)
+        fill(old)
+        j4b(old, R)
+        j5(old, R)
+        keep_old(old, R)
+        lost = m2(None)
+        marker_lost(lost, "!lost")
+        select(lost, "!lost", ("html-a", "html-b"), "select:html-b")
+        none = m2(None)
+        marker_lost(none, "!lost")
+        select(none, "!lost", ("html-a", "html-b"), "select:none")
+        for good in (new, old, lost, none):
+            marker(good)
+        w = next(iter(lost["rooms"]["!lost"]["decisions"]))
+        dec = ["rooms", "!lost", "decisions", w]
+        changed = vector(("html-a", "html-b", "html-c"))
+        retoken = vector(("html-a",)) + vector(("html-b",), "e" * 64)
+        cases = {
+            "select over a changed, unreviewed C": [
+                (dec + ["candidates"], changed), (dec + ["candidates_sha256"], candidates_digest(changed))],
+            "select over a C whose chosen candidate changed": [
+                (dec + ["candidates"], retoken), (dec + ["candidates_sha256"], candidates_digest(retoken))],
+            "accepted proposed differing from its review": [(cur + ["proposed", "name"], "Red")],
+            "accepted revision differing from its review": [(cur + ["revision"], "r2"),
+                                                            (cur + ["proposed", "revision"], "r2")],
+            "accepted_observed_sha256 differing from the capture": [(cur + ["accepted_observed_sha256"], "f" * 64)],
+            "keep-new without its promotion": [(cur, None)],
+            "an active keep-old without its Rejected entry": [(["rooms", R, "rejected"], [])],
+            "select:<kind> without its current": [(["rooms", "!lost", "current"], None)],
+            "select:<kind> without its unselected entry": [(["rooms", "!lost", "unselected"], [])],
+            "select:none without its unselected entries": [(["rooms", "!lost", "unselected"], [])],
+        }
+        source = {"select over a changed, unreviewed C": lost, "select over a C whose chosen candidate changed": lost,
+                  "an active keep-old without its Rejected entry": old,
+                  "select:<kind> without its current": lost, "select:<kind> without its unselected entry": lost,
+                  "select:none without its unselected entries": none}
+        for name, edits in cases.items():
+            with self.subTest(name):
+                bad = source.get(name, new)
+                for path, value in edits:
+                    bad = self.mutate(bad, path, value)
+                self.assertRaises(Invalid, marker, bad)
+        stale = m2(None)
+        fill(stale)
+        j4b(stale, R)
+        j5(stale, R)
+        first = stale["rooms"][R]["active_review_id"]
+        refuse_keep_new(stale, R)
+        keep_old(stale, R, first)
+        marker(stale)
+        rv = stale["rooms"][R]["reviews"][first]
+        bad = self.mutate(stale, ["rooms", R, "rejected"], [{"kind": rv["kind"], "op_id": rv["op_id"],
+                                                             "revision": "r1", "review_id": first}])
+        self.assertRaises(Invalid, marker, bad)
 
     def mutate(self, m, path, value):
         bad = copy.deepcopy(m)
@@ -821,6 +1043,111 @@ class SchemaTransitionTest(unittest.TestCase):
 DELETE = object()
 
 
+def expected_opaque(kind, source, revision, digest):
+    return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
+            "review_id": None, "v1_entry_sha256": digest}
+
+
+class ConversionMatrixTest(unittest.TestCase):
+    """A.9, row by row: the exact room M2 writes for each v1 shape, and every shape it refuses."""
+    PREV = {"kind": "html-p", "state": "complete", "hash": "h0", "revision": "r6"}
+    ROWS = {  # name: (v1 entry, current as (kind, source, revision) or None, legacy-in-flight (kind, op_id, state))
+        "complete, main": ({"kind": "html-a", "state": "complete", "hash": "h", "updated_at": T},
+                           ("html-a", "v1-complete", None), None),
+        "complete, head, state absent": ({"kind": "html-a", "hash": "h", "revision": "r7", "prompts": ["p"]},
+                                         ("html-a", "v1-complete", "r7"), None),
+        "complete, foreign": ({"kind": "html-a", "state": "complete", "hash": "h", "revision": "r7", "foreign": True},
+                              ("html-a", "v1-foreign", "r7"), None),
+        "complete, interrupted and foreign": (
+            {"kind": "html-a", "state": "complete", "hash": "h", "revision": "r7", "foreign": True,
+             "interrupted": {"done": 1, "target": "h1", "page": "h2"}}, ("html-a", "v1-interrupted", "r7"), None),
+        "complete, interrupted": ({"kind": "html-a", "hash": "h", "interrupted": {"done": 0}},
+                                  ("html-a", "v1-interrupted", None), None),
+        "creating, main": ({"state": "creating", "operation_id": "tutorial-1", "updated_at": T}, None,
+                           (None, "tutorial-1", "creating")),
+        "creating, head, a previous": ({"state": "creating", "operation_id": "op", "kind": None, "revision": "r8",
+                                        "previous": PREV, "target": "x", "done": 0},
+                                       ("html-p", "v1-previous", "r6"), (None, "op", "creating")),
+        "pending, main": ({"kind": "html-a", "state": "pending", "operation_id": "op", "updated_at": T}, None,
+                          ("html-a", "op", "pending")),
+        "pending, head, a previous, no operation_id": (
+            {"kind": "html-a", "state": "pending", "revision": "r8", "previous": PREV, "target": "x"},
+            ("html-p", "v1-previous", "r6"), ("html-a", None, "pending")),
+        "updating, a previous": ({"kind": "html-a", "state": "updating", "done": 2, "revision": "r8",
+                                  "previous": PREV, "target": "x", "before": "y"},
+                                 ("html-a", "v1-updating", "r6"), ("html-a", None, "updating")),
+        "updating, no previous": ({"kind": "html-a", "state": "updating", "done": 0, "previous": None},
+                                  ("html-a", "v1-updating", None), ("html-a", None, "updating")),
+    }
+
+    def expected_room(self, entry, cur, legacy, got):
+        digest = sha(canonical(entry))
+        rm = new_room()
+        if cur:
+            rm["current"] = expected_opaque(*cur, digest)
+        if legacy:
+            v = got["active_review_id"]
+            self.assertTrue(is_id(v))
+            rm["active_review_id"] = v
+            rm["reviews"] = {v: {"review_id": v, "reason": "legacy-in-flight", "kind": legacy[0], "op_id": legacy[1],
+                                 "v1_state": legacy[2], "v1_entry_sha256": digest, "at": T, "superseded_by": None,
+                                 "findings": ["v1-" + legacy[2]]}}
+        return rm
+
+    def test_each_row_converts_to_its_exact_v2_file(self):
+        for name, (entry, cur, legacy) in self.ROWS.items():
+            with self.subTest(name):
+                data = v1_file({"!r": entry})
+                m = m2(data)
+                marker(m)
+                self.assertEqual(m, {
+                    "version": 2,
+                    "migration": {"phase": "converted", "converted_at": T, "fenced_at": None,
+                                  "source": {"kind": "legacy", "v1_sha256": sha(data), "v1_size": len(data),
+                                             "backup": "getting-started.v1.bak"}},
+                    "migrated_from": {"at": T, "v1_rooms": {"!r": {"entry_sha256": sha(canonical(entry)),
+                                                                     "entry": entry}}},
+                    "rooms": {"!r": self.expected_room(entry, cur, legacy, m["rooms"]["!r"])}})
+
+    def test_every_row_at_once_and_a_clean_first_use(self):
+        m = m2(v1_file({f"!{i}": e for i, (e, _, _) in enumerate(self.ROWS.values())}))
+        marker(m)
+        self.assertEqual(len(m["rooms"]), len(self.ROWS))
+        self.assertEqual(m2(None)["migration"]["source"], {"kind": "none"})
+        self.assertEqual(m2(v1_file({}))["rooms"], {})
+
+    def test_every_shape_a9_does_not_list_refuses(self):
+        ok = {"kind": "html-a", "state": "complete", "hash": "h"}
+        files = {
+            "not UTF-8 JSON": b"{\xff", "truncated": v1_file({"!r": ok})[:-2], "not an object": b"[]",
+            "version 2": json.dumps({"version": 2, "rooms": {}}).encode(),
+            "version true": json.dumps({"version": True, "rooms": {}}).encode(),
+            "version 1.0": json.dumps({"version": 1.0, "rooms": {}}).encode(),
+            "rooms not an object": json.dumps({"version": 1, "rooms": []}).encode(),
+            "an unknown top-level key": json.dumps({"version": 1, "rooms": {}, "x": 1}).encode(),
+            "an empty room key": v1_file({"": ok}),
+        }
+        entries = {
+            "a non-object entry": [ok], "a string entry": "complete",
+            "an unknown state": {**ok, "state": "done"}, "a null state": {**ok, "state": None},
+            "a non-html kind": {**ok, "kind": "page-a"}, "complete without a kind": {"state": "complete", "hash": "h"},
+            "foreign false": {**ok, "foreign": False}, "interrupted not an object": {**ok, "interrupted": 1},
+            "creating without an operation_id": {"state": "creating", "updated_at": T},
+            "creating with a non-string operation_id": {"state": "creating", "operation_id": 7},
+            "creating with a kind": {"state": "creating", "operation_id": "op", "kind": "html-a"},
+            "pending without a kind": {"state": "pending", "operation_id": "op"},
+            "pending with a non-string operation_id": {"kind": "html-a", "state": "pending", "operation_id": 1},
+            "updating with a null kind": {"kind": None, "state": "updating"},
+            "a previous that isn't complete": {"state": "creating", "operation_id": "op",
+                                               "previous": {"kind": "html-p", "state": "pending"}},
+            "a previous with a non-html kind": {"kind": "html-a", "state": "updating", "previous": {"kind": "x"}},
+        }
+        files.update({name: v1_file({"!ok": ok, "!r": e}) for name, e in entries.items()})
+        for name, data in files.items():
+            with self.subTest(name):
+                self.assertRaises(Refused, m2, data)
+
+
 # The staged load (§9): fixed paths first, then validation, then only the paths validation vouches for.
 FIXED_FILES = ("state/tutorial/getting-started.v2.json", "state/tutorial/getting-started.v1.bak")
 FIXED_DIRS = ("state/tutorial/getting-started.json", "state/tutorial/ops", "state/tutorial", "state", ".")
@@ -829,12 +1156,9 @@ FIXED_DIRS = ("state/tutorial/getting-started.json", "state/tutorial/ops", "stat
 def staged_load(m, synced: list) -> None:
     synced += FIXED_FILES + FIXED_DIRS
     marker(m)
-    for rm in m["rooms"].values():
-        j = rm["journal"]
-        for op in (j or {}).get("operations", []):
-            synced.append("state/tutorial/" + op["base_ref"])
-        if j and j.get("operations"):
-            synced += [f"state/tutorial/ops/{j['op_id']}", "state/tutorial/ops"]
+    named = [rm["journal"] for rm in m["rooms"].values() if rm["journal"] and rm["journal"].get("operations")]
+    synced += ["state/tutorial/" + op["base_ref"] for j in named for op in j["operations"]]
+    synced += [f"state/tutorial/ops/{j['op_id']}" for j in named] + ["state/tutorial/ops"] * bool(named)
 
 
 class StagedLoadTest(unittest.TestCase):
@@ -842,11 +1166,14 @@ class StagedLoadTest(unittest.TestCase):
         m = m2(None)
         fill(m, ops=1)
         j2(m, R)
+        fill(m, "!two", ops=1)
         synced = []
         staged_load(m, synced)
-        op_id = m["rooms"][R]["journal"]["op_id"]
-        self.assertIn(f"state/tutorial/ops/{op_id}/1.base", synced)
-        self.assertEqual(synced[-2:], [f"state/tutorial/ops/{op_id}", "state/tutorial/ops"])
+        a, b = (m["rooms"][k]["journal"]["op_id"] for k in (R, "!two"))
+        ops = "state/tutorial/ops"
+        self.assertEqual(synced, list(FIXED_FILES + FIXED_DIRS) + [
+            f"{ops}/{a}/0.base", f"{ops}/{a}/1.base", f"{ops}/{b}/0.base", f"{ops}/{a}", f"{ops}/{b}", ops],
+            "every sidecar, then every ops/<op_id>/, then ops/ once")
         m["rooms"][R]["journal"]["operations"][1]["base_ref"] = "../../../escape"
         synced = []
         self.assertRaises(Invalid, staged_load, m, synced)
@@ -938,6 +1265,7 @@ class Budget:
         if self.left == 0:
             raise Fault(name)
         self.left -= 1
+        self.log.append(name)
 
 
 ST = "state/tutorial"
@@ -1033,6 +1361,12 @@ class FileModelTest(unittest.TestCase):
 
     def test_no_power_loss_leaves_a_v2_file_without_an_intact_backup(self):
         self.assertEqual(v2_without_backup(explore(migrate_start(), migrate)), [])
+
+    def test_m1_links_then_syncs_the_inode_then_the_directory_and_only_then_m2(self):
+        log = []
+        migrate(migrate_start(), Budget(-1, log))
+        self.assertEqual(log, ["fsync " + ST, "fsync state", "link", "fsync backup", "fsync " + ST,
+                               "rename " + V2, "fsync " + ST, "unlink", "fsync " + ST])
 
     def test_m1_must_file_sync_the_backup_inode_and_the_load_must_sync_it_too(self):
         for variant in ({"m1_sync": False}, {"sync_backup": False}):
