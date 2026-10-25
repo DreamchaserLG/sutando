@@ -65,6 +65,9 @@ class FakeGateway:
                        "https://relay.beta-fixture.net": ["@sutando:beta-fixture.net"]}
 
     def __call__(self, url, token, address=None):
+        if self.agents.get(url) == "reject":
+            import urllib.error
+            raise urllib.error.HTTPError(url, 401, "nope", {}, None)
         return {"agents": [{"id": i} for i in self.agents.get(url, [])]}
 
 
@@ -239,6 +242,58 @@ class ViewTests(unittest.TestCase):
             self.call("connection.update_token", instance="nope", token=TOKEN_B)
         self.assertEqual(cm.exception.code, -32602)
         self.assertIn("nope", str(cm.exception))
+
+    def test_every_coded_refusal_is_a_conflict_on_this_surface_too(self):
+        """The same class answers CONFLICT here and 409 over HTTP: a rejected code (was -32602), a
+        disabled row made primary, an unconfirmed agent, a shadowed token source, the legacy row."""
+        import os
+        self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        self.gateway.agents["https://rejecting-fixture.net"] = "reject"
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.add", token="https://rejecting-fixture.net|bad", confirm=True,
+                      expected_server="rejecting-fixture.net")
+        self.assertEqual((cm.exception.code, str(cm.exception)[:14]), (CONFLICT, "token_rejected"))
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="beta-fixture-net", token="https://rejecting-fixture.net|bad")
+        self.assertEqual((cm.exception.code, str(cm.exception)[:14]), (CONFLICT, "token_rejected"),
+                         "a rejected code is refused before the server check")
+        self.gateway.agents["https://relay.beta-fixture.net"] = "reject"
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        self.assertEqual((cm.exception.code, str(cm.exception)[:14]), (CONFLICT, "token_rejected"))
+        self.gateway.agents["https://relay.beta-fixture.net"] = []
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("token_unverified"))
+        self.gateway.agents["https://relay.beta-fixture.net"] = ["@sutando:beta-fixture.net"]
+        os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
+        try:
+            with self.assertRaises(ProtocolError) as cm:
+                self.call("connection.update_token", instance="beta-fixture-net", token="https://relay.beta-fixture.net|rotated")
+        finally:
+            del os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"]
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("token_source_shadowed: AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"))
+        self.assertEqual((self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"], self.spawned), (TOKEN_B, []),
+                         "every refusal left the vault and the bridge alone")
+        self.call("connection.disconnect", instance="beta-fixture-net")
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.set_primary", instance="beta-fixture-net")
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("disabled_cannot_be_primary"))
+        self.assertEqual([r["primary"] for r in self.call("connection.list")["connections"]], [True, False])
+        connections.import_from_env({"REMOTE_TASK_TOKEN": "https://chat.legacy-fixture.net|legacy"}, workspace=self.ws,
+                                    vault=self.vault)
+        for method in ("connection.disconnect", "connection.update_token"):
+            with self.assertRaises(ProtocolError, msg=method) as cm:
+                self.call(method, instance="", token="https://chat.legacy-fixture.net|rotated")
+            self.assertEqual(cm.exception.code, CONFLICT)
+            self.assertTrue(str(cm.exception).startswith("legacy_row_unmanaged"))
+        self.assertEqual(self.vault.store["REMOTE_TASK_TOKEN"], "https://chat.legacy-fixture.net|legacy")
+        out = self.call("connection.set_primary", instance="alpha-fixture-net")
+        self.assertFalse(out["connection"]["relaunch_needed"], "the hint rides on the row")
 
     def test_known_servers_joins_the_registry_with_the_rows(self):
         fixtures = [dotspace.DotSpace(server="alpha-fixture.net"), dotspace.DotSpace(server="beta-fixture.net")]

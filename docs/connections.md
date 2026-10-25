@@ -21,7 +21,31 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `server_source` | Where `server` came from: `identity` (the DotSpace the resolver registers for the gateway host, confirmed by the gateway's own agent listing), `resolver` (the registered DotSpace alone), or `gateway` (the host itself, provisional). |
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
 | `agent_display_name`, `agent_avatar_url`, `owner_mxid` | Optional, from the same listing entry as `agent_mxid` and only on a verified preview: the entry's `display_name`, its `avatar_url` (stored only as an `mxc://` URI) and its `owner` mxid. Absent until the gateway sends them; never a secret. The list spells every one of them out, `null` when unknown. |
-| `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` or `update_token` clears it. Absent on older rows, which load as enabled. |
+| `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` or `update_token` clears it. Written only over a stopped bridge (below). Absent on older rows, which load as enabled. |
+
+An explicit `instance` must be a slug of `[A-Za-z0-9_-]{1,32}` and not one of the HTTP
+resource's fixed names (`known-servers`, `token`): a row so named could never be addressed
+there, so `add` refuses it (400, CLI exit 1) and nothing is written.
+
+### Refusals by code
+
+Every refusal that comes from a row's or a code's state is a `connections.Refusal` whose
+`CODE` each surface returns as is: HTTP **409** `{"error": "<code>"}`, runtime API
+**CONFLICT** with the module's message, CLI exit 1 with `connections: <code>: ...` on
+stderr. Nothing is written when one is raised.
+
+| Code | Raised by | Meaning |
+|---|---|---|
+| `primary_cannot_disconnect` | `disconnect` | The row is primary; make another row primary first. |
+| `disabled_cannot_be_primary` | `set_primary` | The row is disconnected; a disabled primary never launches, so no bridge would carry the proactive room. Reconnect it first. |
+| `legacy_row_unmanaged` | `disconnect`, `update_token` | The legacy unsuffixed row (`instance: ""`) is launched from `REMOTE_TASK_TOKEN` in the environment, not from this directory; change that variable instead. |
+| `bridge_still_running` | `disconnect`, `remove`, `reconnect`, `update_token` | The bridge kept its singleton lock past the stop deadline, or refused the signal; the message names the pid. The row is as it was: `disabled` is never written over a running bridge. |
+| `token_source_shadowed` | `update_token` | The row's `token_ref` (`AG2_REMOTE_TOKEN_<INST>`) is set in the environment, which the bridge reads before the vault; the new secret would be stored and never used. Unset the variable (or let `import-env` own that row) and retry. |
+| `token_server_mismatch` | `update_token` | The code previews as another server, or as a server another row already holds. |
+| `token_agent_mismatch` | `update_token` | The row names an agent and the code's gateway names another; that agent is its own connection. |
+| `token_unverified` | `update_token` | The row names an agent and the preview did not confirm it (gateway unreachable, an error, a listing naming none or several); the code is not shown to be this connection's. |
+| `token_rejected` | `add`, `update_token` | The gateway answered 401/403 on the preview. |
+| `vault_key_in_use` | `add` | The vault already holds a secret under the new row's key and no row owns it. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
 token_ref / server) and published atomically under a lock file beside it, so a reader
@@ -88,7 +112,13 @@ flag only to the `REMOTE_TASK_TOKEN` row (the legacy unsuffixed bridge), never t
 named `AG2_REMOTE_TOKEN_<INST>`; removing the primary leaves none until `set_primary`
 or the next saved row. Adding **never changes which row is primary** except that the very
 first row saved becomes primary. `set_primary(instance)` is the one way to move it,
-and moving it is what moves proactive and owner-DM routing at the next launch.
+and moving it is what moves proactive and owner-DM routing **at the next launch**: a bridge
+already running keeps the environment it was launched with. A disabled row is refused
+(`disabled_cannot_be_primary`). The returned row carries `relaunch_needed: true` when the
+new primary's bridge is running (it has no proactive room yet); the panel shows it. The
+handoff order is therefore **promote B, reconnect B, then disconnect A**: after the
+reconnect B's launch carries `REMOTE_PROACTIVE_ROOM`, and A's next launch does not. Promoting
+and disconnecting A straight away would stop the only bridge that had the room.
 
 ## State
 
@@ -104,26 +134,46 @@ under `state/connections-launch/<instance>.json`:
 | `failed` | With `reason`: `no_token`, `launch_failed`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
 
 `disconnect(instance)` stops the one bridge holding that instance's singleton lock (the
-same stop `remove_connection` and `reconnect` use) and marks the row `disabled`; the row,
-its vault key and its launch record stay, so the owner can come back without a new token.
-The launch plan omits a disabled row, so a core restart leaves it down. The primary cannot
-be disconnected while it is primary (`PrimaryCannotDisconnect`, HTTP 409
-`primary_cannot_disconnect`, CLI exit 1): make another row primary first. Disconnecting a
-disabled row is a no-op. `reconnect(instance)` clears the flag, stops the bridge if one is
+same stop `remove_connection` and `reconnect` use) and **then** marks the row `disabled`; the
+row, its vault key and its launch record stay, so the owner can come back without a new
+token. The stop is SIGTERM, then a wait of `STOP_TIMEOUT_S` for the lock to free; a bridge
+that still holds it (or refuses the signal) is `bridge_still_running` with its pid, and the
+row is not touched, so `disabled` never masks a live sidecar. The launch plan omits a
+disabled row, so a core restart leaves it down. The primary cannot be disconnected while it
+is primary (`primary_cannot_disconnect`): make another row primary first. The legacy
+unsuffixed row cannot be disconnected here at all (`legacy_row_unmanaged`): the legacy
+launchers start it from `REMOTE_TASK_TOKEN` and never read the flag. Disconnecting a
+disabled row is a no-op. `launch` holds the record lock from the plan read to the spawn, so
+a disconnect or remove that starts in between waits for the spawn and then stops the bridge
+it started; a bridge never comes up against a row that already says it is down.
+`reconnect(instance)` clears the flag, stops the bridge if one is
 running, learns the identity its token answers to now and launches it again; the other
 connections keep running. A plain `launch` of a disabled row is refused by name
 ("disconnected; reconnect it"). `update_token(instance, token)` is for a code that was
 rotated or revoked on the homeserver (Get new token, Revoke) or an agent moved away and
-back: it previews the new code exactly as `add` does, refuses one for another server
-(`TokenServerMismatch`, code `token_server_mismatch`) or for another agent while the row
-names one (`TokenAgentMismatch`, `token_agent_mismatch`; a code for another agent is a new
-connection, never pasted over this row) or one the gateway rejected (`token_rejected`), with
-the vault and the row untouched; otherwise it replaces the secret under the row's existing
+back. It is refused with the vault and the row untouched, in this order: on the legacy row
+(`legacy_row_unmanaged`); when the row's `token_ref` is **set in the environment**
+(`token_source_shadowed`) — `launch_env` and the bridge's own source order read the variable
+before the vault, so a vault write would report success and the relaunch, and every later
+restart, would run on the old code; rows that `import-env` created from
+`AG2_REMOTE_TOKEN_<INST>` are the usual case, and the owner unsets the variable first (or
+lets the import path own that row); for a code the gateway rejected (`token_rejected`); for
+another server, or for a server another row already holds (`token_server_mismatch`); and,
+while the row names an agent, unless the preview **confirms that same agent**: an unconfirmed
+preview (gateway unreachable, an error, a listing naming none or several agents) is
+`token_unverified`, another agent `token_agent_mismatch` (a code for another agent is a new
+connection, never pasted over this row). A provisional row with no agent keeps its earlier
+behaviour and learns the identity. The new row is built and validated **before** any
+external effect; only then is the bridge stopped (`bridge_still_running` if it will not) and
+the vault written; a failure after the vault write (the record write, say) puts the previous
+secret back. Otherwise it replaces the secret under the row's existing
 `token_ref`, keeps the instance, primary flag, `added_at` and launch record, updates
-`gateway_url` and the identity fields from the preview (a row without an agent identity learns
-one), clears `disabled` and relaunches the bridge the way `reconnect` does, so a disconnected
-or failed row comes back on the new code; a relaunch that fails is the row's `failed` state,
-not an error of the update. `remove_connection(instance)`
+`gateway_url` and the identity fields from the preview, clears `disabled` and relaunches the
+bridge the way `reconnect` does, so a disconnected or failed row comes back on the new code;
+a relaunch that fails is the row's `failed` state, not an error of the update. A row keyed by
+identity refreshes its identity fields only from a verified preview of **the same agent**:
+adding or previewing another agent's code on that server leaves the row (and its token)
+exactly as it was. `remove_connection(instance)`
 stops that bridge the same way, then drops the row, its vault key and its launch record,
 and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
 removed env-imported row is remembered in the record's `removed_env` list, so
@@ -170,8 +220,8 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | update-token | launch | import-env | launch-plan`.
-- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`; another server or agent is `CONFLICT`).
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | update-token | launch | import-env | launch-plan`. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
+- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
   | Route | Body | Answer |
@@ -180,11 +230,14 @@ not here.
   | `GET /api/v1/connections/known-servers` | — | 200 `{"servers": [{"server", "connected", "instance", "primary", "disabled"}]}`; matched before any `<instance>` route (405 for another method, never a slug lookup) |
   | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
   | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "connection": row}`; 200 `{"created": false, ...}` for an existing row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
-  | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 404 |
-  | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` |
-  | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}`; 404 |
-  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled` |
-  | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "token_server_mismatch"}` or `{"error": "token_agent_mismatch"}` (nothing changed); 409 `{"error": "token_rejected"}`; 400 without a token; 404 |
+  | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 409 `bridge_still_running`; 404 |
+  | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` (with `relaunch_needed`); 409 `{"error": "disabled_cannot_be_primary"}`; 404 |
+  | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}` or `bridge_still_running` (row unchanged); 404 |
+  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled`; 409 `bridge_still_running` |
+  | `POST /api/v1/connections/<instance>/token` | `{"token"}` | 200 `{"connection": row}` (secret replaced under the same `token_ref`, `disabled` cleared, bridge relaunched); 409 `{"error": "<code>"}` for `token_source_shadowed`, `token_server_mismatch`, `token_agent_mismatch`, `token_unverified`, `token_rejected`, `bridge_still_running` (nothing changed); 400 without a token; 404 |
+
+  The legacy row (`instance: ""`) has no HTTP address (an empty segment is no segment); its
+  refusals (`legacy_row_unmanaged`) are the CLI's and the runtime API's.
 
 ### Authorization for the HTTP routes
 

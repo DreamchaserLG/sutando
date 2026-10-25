@@ -22,11 +22,16 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
-`disconnect` marks a row `disabled` and stops its bridge, keeping the row, the vault secret
+`disconnect` stops a row's bridge and then marks it `disabled`, keeping the row, the vault secret
 and the launch record: the plan skips a disabled row, so a restart leaves it down until
-`reconnect` clears the flag. The primary cannot be disconnected while it is primary.
-`update_token` replaces the secret under a row's existing `token_ref` with a new code for the
-same server and agent (anything else is refused by code), clears the flag and relaunches.
+`reconnect` clears the flag. A bridge that will not stop leaves the row as it was
+(`BridgeStillRunning`); the primary cannot be disconnected while it is primary, and a
+disabled row cannot become primary. `update_token` replaces the secret under a row's existing
+`token_ref` with a new code for the same server and agent (anything else is refused by code),
+clears the flag and relaunches; it is refused while a higher-precedence source (the row's
+environment variable) would shadow the vault. The legacy unsuffixed row is the environment's:
+`disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`). Every such refusal is a
+`Refusal` whose `CODE` each surface returns unchanged.
 
 A row's `server_source` says where its server came from: `identity` (the resolver's
 registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
@@ -74,6 +79,8 @@ STATES = ("pending", "connected", "disconnected", "failed")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# Fixed names on the HTTP resource: a row so named could never be addressed there.
+RESERVED_INSTANCES = ("known-servers", "token")
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
@@ -115,7 +122,14 @@ class PrimaryProtected(ConnectionsError):
     pass
 
 
-class PrimaryCannotDisconnect(PrimaryProtected):
+class Refusal(ConnectionsError):
+    """Refused by the row's or the code's state, nothing written: `CODE` is the error code every
+    surface returns as is (HTTP 409 `{"error": CODE}`, runtime-api CONFLICT, CLI exit 1)."""
+
+    CODE = "refused"
+
+
+class PrimaryCannotDisconnect(PrimaryProtected, Refusal):
     """The primary row stays up while it is primary; make another row primary first."""
 
     CODE = "primary_cannot_disconnect"
@@ -125,7 +139,48 @@ class PrimaryCannotDisconnect(PrimaryProtected):
                          "make another connection primary first")
 
 
-class TokenMismatch(ConnectionsError):
+class DisabledCannotBePrimary(Refusal):
+    """A disabled row never launches, so as primary no bridge would carry the proactive room."""
+
+    CODE = "disabled_cannot_be_primary"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance} is disconnected; reconnect it before making it primary")
+
+
+class LegacyRowUnmanaged(Refusal):
+    """The unsuffixed bridge is launched by the environment, not by this directory."""
+
+    CODE = "legacy_row_unmanaged"
+
+    def __init__(self, verb: str):
+        super().__init__(f"{self.CODE}: the legacy unsuffixed bridge is launched from REMOTE_TASK_TOKEN in the "
+                         f"environment, so {verb} does not reach it; change that variable instead")
+
+
+class BridgeStillRunning(Refusal):
+    """The bridge kept its singleton lock past the stop deadline; the row is as it was."""
+
+    CODE = "bridge_still_running"
+
+    def __init__(self, instance: str, pid: int, detail: str = ""):
+        super().__init__(f"{self.CODE}: the bridge for {instance or '<primary>'} (pid {pid}) is still running"
+                         + (f" ({detail})" if detail else "") + "; nothing changed")
+        self.pid = pid
+
+
+class TokenSourceShadowed(Refusal):
+    """A source the bridge reads before the vault holds this row's token; a vault write would be ignored."""
+
+    CODE = "token_source_shadowed"
+
+    def __init__(self, instance: str, variable: str):
+        super().__init__(f"{self.CODE}: {variable} is set in the environment and outranks the vault; unset it "
+                         f"(or let import-env own it) before updating the token of {instance}")
+        self.variable = variable
+
+
+class TokenMismatch(Refusal):
     """The new code is not this row's: `update_token` refuses it, naming the code in CODE."""
 
     CODE = "token_mismatch"
@@ -146,6 +201,13 @@ class TokenAgentMismatch(TokenMismatch):
     CODE = "token_agent_mismatch"
 
 
+class TokenUnverified(TokenMismatch):
+    """The row names an agent but the preview could not confirm one (gateway unreachable, an error,
+    or a listing not naming exactly one agent): the code is not shown to be this connection's."""
+
+    CODE = "token_unverified"
+
+
 class InvalidToken(ConnectionsError):
     pass
 
@@ -158,12 +220,19 @@ class LaunchFailed(ConnectionsError):
     pass
 
 
-class VaultKeyInUse(ConnectionsError):
+class VaultKeyInUse(Refusal):
     """The vault already holds a secret under this key and no row owns it."""
 
+    CODE = "vault_key_in_use"
 
-class TokenRejected(ConnectionsError):
+
+class TokenRejected(Refusal):
     """The gateway refused the token on the preview; nothing to store."""
+
+    CODE = "token_rejected"
+
+    def __init__(self):
+        super().__init__(f"{self.CODE}: the gateway rejected this token; nothing stored")
 
 
 # ── token → server ───────────────────────────────────────────────────────────
@@ -698,10 +767,12 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
     if not isinstance(expected_server, str) or expected_server.strip().lower() != server:
         raise ConnectionMismatch(server, expected_server if isinstance(expected_server, str) else "")
     if seen.get("authenticated") is False:
-        raise TokenRejected("the gateway rejected this token; nothing stored")
+        raise TokenRejected()
     inst = instance if instance is not None else instance_for(server)
     if not INSTANCE_RE.match(inst):
         raise ConnectionsError(f"instance {inst!r} is not a slug of [A-Za-z0-9_-]{{1,32}}")
+    if inst in RESERVED_INSTANCES:
+        raise ConnectionsError(f"instance {inst!r} is a reserved name ({', '.join(RESERVED_INSTANCES)}); pass another")
     ref = token_ref_for(inst)
     vault = _vault(vault)
     stored = False
@@ -754,11 +825,12 @@ def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:
 def _rekey(row: dict, seen: Mapping[str, object]) -> bool:
     """A verified identity replaces a provisional server in place; the instance slug stays. A row
     already keyed by identity only refreshes its identity fields from a verified preview of the
-    same server, never its key."""
+    same server AND the same agent (or one it has not learned yet), never its key: another agent
+    of that server is another connection, whatever becomes of its code."""
     if not seen.get("verified"):
         return False
     if row["server_source"] == "identity":
-        if str(seen.get("server") or "") == row["server"]:
+        if str(seen.get("server") or "") == row["server"] and row.get("agent_mxid") in (None, seen.get("agent_mxid")):
             _learn_fields(row, seen)
         return False
     row.update(server=str(seen["server"]), server_source="identity", verified=True)
@@ -785,12 +857,21 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
 
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
-    """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch."""
+    """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
+    A disabled row is refused (`DisabledCannotBePrimary`): it never launches, so nothing would
+    carry the proactive room. The returned row carries `relaunch_needed`: true when the new
+    primary's bridge is running, since it was launched without the room and keeps that
+    environment until `reconnect`; the previous primary's bridge keeps the room until its own."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
+        if row.get("disabled"):
+            raise DisabledCannotBePrimary(instance)
+        promoted = not row["primary"]
         for r in rec["rows"]:
             r["primary"] = r is row
-    return dict(row)
+    out = dict(row)
+    out["relaunch_needed"] = bool(promoted and instance and bridge_pid(instance, workspace))
+    return out
 
 
 def remove_connection(instance: str, *, force: bool = False, workspace: Optional[Path] = None,
@@ -819,14 +900,19 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 
 
 def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
-    """Stop the bridge and mark the row disabled; the row, its vault key and its launch record
+    """Stop the bridge, then mark the row disabled; the row, its vault key and its launch record
     stay, so `reconnect` resumes it without a new token. The primary is refused while it is
-    primary (`PrimaryCannotDisconnect`). Disconnecting a disabled row is a no-op."""
+    primary (`PrimaryCannotDisconnect`), the legacy unsuffixed row always (`LegacyRowUnmanaged`),
+    and a bridge that keeps its lock past the stop deadline leaves the row enabled
+    (`BridgeStillRunning`): `disabled` is only ever written over a stopped bridge. Disconnecting
+    a disabled row is a no-op."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
+        if not instance:
+            raise LegacyRowUnmanaged("disconnect")
         if row["primary"]:
             raise PrimaryCannotDisconnect(instance)
-        stopped = stop_bridge(instance, workspace=workspace, kill=kill) if instance else 0
+        stopped = stop_bridge(instance, workspace=workspace, kill=kill)
         row["disabled"] = True
     out = dict(row)
     out["stopped_pid"] = stopped
@@ -1045,22 +1131,25 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
            env_only: bool = False) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
-    singleton lock turns a duplicate into a clean stand-down."""
+    singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
+    plan read to the spawn, so a `disconnect` or `remove` cannot commit between them and have
+    the bridge come up against a row that says it is down."""
     environ = os.environ if environ is None else environ
-    entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
-    try:
-        env = launch_env(entry, environ, vault=vault)
-    except NoToken as e:
-        _record_launch(instance, workspace, ok=False, reason="no_token")
-        raise LaunchFailed(str(e)) from None
-    argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
-    log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
-    try:
-        pid = (spawn or _spawn)(argv, env, log_path)
-    except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
-        _record_launch(instance, workspace, ok=False, reason="launch_failed")
-        raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
-    return _record_launch(instance, workspace, ok=True, pid=pid)
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
+        try:
+            env = launch_env(entry, environ, vault=vault)
+        except NoToken as e:
+            _record_launch(instance, workspace, ok=False, reason="no_token")
+            raise LaunchFailed(str(e)) from None
+        argv = [python or sys.executable, str(Path(repo) / "src" / "remote-gateway-bridge.py")]
+        log_path = Path(logs_dir) / f"remote-gateway-bridge.{instance}.log"
+        try:
+            pid = (spawn or _spawn)(argv, env, log_path)
+        except Exception as e:  # noqa: BLE001 - the reason is recorded for status_for, then re-raised by name
+            _record_launch(instance, workspace, ok=False, reason="launch_failed")
+            raise LaunchFailed(f"could not start the bridge for {instance} ({type(e).__name__})") from None
+        return _record_launch(instance, workspace, ok=True, pid=pid)
 
 
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
@@ -1082,15 +1171,26 @@ def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
 
 
 def stop_bridge(instance: str, *, workspace: Optional[Path] = None, kill=None,
-                timeout_s: float = STOP_TIMEOUT_S) -> int:
-    """SIGTERM the bridge holding `instance`'s lock and wait for the lock to free; the pid, or 0."""
+                timeout_s: Optional[float] = None) -> int:
+    """SIGTERM the bridge holding `instance`'s lock and wait for the lock to free; the pid, or 0
+    when none held it. A lock still held at the deadline, or a signal the process refuses, is
+    `BridgeStillRunning`: the caller writes nothing over a bridge that is still up."""
+    timeout_s = STOP_TIMEOUT_S if timeout_s is None else timeout_s
     pid = bridge_pid(instance, workspace)
     if not pid:
         return 0
-    (kill or os.kill)(pid, signal.SIGTERM)
+    try:
+        (kill or os.kill)(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # gone between the read and the signal; the kernel released its lock
+    except OSError as e:
+        raise BridgeStillRunning(instance, pid, f"signal refused: {type(e).__name__}") from None
     deadline = time.monotonic() + timeout_s
-    while bridge_pid(instance, workspace) == pid and time.monotonic() < deadline:
+    while bridge_pid(instance, workspace) and time.monotonic() < deadline:
         time.sleep(0.1)
+    holder = bridge_pid(instance, workspace)
+    if holder:
+        raise BridgeStillRunning(instance, holder, "lock still held after the stop deadline")
     return pid
 
 
@@ -1127,36 +1227,78 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     (the homeserver's Get new token or Revoke, an agent moved away and back), then relaunch the
     bridge the way `reconnect` does. The row keeps its instance, primary flag and added_at;
     `gateway_url` and the identity fields follow the preview (a row without an agent identity
-    learns one, see `_rekey`) and `disabled` is cleared. Refused with nothing touched: a code
-    whose preview is not this connection's (`TokenServerMismatch`), one naming another agent
-    while the row names one (`TokenAgentMismatch`), one the gateway rejected (`TokenRejected`).
+    learns one, see `_rekey`) and `disabled` is cleared.
+
+    Refused with nothing touched, in this order: the legacy unsuffixed row (`LegacyRowUnmanaged`:
+    its token is the environment's); a row whose token_ref is set in `environ`
+    (`TokenSourceShadowed`: the bridge reads that variable before the vault, so the new secret
+    would never be used); a code the gateway rejected (`TokenRejected`); a code whose preview is
+    not this connection's, or whose verified server is already another row's
+    (`TokenServerMismatch`); a row naming an agent whose preview did not confirm that same agent:
+    unconfirmed (`TokenUnverified`) or another agent (`TokenAgentMismatch`); a bridge that will
+    not stop (`BridgeStillRunning`). The new row is built and validated before the bridge is
+    stopped or the vault written; a failure after the vault write puts the previous secret back.
     Returns the row with `stopped_pid` and the launch record under `launch`; a launch that fails
-    is that record (and the row's state), not an exception. The legacy unsuffixed row keeps its
-    own launch path: its secret is replaced and `launch` is None."""
-    _find(list_connections(workspace), instance)  # an unknown instance probes nothing
+    is that record (and the row's state), not an exception."""
+    environ = os.environ if environ is None else environ
+    current = _find(list_connections(workspace), instance)  # an unknown instance probes nothing
+    if not instance:
+        raise LegacyRowUnmanaged("update_token")
+    if (environ.get(current["token_ref"]) or "").strip():
+        raise TokenSourceShadowed(instance, current["token_ref"])
     seen = preview_connection(token, fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
     if seen.get("authenticated") is False:
-        raise TokenRejected("the gateway rejected this token; nothing stored")
+        raise TokenRejected()
     vault = _vault(vault)
-    with _transaction(workspace) as rec:
-        row = _find(rec["rows"], instance)
-        if _same_connection([row], seen) is None:
-            raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
-        mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
-        if mine and theirs and mine != theirs:
-            raise TokenAgentMismatch(instance, f"the code is for agent {theirs}, not {mine}")
-        _vault_store(vault, row["token_ref"], token.strip())
-        stopped = stop_bridge(instance, workspace=workspace, kill=kill) if instance else 0
-        row["gateway_url"] = str(seen["gateway_url"])
-        _rekey(row, seen)
-        row["disabled"] = False
+    ref = current["token_ref"]
+    previous = _vault_get(vault, ref)
+    stored = False
+    try:
+        with _transaction(workspace) as rec:
+            row = _find(rec["rows"], instance)
+            candidate = _updated_row(rec, row, seen, instance)
+            stopped = stop_bridge(instance, workspace=workspace, kill=kill)
+            _vault_store(vault, ref, token.strip())
+            stored = True
+            row.clear()
+            row.update(candidate)
+    except Exception:
+        if stored:
+            # The row still names the old secret; put it back so the next launch finds it.
+            try:
+                vault.set(ref, previous) if previous else vault.delete(ref)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
     out = dict(row)
     out["stopped_pid"] = stopped
-    out["launch"] = None
-    if instance:
-        try:
-            out["launch"] = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                                   vault=vault, spawn=spawn, python=python)
-        except LaunchFailed:
-            out["launch"] = _read_json(launch_record_path(instance, workspace))
+    try:
+        out["launch"] = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                               vault=vault, spawn=spawn, python=python)
+    except LaunchFailed:
+        out["launch"] = _read_json(launch_record_path(instance, workspace))
     return out
+
+
+def _updated_row(rec: dict, row: dict, seen: Mapping[str, object], instance: str) -> dict:
+    """The row `update_token` would write for `seen`, checked as `add_connection` checks a new row
+    (same connection, same agent, unique server) and against the record schema; a refusal here
+    precedes every external effect."""
+    if _same_connection([row], seen) is None:
+        raise TokenServerMismatch(instance, f"the code is for server {seen['server']!r}, not {row['server']!r}")
+    mine, theirs = row.get("agent_mxid"), seen.get("agent_mxid")
+    if mine and not theirs:
+        raise TokenUnverified(instance, f"the gateway did not confirm agent {mine} for this code"
+                              + (f" ({seen['error']})" if seen.get("error") else ""))
+    if mine and theirs != mine:
+        raise TokenAgentMismatch(instance, f"the code is for agent {theirs}, not {mine}")
+    candidate = dict(row)
+    candidate["gateway_url"] = str(seen["gateway_url"])
+    _rekey(candidate, seen)
+    candidate["disabled"] = False
+    taken = [r["instance"] for r in rec["rows"] if r is not row and r["server"] == candidate["server"]]
+    if taken:
+        raise TokenServerMismatch(instance, f"the code's server {candidate['server']!r} is connection {taken[0]!r}")
+    trial = [candidate if r is row else r for r in rec["rows"]]
+    _validate({"schema_version": SCHEMA_VERSION, "connections": trial, REMOVED_KEY: rec[REMOVED_KEY]})
+    return candidate

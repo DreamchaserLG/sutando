@@ -174,6 +174,16 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("disconnect", "nope")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no connection", proc.stderr)
+        proc = self.run_cli("set-primary", "beta-fixture-net")
+        self.assertEqual(proc.returncode, 1, "a disconnected row cannot become primary")
+        self.assertIn("disabled_cannot_be_primary", proc.stderr)
+        self.assertEqual(self.run_cli("primary").stdout.strip(), "alpha-fixture-net", "the primary is unchanged")
+        self.run_cli("add", TOKEN_A.replace("alpha", "legacy"), "--yes", "--expected-server", "legacy-fixture.net",
+                     "--instance", "legacy-fixture")
+        proc = self.run_cli("add", TOKEN_A.replace("alpha", "reserved"), "--yes", "--expected-server", "reserved-fixture.net",
+                            "--instance", "known-servers")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("reserved", proc.stderr)
 
         proc = self.run_cli("known-servers", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -363,8 +373,6 @@ class InProcess(unittest.TestCase):
         rc, out, _ = self.run_main(args, update_token=fake({"ok": False, "reason": "launch_failed"}))
         self.assertEqual((rc, out), (0, "updated token of dev (s.space; vault key AG2_REMOTE_TOKEN_DEV replaced; "
                                         "relaunch failed: launch_failed)\n"))
-        rc, out, _ = self.run_main(args, update_token=fake(None))
-        self.assertIn("legacy bridge not relaunched here", out)
         with self.assertRaises(SystemExit) as cm:
             self.run_main(["update-token", "dev", "--repo", "/r", "--logs-dir", "/l"], update_token=fake(None))
         self.assertEqual(cm.exception.code, 2, "the token is a required argument, as for add")
@@ -374,6 +382,35 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(args, update_token=boom)
         self.assertEqual((rc, out), (1, ""))
         self.assertIn("connections: token_agent_mismatch: ", err)
+
+    def test_update_token_help_documents_stdin_as_the_form_that_hides_the_code(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(["update-token", "--help"])
+        self.assertEqual(cm.exception.code, 0)
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            self.cli.main(["update-token", "--help"])
+        self.assertIn("TOKEN|-", out.getvalue())
+        self.assertIn("stdin", out.getvalue())
+        self.assertIn("process list", out.getvalue())
+        self.assertIn("update-token INSTANCE - --repo", self.cli.__doc__, "the verb table shows the stdin form")
+
+    def test_set_primary_prints_the_relaunch_hint_and_exits_one_on_a_disabled_row(self):
+        rc, out, _ = self.run_main(["set-primary", "dev"], set_primary=lambda inst, workspace=None: {
+            "instance": inst, "server": "s.space", "primary": True, "relaunch_needed": True})
+        self.assertEqual((rc, out), (0, "primary is now dev (s.space); its running bridge carries the proactive room "
+                                        "after you reconnect it\n"))
+        rc, out, _ = self.run_main(["set-primary", "dev"], set_primary=lambda inst, workspace=None: {
+            "instance": inst, "server": "s.space", "primary": True, "relaunch_needed": False})
+        self.assertEqual((rc, out), (0, "primary is now dev (s.space)\n"))
+
+        def refused(inst, workspace=None):
+            raise self.cli.connections.DisabledCannotBePrimary(inst)
+        rc, out, err = self.run_main(["set-primary", "dev"], set_primary=refused)
+        self.assertEqual((rc, out), (1, ""))
+        self.assertIn("connections: disabled_cannot_be_primary: dev", err)
 
 
 if __name__ == "__main__":

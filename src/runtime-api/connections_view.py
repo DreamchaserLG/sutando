@@ -11,8 +11,11 @@ of the HTTP resource: GET = list, POST without confirm = preview, POST with
 confirm = create (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
 POST <instance>/primary = set_primary, POST <instance>/disconnect = disconnect,
 POST <instance>/reconnect = reconnect, POST <instance>/token = update_token,
-GET known-servers = known_servers; a confirm whose identity moved, a disconnect of
-the primary, and a new code for another server or agent answer CONFLICT, the 409.
+GET known-servers = known_servers; a confirm whose identity moved and every state
+refusal the module codes (`connections.Refusal`: a disconnect of the primary, a
+disabled row made primary, the legacy row, a shadowed token source, a new code for
+another server or agent or one unconfirmed or rejected, a bridge that will not stop)
+answer CONFLICT, the 409, with the module's own message.
 
 Mutation sits on the same footing as task.submit: the Unix socket is the
 owner's, and no device grant is required.
@@ -86,6 +89,8 @@ class ConnectionsView:
                     workspace=self.workspace, vault=self.vault)
             except connections.ConnectionMismatch as e:
                 raise ProtocolError(CONFLICT, f"mismatch: {e}")
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"created": created, "connection": connections.status_for(row, self.workspace)}
@@ -95,7 +100,9 @@ class ConnectionsView:
         instance = self._instance(params)
         try:
             row = connections.remove_connection(instance, force=bool(params.get("force", False)),
-                                                workspace=self.workspace, vault=self.vault)
+                                                workspace=self.workspace, vault=self.vault, kill=self.kill)
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"removed": row}
@@ -105,6 +112,8 @@ class ConnectionsView:
         instance = self._instance(params)
         try:
             row = connections.set_primary(instance, workspace=self.workspace)
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"connection": connections.status_for(row, self.workspace)}
@@ -114,7 +123,7 @@ class ConnectionsView:
         instance = self._instance(params)
         try:
             row = connections.disconnect(instance, workspace=self.workspace, kill=self.kill)
-        except connections.PrimaryCannotDisconnect as e:
+        except connections.Refusal as e:
             raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
@@ -128,13 +137,15 @@ class ConnectionsView:
                                            workspace=self.workspace, vault=self.vault,
                                            spawn=self.spawn, kill=self.kill, fetch=self.fetch,
                                            getaddrinfo=self.getaddrinfo)
+        except connections.Refusal as e:
+            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"launch": record}
 
     # ── connection.update_token ─────────────────────────────────────────────
     def update_token(self, params: dict) -> dict:
-        """{instance, token}: the row on the new code, relaunched; another server or agent is CONFLICT."""
+        """{instance, token}: the row on the new code, relaunched; every refusal by code is CONFLICT."""
         instance = self._instance(params)
         token = params.get("token")
         if not isinstance(token, str) or not token.strip():
@@ -143,7 +154,7 @@ class ConnectionsView:
             row = connections.update_token(instance, token, repo=self.repo, logs_dir=self.logs_dir,
                                            workspace=self.workspace, vault=self.vault, spawn=self.spawn,
                                            kill=self.kill, fetch=self.fetch, getaddrinfo=self.getaddrinfo)
-        except connections.TokenMismatch as e:
+        except connections.Refusal as e:
             raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))

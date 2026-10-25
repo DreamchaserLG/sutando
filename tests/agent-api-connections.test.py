@@ -281,6 +281,13 @@ for inst in (["x"], 5):
     s, b, _ = req("POST", "/api/v1/connections", {"token": TOKEN_B, "confirm": True, "expected_server": "beta-fixture.net",
                                                   "instance": inst})
     check(f"instance {inst!r} is 400, not a crash", s == 400 and "error" in (b or {}), f"{s} {b}")
+for inst in C.RESERVED_INSTANCES:
+    s, b, _ = req("POST", "/api/v1/connections", {"token": "https://gw.unregistered-fixture.net|u", "confirm": True,
+                                                  "expected_server": "gw.unregistered-fixture.net", "instance": inst})
+    check(f"the fixed route name {inst!r} is refused as an instance (400 reserved)",
+          s == 400 and "reserved" in (b or {}).get("error", ""), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("no reserved-name row was written", [r["instance"] for r in b["connections"]] == ["alpha-fixture-net", "beta-fixture-net"], b)
 
 print("== list with status ==")
 (WS / "state" / "gateway-status.alpha-fixture-net.json").write_text(json.dumps({"connected": True, "last_ok_ts": 7}))
@@ -328,6 +335,26 @@ check("the list shows the flag and the state", [(r["instance"], r["disabled"], r
 check("every row spells out the identity fields", all(k in r for r in b["connections"] for k in C.IDENTITY_FIELDS))
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
 check("disconnecting twice is still 200", s == 200 and b["connection"]["disabled"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})
+check("a disabled row made primary is 409 disabled_cannot_be_primary", (s, b) == (409, {"error": "disabled_cannot_be_primary"}), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the primary did not move", [r["primary"] for r in b["connections"]] == [True, False], b)
+# A bridge that keeps its lock: the route's kill fake signals nothing, so the stop deadline passes.
+_lock = WS / "state" / "locks" / "gateway-bridge.alpha-fixture-net.lock"
+_lock.parent.mkdir(parents=True, exist_ok=True)
+_lock.write_text("4321\n")
+_fd = os.open(str(_lock), os.O_RDWR)
+import file_lock  # noqa: E402
+file_lock.lock_fd(_fd)
+C.STOP_TIMEOUT_S, _saved_timeout = 0.3, C.STOP_TIMEOUT_S
+s, b, _ = req("DELETE", "/api/v1/connections/alpha-fixture-net?force=1")
+check("removing a row whose bridge will not stop is 409 bridge_still_running",
+      (s, b) == (409, {"error": "bridge_still_running"}), f"{s} {b}")
+C.STOP_TIMEOUT_S = _saved_timeout
+os.close(_fd)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the row and its key stayed", [r["instance"] for r in b["connections"]] == ["alpha-fixture-net", "beta-fixture-net"]
+      and "AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET" in FakeVault.store, b)
 s, b, _ = req("POST", "/api/v1/connections/nope/disconnect", {})
 check("disconnecting an unknown instance is 404", s == 404, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/reconnect", {})
@@ -345,7 +372,15 @@ check("a code for another server is 409 token_server_mismatch", (s, b) == (409, 
 GATEWAY["https://relay.beta-fixture.net"] = ["@other:beta-fixture.net"]
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
 check("a code for another agent is 409 token_agent_mismatch", (s, b) == (409, {"error": "token_agent_mismatch"}), f"{s} {b}")
+GATEWAY["https://relay.beta-fixture.net"] = []
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+check("a code whose gateway names no agent for a row that names one is 409 token_unverified",
+      (s, b) == (409, {"error": "token_unverified"}), f"{s} {b}")
 GATEWAY["https://relay.beta-fixture.net"] = ["@sutando:beta-fixture.net"]
+os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/token", {"token": "https://relay.beta-fixture.net|secret-beta-rotated"})
+del os.environ["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"]
+check("a token_ref set in the environment is 409 token_source_shadowed", (s, b) == (409, {"error": "token_source_shadowed"}), f"{s} {b}")
 check("a refused code changed nothing", FakeVault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] == TOKEN_B and SPAWNED == [], SPAWNED)
 s, b, _ = req("GET", "/api/v1/connections")
 check("the refused row is still disabled", [r["disabled"] for r in b["connections"]] == [False, True], b)
