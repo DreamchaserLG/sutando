@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import functools
 import hashlib
+import importlib.util
 import itertools
 import json
 import re
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 
 REASONS = ("invariant-failure", "struct-mismatch", "replay-budget")
 CAPTURED = ("observed",) + REASONS
@@ -354,7 +358,8 @@ def room(rm, key: str, v1_entries: dict) -> None:
         review(r)
         need(k == r["review_id"], "review key")
         if r["reason"] == "legacy-in-flight":
-            need(r["v1_entry_sha256"] == v1_entries.get(key), "legacy-in-flight: v1 entry digest")
+            need(r["v1_entry_sha256"] == v1_entries.get(key, {}).get("entry_sha256"),
+                 "legacy-in-flight: v1 entry digest")
     for k, d in decisions.items():
         need(k in reviews, "a decision without a review")
         decision(d, key, reviews[k])
@@ -391,8 +396,22 @@ def room(rm, key: str, v1_entries: dict) -> None:
                  and c["accepted_observed_sha256"] == r["capture"]["observed_sha256"], "current: copies its review")
         elif c["source"] == "manual-selection":
             need(decided(c["review_id"], ("select:",))["choice"] == "select:" + c["kind"], "current: its selection")
-        else:
-            need(c["v1_entry_sha256"] == v1_entries.get(key), "current: its v1 entry digest")
+    # §6 slots: superseded is history, each entry pushed out by the keep-new promotion after it.
+    history = rm["superseded"] + ([rm["current"]] if rm["current"] is not None else [])
+    for j in range(len(rm["superseded"])):
+        need(not history[j + 1]["opaque"] if j + 1 < len(history) else False,
+             f"superseded[{j}]: not followed by the keep-new promotion that replaced it")
+    # M2's current, re-derived from the verbatim v1 entry, is the first of that history.
+    v1 = v1_entries.get(key)
+    try:
+        m2_current, m2_legacy = classify(key, v1["entry"]) if v1 else (None, None)
+    except Refused as e:
+        raise Invalid(f"room {key}: migrated_from entry: {e}") from None
+    born = [opaque_entry(m2_current, v1["entry_sha256"])] if m2_current else []
+    need([c for c in history if c["opaque"] and c["source"] in V1_SOURCES] == born and history[:len(born)] == born,
+         f"room {key}: M2's current is not the first entry of its history")
+    legacies = [(r["kind"], r["op_id"], r["v1_state"]) for r in reviews.values() if r["reason"] == "legacy-in-flight"]
+    need(legacies == ([m2_legacy] if m2_legacy else []), f"room {key}: M2's legacy-in-flight review")
     need(isinstance(rm["rejected"], list), "rejected")
     for x in rm["rejected"]:
         closed(x, {"kind", "op_id", "revision", "review_id"}, where="rejected")
@@ -448,7 +467,7 @@ def marker(m) -> None:
         closed(v, {"entry_sha256", "entry"}, where="migrated_from room")
         need(isinstance(v["entry"], dict) and v["entry_sha256"] == sha(canonical(v["entry"])), "v1 entry digest")
         need(key in m["rooms"], "a v1 room missing from rooms")
-        v1_entries[key] = v["entry_sha256"]
+        v1_entries[key] = v
     for key, rm in m["rooms"].items():
         need(is_str(key) and key, "room key")
         room(rm, key, v1_entries)
@@ -473,52 +492,58 @@ def refuse_unless(cond, why: str) -> None:
         raise Refused(why)
 
 
-def v1_complete(e) -> bool:
-    """A.9's complete row: an html-* kind, and state complete or absent."""
-    return isinstance(e, dict) and is_kind(e.get("kind")) and e.get("state", "complete") == "complete"
+def complete_source(e, where: str) -> str:
+    """A.9's complete row, top-level or nested as previous: its v1-* source, or Refused."""
+    refuse_unless(isinstance(e, dict) and is_kind(e.get("kind")) and e.get("state", "complete") == "complete",
+                  f"{where}: not a complete entry")
+    refuse_unless(e.get("foreign", True) is True, f"{where}: foreign")
+    refuse_unless(isinstance(e.get("interrupted", {}), dict), f"{where}: interrupted")
+    return "v1-interrupted" if "interrupted" in e else "v1-foreign" if "foreign" in e else "v1-complete"
 
 
 def v1_revision(e):
     return e["revision"] if isinstance(e, dict) and isinstance(e.get("revision"), str) else None
 
 
-def convert(key: str, e, digest: str) -> dict:
-    """A.9: one v1 room entry to its v2 room, or Refused."""
+def classify(key: str, e):
+    """A.9 for one v1 room entry: (current as (kind, source, revision) or None,
+    legacy-in-flight as (kind, op_id, v1_state) or None), or Refused."""
     refuse_unless(isinstance(key, str) and key, f"room {key!r}: not a room key")
     refuse_unless(isinstance(e, dict), f"room {key}: not an object")
-    rm = new_room()
-
-    def opaque(kind, source, revision):
-        return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
-                "review_id": None, "v1_entry_sha256": digest}
-
-    def legacy(kind, op_id, state):
-        mint(rm, {"reason": "legacy-in-flight", "kind": kind, "op_id": op_id, "v1_state": state,
-                  "v1_entry_sha256": digest, "findings": ["v1-" + state]})
-
     prev = e.get("previous")
-    refuse_unless(prev is None or v1_complete(prev), f"room {key}: previous is not a complete entry")
+    if prev is not None:
+        complete_source(prev, f"room {key}: previous")
     state = e.get("state", "complete")
     if state == "complete":
-        refuse_unless(is_kind(e.get("kind")), f"room {key}: kind")
-        refuse_unless(e.get("foreign", True) is True, f"room {key}: foreign")
-        refuse_unless(isinstance(e.get("interrupted", {}), dict), f"room {key}: interrupted")
-        source = "v1-interrupted" if "interrupted" in e else "v1-foreign" if "foreign" in e else "v1-complete"
-        rm["current"] = opaque(e["kind"], source, v1_revision(e))
-    elif state in ("creating", "pending"):
+        return (e.get("kind"), complete_source(e, f"room {key}"), v1_revision(e)), None
+    if state in ("creating", "pending"):
         op_id = e.get("operation_id")
         if state == "creating":
             refuse_unless(e.get("kind") is None and isinstance(op_id, str), f"room {key}: creating")
         else:
             refuse_unless(is_kind(e.get("kind")) and opt(is_str, op_id), f"room {key}: pending")
-        rm["current"] = None if prev is None else opaque(prev["kind"], "v1-previous", v1_revision(prev))
-        legacy(e.get("kind"), op_id, state)
-    elif state == "updating":
+        cur = None if prev is None else (prev["kind"], "v1-previous", v1_revision(prev))
+        return cur, (e.get("kind"), op_id, state)
+    if state == "updating":
         refuse_unless(is_kind(e.get("kind")), f"room {key}: updating")
-        rm["current"] = opaque(e["kind"], "v1-updating", v1_revision(prev))
-        legacy(e["kind"], None, "updating")
-    else:
-        raise Refused(f"room {key}: unknown state {state!r}")
+        return (e["kind"], "v1-updating", v1_revision(prev)), (e["kind"], None, "updating")
+    raise Refused(f"room {key}: unknown state {state!r}")
+
+
+def opaque_entry(cur, digest: str) -> dict:
+    kind, source, revision = cur
+    return {"opaque": True, "kind": kind, "revision": revision, "proposed": None, "source": source,
+            "review_id": None, "v1_entry_sha256": digest}
+
+
+def convert(key: str, e, digest: str) -> dict:
+    """A.9: one v1 room entry to its v2 room, or Refused."""
+    cur, legacy = classify(key, e)
+    rm = new_room()
+    rm["current"] = opaque_entry(cur, digest) if cur else None
+    if legacy:
+        mint(rm, {"reason": "legacy-in-flight", "kind": legacy[0], "op_id": legacy[1], "v1_state": legacy[2],
+                  "v1_entry_sha256": digest, "findings": ["v1-" + legacy[2]]})
     return rm
 
 
@@ -543,9 +568,23 @@ def m2(v1: "bytes | None") -> dict:
     return m
 
 
+DEPLOYED = Path(__file__).resolve().parent / "fixtures" / "old_main" / "tutorial_cf87f324" / "getting_started.py"
+
+
+@functools.lru_cache(maxsize=None)
+def deployed_writer():
+    spec = importlib.util.spec_from_file_location("deployed_v1_writer", DEPLOYED)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def v1_file(rooms: dict) -> bytes:
-    """The bytes the deployed writer saves."""
-    return json.dumps({"version": 1, "rooms": rooms}, indent=2, sort_keys=True).encode()
+    """The exact bytes the deployed writer's save_marker() leaves on disk."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "getting-started.json"
+        deployed_writer().save_marker(path, rooms)
+        return path.read_bytes()
 
 
 def m4(m):
@@ -910,6 +949,7 @@ class SchemaTransitionTest(unittest.TestCase):
                 if path[:2] != ["migrated_from", "v1_rooms"]:
                     yield from ints(v, path + [k])
         found = list(ints(m, []))
+        self.assertTrue(any(v in (0, 1) for _, v in found), "no bool case would run")
         names = {"/".join(str(k) for k in p if not isinstance(k, int)) for p, _ in found}
         self.assertTrue({"version", "migration/source/v1_size", "rooms/!room/journal/operations/index",
                          "rooms/!room/journal/operations/struct_v", "rooms/!room/journal/capture/ranges/op",
@@ -917,8 +957,9 @@ class SchemaTransitionTest(unittest.TestCase):
                          "rooms/!room/journal/failure/op", "rooms/!room/journal/plan",
                          "rooms/!v1/journal/next_op"} <= names, names)
         for path, value in found:
-            for bad in {float(value), *([bool(value)] if value in (0, 1) else [])}:
-                with self.subTest(path="/".join(map(str, path)), value=bad):
+            for kind, bad in [("float", float(value))] + ([("bool", bool(value))] if value in (0, 1) else []):
+                with self.subTest(path="/".join(map(str, path)), kind=kind):
+                    self.assertIs(type(bad), {"float": float, "bool": bool}[kind])
                     self.assertRaises(Invalid, marker, self.mutate(m, path, bad))
 
     def test_decisions_and_their_room_effects_are_bound_to_the_reviews_they_cite(self):
@@ -982,6 +1023,35 @@ class SchemaTransitionTest(unittest.TestCase):
         bad = self.mutate(stale, ["rooms", R, "rejected"], [{"kind": rv["kind"], "op_id": rv["op_id"],
                                                              "revision": "r1", "review_id": first}])
         self.assertRaises(Invalid, marker, bad)
+
+    def test_promotions_and_selections_land_in_current_and_push_the_prior_one_to_superseded(self):
+        def twice(m):
+            for _ in range(2):
+                fill(m, "!done")
+                j4b(m, "!done")
+                j5(m, "!done")
+                keep_new(m, "!done")
+        m = self.walk(m2(v1_file({"!done": {"kind": "html-old", "hash": "h"}})), [twice])
+        rm = m["rooms"]["!done"]
+        self.assertEqual([c["opaque"] for c in rm["superseded"]] + [rm["current"]["opaque"]], [True, False, False])
+        lost = self.walk(m2(None), [lambda m: marker_lost(m, "!lost"),
+                                    lambda m: select(m, "!lost", ("html-a", "html-b"), "select:html-a")])
+        self.assertEqual(lost["rooms"]["!lost"]["current"]["source"], "manual-selection")
+        sup, cur = ["rooms", "!done", "superseded"], ["rooms", "!done", "current"]
+        cases = {
+            "the promotion moved from current to superseded":
+                self.mutate(self.mutate(m, sup, rm["superseded"] + [rm["current"]]), cur, None),
+            "the manual selection moved from current to superseded": self.mutate(self.mutate(
+                lost, ["rooms", "!lost", "superseded"], [lost["rooms"]["!lost"]["current"]]),
+                ["rooms", "!lost", "current"], None),
+            "the prior migrated current dropped": self.mutate(m, sup, rm["superseded"][1:]),
+            "the prior accepted current dropped": self.mutate(m, sup, rm["superseded"][:1]),
+            "superseded out of order": self.mutate(m, sup, rm["superseded"][::-1]),
+            "a second M2 current": self.mutate(m, sup, rm["superseded"][:1] * 2 + rm["superseded"][1:]),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name):
+                self.assertRaises(Invalid, marker, bad)
 
     def mutate(self, m, path, value):
         bad = copy.deepcopy(m)
@@ -1076,6 +1146,9 @@ class ConversionMatrixTest(unittest.TestCase):
         "updating, a previous": ({"kind": "html-a", "state": "updating", "done": 2, "revision": "r8",
                                   "previous": PREV, "target": "x", "before": "y"},
                                  ("html-a", "v1-updating", "r6"), ("html-a", None, "updating")),
+        "creating, a foreign interrupted previous": (
+            {"state": "creating", "operation_id": "op", "previous": {**PREV, "foreign": True, "interrupted": {}}},
+            ("html-p", "v1-previous", "r6"), (None, "op", "creating")),
         "updating, no previous": ({"kind": "html-a", "state": "updating", "done": 0, "previous": None},
                                   ("html-a", "v1-updating", None), ("html-a", None, "updating")),
     }
@@ -1098,6 +1171,8 @@ class ConversionMatrixTest(unittest.TestCase):
         for name, (entry, cur, legacy) in self.ROWS.items():
             with self.subTest(name):
                 data = v1_file({"!r": entry})
+                self.assertEqual(data, json.dumps({"version": 1, "rooms": {"!r": entry}}, indent=2,
+                                                  sort_keys=True).encode() + b"\n")
                 m = m2(data)
                 marker(m)
                 self.assertEqual(m, {
@@ -1141,6 +1216,12 @@ class ConversionMatrixTest(unittest.TestCase):
             "a previous that isn't complete": {"state": "creating", "operation_id": "op",
                                                "previous": {"kind": "html-p", "state": "pending"}},
             "a previous with a non-html kind": {"kind": "html-a", "state": "updating", "previous": {"kind": "x"}},
+            "a previous with foreign false": {"state": "creating", "operation_id": "op",
+                                              "previous": {**self.PREV, "foreign": False}},
+            "a previous with a non-object interrupted": {"kind": "html-a", "state": "pending",
+                                                         "previous": {**self.PREV, "interrupted": "x"}},
+            "an updating previous with foreign false": {"kind": "html-a", "state": "updating",
+                                                        "previous": {**self.PREV, "foreign": 0}},
         }
         files.update({name: v1_file({"!ok": ok, "!r": e}) for name, e in entries.items()})
         for name, data in files.items():
