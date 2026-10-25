@@ -5823,6 +5823,8 @@ def _reconcile_decided(retained: Path) -> bool:
     if m is None:
         return True  # not a name this reconciler owns
     stem, ns = m.group("stem"), m.group("ns")
+    if not _decide_pending_snapshots(stem):
+        return False
     state, generation, epoch_now = _claim_receipt(retained, stem)
     if generation is None:
         _log_backoff(("proactive-decided", retained.name),
@@ -5834,7 +5836,7 @@ def _reconcile_decided(retained: Path) -> bool:
             return False  # still being written: the next pass reads it again
         claim = None
         if not _copy_exists(stem, data):
-            claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{time.time_ns()}"
+            claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
             if not _place_snapshot(data, claim, stem):
                 return False
         recorded = True
@@ -5849,7 +5851,7 @@ def _reconcile_decided(retained: Path) -> bool:
         if claim is not None:
             _log(f"proactive {retained.name} holds new bytes; published as {claim.name} and decided")
             _decide_orphan_claim(claim)
-        return recorded
+        return recorded and not _claim_pending(claim)
     decided = None if m.group("epoch") == "x" else int(m.group("epoch"))
     if not (state == "QUEUED" and decided is not None and epoch_now is not None and epoch_now > decided):
         return True
@@ -5861,6 +5863,22 @@ def _reconcile_decided(retained: Path) -> bool:
         undelivered_quarantine.rename_noreplace(
             retained, retained.with_name(f".{stem}{_DECIDED_INFIX}{m.group('digest')}-e{epoch_now}.{ns}"))
     return True
+
+
+_SNAPSHOT_MARK = "s"
+
+
+def _claim_pending(claim: "Path | None") -> bool:
+    return claim is not None and os.path.lexists(claim)
+
+
+def _decide_pending_snapshots(stem: str) -> bool:
+    """Decide again this process's snapshot claims for `stem` that an earlier decision left (the live
+    name was held, or placing failed); our own pid keeps the orphan sweep off them. True when none remain."""
+    pending = list(RESULTS_DIR.glob(f"{glob.escape(stem)}.sending.{os.getpid()}.{_SNAPSHOT_MARK}*"))
+    for c in pending:
+        _decide_orphan_claim(c)
+    return not any(os.path.lexists(c) for c in pending)
 
 
 def _copy_exists(stem: str, data: bytes) -> bool:

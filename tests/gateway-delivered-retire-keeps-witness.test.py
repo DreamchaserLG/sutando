@@ -848,6 +848,51 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self._fault_then_clear(lambda: mock.patch.object(
             gb, "_claim_receipt", return_value=("unknown", None, None)))
 
+    def test_a_snapshot_whose_hand_back_is_blocked_is_decided_again_by_a_later_drain(self):
+        """B's snapshot cannot go live because a newer file holds the live name; the drain that sends
+        that file frees the name, and a later ordinary drain hands B back and sends it once."""
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                lane.write("proactive-1.txt", "NEWER C\n")
+                for _ in range(4):
+                    lane.drain()
+                self.assertEqual(sorted(p.get("body") for p in lane.posts), ["NEWER C", "UNSENT B"],
+                                 "both sent once, with no restart")
+                lane.restart()
+                for _ in range(2):
+                    lane.drain()
+                self.assertEqual(len(lane.posts), 2, "no repeat")
+                self.assertEqual(list(lane.results.glob("proactive-1.sending.*")), [], "no snapshot left behind")
+                hidden()
+
+    def test_new_bytes_whose_digest_cannot_be_recorded_are_sent_once_and_recorded_later(self):
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                real = gb.undelivered_quarantine.rename_noreplace
+
+                def refuse_the_record(src, dst):
+                    if gb._DECIDED_INFIX in Path(dst).name:
+                        raise OSError(1, "Operation not permitted")
+                    return real(src, dst)
+                with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", refuse_the_record):
+                    lane.drain()
+                for _ in range(3):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "sent once")
+                digest = __import__("hashlib").sha256(b"UNSENT B\n").hexdigest()[:32]
+                self.assertEqual(len(list(lane.results.glob(f".proactive-1{gb._DECIDED_INFIX}{digest}-*"))), 1,
+                                 "a later drain recorded B's digest")
+                lane.restart()
+                lane.drain()
+                self.assertEqual(len(lane.posts), 1, "no repeat")
+                hidden()
+
     def test_a_retained_original_that_is_gone_leaves_no_seen_entry(self):
         lane = Lane(gb, scratch("gw-decided-prune-"))
         r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
@@ -1009,8 +1054,9 @@ class DecidedClaimEdges(unittest.TestCase):
         claims = [c for c in self.res.glob("proactive-1.sending.*")]
         self.assertEqual([c.read_text() for c in claims], ["new bytes\n"], "its bytes went out as a snapshot")
         self.assertNotEqual(os.lstat(claims[0]).st_ino, os.lstat(r).st_ino)
-        gb._reconcile_decided(r)  # unrecorded: the existing copy is found, nothing is published twice
-        self.assertEqual(len(list(self.res.glob("proactive-1.sending.*"))), 1)
+        self.assertTrue(gb._reconcile_decided(r), "the pending snapshot is decided again; the copy is found")
+        copies = [p for p in [*self.res.glob("proactive-1.sending.*"), self.res / "proactive-1.txt"] if p.exists()]
+        self.assertEqual([p.read_text() for p in copies], ["new bytes\n"], "nothing is published twice")
 
     def test_a_requeue_is_not_handed_back_over_a_newer_live_file(self):
         r = self.retained(b"body\n")
