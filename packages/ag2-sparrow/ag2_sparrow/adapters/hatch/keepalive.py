@@ -18,6 +18,7 @@ or left the queue with no receipt (`task-held-line-unconfirmed`).
 watchdog-and-probe pair too."""
 from __future__ import annotations
 
+import calendar
 import datetime
 import json
 import os
@@ -309,8 +310,32 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
 
 
-def _stop(pid: int) -> bool:
-    """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL."""
+def proven_sparrow(pid: int, lock: "dict | None") -> bool:
+    """`pid` runs Sparrow now and is the process that took `lock`, not a later one given its pid:
+    its start time is the one the lock declares or, for a lock that declares none, no later than
+    the lock was taken. False whenever that cannot be read."""
+    if not isinstance(lock, dict) or lock.get("pid") != pid or not is_sparrow_pid(pid):
+        return False
+    start = agent_identity.start_time(pid)
+    if start is None:
+        return False
+    if "start" in lock:
+        return lock["start"] == start
+    try:
+        began = calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return False
+    acquired = lock.get("acquired_at")
+    return _is_epoch(acquired) and began <= acquired + 1
+
+
+def _stop(cfg: dict, pid: int) -> bool:
+    """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL. The lock is re-read and the
+    target proven to be its Sparrow right before the signal, else nothing is sent."""
+    if not proven_sparrow(pid, _cli._lock_record(_state_dir(cfg), _instance(cfg))):
+        print(f"error: pid {pid} is not proven to be the Sparrow holding the lock; it was not "
+              "signalled", file=sys.stderr)
+        return False
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -357,16 +382,17 @@ def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | No
     LANE_GRACE_S with no record of its own, as a drain from before lane records (the released
     main) does. A drain whose lock declares its protocol is judged by that alone, so a lane record
     it could not write is no evidence against it. A record another process left under a reused
-    pid is not its own. None otherwise, and when the record is invalid or cannot be read."""
+    pid is not its own. None otherwise: when the live pid is not proven to be the Sparrow that
+    took the lock (proven_sparrow), and when the record is invalid or cannot be read."""
     state, instance = _state_dir(cfg), _instance(cfg)
     holder = _cli._lock_record(state, instance)
     pid = _cli.live_lock_holder(holder)
     if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
+    if not proven_sparrow(pid, holder):
+        return None  # the live pid is not proven to be the Sparrow that took this lock
     acquired = (holder or {}).get("acquired_at")
-    if "send_lock" in (holder or {}):
-        if not agent_identity.owned_by(holder, pid, None):
-            return None  # a lock under a reused pid: its declaration is not this process's
+    if "send_lock" in holder:
         return None if holder["send_lock"] == delivery_destination.SEND_LOCK_PROTOCOL else pid
     lane, rec = agent_identity.lane_state(state, instance)
     if lane in (agent_identity.LANE_INVALID, agent_identity.LANE_UNREADABLE):
@@ -386,7 +412,7 @@ def replace_sparrow(cfg: dict, pid: int, why: str = "") -> "tuple[bool, str]":
     start one that has it."""
     print(f"replacing: Sparrow (pid {pid}) " + (why or "runs without "
           f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}"))
-    if not _stop(pid):
+    if not _stop(cfg, pid):
         return False, f"the old Sparrow (pid {pid}) did not stop"
     ok, how = restart_listener(cfg)
     return ok, (how if ok else
@@ -480,7 +506,7 @@ def ensure_sparrow(cfg: dict, health: bool) -> int:
                           "Sparrow's lock; run install again once it exits", file=sys.stderr)
                     return 1
                 print(f"replacing: the Sparrow outside {_cli.SERVICE_NAME} (pid {holder})")
-                if not _stop(holder):
+                if not _stop(cfg, holder):
                     return 1
                 stopped = holder
             start = True

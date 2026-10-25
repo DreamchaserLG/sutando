@@ -2510,6 +2510,26 @@ class StartSparrow(Base):
             p = mock.patch.object(keepalive, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # What ps and /proc would say of each fixture process: a start time a test may set back
+        # (a long-running drain), and Sparrow's argv on hosts without /proc.
+        self.starts, self.argvs = {}, {}
+        real_start, real_proc = agent_identity.start_time, keepalive._proc
+
+        def start(pid):
+            return self.starts.get(pid) or real_start(pid)
+
+        def proc(pid, name):
+            if name == "cmdline" and pid in self.argvs and not Path("/proc").is_dir():
+                return b"\0".join(a.encode() for a in self.argvs[pid]) + b"\0"
+            return real_proc(pid, name)
+        for target, attr, fn in ((agent_identity, "start_time", start), (task_io, "start_time", start),
+                                 (keepalive, "_proc", proc)):
+            p = mock.patch.object(target, attr, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def started_ago(self, proc, ago):
+        self.starts[proc.pid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
 
     def install(self, *extra):
         with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW):
@@ -2525,6 +2545,8 @@ class StartSparrow(Base):
             if linger else "") + f"pathlib.Path({str(ready)!r}).touch()\ntime.sleep(60)\n")
         self.old_argv = [sys.executable, str(script)]
         proc = subprocess.Popen(self.old_argv)
+        if sparrow:
+            self.argvs[proc.pid] = self.old_argv
         self.wait_for(ready)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
         threading.Thread(target=proc.wait, daemon=True).start()
@@ -2532,6 +2554,7 @@ class StartSparrow(Base):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"role": "gateway-bridge", "pid": proc.pid,
                                     "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": int(time.time()),
                                     "heartbeat_at": int(time.time())}))
         (self.state / "gateway-status.json").write_text(json.dumps(
             {"connected": True, "ts": int(time.time()) - 5, "error": None}))
@@ -2581,6 +2604,9 @@ class StartSparrow(Base):
         self.assertFalse(self.seen.exists())
         self.assertIn("sparrow: running and connected", r.stdout)
 
+    def cfg(self):
+        return {"STATE_DIR": str(self.state), "GATEWAY_INSTANCE": ""}
+
     def keepawake(self, env):
         """keepawake against the old Sparrow, its environment read as `env`."""
         self.cli("install", "--mxid", AGENT, "--no-service")
@@ -2627,7 +2653,9 @@ class StartSparrow(Base):
         self.assertTrue(log.read_text().strip().endswith("restarted=1 reason=drain-predates-send-lock"))
 
     def acquired(self, proc, ago):
-        """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back."""
+        """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back by
+        `proc`, which started just before."""
+        self.started_ago(proc, ago + 5)
         path = self.state / "locks" / "gateway-bridge.lock"
         now = int(time.time())
         path.write_text(json.dumps({"role": "gateway-bridge", "pid": proc.pid,
@@ -2701,6 +2729,58 @@ class StartSparrow(Base):
                 mock.patch.object(gb, "_ws_acquire", return_value=deferred) as take:
             self.assertFalse(gb._acquire_singleton())
         self.assertEqual(take.call_args.kwargs["declares"], gb._lock_declares(), "the drain's own take")
+
+    def test_keepawake_never_signals_a_recycled_pid_under_a_legacy_lock(self):
+        # Reviewer's probe: a released main's lock, old and fresh, now names a live process that
+        # is not Sparrow, or a Sparrow that started after that lock was taken (its pid reused).
+        for case in ("not sparrow", "started after the lock"):
+            with self.subTest(case):
+                old = self.old_sparrow(sparrow=case != "not sparrow")
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                if case == "started after the lock":
+                    self.started_ago(old, 1)
+                with mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop:
+                    r, line = self.keepawake(None)  # its environment cannot be read: unknown-env
+                stop.assert_not_called()
+                self.assertTrue(line.endswith(" listener=up restarted=0 reason=unknown-env"), line)
+                self.assertIsNone(old.poll(), "the recycled pid was not signalled")
+                self.assertIsNone(keepalive.drain_predates_send_lock(self.cfg()))
+                old.kill()
+                old.wait(5)
+
+    def test_keepawake_still_replaces_a_genuine_legacy_sparrow(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)  # a released main, running since then
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop:
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        stop.assert_called_once()
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_stop_signals_only_the_proven_sparrow_of_the_lock_it_rereads(self):
+        old = self.old_sparrow()
+        self.acquired(old, 30)
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        cfg = self.cfg()
+        lock = self.state / "locks" / "gateway-bridge.lock"
+        rec = json.loads(lock.read_text())
+        for why, record in (("another pid", {**rec, "pid": os.getppid()}),
+                            ("a newer start", {**rec, "acquired_at": rec["acquired_at"] - 600}),
+                            ("a declared start of another process", {**rec, "start": "2001-01-01T00:00:00Z"})):
+            with self.subTest(why):
+                lock.write_text(json.dumps(record))
+                with mock.patch.object(keepalive.os, "kill") as kill, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertFalse(keepalive._stop(cfg, old.pid))
+                kill.assert_not_called()
+        self.assertFalse(keepalive.proven_sparrow(old.pid, None))
+        self.starts[old.pid] = "not a time"
+        self.assertFalse(keepalive.proven_sparrow(old.pid, rec))
+        self.starts[old.pid] = None
+        with mock.patch.object(keepalive.agent_identity, "start_time", return_value=None):
+            self.assertFalse(keepalive.proven_sparrow(old.pid, rec), "no start time read: no proof")
+        old.kill()
+        old.wait(5)
 
     def test_keepawake_replaces_a_main_version_sparrow_that_publishes_no_lane_record(self):
         old = self.old_sparrow()
