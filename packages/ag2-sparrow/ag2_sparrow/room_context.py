@@ -111,8 +111,8 @@ def _sections(context):
         _require(key not in coverage or _string(coverage[key], limit), "invalid_coverage")
     _require(status == "partial" or not CONTENT_KEYS.intersection(context), "content_without_grant")
     if "room" in context:
-        _object(context["room"], (), ("name", "topic"))
-        for key, limit in (("name", 512), ("topic", 2048)):
+        _object(context["room"], (), ("name", "topic", "category"))
+        for key, limit in (("name", 512), ("topic", 2048), ("category", 256)):
             _require(key not in context["room"] or _string(context["room"][key], limit), "invalid_room")
     if "readme" in context:
         readme = context["readme"]

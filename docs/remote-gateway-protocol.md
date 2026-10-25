@@ -155,7 +155,8 @@ The context adds `status` (`partial`, `unavailable` or `denied`) and `coverage`:
 `completeness` is always `unknown`, `truncated` is a boolean, and optional `cursor`
 and non-sensitive `reason` are bounded strings. `partial` may additionally carry:
 
-- `room`: optional `name` (512 characters) and `topic` (2,048 characters).
+- `room`: optional `name` (512 characters), `topic` (2,048 characters) and
+  `category` (256 Unicode code points). All three values must be strings.
 - `readme`: `text` (8,192 characters), `content_hash` (256 characters) and boolean
   `truncated`. The producer must independently authorize this section.
 - `members`: at most 20 objects with exact `user_id` and optional `display_name`.

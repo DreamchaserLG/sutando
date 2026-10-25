@@ -155,6 +155,22 @@ class ValidationTest(unittest.TestCase):
             self.assertEqual(valid(data, bind)[2], "accepted")
             self.assertEqual(valid(dict(data, messages=[]), bind)[2], "content_without_grant")
 
+    def test_room_category_accepts_only_bounded_unicode_strings(self):
+        binding, context = fixture(now=1000)
+        for module in (rc, bundled):
+            def check(value):
+                packet = dict(context, room=dict(context["room"], category=value))
+                return module.validate(packet, binding, task_id=binding["task_id"], room_id=binding["room_id"],
+                                       access_tier=binding["access_tier"], anchor_event_id=binding["anchor_event_id"],
+                                       agent_id=binding["agent_id"], now=1000)
+            for value in ("", "Research", "x" * 256, "🌍" * 256):
+                packet, _, reason = check(value)
+                self.assertEqual(reason, "accepted")
+                self.assertEqual(packet["room"]["category"], value)
+            for value in (None, True, 1, [], {}, "x" * 257, "🌍" * 257, "bad\x00category"):
+                self.assertEqual(check(value)[2], "invalid_room")
+        self.assertEqual(valid(dict(context, room=dict(context["room"], unknown="still rejected")), binding)[2], "invalid_fields")
+
     def test_byte_bounds_and_depth_are_independent_of_character_count(self):
         binding, context = fixture(now=1000)
         self.assertEqual(valid("x" * (rc.CONTEXT_MAX_BYTES + 1), binding)[2], "oversized")
