@@ -132,7 +132,8 @@ Both objects carry exactly the same binding fields:
 | `visibility` | `all` or `mentions` |
 | `observed_at`, `expires_at` | Integer Unix seconds; at most one hour lifetime, observed at most 60 seconds ahead, not expired |
 
-IDs are bounded to 1,024 characters. The binding is bounded to 8 KiB and the
+IDs are bounded to 1,024 Unicode code points and identifiers exclude CR/LF/tab.
+All timestamps are nonnegative integers at most `2^53 - 1`. The binding is bounded to 8 KiB and the
 context to 32 KiB of UTF-8 JSON, with depth at most 12. Unknown versions, fields,
 malformed values and mismatches discard the entire context without discarding the
 actual request. If a local agent identity is configured, `agent_id` must match it.

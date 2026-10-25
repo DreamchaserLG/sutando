@@ -68,6 +68,15 @@ def valid(context, binding, now=1000, **kw):
 
 
 class ValidationTest(unittest.TestCase):
+    def test_shared_cross_runtime_fixture(self):
+        task = json.loads((REPO / "tests/fixtures/room-context-v1.json").read_text())
+        packet, _, reason = rc.validate(task["room_context"], task["room_context_binding"],
+                                       task_id=task["id"], room_id=task["channel_id"],
+                                       access_tier=task["access_tier"], anchor_event_id=task["source_message_id"],
+                                       agent_id=task["agent_mxid"], now=1730000001)
+        self.assertEqual(reason, "accepted")
+        self.assertIn("blue fox", packet["messages"][0]["body"])
+
     def test_valid_detached_packet_and_string_json(self):
         binding, context = fixture(now=1000)
         for payload, bind in ((context, binding), (json.dumps(context), json.dumps(binding))):
@@ -109,8 +118,9 @@ class ValidationTest(unittest.TestCase):
     def test_binding_values_and_time_bounds(self):
         binding, context = fixture(now=1000)
         cases = [(key, "") for key in ("context_id", "policy_revision", "membership_epoch", "agent_id", "room_id", "task_id")]
-        cases += [("anchor_event_id", 1), ("access_tier", "admin"), ("visibility", "unknown"),
+        cases += [("anchor_event_id", 1), ("policy_revision", "revision\nforged"), ("access_tier", "admin"), ("visibility", "unknown"),
                   ("expires_at", True), ("observed_at", 1061), ("observed_at", -1),
+                  ("expires_at", rc.MAX_SAFE_INTEGER + 1),
                   ("expires_at", 1000), ("expires_at", 10000), ("expires_at", 900)]
         for key, value in cases:
             changed = dict(binding, **{key: value})
@@ -130,6 +140,7 @@ class ValidationTest(unittest.TestCase):
                    dict(messages=[dict(context["messages"][0], selection="policy")]),
                    dict(messages=[dict(context["messages"][0], body="x" * 2049)]),
                    dict(messages=[dict(context["messages"][0], origin_server_ts=True)]),
+                   dict(messages=[dict(context["messages"][0], origin_server_ts=rc.MAX_SAFE_INTEGER + 1)]),
                    dict(messages=[dict(context["messages"][0], thread_root=None)]),
                    dict(messages=context["messages"] * 21)]
         for change in changes:
