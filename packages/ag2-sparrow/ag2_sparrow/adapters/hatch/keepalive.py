@@ -269,8 +269,9 @@ def restart_listener(cfg: dict, bound: "tuple | None" = None) -> "tuple[bool | N
     """Through the user service install wrote when there is one, else a detached Sparrow. With
     `bound`, only the transition keepawake proved, re-read after the unit's own state: ("running",
     old pid, its lock) restarts the unit only while it runs that generation, else (False, why);
-    ("stopped", old pid) starts it only while it is down and no live Sparrow holds the lock, else
-    (None, why), a current generation left untouched. Neither resets nor restarts on a mismatch."""
+    ("stopped", old pid) starts it (`start`, never `restart`) only while it is down and no live
+    Sparrow holds the lock, else (None, why), a current generation left untouched. Neither resets
+    nor restarts on a mismatch."""
     owner = _unit_owner()
     if owner == UNIT_UNREACHABLE:
         return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
@@ -289,6 +290,12 @@ def restart_listener(cfg: dict, bound: "tuple | None" = None) -> "tuple[bool | N
             if why:
                 return (False if bound[0] == "running" else None), f"{why}; nothing was reset or restarted"
         _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
+        if bound is not None and bound[0] == "stopped":
+            # `start` leaves a unit that came up after the check as it is; `restart` would not.
+            r = _cli._systemctl(("--user", "start", "ag2-sparrow.service"))
+            if _cli._ok(r):
+                return True, f"systemctl --user start {_cli.SERVICE_NAME}"
+            return False, f"systemctl --user start {_cli.SERVICE_NAME} failed ({_cli._why(r)})"
         r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
             return True, f"systemctl --user restart {_cli.SERVICE_NAME}"
@@ -805,8 +812,9 @@ def _successor(cfg: dict, old: "tuple[int, str | None]", since: float) -> "tuple
         return None, f"Sparrow pid {pid} has written no status since the restart"
     if status.get("connected") is not True:
         return None, f"Sparrow pid {pid} is running but not connected"
-    now = _cli._lock_record(state, instance) or {}
-    if any(now.get(k) != lock.get(k) for k in _IDENTITY) or process_start(pid) != gen:
+    now = _cli._lock_record(state, instance)
+    if not _cli.canonical_lock(now, state, instance) or any(now.get(k) != lock.get(k) for k in _IDENTITY) \
+            or process_start(pid) != gen:
         return None, f"the lock moved off Sparrow pid {pid} while its status was read"
     return pid, f"Sparrow pid {pid} now holds the lock and is connected"
 

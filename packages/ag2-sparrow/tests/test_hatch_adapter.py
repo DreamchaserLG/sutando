@@ -2848,7 +2848,8 @@ class StartSparrow(Base):
         r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake))
         self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder is stopped first")
         stop.assert_called_once()
-        self.assertEqual(fake.ran("restart"), [["--user", "restart", "ag2-sparrow.service"]])
+        self.assertEqual(fake.ran("start"), [["--user", "start", "ag2-sparrow.service"]])
+        self.assertEqual(fake.ran("restart"), [], "a stopped unit is started, never restarted")
         self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
         self.assertEqual(hatch_cli.live_lock_holder(hatch_cli._lock_record(self.state, "")),
                          self.successors[0], "the unit's new Sparrow owns the lock")
@@ -3187,6 +3188,56 @@ class StartSparrow(Base):
         self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.done_with(old)
+
+    def test_keepawake_never_restarts_a_generation_that_came_up_after_the_final_check(self):
+        # Reviewer's probe: healthy generation B comes up during reset-failed, after the unit was
+        # last read as down; the action that follows must leave it as it is.
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake, came = FakeSystemd(state="inactive"), []
+
+        def call(cmd):
+            if cmd[0] == "systemctl" and cmd[2:3] == ["reset-failed"] and not came:
+                came.append(self.current_generation(fake))
+            if cmd[0] == "systemctl" and cmd[2:3] == ["start"]:
+                fake.calls.append(cmd[1:])
+                return subprocess.CompletedProcess(cmd, 0, "", "")  # a no-op for an active unit
+            return fake(cmd)
+        want = keepalive.health_command(str(self.reply_stub))
+        with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
+                mock.patch.object(keepalive, "START_WAIT_S", 0):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(came, "B came up after the final check")
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
+        self.assertEqual(fake.ran("restart"), [], "B is never restarted")
+        self.assertIsNone(came[0].poll(), "B is left running")
+        self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.done_with(old)
+
+    def test_keepawake_certifies_no_successor_whose_lock_stopped_being_canonical(self):
+        # Reviewer's probe: during the status read the record keeps every generation field but
+        # stops being this workspace's canonical lock.
+        for case, change in (("another workspace", {"workspace": "/elsewhere"}),
+                             ("another role", {"role": "gateway-bridge-x"}),
+                             ("another schema", {"schema_version": 2})):
+            with self.subTest(case):
+                real_read, changed = keepalive._status_snapshot, []
+
+                def read(state, instance, change=change):
+                    status = real_read(state, instance)
+                    if not changed:
+                        lock = json.loads(self.lock_path().read_text())
+                        self.lock_path().write_text(json.dumps({**lock, **change}))
+                        changed.append(True)
+                    return status
+                with mock.patch.object(keepalive, "_status_snapshot", side_effect=read):
+                    r, line = self.keepawake_successor(lambda fake, _t0: self.current_generation(fake))
+                (self.home / "keepalive-probe.log").unlink()
+                self.assertTrue(changed)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn("now holds the lock and is connected", r.stdout)
+                self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
 
     def test_keepawake_restarts_nothing_while_the_unit_is_reloading(self):
         old, _rec = self.legacy()
@@ -3692,7 +3743,7 @@ class StartSparrow(Base):
         real_which, real_proc = shutil.which, keepalive._proc
 
         def run(cmd):
-            if cmd[2:3] == ["restart"] and on_restart:
+            if cmd[2:3] in (["restart"], ["start"]) and on_restart:
                 return on_restart(cmd)
             return fake(cmd)
 
