@@ -55,6 +55,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Reference
 
+- [Connections: one install, several homeservers](connections.md)
 - [Host CLI bindings](host-cli-bindings.md)
 - [DotSpace homeservers](dotspace.md) — which homeservers are AG2-operated, the well-known block, the `core.dotspace` config.
 - [Remote gateway protocol](remote-gateway-protocol.md)
