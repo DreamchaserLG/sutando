@@ -197,7 +197,8 @@ global/profile-memory write is introduced.
 
 `python3 src/room_context.py view <task-file>` prints a read-only view, rechecking
 expiry and exact bindings and replacing unusable context with an unavailable notice.
-It preserves the request and tier guardrails and never rewrites the signed source.
+It preserves the request and tier guardrails and never rewrites the HMAC-stamped
+task file. The room-context binding itself is not cryptographically signed.
 The Claude and Codex standby notifier prompts direct context-enabled tasks through
 this view. Optional Codex and Claude cloud/routine renderers also revalidate before
 rendering. Codex connector sessions include actor, room, tier, policy, membership,

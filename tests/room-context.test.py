@@ -169,6 +169,8 @@ class ValidationTest(unittest.TestCase):
                 self.assertEqual(packet["room"]["category"], value)
             for value in (None, True, 1, [], {}, "x" * 257, "🌍" * 257, "bad\x00category"):
                 self.assertEqual(check(value)[2], "invalid_room")
+            for value in ("\ud800", "\udfff"):
+                self.assertEqual(check(value)[2], "invalid_json")
         self.assertEqual(valid(dict(context, room=dict(context["room"], unknown="still rejected")), binding)[2], "invalid_fields")
 
     def test_byte_bounds_and_depth_are_independent_of_character_count(self):
