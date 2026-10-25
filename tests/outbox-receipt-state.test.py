@@ -169,5 +169,21 @@ class ReceiptState(unittest.TestCase):
                     path.chmod(0o644)
 
 
+    def test_receipt_carries_the_resend_epoch_only_a_requeue_advances(self):
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                root = self.root / mod.__name__
+                self.assertEqual(mod.receipt(root, "proactive-1"), ("absent", None))
+                mod._write_item(root, "proactive-1", {"item_id": "proactive-1", "status": "PARKED", "payload": "x"})
+                self.assertEqual(mod.receipt(root, "proactive-1"), ("PARKED", 0))
+                self.assertEqual(mod.requeue_item_with_epoch(root, "proactive-1")[0], mod.RequeueOutcome.REQUEUED)
+                self.assertEqual(mod.receipt(root, "proactive-1"), ("QUEUED", 1))
+                for bad in ("1", -1, True, None):
+                    mod._write_item(root, "proactive-1", {"item_id": "proactive-1", "status": "QUEUED",
+                                                          "resend_epoch": bad})
+                    self.assertEqual(mod.receipt(root, "proactive-1"), ("QUEUED", None), f"epoch {bad!r}")
+                mod._item_path(root, "proactive-1").write_text('{"status": "QUEU')
+                self.assertEqual(mod.receipt(root, "proactive-1"), ("unknown", None))
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

@@ -964,25 +964,35 @@ def receipt_state(root: Path, item_id: str) -> str:
     directory entry exists, and "unknown" for anything else present — unreadable,
     malformed, not a regular file, or not a status a writer stores. Judged and read
     through one descriptor that follows no symlink, so it validates what it reads."""
+    return receipt(root, item_id)[0]
+
+
+def receipt(root: Path, item_id: str) -> "tuple[str, Optional[int]]":
+    """(`receipt_state`, the record's resend epoch) from one read; the epoch is None unless
+    the status is a stored one and the epoch a non-negative int (absent counts as 0)."""
     import stat as _stat
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:  # no no-follow primitive: a link could not be refused
-        return "unknown"
+        return "unknown", None
     try:
         fd = os.open(_item_path(Path(root), item_id), os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
-        return "absent"
+        return "absent", None
     except OSError:
-        return "unknown"
+        return "unknown", None
     try:
         with os.fdopen(fd, "rb") as fh:
             if not _stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                return "unknown"
+                return "unknown", None
             data = json.loads(fh.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
-        return "unknown"
+        return "unknown", None
     status = data.get("status") if isinstance(data, dict) else None
-    return status if isinstance(status, str) and status in LIFECYCLE_STATUSES else "unknown"
+    if not (isinstance(status, str) and status in LIFECYCLE_STATUSES):
+        return "unknown", None
+    epoch = data.get("resend_epoch", 0)
+    valid = isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0
+    return status, epoch if valid else None
 
 
 def item_status(root: Path, item_id: str) -> Optional[str]:

@@ -319,7 +319,7 @@ from . import __version__ as _PACKAGE_VERSION
 from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
-from .outbox import receipt_state
+from .outbox import receipt
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -5701,7 +5701,7 @@ def _recover_orphan_proactive() -> None:
             except OSError:
                 continue
         target = f.with_name(name.split(".sending")[0] + ".txt")
-        receipt, generation = _claim_receipt(f, target.stem)
+        receipt, generation, epoch = _claim_receipt(f, target.stem)
         if receipt in ("absent", "QUEUED", "READY", "CLAIMED"):  # not terminal: back live, the outbox settles it
             _log(f"recovering orphan proactive claim {f.name} (outbox item {receipt})")
             _hand_back(f, target)
@@ -5711,13 +5711,16 @@ def _recover_orphan_proactive() -> None:
         elif receipt == "PARKED":  # terminal: never resent, kept where parked files go
             parked = _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
                                    / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
-            now = _claim_receipt(parked, target.stem)[0] if parked is not None else "PARKED"
-            if now == "QUEUED":  # the one state an operator's requeue publishes: its body goes back live
+            if parked is None:
+                continue
+            now, moved, epoch_now = _claim_receipt(parked, target.stem)
+            if (now == "QUEUED" and moved == generation and epoch is not None and epoch_now is not None
+                    and epoch_now > epoch):  # only a requeue's own transition proves the operator resent it
                 _log(f"proactive claim {f.name} was requeued while it was being parked; handed back")
                 _hand_back(parked, target)
-            elif now != "PARKED":  # its prior send is uncertain, so a vanished or changed record never resends
-                _log(f"proactive claim {f.name}: its outbox item read {now} after it was parked; kept parked "
-                     "for an operator, not re-queued")
+            elif (now, moved) != ("PARKED", generation):  # its prior send is uncertain: never resent on doubt
+                _log(f"proactive claim {f.name}: its outbox item read {now} (resend epoch {epoch_now}, was "
+                     f"{epoch}) after it was parked; kept parked as {parked.name} for an operator, not re-queued")
         else:  # unknown / unreadable: it may have been sent; kept for an operator
             _log_backoff(("proactive-orphan-receipt", f.name),
                          f"proactive claim {f.name}: its outbox record cannot be read cleanly; kept as "
@@ -5766,23 +5769,44 @@ def _file_generation(path: Path) -> "str | None":
     return f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
-def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None]":
+_CLAIM_READ_LIMIT = 1 << 20
+
+
+def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None, int | None]":
     """(`receipt_state` of the item a claimed proactive file was sent as, the generation
-    that state was read for), from one descriptor that follows no symlink: "absent" when
-    it was never an outbox item, "unknown" when that cannot be told."""
+    that state was read for, the item's resend epoch), from one bounded, non-blocking read
+    of a regular file through a descriptor that follows no symlink: "absent" when it was
+    never an outbox item, "unknown" when that cannot be told."""
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:  # a link could not be refused
+        return "unknown", None, None
     try:
-        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-        with os.fdopen(fd, "rb") as fh:
-            st = os.fstat(fh.fileno())
-            if not stat.S_ISREG(st.st_mode):  # a FIFO or device would block or lie: kept for an operator
-                return "unknown", None
-            route, _, body = _proactive_route(fh.read().decode("utf-8"))
+        fd = os.open(claim, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return "unknown", None, None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _CLAIM_READ_LIMIT:
+            return "unknown", None, None
+        chunks, size = [], 0
+        while size <= _CLAIM_READ_LIMIT:
+            chunk = os.read(fd, _CLAIM_READ_LIMIT + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > _CLAIM_READ_LIMIT:
+            return "unknown", None, None
+        route, _, body = _proactive_route(b"".join(chunks).decode("utf-8"))
     except (OSError, UnicodeDecodeError):
-        return "unknown", None
+        return "unknown", None, None
+    finally:
+        os.close(fd)
     generation = f"{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
     if route != "send" or not body.strip():
-        return "absent", generation  # dropped, foreign or empty: the drain never made it an item
-    return receipt_state(_proactive_outbox_root(), _proactive_item_id(stem, body.strip())), generation
+        return "absent", generation, None  # dropped, foreign or empty: the drain never made it an item
+    state, epoch = receipt(_proactive_outbox_root(), _proactive_item_id(stem, body.strip()))
+    return state, generation, epoch
 
 
 def _hand_back(claim: Path, original: Path) -> None:
