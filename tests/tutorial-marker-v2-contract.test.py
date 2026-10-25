@@ -1013,11 +1013,13 @@ class SchemaTransitionTest(unittest.TestCase):
             "select:<kind> without its current": [(["rooms", "!lost", "current"], None)],
             "select:<kind> without its unselected entry": [(["rooms", "!lost", "unselected"], [])],
             "select:none without its unselected entries": [(["rooms", "!lost", "unselected"], [])],
+            "an opaque entry with an unknown audience": [(["rooms", "!lost", "current", "audience"], "owner")],
         }
         source = {"select over a changed, unreviewed C": lost, "select over a C whose chosen candidate changed": lost,
                   "an active keep-old without its Rejected entry": old,
                   "select:<kind> without its current": lost, "select:<kind> without its unselected entry": lost,
-                  "select:none without its unselected entries": none}
+                  "select:none without its unselected entries": none,
+                  "an opaque entry with an unknown audience": lost}
         for name, edits in cases.items():
             with self.subTest(name):
                 bad = source.get(name, new)
