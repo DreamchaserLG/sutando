@@ -82,8 +82,10 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
-# Prefer IPv4 for gateway/relay connections. The relay host (e.g. chat.ag2.space)
-# publishes AAAA records, but some hosts have IPv6 black-holed at the network
+from .dotspace import NO_FETCH as _NO_FETCH, dotspace_for as _dotspace_for
+
+# Prefer IPv4 for connections to any DotSpace gateway/relay (e.g. chat.ag2.space): they
+# publish AAAA records, but some hosts have IPv6 black-holed at the network
 _DNS_TIMEOUT_S = float(os.environ.get("REMOTE_GATEWAY_DNS_TIMEOUT") or "8")
 _PREFER_V4 = os.environ.get("REMOTE_GATEWAY_ALLOW_IPV6") != "1"
 # Reload-safe original capture: on module re-exec/reload, socket.getaddrinfo is
@@ -274,6 +276,13 @@ def _is_ip_literal(host):
     return False
 
 
+def _prefer_v4_for(host) -> bool:
+    """Whether `host` (str or bytes) is a DotSpace host whose instance asks for IPv4 first."""
+    name = host.decode("ascii", "replace") if isinstance(host, bytes) else str(host)
+    d = _dotspace_for(name, fetch=_NO_FETCH)
+    return bool(d.operator and d.prefer_ipv4)
+
+
 def _getaddrinfo_prefer_v4(host, *args, **kwargs):
     try:
         infos = _resolve_bounded(host, *args, **kwargs)
@@ -290,7 +299,7 @@ def _getaddrinfo_prefer_v4(host, *args, **kwargs):
         for ip in ips:
             # A literal IP never touches DNS: this only shapes the tuples.
             infos.extend(_orig_getaddrinfo(ip, *args, **kwargs))
-    if _PREFER_V4 and host and "ag2.space" in str(host):
+    if _PREFER_V4 and host and _prefer_v4_for(host):
         v4 = [i for i in infos if i[0] == socket.AF_INET]
         return v4 or infos
     return infos
