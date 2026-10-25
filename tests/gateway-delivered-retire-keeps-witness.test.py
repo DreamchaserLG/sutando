@@ -168,6 +168,11 @@ class DeliveredRetireKeepsTheWitness(unittest.TestCase):
         self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
         self.assertEqual(claim.read_text(), "delivered\n")
 
+    def test_a_record_claiming_to_be_absent_never_requeues_the_claim(self):
+        claim = self.dead_owner_claim_with_receipt(lambda record: record.write_text('{"status": "absent"}'))
+        self.assertFalse((self.results / f"{PREFIX}1.txt").exists(), "not re-queued for a second send")
+        self.assertEqual(claim.read_text(), "delivered\n")
+
     def test_a_claim_with_no_receipt_at_all_is_still_requeued(self):
         import subprocess
         self.patched_dirs()

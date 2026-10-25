@@ -877,21 +877,30 @@ def _activity_completed(item_id: str) -> None:
         pass
 
 
+#: The statuses outbox writers store; any other value in a present record is corruption.
+LIFECYCLE_STATUSES = frozenset({"QUEUED", "READY", "CLAIMED", "DELIVERED", "PARKED"})
+
+
 def receipt_state(root: Path, item_id: str) -> str:
     """An item's status only when its record reads cleanly; "absent" only when no
-    record exists, and "unknown" when it is unreadable or malformed — never a guess."""
+    directory entry exists, and "unknown" for anything else present — unreadable,
+    malformed, not a regular file, or a status no writer stores."""
+    import stat as _stat
+    path = _item_path(Path(root), item_id)
     try:
-        raw = _item_path(Path(root), item_id).read_text(encoding="utf-8")
+        st = os.lstat(path)
     except FileNotFoundError:
         return "absent"
-    except (OSError, UnicodeDecodeError):
+    except OSError:
+        return "unknown"
+    if not _stat.S_ISREG(st.st_mode):
         return "unknown"
     try:
-        data = json.loads(raw)
-    except ValueError:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
         return "unknown"
     status = data.get("status") if isinstance(data, dict) else None
-    return status if isinstance(status, str) and status else "unknown"
+    return status if status in LIFECYCLE_STATUSES else "unknown"
 
 
 def item_status(root: Path, item_id: str) -> Optional[str]:

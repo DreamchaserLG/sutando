@@ -122,11 +122,12 @@ def find_task_file(tasks_dir: Path, task_id: str) -> Path | None:
 
 def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" = None,
                              dst_dir_fd: "int | None" = None,
-                             expect: "tuple[int, int] | None" = None) -> Path:
+                             expect: "str | None" = None) -> Path:
     """Move src to dest, or to dest.N if taken. Returns where it landed.
     link()+unlink(): rename()/move() REPLACE on POSIX — data loss on a repeat.
     With directory handles, src/dest are names inside them and no path is re-resolved;
-    `expect` (st_dev, st_ino) refuses to move anything but that inode (PlacementMismatch)."""
+    `expect` (a `file_generation`) moves only that generation and retires the source
+    into the archive's `.retired/` instead of unlinking it (`retire`)."""
     if src_dir_fd is not None or dst_dir_fd is not None:
         return _move_relative(src, dest, src_dir_fd, dst_dir_fd, expect)
     import os
@@ -166,7 +167,7 @@ def _move_without_clobbering(src: Path, dest: Path, *, src_dir_fd: "int | None" 
 
 
 def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: "int | None",
-                   expect: "tuple[int, int] | None" = None) -> Path:
+                   expect: "str | None" = None) -> Path:
     """The handle form of `_move_without_clobbering`: same policy, every call
     relative to the directories, unlink of the (private) source by name in its handle."""
     import os
@@ -177,11 +178,10 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
     while True:
         try:
             os.link(str(src), str(candidate), src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
-            if expect is not None:
-                got = os.lstat(str(candidate), dir_fd=dst_dir_fd)
-                if (got.st_dev, got.st_ino) != expect:  # src was replaced after it was judged
-                    os.unlink(str(candidate), dir_fd=dst_dir_fd)
-                    raise PlacementMismatch(str(src))
+            if expect is not None and file_generation(os.lstat(str(candidate), dir_fd=dst_dir_fd)) != expect:
+                with retired_dir(dst_dir_fd) as rfd:  # src changed after it was judged: set aside
+                    retire(str(candidate), src_dir_fd=dst_dir_fd, retired_fd=rfd, expect=None)
+                raise PlacementMismatch(str(src))
             break
         except FileExistsError:
             n += 1
@@ -191,8 +191,7 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
         except OSError:
             tmp = base.with_name(f".{base.name}.{uuid.uuid4().hex[:12]}.part")
             fd_in = os.open(str(src), os.O_RDONLY, dir_fd=src_dir_fd)
-            got = os.fstat(fd_in)
-            if expect is not None and (got.st_dev, got.st_ino) != expect:
+            if expect is not None and file_generation(os.fstat(fd_in)) != expect:
                 os.close(fd_in)
                 raise PlacementMismatch(str(src))
             try:
@@ -225,33 +224,72 @@ def _move_relative(src: Path, dest: Path, src_dir_fd: "int | None", dst_dir_fd: 
         _checkpoint("after_link", str(src))
         if expect is None:
             os.unlink(str(src), dir_fd=src_dir_fd)
+            if src_dir_fd is not None:
+                _fsync_dir(src_dir_fd)
         else:
-            _retire_source(str(src), str(candidate), src_dir_fd, expect)
-        if src_dir_fd is not None:
-            _fsync_dir(src_dir_fd)
+            with retired_dir(dst_dir_fd) as rfd:
+                stray = retire(str(src), src_dir_fd=src_dir_fd, retired_fd=rfd, expect=expect)
+            if stray:
+                raise PlacementSourceReplaced(str(candidate), f"archive/{RETIRED_DIR}/{stray}")
     except OSError as exc:
         raise PlacementUnsynced(str(candidate), exc) from exc
     return candidate
 
 
-def _retire_source(src: str, landed: str, dir_fd: "int | None", expect: "tuple[int, int]") -> None:
-    """Remove the source name only if it still holds the placed inode: it is first
-    renamed to a name this call owns, so nothing else can be unlinked by name."""
+RETIRED_DIR = ".retired"
+
+
+class retired_dir:
+    """The archive's `.retired/` (created when missing) as a directory handle."""
+
+    def __init__(self, archive_fd: int):
+        self.archive_fd = archive_fd
+
+    def __enter__(self) -> int:
+        import os
+        try:
+            os.mkdir(RETIRED_DIR, 0o700, dir_fd=self.archive_fd)
+        except FileExistsError:
+            pass
+        self.fd = os.open(RETIRED_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                          | getattr(os, "O_NOFOLLOW", 0), dir_fd=self.archive_fd)
+        return self.fd
+
+    def __exit__(self, *exc) -> None:
+        import os
+        os.close(self.fd)
+
+
+def retired_names(name: str, retired_fd: int) -> "list[str]":
+    """Where `retire` may have put `name`: `name` and its `.N`, in order."""
     import os
-    held = f"{src}.retiring"
-    os.rename(src, held, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-    got = os.lstat(held, dir_fd=dir_fd)
-    if (got.st_dev, got.st_ino) == expect:
-        os.unlink(held, dir_fd=dir_fd)
-        return
-    kept = held
-    try:  # a replacement goes back under the name it took, never over anything
-        os.link(held, src, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-        os.unlink(held, dir_fd=dir_fd)
-        kept = src
-    except FileExistsError:
-        pass
-    raise PlacementSourceReplaced(landed, kept)
+    import re
+    tail = re.compile(re.escape(name) + r"(?:\.([1-9][0-9]*))?")
+    return [e for _, e in sorted((int(m.group(1) or 0), e) for e in os.listdir(retired_fd)
+                                 for m in [tail.fullmatch(e)] if m)]
+
+
+def retire(name: str, *, src_dir_fd: "int | None", retired_fd: int, expect: "str | None") -> "str | None":
+    """The one way this module removes a task-bearing name: rename it into
+    `.retired/` under `name` (or the first free `name.N`, so a re-entry never
+    overwrites), sync both directories, and judge what moved. Nothing is unlinked.
+    Returns None when the retired file is the `expect` generation, else its retired
+    name, kept for the operator. FileNotFoundError when `name` is gone."""
+    import os
+    taken = set(retired_names(name, retired_fd))
+    as_name, n = name, 0
+    while as_name in taken:
+        n += 1
+        as_name = f"{name}.{n}"
+    _checkpoint("before_retire", name)
+    os.rename(name, as_name, src_dir_fd=src_dir_fd, dst_dir_fd=retired_fd)
+    _checkpoint("after_retire", name)
+    _fsync_dir(retired_fd)
+    if src_dir_fd is not None:
+        _fsync_dir(src_dir_fd)
+    if expect is not None and file_generation(os.lstat(as_name, dir_fd=retired_fd)) == expect:
+        return None
+    return as_name
 
 
 # The one owner of collision naming, callable from outside the archive path too.
@@ -259,7 +297,8 @@ move_without_clobbering = _move_without_clobbering
 
 
 def _checkpoint(point: str, name: str) -> None:
-    """A named injection point for tests (`before_give_back`, `after_link`); a no-op in production."""
+    """A named injection point for tests (`before_give_back`, `after_link`, `before_retire`,
+    `after_retire`); a no-op in production."""
 
 
 def _fsync_dir(fd: int) -> None:
@@ -331,17 +370,28 @@ class GenerationChanged(Exception):
         self.name, self.why, self.kept_as = name, why, kept_as
 
 
-def _give_back(claim: str, name: str, why: str, dir_fd: int) -> GenerationChanged:
-    """Link the claim back to its name without replacing whatever holds it now;
-    the claim is private, so unlinking it by name is safe. Returns the error to raise."""
+def _give_back(claim: str, name: str, why: str, dir_fd: int, *, archive_fd: int,
+               expect: "str | None" = None) -> GenerationChanged:
+    """Link the claim back to its name without replacing whatever holds it now,
+    then retire the claim name (`retire`, never an unlink). A live name that does
+    not hold `expect` after the link is set aside too. Returns the error to raise."""
     import os
     _checkpoint("before_give_back", name)
     try:
         os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
     except FileExistsError:
         return GenerationChanged(name, why, kept_as=claim)
-    os.unlink(claim, dir_fd=dir_fd)
     _fsync_dir(dir_fd)
+    live = file_generation(os.lstat(name, dir_fd=dir_fd))
+    with retired_dir(archive_fd) as rfd:
+        if expect is not None and live != expect:  # the claim was replaced before the link
+            moved = retire(name, src_dir_fd=dir_fd, retired_fd=rfd, expect=None)
+            return GenerationChanged(name, f"{why}; its claim was replaced, so that file is kept as "
+                                           f"archive/{RETIRED_DIR}/{moved}", kept_as=claim)
+        stray = retire(claim, src_dir_fd=dir_fd, retired_fd=rfd, expect=live)
+    if stray:
+        return GenerationChanged(name, f"{why}; a file that replaced its claim is kept as "
+                                       f"archive/{RETIRED_DIR}/{stray}")
     return GenerationChanged(name, why)
 
 
@@ -404,19 +454,22 @@ def place_claim(claim: str, name: str, generation: str, dest: str, *, src_dir_fd
     try:
         fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=src_dir_fd)
     except OSError as exc:
-        raise _give_back(claim, name, f"cannot be opened as a regular file ({exc})", src_dir_fd) from None
+        raise _give_back(claim, name, f"cannot be opened as a regular file ({exc})", src_dir_fd,
+                         archive_fd=dst_dir_fd) from None
     try:
-        held = os.fstat(fd)
-        if file_generation(held) != generation:
-            raise _give_back(claim, name, "changed since it was planned", src_dir_fd)
+        judged = file_generation(os.fstat(fd))
+        if judged != generation:
+            raise _give_back(claim, name, "changed since it was planned", src_dir_fd,
+                             archive_fd=dst_dir_fd, expect=judged)
         try:
             return move_without_clobbering(Path(claim), Path(dest), src_dir_fd=src_dir_fd,
-                                           dst_dir_fd=dst_dir_fd, expect=(held.st_dev, held.st_ino))
+                                           dst_dir_fd=dst_dir_fd, expect=judged)
         except PlacementMismatch as exc:
             exc.kept_as = _keep_displaced(fd, claim, src_dir_fd)
             raise
         except OSError as exc:
-            raise _give_back(claim, name, f"the archive move failed ({exc})", src_dir_fd) from exc
+            raise _give_back(claim, name, f"the archive move failed ({exc})", src_dir_fd,
+                             archive_fd=dst_dir_fd, expect=judged) from exc
     finally:
         os.close(fd)
 

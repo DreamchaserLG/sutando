@@ -35,6 +35,9 @@ sys.path.insert(0, str(REPO / "src"))
 
 import task_transition as tt  # noqa: E402
 
+# The transition's own entries in the archive dir: its lock and the retired names.
+_OURS = (tt._LOCK_NAME, getattr(tt.task_archive, "RETIRED_DIR", ".retired"))
+
 PREFIX = "proactive-orphan-recovery-"
 FROZEN = 1800000000.0
 
@@ -106,6 +109,12 @@ class Base(unittest.TestCase):
     def archive_names(self) -> list[str]:
         return sorted(x.name for x in self.archive.iterdir() if not x.name.startswith("."))
 
+    def names_outside_retired(self, path: Path) -> int:
+        """Names of this inode in tasks/ and tasks/archive/; `.retired/` holds the set-aside ones."""
+        ino = os.stat(path).st_ino
+        return sum(1 for d in (self.tasks, self.archive) for x in d.iterdir()
+                   if x.is_file() and os.stat(x).st_ino == ino)
+
     def inject(self, point: str, p: Path, action, module=None):
         """Run `action()` once at the named checkpoint for `p` — `before_claim` /
         `after_claim` in task_transition, `before_give_back` in task_archive —
@@ -145,7 +154,7 @@ class TestExclusivePublication(Base):
                          ["notice task-a.txt\n", "notice task-b.txt\n"])
         self.assertEqual(self.archive_names(), ["task-a.txt", "task-b.txt"])
         self.assertEqual(sorted(x.name for x in self.archive.iterdir()
-                                if x.name.startswith(".") and x.name != tt._LOCK_NAME), [])
+                                if x.name.startswith(".") and x.name not in _OURS), [])
 
     def test_a_name_collision_in_one_process_is_retried_never_replaced(self):
         _task(self.tasks, "task-a.txt", "A")
@@ -222,7 +231,7 @@ class TestGenerationGuard(Base):
         self.assertEqual((out["archived"], out["quarantined"], out["result"]), ({}, {}, None))
         self.assertIn("new", p.read_text(), "the new task survives under its own name")
         self.assertEqual(self.live_names(), ["archive", "task-a.txt"], "no claim left behind")
-        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name != tt._LOCK_NAME), [],
+        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name not in _OURS), [],
                          "nothing archived, no journal kept")
 
     def test_a_name_retaken_during_the_give_back_quarantines_the_claim(self):
@@ -397,7 +406,7 @@ class TestNoClobberAndSymlinks(Base):
         out = self.run_transition([], _notice("notice\n"))
         self.assertEqual(out["errors"], [])
         self.assertIsNotNone(out["result"])
-        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name != tt._LOCK_NAME), [],
+        self.assertEqual(sorted(x for x in self.archive.iterdir() if x.name not in _OURS), [],
                          "created empty, no journal")
 
 
@@ -432,7 +441,7 @@ class TestJournalRecovery(Base):
         self.assertEqual(len(self.notices()), 1 if notice_committed else 0)
         self.assertEqual(self.journals(), [])
         self.assertEqual([x.name for x in self.archive.iterdir()
-                          if x.name.startswith(".") and x.name != tt._LOCK_NAME], [])
+                          if x.name.startswith(".") and x.name not in _OURS], [])
 
     def recover(self) -> dict:
         return self.run_transition([], _notice(None))
@@ -908,7 +917,7 @@ class TestRefusalPaths(Base):
         self.assertIn("could not write the journal", out["errors"][0])
         self.assertIn("nothing moved", out["errors"][0])
         self.assertTrue(p.exists())
-        self.assertEqual([x.name for x in self.archive.iterdir() if x.name != tt._LOCK_NAME], [],
+        self.assertEqual([x.name for x in self.archive.iterdir() if x.name not in _OURS], [],
                          "no journal lock, tmp or journal left")
         self.assertEqual(self.notices(), [])
 
@@ -1143,7 +1152,7 @@ class TestCrashWindows(Base):
         out = self.recover()
         self.assertEqual(out["errors"], [], out)
         self.assertEqual(self.archive_names(), ["task-a.txt"])
-        self.assertEqual(os.stat(self.archive / "task-a.txt").st_nlink, 1)
+        self.assertEqual(self.names_outside_retired(self.archive / "task-a.txt"), 1)
         self.assertEqual(out["recovered"][0]["landed"], {"task-a.txt": "task-a.txt"})
         self.invariants(gen, "task: A", notice_committed=True)
 
@@ -1302,7 +1311,7 @@ class TestCrashWindows(Base):
                          {"task-a.txt": "task-a.txt", "task-b.txt": "task-b.txt.2"})
         self.assertEqual(self.archive_names(), ["task-a.txt", "task-b.txt", "task-b.txt.2"], "no .3")
         self.assertFalse(claim.exists())
-        self.assertEqual(os.stat(self.archive / "task-b.txt.2").st_nlink, 1)
+        self.assertEqual(self.names_outside_retired(self.archive / "task-b.txt.2"), 1)
         self.assertEqual(tt.generation_of(self.archive / "task-b.txt.2"), gen_b)
         mine = Path(out["recovered"][0]["result"])
         self.assertNotEqual(mine, foreign)
@@ -1378,7 +1387,7 @@ class TestCrashWindows(Base):
         retry = self.recover()
         self.assertEqual(retry["errors"], [], retry)
         self.assertEqual(self.archive_names(), ["task-a.txt"], "one generation, one archive name")
-        self.assertEqual(os.stat(self.archive / "task-a.txt").st_nlink, 1)
+        self.assertEqual(self.names_outside_retired(self.archive / "task-a.txt"), 1)
         self.invariants(gen, "task: A", notice_committed=True)
 
     def test_a_replaced_claim_entry_is_kept_and_the_journal_retained(self):
@@ -1486,7 +1495,7 @@ class TestRound9(Base):
         return p, out
 
     def test_a_give_back_whose_link_fails_is_returned_by_recovery_not_archived(self):
-        def link_fails(claim, name, why, dir_fd):
+        def link_fails(claim, name, why, dir_fd, **kw):
             raise OSError(5, "Input/output error")
 
         p, out = self.refused_after_claim(link_fails)
@@ -1499,7 +1508,7 @@ class TestRound9(Base):
         self.assertEqual([x.name for x in self.tasks.iterdir() if ".claim-" in x.name], [])
 
     def test_a_give_back_whose_unlink_fails_keeps_one_live_copy_and_no_notice(self):
-        def unlink_fails(claim, name, why, dir_fd):
+        def unlink_fails(claim, name, why, dir_fd, **kw):
             os.link(claim, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
             raise OSError(5, "Input/output error")
 
@@ -1672,7 +1681,7 @@ class TestRound9(Base):
         self.assertEqual([p for p in self.results.iterdir() if p.name.endswith(".witness")], [])
 
     def failed_give_back(self):
-        def link_fails(claim, name, why, dir_fd):
+        def link_fails(claim, name, why, dir_fd, **kw):
             raise OSError(5, "Input/output error")
 
         p, _ = self.refused_after_claim(link_fails)
@@ -1727,13 +1736,13 @@ class TestRound10(Base):
         self.assertEqual((out["archived"], out["result"]), ({}, None))
         self.assertIn("its claim name was replaced meanwhile", out["errors"][0])
         self.assertIn("ORIGINAL ASK", (self.archive / "task-a.txt").read_text())
-        kept = [x for x in self.tasks.iterdir() if x.is_file() and "REPLACEMENT BYTES" in x.read_text()]
+        kept = [x for x in self.tasks.rglob("*") if x.is_file() and "REPLACEMENT BYTES" in x.read_text()]
         self.assertEqual(len(kept), 1, "the replacement bytes still exist")
         self.assertFalse(p.exists())
         again = self.recover()
         self.assertIn("waits for the operator", again["errors"][0])
         self.assertEqual((len(self.journals()), self.notices()), (1, []))
-        self.assertEqual(len([x for x in self.tasks.iterdir() if x.is_file()
+        self.assertEqual(len([x for x in self.tasks.rglob("*") if x.is_file()
                               and "REPLACEMENT BYTES" in x.read_text()]), 1)
 
     # 3 — a refusal whose journal write fails is still never placed
@@ -1767,7 +1776,7 @@ class TestRound10(Base):
         self.assertEqual((self.archive_names(), self.notices(), self.journals()), ([], [], []))
 
     def test_a_refusal_whose_journal_write_and_give_back_both_fail_is_returned_by_recovery(self):
-        def link_fails(claim, name, why, dir_fd):
+        def link_fails(claim, name, why, dir_fd, **kw):
             raise OSError(5, "Input/output error")
 
         p = self.refused_with_failed_persist(link_fails)
@@ -1791,6 +1800,176 @@ class TestRound10(Base):
         self.assertEqual(out["swept"], [])
         self.assertFalse((self.tasks / "task-z.txt").exists())
         self.assertIn("UNAPPROVED REPLACEMENT", stray.read_text())
+
+
+class TestRound11(Base):
+    """Eleventh-round blockers (#4399): one retirement contract for every name this
+    code removes, and an approved sweep bound to the full generation."""
+
+    crash_after, invariants = TestJournalRecovery.crash_after, TestJournalRecovery.invariants
+    recover = TestJournalRecovery.recover
+
+    def replacement_survives(self) -> bool:
+        return any(x.is_file() and "REPLACEMENT" in x.read_text() for x in self.tasks.rglob("*"))
+
+    def claim_of(self, name="task-a.txt") -> str:
+        return next(x.name for x in self.tasks.iterdir() if x.name.startswith(f"{name}.claim-"))
+
+    # 1 — an in-place rewrite of an approved dead claim is never made live
+    def test_an_approved_claim_rewritten_in_place_before_the_sweep_link_is_not_made_live(self):
+        stray = self.tasks / "task-z.txt.claim-4000000000-abcdef0123"
+        stray.write_text("task: APPROVED BYTES\n")
+        self.archive.mkdir()
+        approved = tt.recovery_effects(self.tasks, self.archive)
+        ino, real_link = os.stat(stray).st_ino, os.link
+
+        def rewrite_then_link(src, dst, *a, **kw):
+            if str(src) == stray.name:
+                with open(stray, "r+") as fh:  # same inode, new size and mtime
+                    fh.write("task: UNAPPROVED IN-PLACE REWRITE\n")
+            return real_link(src, dst, *a, **kw)
+
+        with mock.patch.object(os, "link", side_effect=rewrite_then_link):
+            out = tt.transition(self.tasks, self.results, self.archive, moves={}, render=_notice(None),
+                                prefix=PREFIX, authorized=approved)
+        self.assertEqual(os.stat(stray).st_ino, ino)
+        self.assertEqual(out["swept"], [])
+        self.assertIn("changed since it was approved", out["errors"][0])
+        self.assertFalse((self.tasks / "task-z.txt").exists(), "the rewrite is not made live")
+        self.assertIn("UNAPPROVED IN-PLACE REWRITE", stray.read_text())
+
+    # 2 — crash right after the claim name is retired, with a replacement in it
+    def test_a_crash_after_retiring_a_replaced_claim_keeps_the_replacement_and_the_journal(self):
+        _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        fired, real_rename = [], os.rename
+
+        def at(where, name):
+            if where == "after_link" and not fired:
+                fired.append(name)
+                _replace(self.tasks / name, "REPLACEMENT BYTES")
+
+        def rename_then_die(src, dst, *a, **kw):
+            real_rename(src, dst, *a, **kw)
+            if fired and str(src) == fired[0]:
+                raise Crash("killed right after the claim name was retired")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), \
+                mock.patch.object(os, "rename", side_effect=rename_then_die), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        out = self.recover()
+        self.assertTrue(out["errors"], out)
+        self.assertTrue(self.replacement_survives())
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+        self.assertIn("ORIGINAL ASK", (self.archive / "task-a.txt").read_text())
+
+    def test_retiring_the_same_name_twice_keeps_both(self):
+        self.archive.mkdir()
+        dfd = os.open(self.tasks, os.O_RDONLY)
+        afd = os.open(self.archive, os.O_RDONLY)
+        self.addCleanup(os.close, dfd)
+        self.addCleanup(os.close, afd)
+        for body in ("first\n", "second\n"):
+            (self.tasks / "x.claim-1-ab").write_text(body)
+            with tt.task_archive.retired_dir(afd) as rfd:
+                self.assertIsNotNone(tt.task_archive.retire("x.claim-1-ab", src_dir_fd=dfd, retired_fd=rfd,
+                                                            expect=None))
+        retired = self.archive / tt.task_archive.RETIRED_DIR
+        self.assertEqual(sorted((x.name, x.read_text()) for x in retired.iterdir()),
+                         [("x.claim-1-ab", "first\n"), ("x.claim-1-ab.1", "second\n")])
+
+    # 2 — the live refusal's give-back never deletes a raced replacement
+    def test_a_claim_replaced_during_a_refusals_give_back_is_kept(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+        real_link, done = os.link, []
+
+        def link_then_replace(src, dst, *a, **kw):
+            real_link(src, dst, *a, **kw)
+            if str(dst) == "task-a.txt" and ".claim-" in str(src) and not done:
+                done.append(1)
+                _replace(self.tasks / str(src), "REPLACEMENT BYTES")
+
+        with mock.patch.object(os, "link", side_effect=link_then_replace):
+            out = self.run_transition(["task-a.txt"], _naming,
+                                      still_safe=lambda n, read: "now done" if read != n else None)
+        self.assertTrue(done)
+        self.assertTrue(self.replacement_survives(), out)
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual(self.archive_names(), [])
+
+    # 2 — the journaled return never deletes a raced replacement
+    def test_a_claim_replaced_during_a_journaled_return_is_kept(self):
+        p = _task(self.tasks, "task-a.txt", "A")
+
+        def link_fails(claim, name, why, dir_fd, **kw):
+            raise OSError(5, "Input/output error")
+
+        with mock.patch.object(tt.task_archive, "give_back", side_effect=link_fails):
+            self.run_transition(["task-a.txt"], _naming,
+                                still_safe=lambda n, read: "now done" if read != n else None)
+        claim = self.claim_of()
+        real_link, done = os.link, []
+
+        def link_then_replace(src, dst, *a, **kw):
+            real_link(src, dst, *a, **kw)
+            if str(src) == claim and not done:
+                done.append(1)
+                _replace(self.tasks / claim, "REPLACEMENT BYTES")
+
+        with mock.patch.object(os, "link", side_effect=link_then_replace):
+            out = self.recover()
+        self.assertTrue(done)
+        self.assertTrue(out["errors"], out)
+        self.assertTrue(self.replacement_survives())
+        self.assertIn("task: A", p.read_text())
+        self.assertEqual((self.archive_names(), self.notices()), ([], []))
+
+    # 2 — the landed recovery never deletes a raced replacement
+    def test_a_claim_replaced_during_a_landed_recovery_is_kept(self):
+        _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        fired = []
+
+        def at(where, name):
+            if where == "after_link" and not fired:
+                fired.append(name)
+                raise Crash("killed between the link and the claim's retirement")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at), self.assertRaises(Crash):
+            self.run_transition(["task-a.txt"], _naming)
+        claim, archive_ino = fired[0], os.stat(self.archive).st_ino
+        real_sync, done = tt.task_archive._fsync_dir, []
+
+        def sync_then_replace(fd):
+            real_sync(fd)
+            if not done and os.fstat(fd).st_ino == archive_ino and (self.tasks / claim).exists():
+                done.append(1)
+                _replace(self.tasks / claim, "REPLACEMENT BYTES")
+
+        with mock.patch.object(tt.task_archive, "_fsync_dir", side_effect=sync_then_replace):
+            out = self.recover()
+        self.assertTrue(done)
+        self.assertTrue(out["errors"], out)
+        self.assertTrue(self.replacement_survives())
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+
+    # 2 — the placement's own source retirement never deletes a raced replacement
+    def test_a_claim_replaced_between_the_retire_check_and_removal_is_kept(self):
+        _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        real_lstat, done = os.lstat, []
+
+        def lstat_then_replace(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if not done and ".claim-" in str(path) and kw.get("dir_fd") is not None and any(
+                    (self.archive / "task-a.txt").exists() for _ in [0]):
+                held = [x for x in self.tasks.rglob(f"{path}") if x.exists()]
+                if held:
+                    done.append(1)
+                    _replace(held[0], "SECOND REPLACEMENT")
+            return st
+
+        with mock.patch.object(os, "lstat", side_effect=lstat_then_replace):
+            self.run_transition(["task-a.txt"], _naming)
+        self.assertTrue(any(x.is_file() and "SECOND REPLACEMENT" in x.read_text()
+                            for x in self.tasks.rglob("*")), "the replacement is kept somewhere")
 
 
 if __name__ == "__main__":

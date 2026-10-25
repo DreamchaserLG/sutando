@@ -1192,7 +1192,7 @@ class TestApplyPlan(ClassifyBase):
                          "without the guard ../secret.txt lands here")
         self.assertTrue(dotted.exists(), "without the guard ./task-x.txt moves")
         self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks" / "archive").iterdir()
-                                if p.name != ".transition.lock"), [])
+                                if p.name not in (".transition.lock", ".retired")), [])
         self.assertEqual(self.recovery_files(), [])
 
 
@@ -1299,7 +1299,7 @@ class TestApplyTransition(ClassifyBase):
         self.assertEqual(sorted(p.name for p in (self.ws.root / "tasks").iterdir()),
                          ["archive", "task-a.txt"])
         self.assertEqual(sorted(p for p in (self.ws.root / "tasks" / "archive").iterdir()
-                                if p.name != ".transition.lock"), [])
+                                if p.name not in (".transition.lock", ".retired")), [])
 
     def test_an_archived_record_under_the_same_name_is_never_overwritten(self):
         self._orphan("task-a.txt")
@@ -1991,6 +1991,64 @@ class TestRound10Recovery(ClassifyBase):
         (notice,) = self.notices()
         self.assertIn("- task-a.txt [", notice.read_text())
         self.assertIn("(Published by a later pass after an interrupted one.)", notice.read_text())
+
+
+class TestRound11RecoveredNotice(ClassifyBase):
+    """Eleventh round (#4399): a recovered notice reports every verdict the ordinary
+    plan reports, and an unreadable or changed landing keeps the journal."""
+
+    def orphan(self, name: str) -> Path:
+        return self.ws.task(name, f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+
+    def notices(self) -> list[Path]:
+        return sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+
+    def journals(self) -> list[Path]:
+        return sorted((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))
+
+    def crash_after_placed(self) -> Path:
+        tt = self.mod.task_transition
+        self.orphan("task-a.txt")
+        real_set = tt._Journal.set
+
+        def die_once_placed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "placed":
+                raise KeyboardInterrupt("killed before the notice")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_placed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        return self.ws.root / "tasks" / "archive" / "task-a.txt"
+
+    def test_a_landing_now_classified_unknown_is_still_reported(self):
+        self.crash_after_placed()
+        (self.ws.root / "deliveries").write_text("not a directory")  # holder_of cannot read it
+        self.assertEqual(self.mod.classify_task(self.ws.root / "tasks" / "archive" / "task-a.txt",
+                                                self.ws.root, NOW, as_name="task-a.txt")["verdict"], "unknown")
+        out = self.apply()
+        self.assertEqual(out["errors"], [], out)
+        (notice,) = self.notices()
+        self.assertIn("task-a", notice.read_text())
+        self.assertEqual(self.journals(), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_an_unreadable_landing_keeps_the_journal_and_sends_nothing(self):
+        archived = self.crash_after_placed()
+        archived.chmod(0)
+        self.addCleanup(archived.chmod, 0o644)
+        out = self.apply()
+        self.assertTrue(out["errors"], out)
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
+
+    def test_a_landing_replaced_before_recovery_keeps_the_journal_and_sends_nothing(self):
+        archived = self.crash_after_placed()
+        tmp = archived.with_name(".swap")
+        tmp.write_text("task: REPLACED IN THE ARCHIVE\n")
+        os.replace(tmp, archived)
+        out = self.apply()
+        self.assertTrue(any("another generation" in e for e in out["errors"]), out)
+        self.assertEqual((self.notices(), len(self.journals())), ([], 1))
 
 
 class TestWorkerHeld(ClassifyBase):

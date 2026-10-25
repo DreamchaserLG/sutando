@@ -594,7 +594,10 @@ class TestMoveGeneration(unittest.TestCase):
         self.assertIn("changed since it was planned", str(cm.exception))
         self.assertEqual(p.read_text(), "new")
         self.assertEqual(sorted(x.name for x in self.src.iterdir()), ["archive", "task-a.txt"])
-        self.assertEqual(sorted(self.dst.iterdir()), [])
+        self.assertEqual(sorted(x.name for x in self.dst.iterdir()), [_task_archive.RETIRED_DIR],
+                         "nothing placed; the claim name is retired, not unlinked")
+        (retired,) = (self.dst / _task_archive.RETIRED_DIR).iterdir()
+        self.assertEqual(os.stat(retired).st_ino, os.stat(p).st_ino)
 
     def test_a_name_retaken_during_the_give_back_keeps_the_claim(self):
         p = self._file("task-a.txt", "old")
@@ -669,9 +672,8 @@ class TestMoveGeneration(unittest.TestCase):
             self.move("task-a.txt", self._gen(p))
         self.assertEqual(m.call_count, 1)
         self.assertTrue(str(m.call_args.args[0]).startswith("task-a.txt.claim-"))
-        st = os.stat(self.dst / "task-a.txt")
         self.assertEqual(m.call_args.kwargs, {"src_dir_fd": self.sfd, "dst_dir_fd": self.dfd,
-                                              "expect": (st.st_dev, st.st_ino)})
+                                              "expect": self._gen(self.dst / "task-a.txt")})
 
     def test_move_without_clobbering_through_handles_never_resolves_a_path(self):
         self._file("task-a.txt", "A")

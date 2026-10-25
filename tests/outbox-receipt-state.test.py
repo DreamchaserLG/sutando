@@ -52,10 +52,23 @@ class ReceiptState(unittest.TestCase):
             root = self.root / f"torn-{mod.__name__}"
             mod.record_delivered(root, "proactive-1", provider="p")
             (path,) = (root / mod.ITEMS_DIR).iterdir()
-            for body in ('{"status": "DELIV', "[1, 2]", '{"status": ""}', "{}"):
+            for body in ('{"status": "DELIV', "[1, 2]", '{"status": ""}', "{}", '{"status": "absent"}',
+                         '{"status": "delivered"}', '{"status": 1}'):
                 with self.subTest(mod=mod.__name__, body=body):
                     path.write_text(body)
                     self.assertEqual(mod.receipt_state(root, "proactive-1"), "unknown")
+
+    def test_a_dangling_or_non_regular_entry_is_unknown_not_absent(self):
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                path = self.record(mod)
+                path.unlink()
+                path.symlink_to(self.root / "nowhere")
+                self.assertEqual(mod.receipt_state(self.root, "proactive-1"), "unknown")
+                path.unlink()
+                path.mkdir()
+                self.assertEqual(mod.receipt_state(self.root, "proactive-1"), "unknown")
+                path.rmdir()
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
     def test_an_unreadable_record_is_unknown_not_absent(self):

@@ -34,7 +34,9 @@ is archived is a promise. `transition()` keeps it as a staged transaction:
   A mismatched claim is linked
   back to its live name without replacing; if a writer already recreated that
   name, the claimed bytes stay quarantined under the claim name, recorded, and
-  reported. No live name is ever unlinked by this code or by `task_archive`.
+  reported. No task-bearing name is ever unlinked: every removal is
+  `task_archive.retire`, a rename into `tasks/archive/.retired/` judged by its
+  full generation, and anything unexpected it set aside keeps the journal.
 
   Notice. Rendered from the FINAL landed names, published last at the reserved
   name through `result_publish.publish_witnessed`: a dot-named witness link of
@@ -422,7 +424,8 @@ def _claim_held(dirs, name, generation, claim, still_safe, on_refuse) -> str:
         except OSError:
             pass
     try:
-        back = task_archive.give_back(claim, name, problem, dirs.tasks_fd)
+        back = task_archive.give_back(claim, name, problem, dirs.tasks_fd, archive_fd=dirs.archive_fd,
+                                      expect=generation)
     except OSError as exc:
         raise _ClaimRefused(f"refused to move {name!r}: {problem}; giving it back failed ({exc}), "
                             "so the refusal is journaled and the next pass returns it",
@@ -475,7 +478,8 @@ def _record_mismatch(dirs: _Dirs, j: "_Journal", name: str, pending) -> None:
     """A replaced claim is never given back or cleared: marked, and journaled for the operator."""
     if isinstance(pending, dict):
         j.data.setdefault("mismatched", {})[name] = pending
-        _mark_quarantine(dirs, pending["claim"])
+        if "/" not in pending["claim"]:  # a name still in tasks/, not one already retired
+            _mark_quarantine(dirs, pending["claim"])
 
 
 def archive_generation(tasks_dir: Path, name: str, generation: str | None,
@@ -555,7 +559,6 @@ def _sweep_dead_claims(dirs: _Dirs, journaled: set[str], out: dict,
         if only is not None and only.get(entry) != generation:
             continue
         live = _CLAIM_RE.match(entry).group("live")
-        expect = tuple(int(x) for x in generation.split(":")[:2])
         try:
             os.link(entry, live, src_dir_fd=dirs.tasks_fd, dst_dir_fd=dirs.tasks_fd)
         except FileExistsError:
@@ -565,19 +568,31 @@ def _sweep_dead_claims(dirs: _Dirs, journaled: set[str], out: dict,
         except OSError as exc:
             out["errors"].append(f"orphaned claim tasks/{entry} from a dead pass could not be given back ({exc})")
             continue
-        got = os.lstat(live, dir_fd=dirs.tasks_fd)
-        if (got.st_dev, got.st_ino) != expect:  # the claim name was replaced after it was seen
-            os.unlink(live, dir_fd=dirs.tasks_fd)
-            out["errors"].append(f"orphaned claim tasks/{entry} changed since it was approved; it is "
-                                 "kept, not given back")
-            continue
-        try:
-            task_archive._retire_source(entry, live, dirs.tasks_fd, expect)
-        except task_archive.PlacementSourceReplaced as exc:
-            out["errors"].append(f"orphaned claim tasks/{entry} was given back as {live!r}, but its "
-                                 f"name then held another file, kept as tasks/{exc.kept_as}")
-        task_archive._fsync_dir(dirs.tasks_fd)
+        with task_archive.retired_dir(dirs.archive_fd) as rfd:
+            if _generation(os.lstat(live, dir_fd=dirs.tasks_fd)) != generation:  # rewritten or replaced
+                moved = task_archive.retire(live, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=None)
+                out["errors"].append(f"orphaned claim tasks/{entry} changed since it was approved; it is "
+                                     f"not made live (that link is kept as {_retired(moved)})")
+                continue
+            stray = task_archive.retire(entry, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=generation)
+        if stray:
+            out["errors"].append(f"orphaned claim tasks/{entry} was given back as {live!r}, but a file "
+                                 f"that replaced it is kept as {_retired(stray)}")
         out["swept"].append({"claim": entry, "live": live})
+
+
+def _retired(name: str) -> str:
+    return f"tasks/archive/{task_archive.RETIRED_DIR}/{name}"
+
+
+def _retired_strays(dirs: _Dirs, claim: str, generation: str) -> "list[str]":
+    """Files `retire` set aside under this claim's name that are not its planned bytes."""
+    try:
+        with task_archive.retired_dir(dirs.archive_fd) as rfd:
+            return [n for n in task_archive.retired_names(claim, rfd)
+                    if _generation(os.lstat(n, dir_fd=rfd)) != generation]
+    except FileNotFoundError:
+        return []
 
 
 def _exists(name: str, dir_fd: int | None = None) -> bool:
@@ -618,24 +633,32 @@ def _same_file(a: str, a_fd: int, b: str, b_fd: int) -> bool:
     return stat.S_ISREG(sa.st_mode) and (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
-def _finish_return(dirs: _Dirs, name: str, claim: str) -> "str | None":
+def _finish_return(dirs: _Dirs, name: str, claim: str, generation: str) -> "str | None":
     """Complete a journaled refusal: the claim goes back to its live name without
-    replacing, and is never placed. Returns an error line, or None once returned."""
+    replacing, is never placed, and its name is retired, never unlinked. Returns
+    an error line, or None once returned."""
     has_claim, has_live = _exists(claim, dirs.tasks_fd), _exists(name, dirs.tasks_fd)
-    if has_claim and has_live:
-        if not _same_file(claim, dirs.tasks_fd, name, dirs.tasks_fd):
-            _mark_quarantine(dirs, claim)
-            return (f"refused to move {name!r}: its name was taken again while it was being given "
-                    f"back, so it is quarantined as tasks/{claim} — rename it back to requeue")
-    elif has_claim:
-        os.link(claim, name, src_dir_fd=dirs.tasks_fd, dst_dir_fd=dirs.tasks_fd)
-    elif not has_live:
+    if has_claim and has_live and not _same_file(claim, dirs.tasks_fd, name, dirs.tasks_fd):
+        _mark_quarantine(dirs, claim)
+        return (f"refused to move {name!r}: its name was taken again while it was being given "
+                f"back, so it is quarantined as tasks/{claim} — rename it back to requeue")
+    if not has_claim and not has_live:
         return (f"lost track of {name!r}: it was refused and being given back, but neither "
                 f"tasks/{name} nor tasks/{claim} exists — check tasks/archive/")
-    if has_claim:
-        task_archive._fsync_dir(dirs.tasks_fd)  # the live name is durable before the claim goes
-        os.unlink(claim, dir_fd=dirs.tasks_fd)
-    task_archive._fsync_dir(dirs.tasks_fd)
+    if not has_claim:
+        return None
+    with task_archive.retired_dir(dirs.archive_fd) as rfd:
+        if not has_live:
+            os.link(claim, name, src_dir_fd=dirs.tasks_fd, dst_dir_fd=dirs.tasks_fd)
+            task_archive._fsync_dir(dirs.tasks_fd)
+            if _generation(os.lstat(name, dir_fd=dirs.tasks_fd)) != generation:
+                moved = task_archive.retire(name, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=None)
+                return (f"lost track of {name!r}: its claim tasks/{claim} no longer holds the planned "
+                        f"bytes; that file is kept as {_retired(moved)} and the claim stays")
+        stray = task_archive.retire(claim, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=generation)
+    if stray:
+        return (f"lost track of {name!r}: it is back under its name, but a file that replaced its "
+                f"claim is kept as {_retired(stray)}")
     return None
 
 
@@ -664,7 +687,7 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict,
         unjudged = dict(d.get("unjudged") or {})
         if name in refused or name in unjudged:  # refused, or never durably judged safe: never placed
             held_claim = refused.get(name) or unjudged[name]
-            error = _finish_return(dirs, name, held_claim)
+            error = _finish_return(dirs, name, held_claim, generation)
             if error is None or "quarantined" in error:
                 quarantined.update({name: held_claim} if error else {})
                 claims.pop(name, None)
@@ -689,8 +712,15 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict,
                     "for the operator")
                 continue
             task_archive._fsync_dir(dirs.archive_fd)  # the landing is durable before the claim goes
-            os.unlink(claim, dir_fd=dirs.tasks_fd)  # linked, then killed before the unlink
+            with task_archive.retired_dir(dirs.archive_fd) as rfd:  # linked, then killed before the retire
+                stray = task_archive.retire(claim, src_dir_fd=dirs.tasks_fd, retired_fd=rfd, expect=generation)
             _barriers(dirs)
+            if stray:
+                unresolved = True
+                report["errors"].append(f"{name!r} is archived as tasks/archive/{found}, but a file that "
+                                        f"replaced its claim is kept as {_retired(stray)}; the journal waits "
+                                        "for the operator")
+                continue
             landed[name] = found
         elif _exists(claim, dirs.tasks_fd):
             got, error, kept, _, pending = _place(dirs, claim, name, generation)  # renamed, unplaced
@@ -707,6 +737,13 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict,
             del claims[name]  # recorded but never renamed: still live under its name, planned afresh
         elif found:
             _barriers(dirs)  # renamed and placed; the crash hid the record or a barrier failed
+            strays = _retired_strays(dirs, claim, generation)
+            if strays:  # the claim name held another file when it was retired
+                unresolved = True
+                report["errors"].append(f"{name!r} is archived as tasks/archive/{found}, but "
+                                        f"{', '.join(_retired(x) for x in strays)} holds a file that "
+                                        "replaced its claim; the journal waits for the operator")
+                continue
             landed[name] = found
         else:
             unresolved = True
@@ -716,6 +753,15 @@ def _continue(dirs: _Dirs, j: _Journal, results_dir: Path, report: dict,
                                     "— check tasks/archive/")
         j.set(claims=claims, landed=landed, quarantined=quarantined)
     report["landed"] = landed
+    for name, where in sorted(landed.items()):  # the notice describes these bytes: they must be the planned ones
+        try:
+            now = _generation(os.lstat(where, dir_fd=dirs.archive_fd))
+        except FileNotFoundError:
+            now = None
+        if now != d["moves"].get(name):
+            unresolved = True
+            report["errors"].append(f"{name!r} was archived as tasks/archive/{where}, but that file is "
+                                    "now missing or another generation; the journal waits for the operator")
     if unresolved:  # a notice now would omit it, and a later pass would adopt that notice
         j.release()
         return

@@ -668,23 +668,25 @@ def _unanswered(workspace: Path, landed: dict) -> dict:
 
 
 def _render_recovered(workspace: Path, now: float | None):
-    """An interrupted pass's notice by today's rules: each landed file classified
-    from its archived copy, and only what is still an unanswered orphan reported."""
+    """An interrupted pass's notice by today's rules, from each landed file's archived
+    copy. Only a current `done` (or a voice/phone orphan) is silent; every verdict the
+    ordinary plan would report is rendered. A read failure raises, so the journal stays."""
+    groups_for = {"import-stalled": "stalled", "import-unbound": "unbound", "unknown": "unknown"}
+
     def render(landed: dict) -> str | None:
-        rows = []
+        groups: dict = {"deferred": [], "stalled": [], "unbound": [], "unknown": []}
         for name, where in sorted(landed.items()):
-            try:
-                row = classify_task(workspace / "tasks" / "archive" / where, workspace,
-                                    time.time() if now is None else now, as_name=name)
-            except OSError:
+            row = classify_task(workspace / "tasks" / "archive" / where, workspace,
+                                time.time() if now is None else now, as_name=name)
+            verdict = row.get("verdict")
+            if verdict == "done":
                 continue
-            silent = (row.get("trusted_source") or "").strip() in ("voice", "phone")
-            if row.get("verdict") == "orphan" and not silent:
-                rows.append(row)
-        if not rows:
+            if verdict == "orphan" and (row.get("trusted_source") or "").strip() in ("voice", "phone"):
+                continue
+            groups[groups_for.get(verdict, "deferred")].append(row)
+        if not any(groups.values()):
             return None
-        groups = {"deferred": rows, "stalled": [], "unbound": [], "unknown": []}
-        return _final_body(groups, {row["file"]: landed[row["file"]] for row in rows})
+        return _final_body(groups, {row["file"]: landed[row["file"]] for row in groups["deferred"]})
     return render
 
 
