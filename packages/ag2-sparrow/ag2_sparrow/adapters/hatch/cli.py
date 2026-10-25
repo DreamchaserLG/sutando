@@ -469,11 +469,15 @@ def _lock_role(instance: str) -> str:
     return f"gateway-bridge{gateway_instance.suffix(instance)}"
 
 
+def _lock_file(state_dir: Path, instance: str) -> Path:
+    return state_dir.parent / "state" / "locks" / f"{_lock_role(instance)}.lock"
+
+
 def _lock_record(state_dir: Path, instance: str) -> "dict | None":
     """This host's Sparrow single-instance lock record, or None when there is none to read. It
     is read without following a symlink and never blocks: a FIFO, a non-regular or an oversized
     file is refused."""
-    lock = state_dir.parent / "state" / "locks" / f"{_lock_role(instance)}.lock"
+    lock = _lock_file(state_dir, instance)
     text = bounded_file_read.read_regular(str(lock), _LOCK_MAX_BYTES, follow=False)[0]
     try:
         holder = json.loads(text) if text is not None else None
@@ -481,6 +485,23 @@ def _lock_record(state_dir: Path, instance: str) -> "dict | None":
         return None
     ok = isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label()
     return holder if ok else None
+
+
+def _file_id(path: Path) -> "tuple[int, int] | None":
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def lock_snapshot(state_dir: Path, instance: str) -> "tuple[dict | None, tuple[int, int] | None]":
+    """(_lock_record, the lock file's (device, inode)), the id None unless the same file was in
+    place before and after the read, so the record is that file's content."""
+    path = _lock_file(state_dir, instance)
+    before = _file_id(path)
+    record = _lock_record(state_dir, instance)
+    return record, (before if before is not None and _file_id(path) == before else None)
 
 
 def canonical_lock(lock: "dict | None", state_dir: Path, instance: str) -> bool:

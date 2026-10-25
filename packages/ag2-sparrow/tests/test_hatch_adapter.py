@@ -2848,7 +2848,8 @@ class StartSparrow(Base):
         r, line, stop = self.keepawake_unit(fake, self.restarted_unit(fake))
         self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder is stopped first")
         stop.assert_called_once()
-        self.assertEqual(fake.ran("start"), [["--user", "start", "ag2-sparrow.service"]])
+        said = r.stdout + r.stderr + repr(fake.calls)
+        self.assertEqual(fake.ran("start"), [["--user", "start", "ag2-sparrow.service"]], said)
         self.assertEqual(fake.ran("restart"), [], "a stopped unit is started, never restarted")
         self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
         self.assertEqual(hatch_cli.live_lock_holder(hatch_cli._lock_record(self.state, "")),
@@ -3190,37 +3191,57 @@ class StartSparrow(Base):
         self.done_with(old)
 
     def test_keepawake_never_restarts_a_generation_that_came_up_after_the_final_check(self):
-        # Reviewer's probe: healthy generation B comes up during reset-failed, after the unit was
-        # last read as down; the action that follows must leave it as it is.
-        old, _rec = self.legacy()
-        self.old_pid = old.pid
-        fake, came = FakeSystemd(state="inactive"), []
+        # Reviewer's probe: healthy generation B comes up after the last inactive-unit proof, as
+        # that `show` answers or during the action itself; only a `start` may follow.
+        for when in ("after the final show", "during the start"):
+            with self.subTest(when):
+                old, _rec = self.legacy()
+                self.old_pid = old.pid
+                fake, came, stopped, real_stop = FakeSystemd(state="inactive"), [], [], keepalive._stop
 
-        def call(cmd):
-            if cmd[0] == "systemctl" and cmd[2:3] == ["reset-failed"] and not came:
-                came.append(self.current_generation(fake))
-            if cmd[0] == "systemctl" and cmd[2:3] == ["start"]:
-                fake.calls.append(cmd[1:])
-                return subprocess.CompletedProcess(cmd, 0, "", "")  # a no-op for an active unit
-            return fake(cmd)
-        want = keepalive.health_command(str(self.reply_stub))
-        with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
-                mock.patch.object(keepalive, "START_WAIT_S", 0):
-            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
-        self.assertTrue(came, "B came up after the final check")
-        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
-        self.assertEqual(fake.ran("restart"), [], "B is never restarted")
-        self.assertIsNone(came[0].poll(), "B is left running")
-        self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.done_with(old)
+                def stop(pid, handle=None, old=old):
+                    done = real_stop(pid, handle)
+                    stopped.append(len(fake.calls))
+                    return done
+
+                def call(cmd, when=when):
+                    verb = cmd[2:3] if cmd[0] == "systemctl" else []
+                    if verb == ["start"]:
+                        fake.calls.append(cmd[1:])
+                        if when == "during the start" and not came:
+                            came.append(self.current_generation(fake))
+                        return subprocess.CompletedProcess(cmd, 0, "", "")  # a no-op for an active unit
+                    out = fake(cmd)
+                    if verb == ["show"] and stopped and when == "after the final show" and not came:
+                        came.append(self.current_generation(fake))
+                    return out
+                want = keepalive.health_command(str(self.reply_stub))
+                with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
+                        mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                        mock.patch.object(keepalive, "START_WAIT_S", 0):
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                said = r.stdout + r.stderr + repr(fake.calls)
+                self.assertTrue(came, "B came up after the final check")
+                self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
+                acted = [c[1] for c in fake.calls[stopped[0]:] if c[1] not in ("show", "is-active", "show-environment")]
+                self.assertIn(acted, ([], ["start"]), said)  # nothing, or the no-op start
+                if when == "during the start":
+                    self.assertEqual(acted, ["start"], said)
+                self.assertEqual(fake.ran("reset-failed") + fake.ran("restart"), [], said)
+                self.assertIsNone(came[0].poll(), "B is left running")
+                self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
+                self.assertEqual(r.returncode, 0, said)
+                self.done_with(old)
+                came[0].kill()
+                (self.home / "keepalive-probe.log").unlink()
 
     def test_keepawake_certifies_no_successor_whose_lock_stopped_being_canonical(self):
         # Reviewer's probe: during the status read the record keeps every generation field but
-        # stops being this workspace's canonical lock.
+        # stops being this workspace's canonical lock, or is replaced by an equal one.
         for case, change in (("another workspace", {"workspace": "/elsewhere"}),
                              ("another role", {"role": "gateway-bridge-x"}),
-                             ("another schema", {"schema_version": 2})):
+                             ("another schema", {"schema_version": 2}),
+                             ("the same record in another file", {})):
             with self.subTest(case):
                 real_read, changed = keepalive._status_snapshot, []
 
@@ -3228,7 +3249,9 @@ class StartSparrow(Base):
                     status = real_read(state, instance)
                     if not changed:
                         lock = json.loads(self.lock_path().read_text())
-                        self.lock_path().write_text(json.dumps({**lock, **change}))
+                        fresh = self.lock_path().with_name("fresh.lock")
+                        fresh.write_text(json.dumps({**lock, **change}))
+                        os.replace(fresh, self.lock_path())  # a new inode, as any rewrite makes
                         changed.append(True)
                     return status
                 with mock.patch.object(keepalive, "_status_snapshot", side_effect=read):
