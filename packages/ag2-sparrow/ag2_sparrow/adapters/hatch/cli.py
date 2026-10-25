@@ -12,6 +12,7 @@ wake-context prints the text a woken worker follows (served by the backend, else
 from __future__ import annotations
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import json
@@ -1339,17 +1340,25 @@ WITHDRAW_NOTES = {
 }
 
 
-def _withdraw_line_locked(result_dir: Path, tid: str) -> str:
+def _withdraw_line_locked(result_dir: Path, tid: str, undo: "list | None" = None) -> str:
     """Take `tid`'s hold line off the queue and say where it stands; the caller holds the send
     lock. "withdrawn" or "stopped" (no send of it will begin; "stopped" when one already began
     with an unknown outcome), "posted", "unsent", "unconfirmed", or "none" (never queued).
-    OSError when a claimed line's sentinel cannot be written: nothing then stops its send."""
+    OSError when a claimed line's sentinel cannot be written: nothing then stops its send.
+    Each step taken appends to `undo` a callable that reverts it, newest last."""
     notice = _hold_notice(result_dir, tid)
-    begun = delivery_destination.attempts_begun(result_dir, notice.stem)
+    begun = delivery_destination.attempts_ever(result_dir, notice.stem)
     queued = notice.exists()
+    text = result_ready.read_ready_result(notice) if queued else None
     notice.unlink(missing_ok=True)
+    if undo is not None and text is not None:
+        undo.append(lambda: _publish_once(notice, text + "\n"))
     if _line_claimed(result_dir, notice):
-        delivery_destination.withdrawn_path(notice).touch()
+        sentinel = delivery_destination.withdrawn_path(notice)
+        made = not sentinel.exists()
+        sentinel.touch()
+        if undo is not None and made:
+            undo.append(lambda: sentinel.unlink(missing_ok=True))
         queued = True
     if queued:
         return "withdrawn" if begun == 0 else "stopped"
@@ -1359,6 +1368,28 @@ def _withdraw_line_locked(result_dir: Path, tid: str) -> str:
     if outcome == "delivered":
         return "posted"
     return "unsent" if outcome == "undelivered" and begun == 0 else "unconfirmed"
+
+
+def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path, item: str,
+                          result_file: Path, body: str) -> "tuple[bool, str]":
+    """reply's commit under the send lock: claim the task, withdraw its hold line, queue the
+    answer. A failure at any step undoes the ones before it (the claim is released and the line
+    restored) and raises OSError, so a retry finds the task as it was."""
+    _prune_claims(result_dir, task_dir)
+    if not _claim(result_dir, tid):
+        return False, "none"
+    if outbox.item_status(root, item) is not None:
+        return False, "none"
+    undo = [lambda: (_claims_dir(result_dir) / tid).unlink(missing_ok=True)]
+    try:
+        where = _withdraw_line_locked(result_dir, tid, undo)
+        # False: another result holds the name, so the task is answered and its line stays withdrawn.
+        return _publish_once(result_file, body), where
+    except BaseException:
+        for step in reversed(undo):
+            with contextlib.suppress(OSError):
+                step()
+        raise
 
 
 def _note_withdrawal(tid: str, where: str) -> None:
@@ -1395,13 +1426,11 @@ def reply(args) -> int:
     # answer queued under the send lock, so no line is published or sent after the answer.
     try:
         with delivery_destination.send_lock(result_dir):
-            where = _withdraw_line_locked(result_dir, tid)
-            _prune_claims(result_dir, task_dir)
-            committed = (_claim(result_dir, tid) and outbox.item_status(root, item) is None
-                         and _publish_once(result_file, body))
-    except OSError as e:  # SendLockUnavailable included: nothing was written
-        print(f"error: the hold line could not be settled before the answer "
-              f"({diagnostics.describe(e)}); nothing written, run reply again", file=sys.stderr)
+            committed, where = _commit_answer_locked(result_dir, task_dir, tid, root, item,
+                                                     result_file, body)
+    except OSError as e:  # SendLockUnavailable included: every step taken was undone
+        print(f"error: the answer was not committed ({diagnostics.describe(e)}); nothing "
+              "written and any hold line left as it was, run reply again", file=sys.stderr)
         return 2
     _note_withdrawal(tid, where)
     if not committed:

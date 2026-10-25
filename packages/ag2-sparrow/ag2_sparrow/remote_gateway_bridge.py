@@ -2684,14 +2684,16 @@ _RESP_META = threading.local()
 def _read_by(resp, deadline: float) -> bytes:
     """The body, read in chunks against a wall-clock deadline: urllib's timeout bounds each
     socket operation, so a body that drips in could otherwise run on past it."""
-    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
     chunks = []
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError("response body still arriving at its deadline")
+        # Looked up each pass: the response drops its socket once the last byte is read.
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
         if sock is not None:
-            sock.settimeout(left)
+            with contextlib.suppress(OSError):
+                sock.settimeout(left)
         # read1 returns what one socket read gave; read(n) would wait for all n bytes.
         chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
@@ -2717,20 +2719,76 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         req.add_header("User-Agent", "sutando-gateway-client/1.0")
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            headers = getattr(resp, "headers", None) or {}
-            _RESP_META.last = {"status": getattr(resp, "status", None),
-                               "content_length": headers.get("Content-Length"),
-                               "cf_ray": headers.get("CF-Ray")}
-            raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
-            return json.loads(raw) if raw else {}
+        if deadline is None:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return _parse_response(resp, resp.read())
+        # The deadline covers every phase (status, headers, body, an error's body): at it, a
+        # timer shuts down the request's socket, which ends whatever read is blocked on it.
+        socks: "list[socket.socket]" = []
+
+        def recorded(base):
+            class Recorded(base):
+                def __init__(self, *a, **k):
+                    super().__init__(*a, **k)
+                    create = self._create_connection
+
+                    def made(*ca, **ck):
+                        socks.append(create(*ca, **ck))
+                        return socks[-1]
+                    self._create_connection = made
+            return Recorded
+
+        class Http(urllib.request.HTTPHandler):
+            def http_open(self, r):
+                return self.do_open(recorded(http.client.HTTPConnection), r)
+
+        class Https(urllib.request.HTTPSHandler):
+            def https_open(self, r):
+                return self.do_open(recorded(http.client.HTTPSConnection), r, context=self._context)
+        cut = threading.Timer(max(0.0, deadline - time.monotonic()), _shut_sockets, (socks,))
+        cut.daemon = True
+        cut.start()
+        try:
+            try:
+                opened = urllib.request.build_opener(Http, Https).open(req, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                try:
+                    e.sparrow_body = e.read() or b""
+                except Exception:  # noqa: BLE001 - a cut or broken error body reads as empty
+                    e.sparrow_body = b""
+                raise
+            with opened as resp:
+                return _parse_response(resp, _read_by(resp, deadline))
+        except (OSError, http.client.HTTPException) as e:
+            if time.monotonic() >= deadline and not isinstance(e, urllib.error.HTTPError):
+                raise TimeoutError("request still unfinished at its deadline") from None
+            raise
+        finally:
+            cut.cancel()
+
+
+def _shut_sockets(socks) -> None:
+    for sock in list(socks):
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+
+
+def _parse_response(resp, body: bytes):
+    headers = getattr(resp, "headers", None) or {}
+    _RESP_META.last = {"status": getattr(resp, "status", None),
+                       "content_length": headers.get("Content-Length"),
+                       "cf_ray": headers.get("CF-Ray")}
+    raw = body.decode().strip()
+    return json.loads(raw) if raw else {}
 
 
 def _http_error_body(e) -> str:
     """Best-effort read of an HTTPError's response body, for content-sniffing a
-    per-task answer vs an endpoint-unsupported one. Never raises."""
+    per-task answer vs an endpoint-unsupported one. Never raises. A deadline-bound request has
+    already read it within its deadline."""
     try:
-        return (e.read() or b"").decode("utf-8", "replace")
+        body = getattr(e, "sparrow_body", None)
+        return (body if body is not None else (e.read() or b"")).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -5655,6 +5713,7 @@ def _resolve_send_failure(claim, original, exc) -> str:
     if outcome == "retried":
         return f"will retry ({tried + 1}/{MAX_TRANSIENT_ATTEMPTS})"
     if outcome == "parked":
+        _delivery_destination.park_attempts(RESULTS_DIR, original.stem)
         return (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ after {tried + 1} "
                 "send attempt(s) — it will NOT be re-sent")
     return "stuck"
@@ -5768,6 +5827,20 @@ def _send_claimed(f: Path, claim: Path, withdrawn: Path, payload: dict, dest_roo
         if _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR):
             withdrawn.unlink(missing_ok=True)  # kept while the file is back in the queue
         return
+    begun = _delivery_destination.attempts_begun(RESULTS_DIR, f.stem)
+    if begun > MAX_TRANSIENT_ATTEMPTS:
+        # Sends that began and never settled (a crash after the POST) count too: none is retried.
+        _log(f"proactive {f.name} not sent: "
+             + ("its attempt record is unreadable" if begun >= _delivery_destination.ATTEMPTS_UNREADABLE
+                else f"{begun} sends of it already began")
+             + " — parked, never sent again")
+        try:
+            UNDELIVERABLE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            claim.rename(UNDELIVERABLE_RESULTS_DIR / f.name)
+            _delivery_destination.park_attempts(RESULTS_DIR, f.stem)
+        except OSError as e:
+            _log(f"proactive {f.name} could not be parked ({diagnostics.describe(e)}); left claimed, unsent")
+        return
     try:
         _delivery_destination.record_attempt(RESULTS_DIR, f.stem)
     except (OSError, ValueError) as e:
@@ -5819,6 +5892,12 @@ def _send_claimed(f: Path, claim: Path, withdrawn: Path, payload: dict, dest_roo
     except (urllib.error.URLError, TimeoutError) as e:
         outcome = _resolve_send_failure(claim, f, e)
         _log(f"proactive send network error for {f.name}: {diagnostics.describe(e)} — {outcome}")
+        return
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        # Begun and not settled: the peer may have applied it, so it is bounded like a timeout.
+        outcome = _resolve_send_failure(claim, f, e)
+        _log(f"proactive send for {f.name} ended with an unknown outcome "
+             f"({diagnostics.describe(e)}) — {outcome}")
         return
     _record_proactive_receipt(f.stem, dest_room)
     ARCHIVE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)

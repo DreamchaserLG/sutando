@@ -290,15 +290,21 @@ A claimed line is withdrawn with a `<stem>.withdrawn` sentinel, which stays unti
 actually retired the line. `reply` reports where the line stood on stderr: withdrawn before any
 send; withdrawn, but an earlier send has an unknown outcome (a 2xx with no event id, a 5xx, a
 timeout or a transport failure: the room may show it); already posted; parked unsent; or
-unconfirmed. The drain counts each begun send durably (`.proactive-attempts/<stem>`), so its
-retry budget is not reset by a restart, and bounds each send by a 15-second wall-clock
-deadline that also covers a body arriving slowly. A producer waits at most 30 seconds for the
+unconfirmed. The drain counts each begun send durably (`.proactive-attempts/<stem>`) before its POST and
+refuses to begin one once the first send and its retries are spent or the count is unreadable,
+so neither a restart nor a crash after a POST resets the budget; a parked file's count moves to
+`<stem>.parked`, so a file re-queued later starts a fresh budget while reports still count what
+began. Each send has a 15-second wall-clock deadline covering status, headers, body and an
+error's body: at it the request's socket is shut down. `reply` claims the task, withdraws the
+line and queues the answer as one step; if the answer cannot be written, the claim is released
+and the line restored, so the retry finds the task as it was. A producer waits at most 30 seconds for the
 lock and then writes nothing (`hold` exits 3, `reply` exits 2: run it again); the drain waits 2
 seconds and hands the line back unsent. The remaining boundary: once the drain has won the lock
 and begun its send, the line goes out ahead of the answer. Upgrade fence: a drain that honours
 the lock declares it in its lane record (`send_lock`). `hold` refuses while the live Sparrow does
 not (exit 3, the task still reads `task-not-picked-up`), and `keepalive keepawake` restarts such
-a Sparrow, through the user service when one runs it. For a sender who is not the owner, the
+a Sparrow, through the user service when one runs it, including one from before lane records that has
+held its lock over two minutes with none. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker

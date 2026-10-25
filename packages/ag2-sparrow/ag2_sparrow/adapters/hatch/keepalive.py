@@ -49,6 +49,8 @@ TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
 # A running Sparrow from before the send lock: hold refuses for it and keepawake restarts it.
 OLD_DRAIN = "drain-predates-send-lock"
+# How long a live drain may go without its lane record before it counts as an older drain.
+LANE_GRACE_S = 120
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
@@ -345,16 +347,24 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def drain_predates_send_lock(cfg: dict) -> "int | None":
-    """The pid of the live Sparrow whose own lane record lacks the send-lock protocol this
-    package's hold and reply rely on: one started before an upgrade. None otherwise, including
-    while no record of that pid exists yet."""
+def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | None":
+    """The pid of the live, connected Sparrow that is not this package's drain: its own lane
+    record lacks the send-lock protocol, or it has held its lock past LANE_GRACE_S with no lane
+    record at all, as a drain from before lane records (the released main) does. None otherwise."""
     state, instance = _state_dir(cfg), _instance(cfg)
-    rec = agent_identity.published_lane_record(state, instance)
-    pid = _cli.live_lock_holder(_cli._lock_record(state, instance))
-    if rec is None or pid is None or rec.get("pid") != pid:
+    holder = _cli._lock_record(state, instance)
+    pid = _cli.live_lock_holder(holder)
+    if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
-    return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
+    rec = agent_identity.published_lane_record(state, instance)
+    if rec is not None and rec.get("pid") == pid:
+        return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
+    # This package's drain publishes its record on its first pass, every few seconds after.
+    acquired = (holder or {}).get("acquired_at")
+    now = time.time() if now is None else now
+    old = isinstance(acquired, (int, float)) and not isinstance(acquired, bool) \
+        and 0 <= now - acquired and now - acquired > LANE_GRACE_S
+    return pid if old else None
 
 
 def replace_sparrow(cfg: dict, pid: int, why: str = "") -> "tuple[bool, str]":

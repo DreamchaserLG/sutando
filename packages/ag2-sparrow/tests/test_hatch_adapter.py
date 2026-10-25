@@ -18,6 +18,7 @@ import tempfile
 import time
 import contextlib
 import io
+import textwrap
 import threading
 import types
 import unittest
@@ -2650,6 +2651,32 @@ class StartSparrow(Base):
         replace.assert_not_called()
         self.assertTrue(log.read_text().strip().endswith("restarted=1 reason=drain-predates-send-lock"))
 
+    def acquired(self, proc, ago):
+        """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back."""
+        path = self.state / "locks" / "gateway-bridge.lock"
+        now = int(time.time())
+        path.write_text(json.dumps({"role": "gateway-bridge", "pid": proc.pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": now - ago, "heartbeat_at": now,
+                                    "schema_version": 1}))
+
+    def test_keepawake_replaces_a_main_version_sparrow_that_publishes_no_lane_record(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)  # no lane-identity file at all
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_keepawake_gives_a_just_started_sparrow_time_to_publish_its_lane(self):
+        old = self.old_sparrow()
+        self.acquired(old, 5)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll())
+
     def test_keepawake_leaves_a_sparrow_that_declares_the_send_lock(self):
         old = self.old_sparrow()
         self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
@@ -4238,6 +4265,198 @@ class Hold(Base):
         self.assertEqual(len(posts), gb.MAX_TRANSIENT_ATTEMPTS + 1)
         self.assertTrue((self.results / "undelivered" / self.notice.name).is_file())
         self.assertIn("whether it posted is unconfirmed", self.reply_now().stderr)
+
+    def gateway(self, handler):
+        """A real local gateway on a free port, run by `handler`'s do_POST; returns its URL."""
+        import http.server
+
+        class Quiet(handler):
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def test_a_plain_fixed_length_success_is_delivered_and_settled(self):
+        import http.server
+        posts = []
+
+        class Ok(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                posts.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                body = b'{"ok": true, "event_id": "$local"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        url = self.gateway(Ok)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        self.drain_with(None, url=url)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(list(self.results.glob(f"{self.notice.stem}.sending.*")), [], "settled, not stranded")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+        self.drain_with(None, url=url)
+        self.assertEqual(len(posts), 1, "never sent twice")
+
+    def test_the_deadline_covers_slow_headers(self):
+        import http.server
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowHeaders)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=url)
+        self.assertLess(time.monotonic() - started, 3.0, "headers arriving slowly cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertTrue(self.notice.exists(), "an unfinished send is queued for its bounded retry")
+
+    def test_the_deadline_covers_an_error_body(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class SlowError(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowError)
+        started = time.monotonic()
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
+                        deadline=time.monotonic() + 0.5)
+            gb._http_error_body(caught.exception)
+        self.assertLess(time.monotonic() - started, 2.0, "an error body arriving slowly is cut at the deadline")
+
+    def test_a_send_that_began_counts_against_the_budget_before_the_post(self):
+        # Each child process POSTs and dies before settling; orphan recovery runs between them.
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = self.home / "posts"
+        child = textwrap.dedent(f"""
+            import os, time
+            from pathlib import Path
+            from ag2_sparrow import remote_gateway_bridge as gb
+            results = Path({str(self.results)!r})
+            gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = results, results / "archive"
+            gb.UNDELIVERABLE_RESULTS_DIR, gb._STATE = results / "undelivered", Path({str(self.home / "state")!r})
+            gb.PROACTIVE_ROOM, gb.PROACTIVE_CLAIM_GATE, gb._log = "", None, lambda *a: None
+            gb._ROUTING.update(owner_dm="", loaded=True, next=time.time() + 3600)
+            def crash(method, path, payload=None, **kw):
+                with open({str(posts)!r}, "a") as fh:
+                    fh.write("post\\n")
+                os._exit(77)
+            gb._req = crash
+            gb._recover_orphan_proactive()
+            gb._post_proactive()
+        """)
+        codes = [subprocess.run([sys.executable, "-c", child], env={**py_env(self.home), "AGENT_MXID": AGENT},
+                                capture_output=True, text=True, timeout=60).returncode
+                 for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 4)]
+        sent = posts.read_text().count("post") if posts.exists() else 0
+        self.assertEqual(sent, gb.MAX_TRANSIENT_ATTEMPTS + 1, codes)
+        self.assertTrue((self.results / "undelivered" / self.notice.name).is_file(), "parked, unsent")
+
+    def test_an_unreadable_attempt_record_sends_nothing_and_is_kept(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        record = self.results / delivery_destination.ATTEMPTS_DIR / self.notice.stem
+        record.parent.mkdir()
+        record.write_text("garbage")
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "an unreadable count is beyond the budget")
+        self.assertEqual(record.read_text(), "garbage", "kept, not overwritten")
+        self.assertTrue((self.results / "undelivered" / self.notice.name).is_file())
+
+    def test_a_requeued_parked_line_gets_a_fresh_budget(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 1):
+            self.drain_pass(posts, fail=urllib.error.URLError(ConnectionRefusedError(61, "refused")))
+        parked = self.results / "undelivered" / self.notice.name
+        self.assertTrue(parked.is_file())
+        stem = self.notice.stem
+        self.assertEqual(delivery_destination.attempts_begun(self.results, stem), 0, "the budget is set aside")
+        self.assertEqual(delivery_destination.attempts_ever(self.results, stem), gb.MAX_TRANSIENT_ATTEMPTS + 1)
+        parked.rename(self.notice)  # an operator re-queues it
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), gb.MAX_TRANSIENT_ATTEMPTS + 2, "the re-queued line is sent")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+        self.assertEqual(delivery_destination.attempts_ever(self.results, stem), 0, "cleared once delivered")
+
+    def test_a_parked_line_that_was_sent_is_never_reported_unsent(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 1):
+            self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        note = self.reply_now().stderr
+        self.assertIn("whether it posted is unconfirmed", note)
+        self.assertNotIn("parked unsent", note)
+
+    def test_an_attempt_that_cannot_be_recorded_is_never_sent(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        with mock.patch.object(delivery_destination, "record_attempt",
+                               side_effect=OSError(28, "No space left on device")):
+            self.drain_pass(posts)
+        self.assertEqual(posts, [], "a send not counted on disk does not begin")
+        self.assertTrue(self.notice.exists(), "handed back to the queue")
+        self.assertEqual(list(self.results.glob(f"{self.notice.stem}.sending.*")), [])
+        self.assertTrue(self.lock_is_free())
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, "sent once the count can be recorded")
+
+    def test_an_answer_whose_publication_fails_leaves_the_task_and_its_line_as_they_were(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        line = self.notice.read_text()
+        real = hatch_cli._publish_once
+
+        def failing(path, body):
+            if path == self.result_file:
+                raise OSError(28, "No space left on device")
+            return real(path, body)
+        with mock.patch.object(hatch_cli, "_publish_once", failing):
+            r = self.reply_now()
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("nothing written", r.stderr)
+        self.assertFalse(self.result_file.exists())
+        self.assertEqual(self.notice.read_text().strip(), line.strip(), "the hold line is back in the queue")
+        self.assertFalse((hatch_cli._claims_dir(self.results) / self.TID).exists(), "the claim is released")
+        r = self.reply_now()
+        self.assertIn(r.returncode, (hatch_cli.REPLY_POSTED, hatch_cli.REPLY_UNCONFIRMED), r.stderr)
+        self.assertEqual(self.result_file.read_text(), "done")
+        self.assertFalse(self.notice.exists())
 
     def test_the_send_has_a_wall_clock_deadline_and_releases_the_lock(self):
         import http.server

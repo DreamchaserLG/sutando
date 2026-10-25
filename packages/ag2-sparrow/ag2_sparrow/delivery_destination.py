@@ -46,6 +46,8 @@ _LOCK_POLL_S = 0.05
 ATTEMPTS_DIR = ".proactive-attempts"
 # An attempts record that cannot be read proves nothing: it counts as attempted beyond any budget.
 ATTEMPTS_UNREADABLE = 1 << 20
+# Where a parked file's count goes, beside the live one, so a re-queue starts a fresh budget.
+PARKED_SUFFIX = ".parked"
 
 
 def claim_path(queued: Path, pid: int) -> Path:
@@ -105,10 +107,7 @@ def _attempts_path(result_dir: Path, stem: str) -> Path:
     return Path(result_dir) / ATTEMPTS_DIR / stem
 
 
-def attempts_begun(result_dir: Path, stem: str) -> int:
-    """How many sends of `stem` were begun; 0 for none, ATTEMPTS_UNREADABLE when the record
-    exists but cannot be read."""
-    path = _attempts_path(result_dir, stem)
+def _read_count(path: Path) -> int:
     try:
         text = path.read_text(encoding="ascii").strip()
     except FileNotFoundError:
@@ -118,13 +117,10 @@ def attempts_begun(result_dir: Path, stem: str) -> int:
     return int(text) if text.isdigit() and len(text) < 8 else ATTEMPTS_UNREADABLE
 
 
-def record_attempt(result_dir: Path, stem: str) -> int:
-    """Durably count one more begun send of `stem` (temp file, fsync, replace) and return the
-    count; OSError when it is not on disk, and then the send must not begin."""
-    path = _attempts_path(result_dir, stem)
+def _write_count(path: Path, count: int) -> None:
+    """Temp file, fsync, replace, then the directory; OSError when it is not on disk."""
     path.parent.mkdir(mode=0o700, exist_ok=True)
-    count = min(attempts_begun(result_dir, stem), ATTEMPTS_UNREADABLE - 1) + 1
-    tmp = path.with_name(f".{stem}.{os.getpid()}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
         os.write(fd, str(count).encode("ascii"))
@@ -138,13 +134,52 @@ def record_attempt(result_dir: Path, stem: str) -> int:
             os.fsync(dfd)
         finally:
             os.close(dfd)
-    return count
+
+
+def attempts_begun(result_dir: Path, stem: str) -> int:
+    """How many sends of `stem` began since it was last queued (its retry budget's count); 0 for
+    none, ATTEMPTS_UNREADABLE when the record exists but cannot be read."""
+    return _read_count(_attempts_path(result_dir, stem))
+
+
+def attempts_ever(result_dir: Path, stem: str) -> int:
+    """Every begun send of `stem`, parked budgets included: what a report of its outcome counts."""
+    live = attempts_begun(result_dir, stem)
+    parked = _read_count(_attempts_path(result_dir, stem).with_name(stem + PARKED_SUFFIX))
+    return ATTEMPTS_UNREADABLE if ATTEMPTS_UNREADABLE in (live, parked) else live + parked
+
+
+def record_attempt(result_dir: Path, stem: str) -> int:
+    """Durably count one more begun send of `stem` and return the count; OSError when it is not
+    on disk, and then the send must not begin. An unreadable record is kept, never overwritten."""
+    begun = attempts_begun(result_dir, stem)
+    if begun >= ATTEMPTS_UNREADABLE:
+        raise OSError(f"the attempt record of {stem} is unreadable; it is kept, not overwritten")
+    _write_count(_attempts_path(result_dir, stem), begun + 1)
+    return begun + 1
+
+
+def park_attempts(result_dir: Path, stem: str) -> None:
+    """At a park: move `stem`'s count into its parked record, so a file re-queued later gets a
+    fresh budget while attempts_ever still counts what began. An unreadable count stays where it
+    is and keeps refusing sends. Best effort: a count left in place only keeps the line parked."""
+    live = attempts_begun(result_dir, stem)
+    if live == 0 or live >= ATTEMPTS_UNREADABLE:
+        return
+    path = _attempts_path(result_dir, stem)
+    parked = path.with_name(stem + PARKED_SUFFIX)
+    with contextlib.suppress(OSError):
+        before = _read_count(parked)
+        _write_count(parked, live + (0 if before >= ATTEMPTS_UNREADABLE else before))
+        path.unlink()
 
 
 def forget_attempts(result_dir: Path, stem: str) -> None:
-    """Drop `stem`'s record once its delivery is confirmed; best effort."""
+    """Drop `stem`'s records, live and parked, once its delivery is confirmed; best effort."""
     with contextlib.suppress(OSError, ValueError):
-        _attempts_path(result_dir, stem).unlink()
+        path = _attempts_path(result_dir, stem)
+        path.unlink(missing_ok=True)
+        path.with_name(stem + PARKED_SUFFIX).unlink(missing_ok=True)
 
 
 def claim_pid(name: str) -> "int | None":
