@@ -654,6 +654,13 @@ fi
 mkdir -p "$WORKSPACE/logs" "$WORKSPACE/tasks" "$WORKSPACE/results" "$WORKSPACE/data" "$WORKSPACE/state"
 LOGS_DIR="$WORKSPACE/logs"
 
+# Every engine update ends in this start: rebuild each room's Getting started page whose feature
+# list is now newer. Backgrounded, as it reads and writes rooms over the network under its own lock.
+if [ -n "$PY" ] && [ -f "$REPO/skills/tutorial/scripts/getting_started.py" ]; then
+  "$PY" "$REPO/skills/tutorial/scripts/getting_started.py" publish --all-rooms --if-newer \
+    >> "$LOGS_DIR/tutorial-refresh.log" 2>&1 < /dev/null &
+fi
+
 # Self-heal: stand-identity.json was misclassified `rehome-state` by pre-#1540
 # `sutando-migrate.sh`, which put it at `<workspace>/state/stand-identity.json`.
 # Its reader (`personal_path()` / `personalPath()`) resolves

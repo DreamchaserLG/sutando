@@ -148,11 +148,14 @@ each room's entry.
   older render, so a pre-digest page the owner edited inside is upgraded with the rest. A write that landed on a page someone edited meanwhile is taken back the
   way it was made, in place (the replaced page replaced back, an appended piece removed); when that
   call cannot fit, nothing more is written and the result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
-  before it reads its own name, list, prompts or media. It summons no one. Run it after an engine
-  update, in every room with an entry, so an owner's page gains the steps a release added:
+  before it reads its own name, list, prompts or media. It summons no one. `src/startup.sh` runs it in every room with an entry on each engine start, an
+  update included, so an owner's page gains the steps a release added. `--all-rooms` makes one
+  `--if-newer` run per room the marker records; a room that fails leaves the others refreshed, and
+  the result lists each room's outcome (log: `logs/tutorial-refresh.log` in the workspace). By hand:
 
   ```bash
-  python3 skills/tutorial/scripts/getting_started.py publish --if-newer
+  python3 skills/tutorial/scripts/getting_started.py publish --all-rooms --if-newer
+  python3 skills/tutorial/scripts/getting_started.py publish --room <room> --if-newer  # one room
   ```
 - If the marker file is lost, a listed "Getting started" page is reused only when its text
   carries this agent's ownership marker. A same-titled page without it is never touched. More

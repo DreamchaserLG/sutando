@@ -9,6 +9,10 @@
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool,
           "name": the name used, "revision": the feature list's, "list": "file" or the --list source,
           "media": the asset names the page points at room media for}
+  getting_started.py publish --all-rooms --if-newer [options as above, but no --room]
+      -> {"ok": every room's run succeeded, "action": "refreshed", "rooms": {room: {"code": exit code,
+          ...that room's result}}}: one --if-newer run per room the marker has an entry for, which
+          src/startup.sh starts after every engine start, so an update's newer list reaches every page
 
 The page (tour_page.py) is a short interactive AG2 Space tour rendered from the skill's feature
 list (feature-list.json: nine steps for every core, plus the Claude Code history import step when
@@ -70,6 +74,7 @@ import contextlib
 import fcntl
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -976,6 +981,29 @@ def _personal_args(parser: argparse.ArgumentParser) -> None:
                              "on stderr and the skill's own file is used")
 
 
+def publish_all_rooms(args: argparse.Namespace, raw: List[str]) -> int:
+    """`publish --if-newer` in each room with an entry, one run per room, so one room's failure
+    leaves the others refreshed. Exits with the worst room's code."""
+    if args.room or not args.if_newer:
+        print("getting_started: --all-rooms takes --if-newer and no --room", file=sys.stderr)
+        return 2
+    rest = [a for a in raw if a != "--all-rooms"]
+    results, worst = {}, 0
+    for room in sorted(load_marker(marker_path(_workspace()))):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(rest + ["--room", room])
+        lines = out.getvalue().strip().splitlines()
+        try:
+            got = json.loads(lines[-1]) if lines else {}
+        except ValueError:
+            got = {"output": lines[-1]}
+        results[room] = {"code": code, **(got if isinstance(got, dict) else {"output": got})}
+        worst = max(worst, code)
+    print(json.dumps({"ok": worst == 0, "action": "refreshed", "rooms": results}))
+    return worst
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="getting_started.py", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1009,9 +1037,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--if-newer", action="store_true",
                    help="rewrite a complete page only when the feature list's revision is newer than the "
                         "page's (a pass after an engine update); the prompts it was built with are kept")
+    u.add_argument("--all-rooms", action="store_true",
+                   help="with --if-newer: run once in every room the marker has an entry for (the pass "
+                        "after an engine update)")
     u.add_argument("--room-commons", type=Path, default=None,
                    help="path to room_commons.py (default: beside this skill, else the installed skill)")
-    args = ap.parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = ap.parse_args(raw)
+    if args.command == "publish" and args.all_rooms:
+        return publish_all_rooms(args, raw)
     if args.command == "publish":
         args = with_inputs(args, load_inputs(inputs_path(_workspace())))
         if not args.room:
