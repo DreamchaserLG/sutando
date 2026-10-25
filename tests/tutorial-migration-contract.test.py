@@ -15,8 +15,10 @@ import importlib.util
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -50,6 +52,14 @@ DEPLOYED_ROWS = {"complete": {"kind", "state", "hash", "updated_at"},
                  "creating": {"state", "operation_id", "updated_at"},
                  "pending": {"kind", "state", "operation_id", "updated_at"}}
 
+# Parks the room stub inside the deployed writer's locked section, so the test can kill it there.
+HANG = textwrap.dedent('''
+    import os, sys, time
+    from pathlib import Path
+    if os.environ.get("STUB_HANG") and "pages" in sys.argv[1:3]:
+        Path(os.environ["STUB_HANG"]).write_text(str(os.getpid()))
+        time.sleep(300)
+''')
 CREATE_FAILS = "        if os.environ.get('STUB_CREATE_FAIL'): raise RuntimeError('create lost')\n"
 
 
@@ -114,6 +124,41 @@ class MigrationContractTest(unittest.TestCase):
     def test_the_predicate_cleanup_keeps_a_deployed_writer_waiting_on_the_lock(self):
         code, inside = self.held_cleanup(self.tmp / "ws", litter)
         self.assertEqual((code, inside), (None, []))
+
+    def test_a_writer_killed_holding_the_lock_then_a_retry_then_cleanup_twice(self):
+        ws = self.tmp / "ws"
+        self.seed(ws)
+        directory = fence.fence(ws).parent
+        (self.tmp / "room_commons.py").write_text(HANG + fence.base.STUB)
+        parked = self.tmp / "parked"
+        run = subprocess.Popen(self.argv(ws), env=self.env(STUB_HANG=str(parked)),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 60
+        while not parked.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        stub = int(parked.read_text())
+        run.kill()
+        run.wait(timeout=60)
+        os.kill(stub, signal.SIGKILL)
+        with open(directory / LOCK, "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)  # process death released it
+        self.assertEqual(litter(directory), set(), "it died before its record")
+        self.assertEqual(self.run_deployed(ws), 4)
+        self.assertEqual(self.run_deployed(ws), 4)
+        left = litter(directory)
+        self.assertEqual(len(left), 2)
+        with open(directory / LOCK, "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            (directory / sorted(left)[0]).unlink()  # a cleanup that dies part-way
+            for attempt in (1, 2):
+                for name in litter(directory):
+                    try:
+                        (directory / name).unlink()
+                    except FileNotFoundError:
+                        pass
+                self.assertEqual(litter(directory), set(), attempt)
+        self.assertTrue((directory / LOCK).is_file())
+        self.assertEqual(self.writes(), [])
 
     def run_deployed(self, ws: Path, **extra) -> int:
         return subprocess.run(self.argv(ws), env=self.env(**extra), capture_output=True, text=True,

@@ -282,7 +282,8 @@ HISTORICAL_REASON = (
     "cf87f324's getting_started.py, byte for byte: the deployed writer the tutorial's rollout fence is "
     "measured against (tests/tutorial-deployed-fence.test.py pins its SHA-256 and runs it as its own "
     "process). Its findings are evidence of what is deployed, so they can't be fixed in place.")
-# Exact nodes, as (line, column, source text), permitted in that one file; every other site is reported.
+# Preserves the deployed parent's state as evidence: only these exact nodes, as (line, column, source text),
+# only in that one file; the same token anywhere else is reported.
 HISTORICAL = {HISTORICAL_FIXTURE: frozenset({
     (103, 15, "importlib.util.spec_from_file_location('_tutorial_room_commons', script)"),
     (105, 8, "spec.loader.exec_module(mod)"),

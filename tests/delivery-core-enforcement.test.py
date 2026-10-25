@@ -438,7 +438,8 @@ HISTORICAL_REASON = (
     "cf87f324's getting_started.py, byte for byte: the deployed writer the tutorial's rollout fence is "
     "measured against (tests/tutorial-deployed-fence.test.py pins its SHA-256 and runs it as its own "
     "process). Its Commons.reconcile(pages, agent) is not a delivery provider and can't be changed in place.")
-# Exact defs, as (line, column, qualified name, arguments), permitted in that one file.
+# Preserves the deployed parent's state as evidence: only these exact defs, as (line, column, qualified name, arguments),
+# only in that one file; the same token anywhere else is reported.
 HISTORICAL = {HISTORICAL_FIXTURE: frozenset({(383, 4, "Commons.reconcile", ("pages", "agent"))})}
 
 
