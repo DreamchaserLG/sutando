@@ -5652,14 +5652,20 @@ def _marked_thread(text: str) -> "str | None":
     return _thread_marker(text)[0]
 
 
-def _proactive_identity(stem: str, text: str) -> "tuple[str, str, str | None, str | None] | None":
-    """(item id, body, room, thread) a proactive text is sent as, or None when it sends nothing here."""
+def _proactive_identity(stem: str, text: str, envelope: "dict | None" = None
+                        ) -> "tuple[str, str, str | None, str | None] | None":
+    """(item id, body, room, thread) a proactive text is sent as, or None when it sends nothing here.
+    A marked file sent before its route joined the key keeps that body-only item when it is this
+    generation's (`_legacy_item_for`), so every reader settles it under the one item it was sent as."""
     route, room, routed = _proactive_route(text)
     body = routed.strip() if route == "send" else ""
     if not body:
         return None
     thread = _marked_thread(text)
-    return _proactive_item_id(stem, body, room, thread), body, room, thread
+    item_id = _proactive_item_id(stem, body, room, thread)
+    if (room, thread) != (None, None) and receipt(_proactive_outbox_root(), item_id)[0] == "absent":
+        item_id = _legacy_item_for(stem, text, body, room, thread, envelope) or item_id
+    return item_id, body, room, thread
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
@@ -5758,9 +5764,16 @@ def _recover_orphan_proactive() -> None:
                     continue
             except OSError:
                 continue
-        _decide_orphan_claim(f)
+        try:
+            _decide_orphan_claim(f)
+        except Exception as e:  # noqa: BLE001 - one item's failure never stops the others' recovery
+            _log(f"proactive claim {f.name} could not be recovered ({diagnostics.describe(e)}); kept as its "
+                 "claim for an operator")
     for r in list(RESULTS_DIR.glob(f".proactive-*{_DECIDED_INFIX}*")):
-        _reconcile_decided(r)
+        try:
+            _reconcile_decided(r)
+        except Exception as e:  # noqa: BLE001
+            _log(f"proactive {r.name} could not be reconciled ({diagnostics.describe(e)}); retried")
 
 
 def _decide_orphan_claim(f: Path) -> None:
@@ -6110,32 +6123,42 @@ def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None, int | None
     if identity is None:
         return "absent", generation, None  # dropped, foreign or empty: the drain never made it an item
     item_id, body, room, thread = identity
-    state, epoch = receipt(_proactive_outbox_root(), item_id)
-    if state == "absent" and (room, thread) != (None, None):
-        state, epoch = _route_matched_legacy_receipt(stem, data.decode("utf-8"), body, room, thread)
+    root = _proactive_outbox_root()
+    state, epoch = receipt(root, item_id)
+    if (state not in ("absent", "unknown") and (room, thread) != (None, None)
+            and item_id == _proactive_item_id(stem, body) and _stored_payload(root, item_id) is None):
+        return "unknown", generation, None  # an adopted legacy record that cannot be read: kept for an operator
     return state, generation, epoch
 
 
-def _route_matched_legacy_receipt(stem: str, text: str, body: str, room, thread) -> "tuple[str, int | None]":
-    """A marked claim written before its route joined the item key: the body-only item counts only
-    when its stored payload names this route, as the file marks it or as its send resolved it (a
-    linked task's thread replaces the marker's), so a send there is never repeated."""
+def _stored_payload(root: Path, item_id: str) -> "dict | None":
+    """An item's stored payload as an object, or None when it is missing, not JSON or not an object."""
+    try:
+        stored = json.loads((read_item(root, item_id) or {}).get("payload") or "")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return stored if isinstance(stored, dict) else None
+
+
+def _legacy_item_for(stem: str, text: str, body: str, room, thread, envelope=None) -> "str | None":
+    """The body-only item a marked file was sent under before its route joined the key, when it is
+    this generation's: its stored payload names exactly the room and thread this send resolves (a
+    linked task's thread replaces the marker's; no thread means top level, never "any"). With no
+    resolution, the file's own marks are compared exactly. An unusable record is kept as this item,
+    so it fails closed (it may already have been sent) instead of being sent again under a new key."""
     root, legacy = _proactive_outbox_root(), _proactive_item_id(stem, body)
-    state, epoch = receipt(root, legacy)
-    if state in ("absent", "unknown"):
-        return state, epoch
-    try:
-        stored = json.loads((read_item(root, legacy) or {}).get("payload") or "{}")
-    except ValueError:
-        return "unknown", None
-    try:
-        resolved = _proactive_envelope(f"{stem}.txt", text, room, body)
-    except Exception:  # noqa: BLE001 - no resolution: only the file's own marks can match
-        resolved = {}
-    rooms = {room, resolved.get("room_id")} - {None}
-    threads = {thread, resolved.get("thread_root")} - {None}
-    same = (room is None or stored.get("room_id") in rooms) and (thread is None or stored.get("thread_root") in threads)
-    return (state, epoch) if same else ("absent", None)
+    if receipt(root, legacy)[0] == "absent":
+        return None
+    stored = _stored_payload(root, legacy)
+    if stored is None:
+        return legacy
+    if envelope is None:
+        try:
+            envelope = _proactive_envelope(f"{stem}.txt", text, room, body)
+        except Exception:  # noqa: BLE001 - no resolution: only the file's own marks can match
+            envelope = {"room_id": room, "thread_root": thread}
+    want = (envelope.get("room_id") or room, envelope.get("thread_root"))
+    return legacy if (stored.get("room_id"), stored.get("thread_root")) == want else None
 
 
 def _hand_back(claim: Path, original: Path) -> None:
@@ -6386,8 +6409,9 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         envelope = _proactive_envelope(f.name, claimed_text, room_override, body)
+        identity = _proactive_identity(f.stem, claimed_text, envelope)
         _send_proactive(claim, f, envelope, room_override is None, noticed,
-                        item_id=_proactive_item_id(f.stem, body, room_override, _marked_thread(claimed_text)))
+                        item_id=identity[0] if identity else _proactive_item_id(f.stem, body))
 
 
 def _proactive_envelope(name: str, text: str, room_override, body: str) -> dict:

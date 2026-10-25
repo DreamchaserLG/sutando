@@ -1375,6 +1375,95 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts],
                          [("!RoomOne:ag2.space", "SAME BODY")], "never sent there, so sent once to its own room")
 
+    def _old_key_sender_dies(self, lane, text: str, cut: str) -> str:
+        """The pre-upgrade sender, keyed on stem and body only, posts `text` for real and dies at `cut`
+        (before or after it records the provider's receipt). Returns that legacy item id."""
+        real_key, real_receipt = gb.proactive_item_id, gb._record_proactive_receipt
+
+        def receipt_then(*a):
+            if cut == "after-receipt":
+                real_receipt(*a)
+            raise Killed(cut)
+        lane.write("proactive-1.txt", text)
+        with mock.patch.object(gb, "proactive_item_id", lambda stem, body, *rest: real_key(stem, body)), \
+                mock.patch.object(gb, "_record_proactive_receipt", receipt_then):
+            try:
+                lane.drain()
+            except Killed:
+                pass
+        legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
+        root = lane.results / ".outbox-ag2space-proactive"
+        dead = _dead_pid()
+        claim_file = outbox._claim_path(root, legacy)
+        if claim_file.exists():  # its process died: the claim's owner is dead and past its window
+            data = json.loads(claim_file.read_text())
+            claim_file.write_text(json.dumps({**data, "pid": dead, "start_usec": None,
+                                              "claimed_at": data["claimed_at"] - 3600}))
+        for c in lane.results.glob("proactive-1.sending.*"):
+            c.rename(c.with_name(f"proactive-1.sending.{dead}.1"))
+        return legacy
+
+    def test_a_send_landed_by_the_old_key_is_never_posted_again_under_the_new_one(self):
+        """A [channel:]-marked file sent by the pre-upgrade code, which died right before or right after
+        recording the provider receipt: after the upgrade, restart and drains settle it under the
+        same legacy item, with no second POST and no new-key item."""
+        for cut in ("before-receipt", "after-receipt"):
+            with self.subTest(cut=cut):
+                lane = Lane(gb, scratch("gw-old-key-crash-"))
+                root = lane.results / ".outbox-ag2space-proactive"
+                legacy = self._old_key_sender_dies(lane, "[channel: !RoomOne:ag2.space]\nSAME BODY\n", cut)
+                self.assertEqual(len(lane.posts), 1, "the old sender's POST landed")
+                lane.restart()
+                for _ in range(3):
+                    lane.drain()
+                self.assertEqual(len(lane.posts), 1, "never posted again")
+                self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id(
+                    "proactive-1", "SAME BODY", "!RoomOne:ag2.space", None)), "absent", "no new-key item")
+                self.assertIn(outbox.receipt_state(root, legacy), ("DELIVERED", "PARKED"),
+                              "settled under the one item it was sent as")
+
+    def _legacy_then_recover(self, stored: dict, text: str) -> list:
+        lane = Lane(gb, scratch("gw-legacy-thread-exact-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
+        outbox._write_item(root, legacy, {"item_id": legacy, "status": "DELIVERED", "provider_ref": "$sent",
+                                          "payload": json.dumps({"body": "SAME BODY", **stored}, sort_keys=True)})
+        (lane.results / f"proactive-1.sending.{_dead_pid()}.1").write_text(text)
+        lane.restart()
+        for _ in range(3):
+            lane.drain()
+        return [(p.get("room_id"), p.get("thread_root")) for p in lane.posts]
+
+    def test_no_thread_means_top_level_when_an_upgraded_claim_is_matched(self):
+        one = "!RoomOne:ag2.space"
+        cases = (  # (the legacy item's route, the claim, POSTs expected)
+            ({"room_id": one, "thread_root": "$OldThread"}, f"[channel: {one}]\nSAME BODY\n", [(one, None)]),
+            ({"room_id": one}, f"[channel: {one}]\n[thread: $NewThread]\nSAME BODY\n", [(one, "$NewThread")]),
+            ({"room_id": one, "thread_root": "$A"}, f"[channel: {one}]\n[thread: $B]\nSAME BODY\n", [(one, "$B")]),
+            ({"room_id": one}, f"[channel: {one}]\nSAME BODY\n", []),
+            ({"room_id": one, "thread_root": "$A"}, f"[channel: {one}]\n[thread: $A]\nSAME BODY\n", []),
+        )
+        for stored, text, expected in cases:
+            with self.subTest(stored=stored, text=text):
+                self.assertEqual(self._legacy_then_recover(stored, text), expected)
+
+    def test_a_legacy_payload_that_is_not_an_object_keeps_its_claim_and_recovery_goes_on(self):
+        for payload in ("[]", "null", "5", '"text"', "{"):
+            with self.subTest(payload=payload):
+                lane = Lane(gb, scratch("gw-legacy-shape-"))
+                root = lane.results / ".outbox-ag2space-proactive"
+                legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
+                outbox._write_item(root, legacy, {"item_id": legacy, "status": "DELIVERED", "payload": payload})
+                claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+                claim.write_text("[channel: !RoomOne:ag2.space]\nSAME BODY\n")
+                (lane.results / f"proactive-2.sending.{_dead_pid()}.1").write_text("another nudge\n")
+                lane.restart()
+                for _ in range(2):
+                    lane.drain()
+                self.assertTrue(claim.exists(), "kept as its claim for an operator")
+                self.assertEqual([p.get("body") for p in lane.posts], ["another nudge"],
+                                 "every other claim is still recovered and sent")
+
     def test_the_marker_key_and_the_send_read_a_thread_marker_the_same_way(self):
         """A malformed [thread:] before a valid one: the send posts top level, and the item key agrees."""
         for text in ("[thread: not-an-event]\n[thread: $Valid]\nbody\n", "[thread: $Valid]\nbody\n",
