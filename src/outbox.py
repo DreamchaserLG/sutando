@@ -1199,6 +1199,34 @@ def list_items(root: Path, status: Optional[str] = None) -> list[dict]:
     return out
 
 
+class BornParked(str, Enum):
+    """Only CREATED means this call wrote the record; the other two touched nothing."""
+
+    CREATED = "created"
+    ALREADY_PARKED = "already-parked"
+    EXISTS = "exists"
+
+
+def publish_parked(root: Path, item_id: str, payload: str, reason: str, *,
+                   source_ready_sha256: Optional[str] = None) -> BornParked:
+    """Create `item_id` already PARKED, in one write under its lock, so it never has a READY moment
+    a drain could claim and no crash can leave it live. ALREADY_PARKED when it exists PARKED with
+    this payload (a retry, or a second writer racing); EXISTS when it exists any other way. Its
+    only way out is an operator's `requeue_item_with_epoch`."""
+    root = Path(root)
+    with _item_lock(root, item_id):
+        if _item_path(root, item_id).exists():
+            d = _read_item(root, item_id)
+            same = d.get("status") == "PARKED" and d.get("payload") == payload
+            return BornParked.ALREADY_PARKED if same else BornParked.EXISTS
+        _write_item(root, item_id, {
+            "item_id": item_id, "payload": payload, "status": "PARKED", "reason": reason,
+            "attempts": 0, "published_at": time.time(),
+            **source_proof_fields(source_ready_sha256, payload, new_publication_id()),
+        })
+        return BornParked.CREATED
+
+
 class RequeueOutcome(str, Enum):
     """Only REQUEUED means this call moved the item; the other two touched
     nothing, which is what makes a repeated requeue safe to script."""

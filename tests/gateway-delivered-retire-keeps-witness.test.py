@@ -12,6 +12,7 @@ Run: python3 tests/gateway-delivered-retire-keeps-witness.test.py
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import stat
@@ -32,10 +33,6 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 import task_transition as tt  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
-
-# A retained original's writer must hold still for SETTLE_SEC before its bytes are taken; the
-# readiness tests below restore that, every other test here pins another property and skips the wait.
-gb._DECIDED_SETTLE_SEC = 0.0
 
 PREFIX = "proactive-orphan-recovery-"
 
@@ -583,32 +580,25 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual(lane.where("proactive-1"), "archived")
 
     def _settled_once(self, lane, a_body: str, kind: str) -> None:
-        """After the owner's death: a restart and real drains send B once under its own key, A keeps
-        its terminal state and every placed copy of A is A's exact bytes; a further pass moves nothing."""
+        """After the owner's death: a restart and real drains send nothing automatically. A keeps its
+        terminal state, every placed copy of A is A's bytes, and B is parked once under its own key;
+        the operator's digest-pinned release sends B once, and a further pass moves nothing."""
         dead = _dead_pid()
         for c in lane.results.glob("proactive-1.sending.*"):
             rest = c.name.split(".sending.", 1)[1].split(".", 1)
             c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
         lane.restart()
         root = lane.results / ".outbox-ag2space-proactive"
-        a_id, b_id = gb._proactive_item_id("proactive-1", a_body), gb._proactive_item_id("proactive-1", "UNSENT B")
+        a_id = gb._proactive_item_id("proactive-1", a_body)
         for _ in range(2):
             lane.drain()
-        bodies = [p.get("body") for p in lane.posts]
-        self.assertEqual(bodies, ["UNSENT B"], f"B sent once, A never ({bodies})")
-        self.assertEqual((outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id)), (kind, "DELIVERED"))
-        placed = [p.read_text() for p in list(lane.results.glob(".proactive-1.delivered-*"))
-                  + list((lane.results / "undelivered").glob("proactive-1-*"))]
-        archived = [p.read_text() for p in (lane.results / "archive").glob("proactive-1*")]
-        self.assertNotIn("UNSENT B\n", placed, "B never hidden as delivered or parked")
-        self.assertEqual(archived.count("UNSENT B\n"), 1, "B archived once, after its POST")
-        self.assertTrue(all(t == a_body + "\n" for t in placed + [a for a in archived if a != "UNSENT B\n"]),
-                        f"every placed copy of A is A's bytes ({placed}, {archived})")
-        lane.restart()
-        for _ in range(2):
-            lane.drain()
-        self.assertEqual([p.get("body") for p in lane.posts], bodies, "a fresh restart and drains send nothing")
-        self.assertEqual((outbox.receipt_state(root, a_id), outbox.receipt_state(root, b_id)), (kind, "DELIVERED"))
+        self.assertEqual(lane.posts, [], "nothing is sent automatically")
+        self.assertEqual(outbox.receipt_state(root, a_id), kind)
+        self._parked_once(lane, b"UNSENT B\n")
+        placed = [p.read_text() for p in lane.results.glob(".proactive-1.delivered-*")]
+        self.assertTrue(all(t == a_body + "\n" for t in placed), f"every placed copy of A is A's bytes ({placed})")
+        self._release_and_send_once(lane, b"UNSENT B\n")
+        self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
 
     def test_a_writer_holding_the_claims_descriptor_never_reaches_a_placed_copy(self):
         """B written through a descriptor opened before recovery, at each cut of the placement
@@ -669,12 +659,37 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         record = outbox.read_item(root, gb._proactive_item_id("proactive-1", body.strip()))
         return {k: v for k, v in record.items() if k not in ("provider_ref", "delivered_at", "provider")}
 
-    def _requeue_by_cli(self, lane, item_id: str) -> "subprocess.CompletedProcess":
+    def _requeue_by_cli(self, lane, item_id: str, body: bytes = b"parked body\n") -> "subprocess.CompletedProcess":
         root = lane.results / ".outbox-ag2space-proactive"
-        cmd = gb._proactive_requeue_command(root, item_id, __import__("hashlib").sha256(b"parked body\n").hexdigest())
+        cmd = gb._proactive_requeue_command(root, item_id, __import__("hashlib").sha256(body).hexdigest())
         argv = [sys.executable if c == "python3" else c for c in __import__("shlex").split(cmd)]
         from _helpers.hermetic_env import isolated_child_env
         return subprocess.run(argv, cwd=REPO, env=isolated_child_env(), capture_output=True, text=True, timeout=60)
+
+    def _parked_once(self, lane, body: bytes) -> None:
+        """`body` sits in undelivered/ exactly once, its own outbox item PARKED, and no live name holds it."""
+        root = lane.results / ".outbox-ag2space-proactive"
+        copies = [p for p in gb._owned(lane.results / "undelivered", "proactive-1") if p.read_bytes() == body]
+        self.assertEqual(len(copies), 1, f"one immutable parked copy of {body!r}")
+        item = gb._proactive_item_id("proactive-1", body.decode().strip())
+        self.assertEqual(outbox.receipt_state(root, item), "PARKED", f"{body!r} is born PARKED")
+        live = [p for p in [*lane.results.glob("proactive-1.txt"), *lane.results.glob("proactive-1.sending.*")]
+                if p.exists() and p.read_bytes() == body]
+        self.assertEqual(live, [], "never under a live or claim name")
+
+    def _release_and_send_once(self, lane, body: bytes) -> None:
+        """The operator's digest-pinned release is the only send: one POST, none after a restart."""
+        before = [p.get("body") for p in lane.posts]
+        item = gb._proactive_item_id("proactive-1", body.decode().strip())
+        run = self._requeue_by_cli(lane, item, body)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts], before + [body.decode().strip()], "released, sent once")
+        lane.restart()
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(len(lane.posts), len(before) + 1, "no repeat after a restart")
 
     def test_an_acknowledged_requeue_of_a_body_being_parked_is_sent_once_after_any_crash(self):
         """The real CLI requeues the item after recovery read PARKED (epoch 0) and before it moves the
@@ -770,51 +785,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
             return {os.lstat(p).st_ino for p in paths}
         return lane, root, a_id, write, lambda: self.assertNotIn(original, visible_inodes(), "the original stays hidden")
 
-    def test_a_generation_written_after_restart_returns_is_sent_once_by_ordinary_drains(self):
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT B\n")
-                for _ in range(6):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "B sent once, with no restart")
-                hidden()
-                lane.restart()
-                for _ in range(3):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "no repeat")
-                self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
-
-    def test_a_generation_written_after_the_last_was_delivered_is_sent_and_leaves_its_archive(self):
-        """B is delivered first (by drains, or as the reviewed head does, by a second restart); C is
-        then written through the same descriptor and must go out once without touching B's archive."""
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT B\n")
-                for _ in range(3):
-                    lane.drain()
-                lane.restart()
-                for _ in range(3):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"])
-                b_archive = [p for p in (lane.results / "archive").glob("proactive-1*") if p.read_text() == "UNSENT B\n"]
-                self.assertEqual(len(b_archive), 1)
-                write(b"UNSENT C\n")
-                for _ in range(6):
-                    lane.drain()
-                lane.restart()
-                for _ in range(6):
-                    lane.drain()
-                self.assertEqual(b_archive[0].read_text(), "UNSENT B\n", "B's archive keeps B's bytes")
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B", "UNSENT C"], "C sent once")
-                hidden()
-                self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
-                for body in ("UNSENT B", "UNSENT C"):
-                    self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", body)), "DELIVERED")
-
     def _fault_then_clear(self, fault):
         """B written after restart; three drains under `fault`, then ordinary drains with it cleared."""
         for kind in ("DELIVERED", "PARKED"):
@@ -834,13 +804,9 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 self.assertEqual(lane.posts, [], "nothing sent while the fault holds")
                 for _ in range(2):
                     lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"],
-                                 "a later ordinary drain sends B once the fault clears")
-                for _ in range(3):
-                    lane.drain()
-                lane.restart()
-                lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "no repeat")
+                self.assertEqual(lane.posts, [], "parked, never sent automatically")
+                self._parked_once(lane, b"UNSENT B\n")
+                self._release_and_send_once(lane, b"UNSENT B\n")
                 self.assertEqual(outbox.receipt_state(root, a_id), kind)
                 hidden()
 
@@ -851,51 +817,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
     def test_an_unreadable_generation_is_retried_by_a_later_drain(self):
         self._fault_then_clear(lambda: mock.patch.object(
             gb, "_claim_receipt", return_value=("unknown", None, None)))
-
-    def test_a_snapshot_whose_hand_back_is_blocked_is_decided_again_by_a_later_drain(self):
-        """B's snapshot cannot go live because a newer file holds the live name; the drain that sends
-        that file frees the name, and a later ordinary drain hands B back and sends it once."""
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT B\n")
-                lane.write("proactive-1.txt", "NEWER C\n")
-                for _ in range(4):
-                    lane.drain()
-                self.assertEqual(sorted(p.get("body") for p in lane.posts), ["NEWER C", "UNSENT B"],
-                                 "both sent once, with no restart")
-                lane.restart()
-                for _ in range(2):
-                    lane.drain()
-                self.assertEqual(len(lane.posts), 2, "no repeat")
-                self.assertEqual(list(lane.results.glob("proactive-1.sending.*")), [], "no snapshot left behind")
-                hidden()
-
-    def test_new_bytes_whose_digest_cannot_be_recorded_are_sent_once_and_recorded_later(self):
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT B\n")
-                real = gb.undelivered_quarantine.rename_noreplace
-
-                def refuse_the_record(src, dst):
-                    if gb._DECIDED_INFIX in Path(dst).name:
-                        raise OSError(1, "Operation not permitted")
-                    return real(src, dst)
-                with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", refuse_the_record):
-                    lane.drain()
-                for _ in range(3):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "sent once")
-                digest = __import__("hashlib").sha256(b"UNSENT B\n").hexdigest()[:32]
-                self.assertEqual(len(list(lane.results.glob(f".proactive-1{gb._DECIDED_INFIX}{digest}-*"))), 1,
-                                 "a later drain recorded B's digest")
-                lane.restart()
-                lane.drain()
-                self.assertEqual(len(lane.posts), 1, "no repeat")
-                hidden()
 
     def test_a_retained_original_that_is_gone_leaves_no_seen_entry(self):
         lane = Lane(gb, scratch("gw-decided-prune-"))
@@ -914,11 +835,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
     def _retained(self, lane) -> Path:
         (r,) = lane.results.glob(".proactive-1.decided-*")
         return r
-
-    def _age(self, lane, seconds: float = 5.0) -> None:
-        """Make the retained original look written `seconds` ago (its writer has paused that long)."""
-        when = __import__("time").time_ns() - int(seconds * 1e9)
-        os.utime(self._retained(lane), ns=(when, when))
 
     def test_a_dead_owners_snapshot_blocked_at_restart_is_sent_by_a_later_drain(self):
         """A snapshot claim left by a process that died: the restart's one try is blocked by live C;
@@ -958,32 +874,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
             lane.drain()
         self.assertEqual(calls.count(snapshot.name), 1, f"one decision per pending snapshot per drain ({calls})")
 
-    def test_an_unknown_receipt_for_readable_new_bytes_is_not_settled(self):
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT B\n")
-                b_record = outbox._item_path(root, gb._proactive_item_id("proactive-1", "UNSENT B"))
-                b_record.parent.mkdir(parents=True, exist_ok=True)
-                b_record.write_text("{")  # unreadable outbox record for B's item
-                with mock.patch.object(gb, "RESULTS_DIR", lane.results):
-                    state, generation, epoch = gb._claim_receipt(self._retained(lane), "proactive-1")
-                self.assertEqual((state, len(generation or ""), epoch), ("unknown", 64, None),
-                                 "the production shape: unknown with a valid digest")
-                self.assertFalse(self._reconcile_in(lane), "unknown is not settled")
-                for _ in range(3):
-                    lane.drain()
-                self.assertEqual(lane.posts, [], "nothing sent while the record is unreadable")
-                b_record.unlink()  # repaired: no retained-file stat changes
-                for _ in range(2):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "sent once the record reads")
-                lane.restart()
-                lane.drain()
-                self.assertEqual(len(lane.posts), 1, "no repeat")
-                hidden()
-
     def test_an_unknown_receipt_for_the_recorded_bytes_is_retried_until_the_record_reads(self):
         """The production shape (unknown, <valid digest>, None) on the recorded generation: an outbox
         record that cannot be read is not settled; once an operator's requeue replaces it, a later
@@ -1015,75 +905,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", lane.results / "archive"):
             return gb._reconcile_decided(self._retained(lane))
 
-    def _with_real_settle(self):
-        patcher = mock.patch.object(gb, "_DECIDED_SETTLE_SEC", __import__("ag2_sparrow.result_ready",
-                                                                           fromlist=["x"]).SETTLE_SEC, create=True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_a_paused_writer_never_gets_a_prefix_sent(self):
-        self._with_real_settle()
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"UNSENT")  # the writer pauses here
-                for _ in range(2):
-                    lane.drain()
-                write(b"UNSENT B\n")
-                self._age(lane)
-                for _ in range(2):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "only the whole body is sent")
-                hidden()
-
-    def test_a_writer_that_truncates_first_never_leaves_an_empty_live_file(self):
-        self._with_real_settle()
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                write(b"")
-                self._age(lane)
-                for _ in range(2):
-                    lane.drain()
-                self.assertFalse((lane.results / "proactive-1.txt").exists(), "no empty live file")
-                write(b"UNSENT B\n")
-                self._age(lane)
-                for _ in range(2):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"])
-
-    def test_a_longer_stems_archive_is_not_proof_of_a_copy(self):
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                (lane.results / "archive" / "proactive-1-longer-123.txt").write_text("UNSENT B\n")
-                write(b"UNSENT B\n")
-                for _ in range(4):
-                    lane.drain()
-                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "sent, not taken as archived")
-
-    def test_a_live_file_rewritten_after_the_reconcile_is_not_proof_of_a_copy(self):
-        for kind in ("DELIVERED", "PARKED"):
-            with self.subTest(kind=kind):
-                lane, root, a_id, write, hidden = self._held_original(kind)
-                lane.restart()
-                live = lane.write("proactive-1.txt", "UNSENT B\n")
-                write(b"UNSENT B\n")
-                real = gb._reconcile_changed_decided
-
-                def then_rewrite_live():
-                    real()
-                    live.write_text("OTHER\n")  # the producer rewrites its live file after the probe
-                with mock.patch.object(gb, "_reconcile_changed_decided", then_rewrite_live):
-                    lane.drain()
-                for _ in range(3):
-                    lane.drain()
-                self.assertEqual(sorted(p.get("body") for p in lane.posts), ["OTHER", "UNSENT B"],
-                                 "B sent once from its own snapshot")
-
     def test_two_deliveries_of_one_stem_in_one_tick_never_share_an_archive(self):
         lane = Lane(gb, scratch("gw-archive-collision-"))
         with mock.patch.object(gb.time, "time_ns", return_value=1792900000000000000):
@@ -1092,35 +913,6 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 lane.drain()
         archived = sorted(p.read_text() for p in (lane.results / "archive").glob("proactive-1-*.txt"))
         self.assertEqual(archived, ["B\n", "C\n"], "C never replaced B's archive")
-
-    def test_a_competing_drainer_cannot_move_a_snapshot_between_its_proof_and_the_commit(self):
-        """A dead owner's snapshot of B is the proof the reconcile relies on. Right before the new
-        digest is committed, a competing drainer moves the dead owner's snapshot live and a newer C
-        replaces it there. The reconcile must own that snapshot first, so B is still sent once."""
-        lane = Lane(gb, scratch("gw-snapshot-race-"))
-        dead = lane.results / f"proactive-1.sending.{_dead_pid()}.s1"
-        dead.write_text("UNSENT B\n")
-        (lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1").write_text("UNSENT B\n")
-        real, raced = gb.undelivered_quarantine.rename_noreplace, []
-
-        def competitor_before_the_commit(src, dst):
-            if gb._DECIDED_INFIX in Path(dst).name and not raced:
-                raced.append(True)
-                if dead.exists():  # the competing drainer's real retry, then C published over the live name
-                    real(dead, lane.results / "proactive-1.txt")
-                    __import__("ag2_sparrow.result_publish", fromlist=["x"]).publish_text(
-                        lane.results / "proactive-1.txt", "NEWER C\n")
-            return real(src, dst)
-        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", competitor_before_the_commit), \
-                mock.patch.object(gb, "_retry_pending_snapshots", lambda: None):  # only the reconcile's proof runs
-            lane.drain()
-        for _ in range(4):
-            lane.drain()
-        lane.restart()
-        lane.drain()
-        self.assertTrue(raced)
-        self.assertIn("UNSENT B", [p.get("body") for p in lane.posts], "B is never lost behind the race")
-        self.assertEqual([p.get("body") for p in lane.posts].count("UNSENT B"), 1)
 
     def test_an_operator_requeue_of_a_settled_original_is_handed_back_by_a_drain(self):
         """PARKED e0 settles and is cached; the operator's requeue makes it QUEUED e1 without touching
@@ -1159,6 +951,250 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual([p.get("body") for p in lane.posts], ["B", "C"])
         hidden = sorted(p.read_text() for p in lane.results.glob(".proactive-1.delivered-*"))
         self.assertEqual(hidden, ["B\n", "C\n"], "C never replaced B's hidden witness")
+
+    def test_each_later_generation_is_parked_for_the_owner_and_sent_only_when_released(self):
+        """B, then (after B is released and delivered) C, written through the held descriptor: each is
+        parked under its own item, never sent automatically, and sent once on its own release. B's
+        archive keeps B's bytes, and the original inode never leaves the hidden namespace."""
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                for _ in range(6):
+                    lane.drain()
+                self.assertEqual(lane.posts, [])
+                self._parked_once(lane, b"UNSENT B\n")
+                hidden()
+                self._release_and_send_once(lane, b"UNSENT B\n")
+                b_archive = [p for p in (lane.results / "archive").glob("proactive-1*") if p.read_text() == "UNSENT B\n"]
+                self.assertEqual(len(b_archive), 1)
+                write(b"UNSENT C\n")
+                for _ in range(6):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "C is parked, not sent")
+                self._parked_once(lane, b"UNSENT C\n")
+                self._release_and_send_once(lane, b"UNSENT C\n")
+                self.assertEqual(b_archive[0].read_text(), "UNSENT B\n", "B's archive keeps B's bytes")
+                self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
+                hidden()
+
+    def test_a_writer_paused_past_settle_time_has_both_generations_parked_and_only_the_released_one_sent(self):
+        """The acceptance case: the writer holds its descriptor open past the old SETTLE_SEC after a
+        prefix, then completes. Nothing is sent automatically; the prefix and the full body are two
+        distinct parked copies; releasing only the full digest sends it once, then no repeat."""
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT")
+                old = __import__("time").time_ns() - int(5e9)  # paused well past the old SETTLE_SEC
+                os.utime(next(lane.results.glob(".proactive-1.decided-*")), ns=(old, old))
+                for _ in range(2):
+                    lane.drain()
+                write(b"UNSENT B\n")
+                for _ in range(2):
+                    lane.drain()
+                self.assertEqual(lane.posts, [], "zero automatic posts")
+                self._parked_once(lane, b"UNSENT")
+                self._parked_once(lane, b"UNSENT B\n")
+                self._release_and_send_once(lane, b"UNSENT B\n")
+                self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", "UNSENT")),
+                                 "PARKED", "the unreleased prefix stays parked")
+                hidden()
+
+    def test_parked_generations_never_clobber_each_other(self):
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        for body in (b"ONE\n", b"TWO\n", b"THREE\n"):
+            write(body)
+            lane.drain()
+        self.assertEqual(lane.posts, [])
+        for body in (b"ONE\n", b"TWO\n", b"THREE\n"):
+            self._parked_once(lane, body)
+        self._release_and_send_once(lane, b"TWO\n")
+        for body in (b"ONE\n", b"THREE\n"):
+            self._parked_once(lane, body)
+
+    def test_an_empty_generation_parks_nothing_and_never_makes_a_live_file(self):
+        lane, root, a_id, write, hidden = self._held_original("PARKED")
+        lane.restart()
+        write(b"")
+        for _ in range(2):
+            lane.drain()
+        self.assertFalse((lane.results / "proactive-1.txt").exists())
+        write(b"UNSENT B\n")
+        lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._parked_once(lane, b"UNSENT B\n")
+
+    def test_no_live_archive_or_file_is_taken_as_already_parked(self):
+        """A longer stem's archive, or a live file holding the same bytes, is not proof: B is still
+        parked under its own item."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        (lane.results / "archive" / "proactive-1-longer-123.txt").write_text("UNSENT B\n")
+        (lane.results / "undelivered").mkdir(exist_ok=True)
+        (lane.results / "undelivered" / "proactive-1-longer-9.txt").write_text("UNSENT B\n")
+        write(b"UNSENT B\n")
+        lane.drain()
+        self._parked_once(lane, b"UNSENT B\n")
+
+    def test_an_unknown_receipt_for_new_bytes_parks_nothing_until_the_record_reads(self):
+        lane, root, a_id, write, hidden = self._held_original("PARKED")
+        lane.restart()
+        write(b"UNSENT B\n")
+        b_record = outbox._item_path(root, gb._proactive_item_id("proactive-1", "UNSENT B"))
+        b_record.parent.mkdir(parents=True, exist_ok=True)
+        b_record.write_text("{")
+        with mock.patch.object(gb, "RESULTS_DIR", lane.results):
+            state, generation, epoch = gb._claim_receipt(self._retained(lane), "proactive-1")
+        self.assertEqual((state, len(generation or ""), epoch), ("unknown", 64, None))
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual([p for p in gb._owned(lane.results / "undelivered", "proactive-1")
+                          if p.read_bytes() == b"UNSENT B\n"], [], "nothing parked yet")
+        b_record.unlink()
+        lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._parked_once(lane, b"UNSENT B\n")
+
+    def _crash_once(self, cut: str):
+        """Kill the reconcile once at `cut` of the park protocol: after the copy is placed, after the
+        PARKED record is born, or right before the retained digest is committed."""
+        real_publish, real_parked, real_move = gb._publish_text_whole, gb.publish_parked, \
+            gb.undelivered_quarantine.rename_noreplace
+        fired = []
+
+        def publish(dst, *a, **k):
+            out = real_publish(dst, *a, **k)
+            if cut == "after-copy" and Path(dst).parent.name == "undelivered" and not fired:
+                fired.append(cut)
+                raise Killed(cut)
+            return out
+
+        def parked(*a, **k):
+            out = real_parked(*a, **k)
+            if cut == "after-parked" and not fired:
+                fired.append(cut)
+                raise Killed(cut)
+            return out
+
+        def move(src, dst):
+            if cut == "before-commit" and gb._DECIDED_INFIX in Path(dst).name and not fired:
+                fired.append(cut)
+                raise Killed(cut)
+            return real_move(src, dst)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(gb, "_publish_text_whole", publish))
+        stack.enter_context(mock.patch.object(gb, "publish_parked", parked))
+        stack.enter_context(mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move))
+        return stack, fired
+
+    def test_a_crash_at_each_step_of_parking_converges_on_one_copy_and_one_parked_item(self):
+        for cut in ("after-copy", "after-parked", "before-commit"):
+            with self.subTest(cut=cut):
+                lane, root, a_id, write, hidden = self._held_original("PARKED")
+                lane.restart()
+                write(b"UNSENT B\n")
+                stack, fired = self._crash_once(cut)
+                with stack:
+                    try:
+                        lane.drain()
+                    except Killed:
+                        pass
+                self.assertEqual(fired, [cut])
+                lane.restart()
+                for _ in range(2):
+                    lane.drain()
+                self.assertEqual(lane.posts, [], "no automatic post after any crash")
+                self._parked_once(lane, b"UNSENT B\n")
+                digest = __import__("hashlib").sha256(b"UNSENT B\n").hexdigest()[:32]
+                self.assertEqual(len(list(lane.results.glob(f".proactive-1{gb._DECIDED_INFIX}{digest}-*"))), 1,
+                                 "the retained generation is recorded once")
+                self._release_and_send_once(lane, b"UNSENT B\n")
+
+    def test_a_copy_whose_parked_record_fails_is_parked_on_a_later_drain(self):
+        """Partial order (a): the immutable copy exists, the born-PARKED publication fails."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        write(b"UNSENT B\n")
+        with mock.patch.object(gb, "publish_parked", side_effect=OSError(28, "No space left on device")):
+            lane.drain()
+        self.assertEqual(len([p for p in (lane.results / "undelivered").glob("proactive-1-*")
+                              if p.read_bytes() == b"UNSENT B\n"]), 1, "the copy exists")
+        self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", "UNSENT B")), "absent")
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._parked_once(lane, b"UNSENT B\n")
+        self._release_and_send_once(lane, b"UNSENT B\n")
+
+    def test_a_parked_record_that_exists_before_its_copy_is_completed_by_a_later_drain(self):
+        """Partial order (b): the item is already born PARKED before its copy and bookkeeping exist."""
+        lane, root, a_id, write, hidden = self._held_original("DELIVERED")
+        lane.restart()
+        with mock.patch.object(gb, "RESULTS_DIR", lane.results):
+            envelope = gb._proactive_envelope("proactive-1.txt", "UNSENT B\n", None, "UNSENT B")
+        self.assertEqual(outbox.publish_parked(root, gb._proactive_item_id("proactive-1", "UNSENT B"),
+                                               json.dumps(envelope, sort_keys=True), gb._UNCONFIRMED),
+                         outbox.BornParked.CREATED)
+        write(b"UNSENT B\n")
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._parked_once(lane, b"UNSENT B\n")
+        self._release_and_send_once(lane, b"UNSENT B\n")
+
+    def test_two_drainers_parking_one_generation_converge(self):
+        """A second drainer runs its whole reconcile while the first is between its copy and its PARKED
+        record, through the production shared writer: one copy, one PARKED item, no post."""
+        lane, root, a_id, write, hidden = self._held_original("PARKED")
+        lane.restart()
+        write(b"UNSENT B\n")
+        retained = self._retained(lane)
+        real, outcomes = outbox.publish_parked, []
+
+        def recorded(*a, **k):
+            out = real(*a, **k)
+            outcomes.append(out)
+            return out
+
+        def first_pauses(*a, **k):
+            if not outcomes:
+                with mock.patch.object(gb, "publish_parked", recorded):
+                    gb._reconcile_decided(retained)  # the second drainer, start to finish
+            return recorded(*a, **k)
+        with mock.patch.object(gb, "publish_parked", first_pauses):
+            lane.drain()
+        self.assertEqual(outcomes, [outbox.BornParked.CREATED, outbox.BornParked.ALREADY_PARKED])
+        for _ in range(2):
+            lane.drain()
+        self.assertEqual(lane.posts, [])
+        self._parked_once(lane, b"UNSENT B\n")
+        self._release_and_send_once(lane, b"UNSENT B\n")
+
+    def test_a_dead_owners_snapshot_is_owned_before_it_is_decided(self):
+        """Finding 1: a competing drainer that moves the dead owner's snapshot live at the moment it is
+        decided, and has a newer C published over it, cannot make B vanish."""
+        lane = Lane(gb, scratch("gw-snapshot-race-"))
+        dead = lane.results / f"proactive-1.sending.{_dead_pid()}.s1"
+        dead.write_text("UNSENT B\n")
+        real, raced = gb._decide_orphan_claim, []
+
+        def competitor_first(c):
+            if not raced:
+                raced.append(True)
+                if dead.exists():
+                    os.rename(dead, lane.results / "proactive-1.txt")
+                    __import__("ag2_sparrow.result_publish", fromlist=["x"]).publish_text(
+                        lane.results / "proactive-1.txt", "NEWER C\n")
+            return real(c)
+        with mock.patch.object(gb, "_decide_orphan_claim", competitor_first):
+            lane.drain()
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual([p.get("body") for p in lane.posts].count("UNSENT B"), 1, "B is never lost")
 
     def test_an_unchanged_retained_original_costs_a_drain_only_a_stat(self):
         lane = Lane(gb, scratch("gw-decided-cost-"))
@@ -1204,8 +1240,8 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
             self.assertEqual(hidden.read_text(), "UNSENT B\n", f"the reaper left {hidden.name}")
         self.assertFalse(ask.drained(res, "proactive-1.txt"), "pending-questions reads it as not yet drained")
         self.lane.drain()
-        self.assertEqual([p.get("body") for p in self.lane.posts], ["UNSENT B"],
-                         "the retained original's new bytes go out once, from a snapshot")
+        self.assertEqual(self.lane.posts, [], "the retained original's new bytes are parked, never sent")
+        self.assertEqual([p.read_text() for p in gb._owned(res / "undelivered", "proactive-1")], ["UNSENT B\n"])
         self.assertEqual(staged.read_text(), "UNSENT B\n", "a live owner's claim is left alone")
 
     def test_a_parked_claim_goes_back_live_only_on_a_requeues_own_transition(self):
@@ -1299,19 +1335,6 @@ class DecidedClaimEdges(unittest.TestCase):
         gb._reconcile_decided(r)
         self.assertTrue(r.is_dir())
 
-    def test_new_bytes_are_published_as_a_snapshot_even_when_they_cannot_be_recorded(self):
-        r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-e0.1"
-        r.write_text("new bytes\n")
-        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", side_effect=OSError(5, "EIO")):
-            gb._reconcile_decided(r)
-        self.assertEqual(r.read_text(), "new bytes\n", "the original stays where it is")
-        claims = [c for c in self.res.glob("proactive-1.sending.*")]
-        self.assertEqual([c.read_text() for c in claims], ["new bytes\n"], "its bytes went out as a snapshot")
-        self.assertNotEqual(os.lstat(claims[0]).st_ino, os.lstat(r).st_ino)
-        self.assertTrue(gb._reconcile_decided(r), "the pending snapshot is decided again; the copy is found")
-        copies = [p for p in [*self.res.glob("proactive-1.sending.*"), self.res / "proactive-1.txt"] if p.exists()]
-        self.assertEqual([p.read_text() for p in copies], ["new bytes\n"], "nothing is published twice")
-
     def test_a_requeue_is_not_handed_back_over_a_newer_live_file(self):
         r = self.retained(b"body\n")
         (self.res / "proactive-1.txt").write_text("a newer body\n")
@@ -1342,7 +1365,9 @@ class DecidedClaimEdges(unittest.TestCase):
         self.assertFalse((self.res / "proactive-1.txt").exists())
         self.assertTrue(r.exists(), "the decision epoch is not advanced")
 
-    def test_a_copy_that_cannot_be_placed_leaves_the_claim(self):
+    def test_a_copy_that_cannot_be_placed_is_completed_by_a_later_reconcile(self):
+        """The claim is retained first; when its copy cannot be placed, the retained original's next
+        reconcile places it. Nothing is ever sent and the claim never goes back live."""
         item = gb._proactive_item_id("proactive-1", "parked body")
         outbox._write_item(self.root, item, {"item_id": item, "status": "PARKED", "attempts": 0,
                                              "payload": "parked body\n"})
@@ -1350,8 +1375,13 @@ class DecidedClaimEdges(unittest.TestCase):
         claim.write_text("parked body\n")
         with mock.patch.object(gb, "_publish_text_whole", side_effect=OSError(28, "No space left on device")):
             gb._recover_orphan_proactive()
-        self.assertEqual(claim.read_text(), "parked body\n")
-        self.assertEqual(list((self.res / "undelivered").glob("proactive-1-*")), [], "nothing parked")
+        self.assertFalse(claim.exists(), "retained, not left a claim")
+        self.assertEqual(list((self.res / "undelivered").glob("proactive-1-*")), [], "nothing placed yet")
+        (r,) = self.res.glob(".proactive-1.decided-*")
+        self.assertTrue(gb._reconcile_decided(r))
+        self.assertEqual([p.read_text() for p in gb._owned(self.res / "undelivered", "proactive-1")],
+                         ["parked body\n"], "placed by the reconcile")
+        self.assertFalse((self.res / "proactive-1.txt").exists())
 
     def test_a_superseded_copy_needs_the_claims_own_bytes(self):
         claim = self.res / "proactive-1.sending.1.1"

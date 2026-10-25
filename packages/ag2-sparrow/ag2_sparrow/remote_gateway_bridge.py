@@ -319,7 +319,7 @@ from . import __version__ as _PACKAGE_VERSION
 from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
 from .outbox import RetrySchedule, delivered_body_differs, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome
-from .outbox import receipt
+from .outbox import BornParked, publish_parked, receipt
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -330,7 +330,7 @@ from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_r
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
-                           ready_body_of, ResultIdentity, SETTLE_SEC)
+                           ready_body_of, ResultIdentity)
 from . import result_disposal as disposal
 from .result_publish import (is_staged_for as _is_staged_for, publish_staged as _publish_staged_whole,
                              publish_text as _publish_text_whole, stage_text as _stage_text)
@@ -5741,33 +5741,37 @@ _DECIDED_RE = re.compile(r"\.(?P<stem>proactive-.+)\.decided-(?P<digest>[0-9a-f]
 
 def _move_decided(claim: Path, stem: str, generation: "str | None", epoch: "int | None",
                   receipt: str) -> "Path | None":
-    """Place a terminal claim as the exact bytes its receipt was read for. Those bytes go to a
-    fresh private file that alone is renamed into the delivered or parked namespace, so a writer
-    holding the claim's descriptor can never reach it. The claim's own inode is then retained
-    under `.<stem>.decided-<digest>-e<epoch>.<ns>`, which every restart reconciles. Returns the
-    placed (or already placed) file, else None."""
+    """Place a terminal claim as the exact bytes its receipt was read for. The claim's own inode is
+    first retained under `.<stem>.decided-<digest>-e<epoch>.<ns>`, which the reconciler watches, so
+    from then on nothing its writer does can reach a live name; then those bytes go to a fresh private
+    file in the delivered or parked namespace. A crash between leaves the retained original, whose
+    reconcile completes the placement. Returns the placed (or already placed) file, else None."""
     data = _read_claim_bytes(claim)
     if data is None or generation is None or hashlib.sha256(data).hexdigest() != generation:
         _log(f"proactive claim {claim.name} changed after its receipt was read; kept as its claim, "
              "decided again from its own receipt on the next restart")
         return None
-    placed = _placed_copy(stem, data, receipt)
-    if placed is None:
-        if receipt == "DELIVERED":
-            dest = claim.with_name(f".{stem}{_DELIVERED_INFIX}{time.time_ns()}")
-        else:
-            dest = undelivered_quarantine.quarantine_dir(RESULTS_DIR) / undelivered_quarantine.quarantine_name(stem)
-        if not _place_snapshot(data, dest, stem):
-            return None
-        placed = dest
     retained = claim.with_name(f".{stem}{_DECIDED_INFIX}{generation[:32]}-e"
                                f"{'x' if epoch is None else epoch}.{time.time_ns()}")
     try:
         undelivered_quarantine.rename_noreplace(claim, retained)
-    except OSError as e:  # still a claim: the next restart finds its copy placed and only retains it
-        _log(f"proactive claim {claim.name} was {receipt.lower()} as {placed.name} but could not be retained "
-             f"({diagnostics.describe(e)}); kept as its claim")
-    return placed
+    except OSError as e:
+        _log(f"proactive claim {claim.name} could not be retained ({diagnostics.describe(e)}); kept as its "
+             "claim, decided again on the next restart")
+        return None
+    return _ensure_placed(stem, data, receipt)
+
+
+def _ensure_placed(stem: str, data: bytes, receipt: str) -> "Path | None":
+    """The copy of a terminal generation's exact bytes in its namespace: the existing one, else new."""
+    placed = _placed_copy(stem, data, receipt)
+    if placed is not None:
+        return placed
+    if receipt == "DELIVERED":
+        dest = RESULTS_DIR / f".{stem}{_DELIVERED_INFIX}{time.time_ns()}"
+    else:
+        dest = undelivered_quarantine.quarantine_dir(RESULTS_DIR) / undelivered_quarantine.quarantine_name(stem)
+    return dest if _place_snapshot(data, dest, stem) else None
 
 
 def _placed_copy(stem: str, data: bytes, receipt: str) -> "Path | None":
@@ -5820,10 +5824,11 @@ def _reconcile_changed_decided() -> None:
 
 def _reconcile_decided(retained: Path) -> bool:
     """A decided claim's retained original, on every restart and on each drain that sees it change.
-    The original stays hidden for good: bytes in it that are new since last recorded are published
-    as a private snapshot claim and decided from their own receipt; the same bytes go back live
-    only once the item reads QUEUED at a resend epoch above the one the decision recorded.
-    True once settled; False when a step failed and must be tried again."""
+    The original stays hidden for good and is never sent. Bytes in it that are new since last
+    recorded cannot be told complete (its writer may only have paused), so each such generation is
+    parked for the owner (`_park_generation`); an operator's digest-pinned requeue is the only way it
+    is sent. The recorded bytes go back live only once the item reads QUEUED at a resend epoch above
+    the one the decision recorded. True once settled; False when a step failed and must be retried."""
     m = _DECIDED_RE.fullmatch(retained.name)
     if m is None:
         return True  # not a name this reconciler owns
@@ -5834,33 +5839,27 @@ def _reconcile_decided(retained: Path) -> bool:
                      f"proactive {retained.name} or its outbox record cannot be read; retried")
         return False
     if generation[:32] != m.group("digest"):
-        if not _retained_settled(retained, generation):
-            return False  # a writer may still be filling it: read again next drain
         data = _read_claim_bytes(retained)
         if data is None or hashlib.sha256(data).hexdigest() != generation:
-            return False  # still being written: the next pass reads it again
-        claim = None
-        if state not in ("DELIVERED", "PARKED"):  # terminal: its own item already owns these bytes
-            claim = _take_matching_snapshot(stem, data)  # owned through the commit below, never only probed
-            if claim is None:
-                claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{_SNAPSHOT_MARK}{time.time_ns()}"
-                if not _place_snapshot(data, claim, stem):
-                    return False
-        recorded = True
-        try:  # recorded only once its snapshot exists: a crash between re-finds that copy
-            undelivered_quarantine.rename_noreplace(
-                retained, retained.with_name(f".{stem}{_DECIDED_INFIX}{generation[:32]}-ex.{ns}"))
+            return False  # changed under the read: the next pass reads it again
+        parked_epoch = _park_generation(stem, data, state)
+        if parked_epoch is False:
+            return False
+        try:  # recorded only once its parked copy and PARKED record are durable
+            undelivered_quarantine.rename_noreplace(retained, retained.with_name(
+                f".{stem}{_DECIDED_INFIX}{generation[:32]}-e{'x' if parked_epoch is None else parked_epoch}.{ns}"))
         except OSError as e:
-            recorded = False
             _log_backoff(("proactive-decided", retained.name),
                          f"proactive {retained.name} changed but its new bytes could not be recorded "
                          f"({diagnostics.describe(e)})")
-        if claim is not None:
-            _log(f"proactive {retained.name} holds new bytes; published as {claim.name} and decided")
-            _decide_orphan_claim(claim)
-        return recorded
+            return False
+        return True
     decided = None if m.group("epoch") == "x" else int(m.group("epoch"))
     if not (state == "QUEUED" and decided is not None and epoch_now is not None and epoch_now > decided):
+        if state in ("DELIVERED", "PARKED") and _placed_copy(stem, _read_claim_bytes(retained) or b"", state) is None:
+            data = _read_claim_bytes(retained)  # a crash after retaining, before placing: complete it
+            return data is not None and hashlib.sha256(data).hexdigest() == generation and \
+                _ensure_placed(stem, data, state) is not None
         return True
     data = _read_claim_bytes(retained)
     if data is None or hashlib.sha256(data).hexdigest() != generation or not _hand_back_decided(stem, data):
@@ -5872,20 +5871,66 @@ def _reconcile_decided(retained: Path) -> bool:
     return True
 
 
+_UNCONFIRMED = "unconfirmed-generation"
+
+
+def _park_generation(stem: str, data: bytes, state: str) -> "int | None | bool":
+    """Park one observed generation of a retained original for the owner: an immutable copy in
+    undelivered/, then its outbox item born PARKED (`outbox.publish_parked`), never live first. The
+    resend epoch the decision records when parked; None when there is nothing of ours to park (no
+    body, or its item already exists in a live or delivered state); False when not done yet."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    route, room_override, routed_body = _proactive_route(text)
+    body = routed_body.strip() if route == "send" else ""
+    if not body or state in ("DELIVERED", "QUEUED", "READY", "CLAIMED"):
+        return None
+    envelope = _proactive_envelope(f"{stem}.txt", text, room_override, body)
+    if not envelope.get("room_id"):
+        return False  # no destination resolved yet: retried
+    copy = _park_intent_copy(stem, data)
+    if copy is None:
+        return False
+    root, item_id = _proactive_outbox_root(), _proactive_item_id(stem, body)
+    try:
+        outcome = publish_parked(root, item_id, json.dumps(envelope, sort_keys=True), _UNCONFIRMED,
+                                 source_ready_sha256=source_digest(body))
+    except OSError as e:
+        _log_backoff(("proactive-park-generation", item_id), f"proactive {stem}: a changed generation "
+                     f"could not be parked ({diagnostics.describe(e)}); retried")
+        return False
+    if outcome is not BornParked.EXISTS:
+        _log_backoff(("proactive-parked-generation", item_id),
+                     f"proactive {stem}: a retained original changed after it was decided; its new bytes "
+                     f"were parked as {copy.name}, not sent. To send them: "
+                     f"{_proactive_requeue_command(root, item_id, hashlib.sha256(data).hexdigest())}")
+    after = receipt(root, item_id)
+    return after[1] if after[0] == "PARKED" else None
+
+
+def _park_intent_copy(stem: str, data: bytes) -> "Path | None":
+    """These exact bytes as an immutable file in undelivered/: an existing identical copy, else a new
+    one published without replacing. Its name derives from their digest, so writers converge on it."""
+    existing = _placed_copy(stem, data, "PARKED")
+    if existing is not None:
+        return existing
+    base = int(hashlib.sha256(data).hexdigest()[:15], 16)
+    quarantine = undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+    for i in range(64):
+        dest = quarantine / f"{stem}-{base + i}.txt"
+        if not os.path.lexists(dest) and _place_snapshot(data, dest, stem):
+            return dest
+        if _read_claim_bytes(dest) == data:
+            return dest  # another writer placed the same bytes here first
+    return None
+
+
 _SNAPSHOT_MARK = "s"
 
 
 _SNAPSHOT_RE = re.compile(r"(?P<stem>proactive-.+)\.sending\.(?P<pid>\d+)\.s\d+")
-_DECIDED_SETTLE_SEC = SETTLE_SEC
-
-
-def _retained_settled(retained: Path, generation: str) -> bool:
-    """A retained original's new bytes are taken only once ready (non-empty, unchanged under the
-    read, per result_ready) and older than SETTLE_SEC: its writer never publishes whole."""
-    ready = read_ready_result_with_identity(retained)
-    if ready is None or ready.identity.digest != generation:
-        return False
-    return time.time() - ready.identity.mtime_ns / 1e9 >= _DECIDED_SETTLE_SEC
 
 
 def _retry_pending_snapshots() -> None:
@@ -5917,22 +5962,6 @@ def _take_snapshot(c: Path) -> "Path | None":
         return mine
     except OSError:
         return None
-
-
-def _take_matching_snapshot(stem: str, data: bytes) -> "Path | None":
-    """A snapshot claim of exactly these bytes for `stem`, now owned by this process; None if there is
-    none we could take. A live other process's is left alone."""
-    for c in RESULTS_DIR.glob(f"{glob.escape(stem)}.sending.*.s*"):
-        m = _SNAPSHOT_RE.fullmatch(c.name)
-        if m is None or m.group("stem") != stem or _read_claim_bytes(c) != data:
-            continue
-        pid = int(m.group("pid"))
-        if pid != os.getpid() and _pid_alive(pid):
-            continue
-        taken = _take_snapshot(c)
-        if taken is not None and _read_claim_bytes(taken) == data:
-            return taken
-    return None
 
 
 def _retained_item(retained: Path) -> "str | None":
@@ -6270,15 +6299,20 @@ def _post_proactive() -> None:
                  "— dead-lettering, it can never be delivered")
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
-        dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
-        thread_root = _proactive_thread_root(claimed_text, f.name)
-        about = about_task(f.name)
-        if about:
-            thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
-        envelope = {"room_id": dest_room, "body": body,
-                    **({"thread_root": thread_root} if thread_root else {}),
-                    **({"task_id": about} if about else {})}
+        envelope = _proactive_envelope(f.name, claimed_text, room_override, body)
         _send_proactive(claim, f, envelope, room_override is None, noticed)
+
+
+def _proactive_envelope(name: str, text: str, room_override, body: str) -> dict:
+    """The outbox payload a proactive file named `name` is sent as: its room, thread and task."""
+    dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+    thread_root = _proactive_thread_root(text, name)
+    about = about_task(name)
+    if about:
+        thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
+    return {"room_id": dest_room, "body": body,
+            **({"thread_root": thread_root} if thread_root else {}),
+            **({"task_id": about} if about else {})}
 
 
 def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
