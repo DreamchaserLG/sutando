@@ -61,6 +61,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import io
 import http.client
 import json
 import os
@@ -931,11 +932,14 @@ def _stale_review_write(path: Path, step: str) -> None:
 _DEFINITE_PUBLISH_FAILURES = ("permanent-refusal", "max-attempts", "retry-window-exhausted")
 
 
-def _post_room_message(room: str, body: str, dedupe_key: str, thread_root: "str | None" = None) -> dict:
-    """The room-message send for an outbox provider: one /v1/room message POST."""
+def _post_room_message(room: str, body: str, dedupe_key: str, thread_root: "str | None" = None,
+                       deadline: "float | None" = None) -> dict:
+    """The room-message send for an outbox provider: one /v1/room message POST, done by
+    `deadline` (time.monotonic()) when one is given."""
     return _req("POST", "/v1/room", {"op": "message", "room_id": room, "body": body,
                                      "dedupe_key": dedupe_key,
-                                     **({"thread_root": thread_root} if thread_root else {})}, timeout=20)
+                                     **({"thread_root": thread_root} if thread_root else {})}, timeout=20,
+                **({"deadline": deadline} if deadline is not None else {}))
 
 
 def _record_release_receipt(item_id: str, event_id: str) -> None:
@@ -2672,15 +2676,18 @@ _RESP_META = threading.local()
 def _read_by(resp, deadline: float) -> bytes:
     """The body, read in chunks against a wall-clock deadline: urllib's timeout bounds each
     socket operation, so a body that drips in could otherwise run on past it."""
-    sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
     chunks = []
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError("response body still arriving at its deadline")
+        # Looked up each pass: the response drops its socket once the last byte is read.
+        sock = getattr(getattr(getattr(resp, "fp", None), "raw", None), "_sock", None)
         if sock is not None:
-            sock.settimeout(left)
-        chunk = resp.read(4096)
+            with contextlib.suppress(OSError):
+                sock.settimeout(left)
+        # read1 returns what one socket read gave; read(n) would wait for all n bytes.
+        chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -2704,20 +2711,77 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         req.add_header("User-Agent", "sutando-gateway-client/1.0")
         if data is not None:
             req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            headers = getattr(resp, "headers", None) or {}
-            _RESP_META.last = {"status": getattr(resp, "status", None),
-                               "content_length": headers.get("Content-Length"),
-                               "cf_ray": headers.get("CF-Ray")}
-            raw = (resp.read() if deadline is None else _read_by(resp, deadline)).decode().strip()
-            return json.loads(raw) if raw else {}
+        if deadline is None:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return _parse_response(resp, resp.read())
+        # The deadline covers every phase (status, headers, body, an error's body): at it, a
+        # timer shuts down the request's socket, which ends whatever read is blocked on it.
+        socks: "list[socket.socket]" = []
+
+        def recorded(base):
+            class Recorded(base):
+                def __init__(self, *a, **k):
+                    super().__init__(*a, **k)
+                    create = self._create_connection
+
+                    def made(*ca, **ck):
+                        socks.append(create(*ca, **ck))
+                        return socks[-1]
+                    self._create_connection = made
+            return Recorded
+
+        class Http(urllib.request.HTTPHandler):
+            def http_open(self, r):
+                return self.do_open(recorded(http.client.HTTPConnection), r)
+
+        class Https(urllib.request.HTTPSHandler):
+            def https_open(self, r):
+                return self.do_open(recorded(http.client.HTTPSConnection), r, context=self._context)
+        cut = threading.Timer(max(0.0, deadline - time.monotonic()), _shut_sockets, (socks,))
+        cut.daemon = True
+        cut.start()
+        try:
+            try:
+                opened = urllib.request.build_opener(Http, Https).open(req, timeout=timeout)
+            except urllib.error.HTTPError as e:
+                # A buffer, not bytes: gateway_call's scrub keeps objects and empties bytes.
+                try:
+                    e.sparrow_body = io.BytesIO(e.read() or b"")
+                except Exception:  # noqa: BLE001 - a cut or broken error body reads as empty
+                    e.sparrow_body = io.BytesIO()
+                raise
+            with opened as resp:
+                return _parse_response(resp, _read_by(resp, deadline))
+        except (OSError, http.client.HTTPException) as e:
+            if time.monotonic() >= deadline and not isinstance(e, urllib.error.HTTPError):
+                raise TimeoutError("request still unfinished at its deadline") from None
+            raise
+        finally:
+            cut.cancel()
+
+
+def _shut_sockets(socks) -> None:
+    for sock in list(socks):
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+
+
+def _parse_response(resp, body: bytes):
+    headers = getattr(resp, "headers", None) or {}
+    _RESP_META.last = {"status": getattr(resp, "status", None),
+                       "content_length": headers.get("Content-Length"),
+                       "cf_ray": headers.get("CF-Ray")}
+    raw = body.decode().strip()
+    return json.loads(raw) if raw else {}
 
 
 def _http_error_body(e) -> str:
     """Best-effort read of an HTTPError's response body, for content-sniffing a
-    per-task answer vs an endpoint-unsupported one. Never raises."""
+    per-task answer vs an endpoint-unsupported one. Never raises. A deadline-bound request has
+    already read it within its deadline."""
     try:
-        return (e.read() or b"").decode("utf-8", "replace")
+        body = getattr(e, "sparrow_body", None)
+        return (body.getvalue() if body is not None else (e.read() or b"")).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
 
@@ -6079,7 +6143,9 @@ def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: 
     """The proactive lane's sender: one room message POST, read for the two refusals the drain
     handles itself. Both are definite non-deliveries, so neither is ever parked as uncertain."""
     try:
-        return _post_room_message(room, body, dedupe_key, thread_root)
+        # Sent under the send lock producers wait on, so the whole request is bounded.
+        return _post_room_message(room, body, dedupe_key, thread_root,
+                                  time.monotonic() + _delivery_destination.SEND_DEADLINE_S)
     except urllib.error.HTTPError as e:
         seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
         if e.code in (401, 403):

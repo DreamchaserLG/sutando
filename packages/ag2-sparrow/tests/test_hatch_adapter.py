@@ -4422,6 +4422,108 @@ class Hold(Base):
                 inode = inode or lock.stat().st_ino
                 self.assertEqual(lock.stat().st_ino, inode, "one lock file, never recreated")
                 self.result_file.write_text("done")  # answered: the next pass leaves this line alone
+    def test_the_send_has_a_wall_clock_deadline_and_releases_the_lock(self):
+        import http.server
+        dribbled = threading.Event()
+
+        class Dribble(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(40):  # about 8 s, each byte inside the socket timeout
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                    time.sleep(0.2)
+                dribbled.set()
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Dribble)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=f"http://127.0.0.1:{server.server_address[1]}")
+        self.assertLess(time.monotonic() - started, 4.0, "a dribbling body cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed",
+                         "an unfinished send is parked as uncertain, never resent")
+
+    def test_the_deadline_covers_slow_headers(self):
+        import http.server
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowHeaders)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=url)
+        self.assertLess(time.monotonic() - started, 3.0, "headers arriving slowly cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed",
+                         "an unfinished send is parked as uncertain, never resent")
+
+    def test_the_deadline_covers_an_error_body(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class SlowError(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+        url = self.gateway(SlowError)
+        started = time.monotonic()
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
+                        deadline=time.monotonic() + 0.5)
+            gb._http_error_body(caught.exception)
+        self.assertLess(time.monotonic() - started, 2.0, "an error body arriving slowly is cut at the deadline")
+
+    def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class Upgraded(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"reason": "room_upgraded", "replacement_room": "!new:ag2.space"}')
+        url = self.gateway(Upgraded)
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15, deadline=time.monotonic() + 5)
+        self.assertEqual(gb._room_upgraded_to(gb._http_error_body(caught.exception)), "!new:ag2.space")
+
     def test_an_answered_item_is_not_held(self):
         self.add_task(self.TID, "$ev1")
         self.result_file.write_text("done\n")

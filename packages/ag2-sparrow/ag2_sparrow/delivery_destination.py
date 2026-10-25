@@ -34,6 +34,8 @@ SEND_LOCK_DIR = ".proactive-send-lock"
 # The protocol a drain that sends under send_lock publishes in its lane record; a producer relying
 # on it refuses to act for a live drain without it.
 SEND_LOCK_PROTOCOL = 2
+# The drain's whole send under the send lock, every phase included.
+SEND_DEADLINE_S = 15.0
 # The longest a producer waits for the send lock, above the drain's longest send under it; the
 # drain waits briefly and hands the file back.
 PRODUCER_LOCK_WAIT_S = 30.0
