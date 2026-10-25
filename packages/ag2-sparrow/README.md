@@ -281,16 +281,24 @@ lock's holder, when a lock is held), and its timestamp is under 30 seconds old (
 cannot write its state directory) `hold` exits 3: "can't confirm the room is deliverable yet". Exit 3 means the hold is not recorded, so the task still reads
 `task-not-picked-up`; running `hold` again records it when it can. The item's result_file
 stays free for the real answer, and `reply` withdraws a hold line that is
-still queued and ends the hold. A line the drain has already claimed is withdrawn
-with a `<stem>.withdrawn` sentinel. Both sides take the results dir's send lock (the
-fixed file `.proactive-send-lock/lock`, never unlinked, so every process and restart locks
-one inode), and acquiring it is the linearization point. If `reply` acquires first, it
-withdraws the line and the drain then sends nothing. If the drain acquires first, it holds
-the lock from its sentinel check through the send and its settlement (receipt, archive,
-retry or park); `reply` waits, then reports that outcome on stderr ("already posted",
-"withdrawn" when a failed send was handed back, "parked unsent", or "unconfirmed") instead
-of claiming a withdrawal. The remaining boundary is that one: once the drain has won
-serialization and begun the send transaction, the line goes out ahead of the answer. For a sender who is not the owner, the
+still queued and ends the hold. `hold`'s commit (its settled check, the line's publication and the marker), `reply`'s
+commit (the line's withdrawal and the answer) and the drain's send (its withdrawal check, the
+POST and the send's settlement) each run under the results dir's send lock: the fixed file
+`.proactive-send-lock/lock`, never unlinked, so every process and restart locks one inode.
+Acquiring it is the linearization point, so no hold line is published or sent after an answer.
+A claimed line is withdrawn with a `<stem>.withdrawn` sentinel, which stays until the drain has
+actually retired the line. `reply` reports where the line stood on stderr: withdrawn before any
+send; withdrawn, but an earlier send has an unknown outcome (a 2xx with no event id, a 5xx, a
+timeout or a transport failure: the room may show it); already posted; parked unsent; or
+unconfirmed. The drain counts each begun send durably (`.proactive-attempts/<stem>`), so its
+retry budget is not reset by a restart, and bounds each send by a 15-second wall-clock
+deadline that also covers a body arriving slowly. A producer waits at most 30 seconds for the
+lock and then writes nothing (`hold` exits 3, `reply` exits 2: run it again); the drain waits 2
+seconds and hands the line back unsent. The remaining boundary: once the drain has won the lock
+and begun its send, the line goes out ahead of the answer. Upgrade fence: a drain that honours
+the lock declares it in its lane record (`send_lock`). `hold` refuses while the live Sparrow does
+not (exit 3, the task still reads `task-not-picked-up`), and `keepalive keepawake` restarts such
+a Sparrow, through the user service when one runs it. For a sender who is not the owner, the
 note itself states the limits (no irreversible actions, configuration changes,
 credential use, private owner context or sends to other rooms; reply only in
 the room; go/no-go goes to the owner), so they do not depend on the worker

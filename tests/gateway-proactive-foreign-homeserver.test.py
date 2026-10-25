@@ -65,7 +65,7 @@ def lane(identity: str, tmp: Path, posts: list, fail_post: bool = False):
     """Run ONE _post_proactive pass as a lane whose enrolled identity is `identity`.
     Every POST attempt is recorded BEFORE it is allowed to fail: a lane that claims
     a room it cannot deliver to shows up here as an attempt, not as silence."""
-    def _fake_req(method, path, payload=None, timeout=None):
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
         if method == "POST":
             posts.append({"path": path, "payload": payload, "identity": identity})
             if fail_post:

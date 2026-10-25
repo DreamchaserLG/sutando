@@ -107,7 +107,7 @@ calls = []
 fail_edits = [False]
 
 
-def fake_req(method, path, payload=None, timeout=35):
+def fake_req(method, path, payload=None, timeout=35, **_kw):
     with lock:
         calls.append((method, path, payload))
         n = len(calls)
@@ -531,7 +531,7 @@ patched = {name: getattr(bridge, name) for name in (
     "_push_pool_advertisement", "refresh_routing")}
 
 
-def beat_req(method, url, payload=None, timeout=35):
+def beat_req(method, url, payload=None, timeout=35, **_kw):
     if url.startswith("/v1/tasks?wait="):
         return {"tasks": [{"id": "task-after-retire-error", "task": "hello",
                            "channel_id": SHARED, "user_id": OWNER}]}
@@ -609,7 +609,7 @@ path = guard.withheld_review_path(bridge._STATE, "task-cas")
 stage = {}
 
 
-def router_race_req(method, url, payload=None, timeout=35):
+def router_race_req(method, url, payload=None, timeout=35, **_kw):
     if ("paused" not in stage and url == "/v1/room" and payload.get("op") == "message"
             and payload.get("room_id") == DM):
         stage["paused"] = True
@@ -729,7 +729,7 @@ path, rid = new_review("task-post-landed")
 claimed = dict(guard.claim_withheld_decision(path, dict(NO)))
 
 
-def post_race_req(method, url, payload=None, timeout=35):
+def post_race_req(method, url, payload=None, timeout=35, **_kw):
     if url == "/v1/room" and payload.get("room_id") == SHARED and "resolved" not in stage:
         stage["resolved"] = bridge._resolve_review_card(path, json.loads(path.read_text()))
     return fake_req(method, url, payload, timeout)
@@ -757,7 +757,7 @@ claimed = dict(guard.claim_withheld_decision(path, dict(NO)))
 archived = path.parent / "archive" / path.name
 
 
-def post_archive_req(method, url, payload=None, timeout=35):
+def post_archive_req(method, url, payload=None, timeout=35, **_kw):
     if url == "/v1/room" and payload.get("room_id") == SHARED and not archived.exists():
         archived.parent.mkdir(exist_ok=True)
         archived.write_text(json.dumps({**claimed, "status": "published",
@@ -784,7 +784,7 @@ path, rid = new_review("task-post-published")
 claimed = dict(guard.claim_withheld_decision(path, dict(NO)))
 
 
-def post_published_req(method, url, payload=None, timeout=35):
+def post_published_req(method, url, payload=None, timeout=35, **_kw):
     if url == "/v1/room" and payload.get("room_id") == SHARED and "other" not in stage:
         current = json.loads(path.read_text())
         stage["other"] = guard.update_record(
@@ -894,7 +894,7 @@ polls = [[decision("Yes", rid, "later-yes")], [decision("No", rid, "later-no")]]
 chat, alive = [], [True, True, False]
 
 
-def poll_req(method, url, payload=None, timeout=35):
+def poll_req(method, url, payload=None, timeout=35, **_kw):
     if url.startswith("/v1/tasks?wait="):
         return {"tasks": polls.pop(0) if polls else []}
     return fake_req(method, url, payload, timeout)
@@ -1114,7 +1114,7 @@ def release(label, answer_for_room):
     path, rid = new_review(f"task-outbox-{label}")
     claimed = dict(guard.claim_withheld_decision(path, dict(NO)))
 
-    def room_req(method, url, payload=None, timeout=35):
+    def room_req(method, url, payload=None, timeout=35, **_kw):
         if url == "/v1/room" and (payload or {}).get("room_id") == SHARED:
             calls.append((method, url, payload))
             return answer_for_room()

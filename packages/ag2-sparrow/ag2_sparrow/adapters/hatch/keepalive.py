@@ -28,7 +28,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, agent_identity, diagnostics, task_hold
+from ... import _dirs, agent_identity, delivery_destination, diagnostics, task_hold
 from ...persisted_number import bounded_number
 from . import cli as _cli, task_fields
 
@@ -47,6 +47,8 @@ TASK_HELD = "task-held-for-owner"
 TASK_HELD_UNDELIVERED, HELD_LINE_DELIVER_S = "task-held-line-undelivered", 10 * 60
 TASK_HELD_UNCONFIRMED = "task-held-line-unconfirmed"
 NO_HEALTH_COMMAND, UNKNOWN_ENV = "no-health-command", "unknown-env"
+# A running Sparrow from before the send lock: hold refuses for it and keepawake restarts it.
+OLD_DRAIN = "drain-predates-send-lock"
 REASON_HINTS = {
     HOOK_NOT_RUNNING: f"the hook has not run in the last {HOOK_STALE_S // 60} minutes; see "
                       "the hook run line above",
@@ -343,11 +345,23 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def replace_sparrow(cfg: dict, pid: int) -> "tuple[bool, str]":
-    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND, and start one
-    that has it."""
-    print(f"replacing: Sparrow (pid {pid}) runs without "
-          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}")
+def drain_predates_send_lock(cfg: dict) -> "int | None":
+    """The pid of the live Sparrow whose own lane record lacks the send-lock protocol this
+    package's hold and reply rely on: one started before an upgrade. None otherwise, including
+    while no record of that pid exists yet."""
+    state, instance = _state_dir(cfg), _instance(cfg)
+    rec = agent_identity.published_lane_record(state, instance)
+    pid = _cli.live_lock_holder(_cli._lock_record(state, instance))
+    if rec is None or pid is None or rec.get("pid") != pid:
+        return None
+    return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
+
+
+def replace_sparrow(cfg: dict, pid: int, why: str = "") -> "tuple[bool, str]":
+    """Stop Sparrow `pid`, which lacks this install's REMOTE_HEALTH_COMMAND (or `why`), and
+    start one that has it."""
+    print(f"replacing: Sparrow (pid {pid}) " + (why or "runs without "
+          f"REMOTE_HEALTH_COMMAND={health_command(_command(cfg))}"))
     if not _stop(pid):
         return False, f"the old Sparrow (pid {pid}) did not stop"
     ok, how = restart_listener(cfg)
@@ -503,8 +517,16 @@ def keepawake(cfg: dict, log: Path, now: float | None = None) -> int:
             rc = 1
     else:
         pid, reason = unmanaged_health_problem(cfg)
-        if reason == NO_HEALTH_COMMAND:
-            ok, how = replace_sparrow(cfg, pid)
+        old = drain_predates_send_lock(cfg) if reason != NO_HEALTH_COMMAND else None
+        if reason == NO_HEALTH_COMMAND or old is not None:
+            if old is not None:
+                reason = OLD_DRAIN
+                owner = _unit_owner()
+                ok, how = (restart_listener(cfg) if owner in ("ours", UNIT_UNREACHABLE) else
+                           (False, "a hand-made unit runs it; restart that unit") if owner else
+                           replace_sparrow(cfg, old, "predates the hold-line send lock"))
+            else:
+                ok, how = replace_sparrow(cfg, pid)
             if ok:
                 restarted = 1
                 print(f"restarted: {how}")

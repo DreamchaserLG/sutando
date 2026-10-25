@@ -1185,6 +1185,14 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
     return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
 
 
+def _lane_has_send_lock(cfg: dict, instance: str) -> bool:
+    """The live drain's lane record declares the send-lock protocol hold and reply rely on; a
+    drain started from an older package does not, and keepawake replaces it."""
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    rec = agent_identity.published_lane_record(state, instance) or {}
+    return rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL
+
+
 def _lane_homeserver(cfg: dict, instance: str) -> str:
     """The homeserver the live drain of `instance` published; "" when there is none, it is another
     instance's, or its publisher is not that live drain, which `hold` refuses rather than guess."""
@@ -1243,6 +1251,35 @@ def hold(args) -> int:
         print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
               file=sys.stderr)
         return 2
+    if not _lane_has_send_lock(cfg, instance):
+        print(f"NOT confirmed: the running Sparrow predates the hold-line send lock, so a hold line "
+              f"could not be withdrawn once answered; no hold recorded and {tid} still reads "
+              f"task-not-picked-up. {restart_hint()}", file=sys.stderr)
+        return REPLY_UNCONFIRMED
+    try:
+        with delivery_destination.send_lock(result_dir):
+            return _hold_under_lock(result_dir, tid, body)
+    except delivery_destination.SendLockUnavailable as e:
+        print(f"NOT confirmed: the hold-line send lock was not taken ({diagnostics.describe(e)}); "
+              f"no hold recorded and {tid} still reads task-not-picked-up. Run hold again",
+              file=sys.stderr)
+        return REPLY_UNCONFIRMED
+
+
+def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
+    """hold's commit, run under the send lock that reply's commit also takes: no answer can land
+    between its settled check and the line's publication."""
+    try:
+        if task_settled(result_dir, tid):
+            print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
+            return REPLY_NOT_POSTED
+        if task_hold.read(result_dir, tid) is not None:
+            print(f"held: {tid} was already held; nothing posted again")
+            return REPLY_POSTED
+    except (OSError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
     notice = _hold_notice(result_dir, tid)
     # Line first: a crash before the marker leaves the task reading stuck, never silent.
     try:
@@ -1278,7 +1315,11 @@ def hold(args) -> int:
               "still reads task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if task_settled(result_dir, tid):
-        _report_withdrawal(result_dir, tid)
+        try:
+            _note_withdrawal(tid, _withdraw_line_locked(result_dir, tid))
+        except OSError as e:
+            print(f"note: the hold line of {tid} could not be withdrawn ({diagnostics.describe(e)})",
+                  file=sys.stderr)
         _release_quietly(result_dir, tid, token)
         print(f"NOT held: {tid} was answered meanwhile", file=sys.stderr)
         return REPLY_NOT_POSTED
@@ -1286,9 +1327,11 @@ def hold(args) -> int:
     return REPLY_POSTED
 
 
-# What _withdraw_line reports for each outcome; "none" (no line was ever queued) says nothing.
+# What a withdrawal reports for each outcome; "none" (no line was ever queued) says nothing.
 WITHDRAW_NOTES = {
-    "withdrawn": "the hold line of {tid} was withdrawn; it will not post",
+    "withdrawn": "the hold line of {tid} was withdrawn before any send; it will not post",
+    "stopped": "the hold line of {tid} was withdrawn, but an earlier send of it has an unknown "
+               "outcome (the room may already show it); it will not be sent again",
     "posted": "the hold line of {tid} was already posted before this answer",
     "unsent": "the hold line of {tid} was parked unsent; it will not post",
     "unconfirmed": "the hold line of {tid} left the queue before this answer; whether it "
@@ -1296,36 +1339,31 @@ WITHDRAW_NOTES = {
 }
 
 
-def _withdraw_line(result_dir: Path, tid: str) -> str:
-    """Take `tid`'s hold line off the queue under the drain's send lock, and say where it stands:
-    "withdrawn" (it will not post), "posted", "unsent", "unconfirmed", or "none" (never queued).
-    A send that took the lock first is settled before this runs, so its outcome is the one told."""
+def _withdraw_line_locked(result_dir: Path, tid: str) -> str:
+    """Take `tid`'s hold line off the queue and say where it stands; the caller holds the send
+    lock. "withdrawn" or "stopped" (no send of it will begin; "stopped" when one already began
+    with an unknown outcome), "posted", "unsent", "unconfirmed", or "none" (never queued).
+    OSError when a claimed line's sentinel cannot be written: nothing then stops its send."""
     notice = _hold_notice(result_dir, tid)
-    try:
-        with delivery_destination.send_lock(result_dir):
-            queued = notice.exists()
-            notice.unlink(missing_ok=True)
-            if _line_claimed(result_dir, notice):
-                delivery_destination.withdrawn_path(notice).touch()
-                return "withdrawn"
-            if queued:
-                return "withdrawn"
-            if not task_hold.notice_marked(result_dir, tid):
-                return "none"
-            return {"delivered": "posted", "undelivered": "unsent"}.get(
-                hold_line_outcome(result_dir, tid), "unconfirmed")
-    except OSError as e:
-        notice.unlink(missing_ok=True)
-        print(f"note: could not withdraw the hold line of {tid} under the send lock "
-              f"({diagnostics.describe(e)}); a claimed one may still post", file=sys.stderr)
-        return "unconfirmed"
+    begun = delivery_destination.attempts_begun(result_dir, notice.stem)
+    queued = notice.exists()
+    notice.unlink(missing_ok=True)
+    if _line_claimed(result_dir, notice):
+        delivery_destination.withdrawn_path(notice).touch()
+        queued = True
+    if queued:
+        return "withdrawn" if begun == 0 else "stopped"
+    if not task_hold.notice_marked(result_dir, tid):
+        return "none"
+    outcome = hold_line_outcome(result_dir, tid)
+    if outcome == "delivered":
+        return "posted"
+    return "unsent" if outcome == "undelivered" and begun == 0 else "unconfirmed"
 
 
-def _report_withdrawal(result_dir: Path, tid: str) -> str:
-    where = _withdraw_line(result_dir, tid)
+def _note_withdrawal(tid: str, where: str) -> None:
     if where in WITHDRAW_NOTES:
         print("note: " + WITHDRAW_NOTES[where].format(tid=tid), file=sys.stderr)
-    return where
 
 
 def _release_quietly(result_dir: Path, tid: str, token: "str | None" = None) -> None:
@@ -1353,11 +1391,20 @@ def reply(args) -> int:
         print(f"error: {why}", file=sys.stderr)
         return 2
     root = gateway_instance.outbox_root(result_dir, instance)
-    # The answer supersedes its hold line, before the answer itself is queued.
-    _report_withdrawal(result_dir, tid)
-    _prune_claims(result_dir, task_dir)
-    if (not _claim(result_dir, tid) or outbox.item_status(root, item) is not None
-            or not _publish_once(result_file, body)):
+    # One transaction with hold's commit and the drain's send: the hold line is withdrawn and the
+    # answer queued under the send lock, so no line is published or sent after the answer.
+    try:
+        with delivery_destination.send_lock(result_dir):
+            where = _withdraw_line_locked(result_dir, tid)
+            _prune_claims(result_dir, task_dir)
+            committed = (_claim(result_dir, tid) and outbox.item_status(root, item) is None
+                         and _publish_once(result_file, body))
+    except OSError as e:  # SendLockUnavailable included: nothing was written
+        print(f"error: the hold line could not be settled before the answer "
+              f"({diagnostics.describe(e)}); nothing written, run reply again", file=sys.stderr)
+        return 2
+    _note_withdrawal(tid, where)
+    if not committed:
         print(f"NOT posted: {result_file.name} already has a reply or result; nothing written",
               file=sys.stderr)
         return REPLY_NOT_POSTED

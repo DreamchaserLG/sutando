@@ -225,15 +225,17 @@ def _valid_lane(rec: "dict | None", instance: str, now: float) -> "dict | None":
     return {**rec, "agent_id": agent.strip()}
 
 
-def publish_lane(state_dir, instance: str, agent_id: str) -> dict:
+def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None) -> dict:
     """Record, under the lane lock, the identity the live drain of `instance` resolved, so a reader
     that must not open the credential env sees that drain's lane; returns the record written.
-    It holds the id, instance, pid and a timestamp only. On a failed write the old record is
-    invalidated in the same locked step, and OSError is raised either way."""
+    It holds the id, instance, pid, a timestamp and, when given, the proactive `send_lock` protocol
+    the drain honours. On a failed write the old record is invalidated in the same locked step, and
+    OSError is raised either way."""
     if valid_pid(os.getpid()) is None:
         raise OSError(f"pid {os.getpid()} is outside the pid domain readers accept")
     record = {"agent_id": (agent_id or "").strip(), "instance": instance or "",
-              "pid": os.getpid(), "ts": time.time()}
+              "pid": os.getpid(), "ts": time.time(),
+              **({"send_lock": send_lock} if send_lock is not None else {})}
     dfd = _auth_dir(state_dir, create=True)
     try:
         with _lane_locked(dfd, instance):

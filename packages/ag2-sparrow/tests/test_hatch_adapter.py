@@ -21,6 +21,7 @@ import io
 import threading
 import types
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -2254,7 +2255,7 @@ class Keepalive(Base):
         self.addCleanup(receipts.chmod, 0o700)
         posts = []
 
-        def req(method, path, payload=None, timeout=None):
+        def req(method, path, payload=None, timeout=None, **_kw):
             if method == "POST":
                 posts.append(payload)
             return {"ok": True, "event_id": "$evt"}
@@ -2619,6 +2620,43 @@ class StartSparrow(Base):
         self.assertTrue(line.endswith(" listener=up restarted=1 reason=no-health-command"), line)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
         self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def lane_of(self, proc, **extra):
+        (self.state / "auth").mkdir(parents=True, exist_ok=True)
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(
+            {"agent_id": AGENT, "instance": "", "pid": proc.pid, "ts": time.time(), **extra}))
+
+    def test_keepawake_replaces_a_running_sparrow_from_before_the_send_lock(self):
+        old = self.old_sparrow()
+        self.lane_of(old)  # its drain publishes a lane record without the send-lock protocol
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+        self.assertEqual(self.wait_for(self.seen), f"{self.reply_stub} keepalive health")
+
+    def test_keepawake_restarts_the_unit_that_runs_a_sparrow_from_before_the_send_lock(self):
+        log = self.home / "keepalive-probe.log"
+        with mock.patch.object(keepalive, "listener_up", return_value=True), \
+                mock.patch.object(keepalive, "unmanaged_health_problem", return_value=(None, None)), \
+                mock.patch.object(keepalive, "drain_predates_send_lock", return_value=4242), \
+                mock.patch.object(keepalive, "_unit_owner", return_value="ours"), \
+                mock.patch.object(keepalive, "restart_listener", return_value=(True, "unit")) as restart, \
+                mock.patch.object(keepalive, "replace_sparrow") as replace, \
+                mock.patch.object(keepalive, "_refresh_setup"), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(keepalive.keepawake({}, log), 0)
+        restart.assert_called_once()
+        replace.assert_not_called()
+        self.assertTrue(log.read_text().strip().endswith("restarted=1 reason=drain-predates-send-lock"))
+
+    def test_keepawake_leaves_a_sparrow_that_declares_the_send_lock(self):
+        old = self.old_sparrow()
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll())
 
     def test_keepawake_leaves_a_sparrow_it_cannot_read_or_that_has_it(self):
         old = self.old_sparrow()
@@ -3862,6 +3900,7 @@ class Hold(Base):
         self.notice = self.results / f"proactive-hold-{self.TID}.txt"
         self.mxid = AGENT
         self.lane_record = True  # the drain has published its lane, as self.mxid
+        self.send_lock = True  # and declares the send-lock protocol
 
     def env(self):
         env = py_env(self.home)
@@ -3872,7 +3911,8 @@ class Hold(Base):
         (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
         if self.lane_record:
             (auth / "lane-identity.json").write_text(json.dumps(
-                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": time.time()}))
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": time.time(),
+                 **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
         return env
 
     def hold(self, *args, cfg=None, env=None):
@@ -4016,7 +4056,7 @@ class Hold(Base):
                                                              "done", "--wait", "0"], self.env()))
             return ready(path)
 
-        def req(method, path, payload=None, timeout=None):
+        def req(method, path, payload=None, timeout=None, **_kw):
             if method == "POST":
                 posts.append(payload)
             return {"ok": True, "event_id": "$evt"}
@@ -4033,7 +4073,7 @@ class Hold(Base):
         self.assertEqual(len(answers), 1, "the answer landed while the line was claimed")
         self.assertEqual(self.result_file.read_text(), "done", answers[0].stderr)
         self.assertEqual(posts, [], "the claimed line was withdrawn, never posted")
-        self.assertIn("was withdrawn; it will not post", answers[0].stderr)
+        self.assertIn("was withdrawn before any send; it will not post", answers[0].stderr)
         self.assertFalse(list(self.results.glob(f"{self.notice.stem}.sending.*")))
         self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
         self.assertNotEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
@@ -4049,7 +4089,7 @@ class Hold(Base):
                 answers.append(run_main(hatch_cli.main, ["reply", str(self.result_file), "--body",
                                                          "done", "--wait", "0"], self.env()))
 
-        def req(method, path, payload=None, timeout=None):
+        def req(method, path, payload=None, timeout=None, **_kw):
             if method == "POST":
                 # The drain has found no withdrawal and is about to send: the worker answers now.
                 worker = threading.Thread(target=answer)
@@ -4075,17 +4115,199 @@ class Hold(Base):
         self.assertNotIn("withdrawn", answers[0].stderr, "the losing reply never claims a withdrawal")
         self.assertFalse(delivery_destination.withdrawn_path(self.notice).exists())
 
-    def drain_with(self, req):
+    def drain_with(self, req, archive=None, url=None, ready=None):
+        """One real drain pass; `req` stands in for the gateway unless `url` names a real one."""
         from ag2_sparrow import remote_gateway_bridge as gb
+        net = (mock.patch.multiple(gb, URL=url, TOKEN="t") if url else mock.patch.object(gb, "_req", req))
+        seam = mock.patch.object(gb, "read_ready_result", ready) if ready else contextlib.nullcontext()
         with mock.patch.object(gb, "RESULTS_DIR", self.results), \
-                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", self.results / "archive"), \
+                mock.patch.object(gb, "ARCHIVE_RESULTS_DIR", archive or self.results / "archive"), \
                 mock.patch.object(gb, "UNDELIVERABLE_RESULTS_DIR", self.results / "undelivered"), \
-                mock.patch.object(gb, "PROACTIVE_ROOM", ""), mock.patch.object(gb, "_req", req), \
+                mock.patch.object(gb, "PROACTIVE_ROOM", ""), net, seam, \
                 mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
                 mock.patch.object(gb, "_STATE", self.home / "state"), \
                 mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
                 mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
             gb._post_proactive()
+
+    def drain_pass(self, posts, archive=None, fail=None, ready=None):
+        """A drain pass whose gateway records each posted body, or raises `fail` after recording."""
+        def req(method, path, payload=None, timeout=None, **_kw):
+            if method == "POST":
+                posts.append(payload["body"])
+                if fail is not None:
+                    raise fail
+            return {"ok": True, "event_id": "$evt"}
+        self.drain_with(req, archive=archive, ready=ready)
+
+    def reply_now(self, *extra):
+        with mock.patch.object(outbox, "_activity_completed", return_value=None):
+            return run_main(hatch_cli.main, ["reply", str(self.result_file), "--body", "done",
+                                             "--wait", "0", *extra], self.env())
+
+    def test_an_answer_committed_while_hold_publishes_never_follows_its_line(self):
+        # Kewei's interleaving: hold pauses after reserving its notice, the answer runs, hold
+        # publishes and places, and the drain runs before hold's last check.
+        self.add_task(self.TID, "$ev1")
+        at_mark, go, posts, codes = threading.Event(), threading.Event(), [], {}
+        real_mark, real_place = task_hold.mark_notice, task_hold.place
+
+        def mark(*a, **k):
+            at_mark.set()
+            go.wait(10)
+            return real_mark(*a, **k)
+
+        def place(*a, **k):
+            token = real_place(*a, **k)
+            self.drain_pass(posts)
+            return token
+
+        def run(name, argv):
+            codes[name] = hatch_cli.main(argv)
+        with mock.patch.dict(os.environ, self.env(), clear=True), \
+                mock.patch.object(hatch_cli, "_installed_config", return_value={}), \
+                mock.patch.object(task_hold, "mark_notice", mark), \
+                mock.patch.object(task_hold, "place", place), \
+                mock.patch.object(outbox, "_activity_completed", return_value=None), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            holder = threading.Thread(target=run, args=("hold", ["hold", str(self.result_file)]))
+            holder.start()
+            self.assertTrue(at_mark.wait(10))
+            answer = threading.Thread(target=run, args=("reply", [
+                "reply", str(self.result_file), "--body", "done", "--wait", "0"]))
+            answer.start()
+            answer.join(1.0)
+            answered_before_publish = self.result_file.exists()
+            go.set()
+            holder.join(30)
+            answer.join(30)
+            self.drain_pass(posts)
+        self.assertFalse(answered_before_publish, "the answer waits for hold's transaction")
+        self.assertEqual(posts, [], "a line published before the answer is withdrawn by it")
+        self.assertEqual(self.result_file.read_text(), "done")
+        self.assertEqual(codes["hold"], hatch_cli.REPLY_POSTED)
+
+    def test_a_withdrawn_line_whose_archive_fails_stays_withdrawn(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        notes, ready = [], gb.read_ready_result
+
+        def claimed(path):
+            # The drain has claimed the line: the worker answers now, withdrawing the claim.
+            if path.name.startswith(self.notice.stem + delivery_destination.CLAIM_INFIX) and not notes:
+                notes.append(self.reply_now().stderr)
+            return ready(path)
+        blocked = self.results / "archive-is-a-file"
+        blocked.write_text("")
+        withdrawn, posts = delivery_destination.withdrawn_path(self.notice), []
+        self.drain_pass(posts, archive=blocked / "archive", ready=claimed)
+        self.assertIn("withdrawn", notes[0])
+        self.assertTrue(self.notice.exists(), "the failed archive put the line back in the queue")
+        self.assertTrue(withdrawn.exists(), "and the withdrawal stays with it")
+        for _ in range(2):
+            self.drain_pass(posts, archive=blocked / "archive")
+            self.assertTrue(withdrawn.exists())
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "a withdrawn line never posts, however often its archive fails")
+        self.assertFalse(withdrawn.exists(), "dropped once the line is retired")
+        self.assertFalse(self.notice.exists())
+
+    def test_a_send_with_an_unknown_outcome_is_never_reported_as_withdrawn(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        self.assertEqual(len(posts), 1)
+        self.assertTrue(self.notice.exists(), "queued again for a retry")
+        note = self.reply_now().stderr
+        self.assertIn("an earlier send of it has an unknown outcome", note)
+        self.assertNotIn("before any send", note)
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, "never sent again once answered")
+
+    def test_the_retry_budget_holds_across_restarts(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        for _ in range(gb.MAX_TRANSIENT_ATTEMPTS + 4):
+            gb._PROACTIVE_ATTEMPTS.clear()  # each pass a freshly restarted Sparrow
+            self.drain_pass(posts, fail=urllib.error.URLError(ConnectionRefusedError(61, "refused")))
+        # The first send and its MAX_TRANSIENT_ATTEMPTS retries: the bound one process keeps.
+        self.assertEqual(len(posts), gb.MAX_TRANSIENT_ATTEMPTS + 1)
+        self.assertTrue((self.results / "undelivered" / self.notice.name).is_file())
+        self.assertIn("whether it posted is unconfirmed", self.reply_now().stderr)
+
+    def test_the_send_has_a_wall_clock_deadline_and_releases_the_lock(self):
+        import http.server
+        dribbled = threading.Event()
+
+        class Dribble(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(40):  # about 8 s, each byte inside the socket timeout
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        break
+                    time.sleep(0.2)
+                dribbled.set()
+
+            def log_message(self, *a):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Dribble)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        started = time.monotonic()
+        with mock.patch.object(delivery_destination, "SEND_DEADLINE_S", 1.0):
+            self.drain_with(None, url=f"http://127.0.0.1:{server.server_address[1]}")
+        self.assertLess(time.monotonic() - started, 4.0, "a dribbling body cannot hold the lock")
+        self.assertTrue(self.lock_is_free())
+        self.assertTrue(self.notice.exists(), "an unfinished send is queued for its bounded retry")
+
+    def test_a_busy_or_broken_lock_hands_back_and_writes_nothing(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        done = []
+        with delivery_destination.send_lock(self.results):
+            with mock.patch.object(delivery_destination, "PRODUCER_LOCK_WAIT_S", 0.3):
+                worker = threading.Thread(target=lambda: done.append(self.reply_now()))
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), "a reply never waits on the lock unbounded")
+            posts = []
+            self.drain_pass(posts)  # the drain's own wait is short: it hands the claim back
+        self.assertEqual(done[0].returncode, 2, done[0].stderr)
+        self.assertIn("nothing written", done[0].stderr)
+        self.assertFalse(self.result_file.exists())
+        self.assertEqual(posts, [])
+        self.assertTrue(self.notice.exists(), "handed back unsent")
+        lock_dir = self.results / delivery_destination.SEND_LOCK_DIR
+        shutil.rmtree(lock_dir)
+        lock_dir.write_text("")  # the lock cannot be opened at all
+        self.drain_pass(posts)
+        self.assertEqual(posts, [])
+        self.assertTrue(self.notice.exists())
+        r = self.reply_now()
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertFalse(self.result_file.exists())
+
+    def test_hold_refuses_while_the_running_sparrow_predates_the_send_lock(self):
+        self.add_task(self.TID, "$ev1")
+        self.send_lock = False
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
+        self.assertIn("predates the hold-line send lock", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
 
     def lock_is_free(self):
         import fcntl  # POSIX only, like the lock under test
@@ -4111,7 +4333,7 @@ class Hold(Base):
             with self.subTest(outcome=type(outcome).__name__):
                 calls = []
 
-                def req(method, path, payload=None, timeout=None, outcome=outcome):
+                def req(method, path, payload=None, timeout=None, outcome=outcome, **_kw):
                     calls.append(self.lock_is_free())
                     if isinstance(outcome, BaseException):
                         raise outcome
@@ -4123,7 +4345,7 @@ class Hold(Base):
                 self.assertTrue(self.lock_is_free())
                 inode = inode or lock.stat().st_ino
                 self.assertEqual(lock.stat().st_ino, inode, "one lock file, never recreated")
-        def auth(method, path, payload=None, timeout=None):
+        def auth(method, path, payload=None, timeout=None, **_kw):
             raise urllib.error.HTTPError("u", 401, "auth", {}, None)
         if not self.notice.exists():
             self.notice.write_text(line)
@@ -4623,7 +4845,7 @@ class Hold(Base):
 
     def test_an_answer_landing_mid_hold_withdraws_the_notice(self):
         self.add_task(self.TID, "$ev1")
-        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, True]):
+        with mock.patch.object(hatch_cli, "task_settled", side_effect=[False, False, True]):
             r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_NOT_POSTED)
         self.assertIn("answered meanwhile", r.stderr)
@@ -5202,7 +5424,7 @@ class DeliveryDestination(unittest.TestCase):
         raw = (state / "auth" / "lane-identity.json").read_text()
         self.assertNotIn(secret, raw)
         rec = json.loads(raw)
-        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts"})
+        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts", "send_lock"})
         self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
         self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
         self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),

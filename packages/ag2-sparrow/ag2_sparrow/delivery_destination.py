@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import time
 
 from pathlib import Path
 
@@ -32,6 +33,19 @@ CLAIM_INFIX = ".sending."
 WITHDRAWN_SUFFIX = ".withdrawn"
 # A directory of its own, so no reader listing the results dir sees a lock file.
 SEND_LOCK_DIR = ".proactive-send-lock"
+# The protocol a drain that honours send_lock and the sentinel publishes in its lane record; a
+# producer relying on them refuses to act for a live drain without it.
+SEND_LOCK_PROTOCOL = 1
+# The drain's whole send under the lock: its POST deadline. The longest a producer waits for the
+# lock is above it plus settlement; the drain waits briefly and hands the file back.
+SEND_DEADLINE_S = 15.0
+PRODUCER_LOCK_WAIT_S = 30.0
+DRAIN_LOCK_WAIT_S = 2.0
+_LOCK_POLL_S = 0.05
+# `<stem>` holds how many sends of that proactive file were begun, across restarts.
+ATTEMPTS_DIR = ".proactive-attempts"
+# An attempts record that cannot be read proves nothing: it counts as attempted beyond any budget.
+ATTEMPTS_UNREADABLE = 1 << 20
 
 
 def claim_path(queued: Path, pid: int) -> Path:
@@ -52,15 +66,16 @@ class SendLockUnavailable(OSError):
 
 
 @contextlib.contextmanager
-def send_lock(result_dir: Path):
+def send_lock(result_dir: Path, wait: "float | None" = None):
     """Exclusive lock on the fixed file `result_dir`/SEND_LOCK_DIR/lock, which is never unlinked, so
     every process and restart locks the same inode. The drain holds it from its withdrawal check
     through the send's settlement, and a producer holds it while it withdraws; acquisition is the
-    linearization point. Released on every exit; SendLockUnavailable when it cannot be taken. A
-    platform without flock (no Hatch there) skips it."""
+    linearization point. Released on every exit; SendLockUnavailable when it cannot be taken
+    within `wait` seconds. A platform without flock (no Hatch there) skips it."""
     if fcntl is None:
         yield
         return
+    wait = PRODUCER_LOCK_WAIT_S if wait is None else wait
     try:
         lock_dir = Path(result_dir) / SEND_LOCK_DIR
         lock_dir.mkdir(mode=0o700, exist_ok=True)
@@ -68,13 +83,68 @@ def send_lock(result_dir: Path):
     except OSError as e:
         raise SendLockUnavailable(str(e)) from e
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except OSError as e:
-            raise SendLockUnavailable(str(e)) from e
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SendLockUnavailable(f"held by another sender past {wait:g}s") from None
+                time.sleep(_LOCK_POLL_S)
+            except OSError as e:
+                raise SendLockUnavailable(str(e)) from e
         yield
     finally:
         os.close(fd)
+
+
+def _attempts_path(result_dir: Path, stem: str) -> Path:
+    if not stem or "/" in stem or stem.startswith("."):
+        raise ValueError(f"not a proactive file stem: {stem!r}")
+    return Path(result_dir) / ATTEMPTS_DIR / stem
+
+
+def attempts_begun(result_dir: Path, stem: str) -> int:
+    """How many sends of `stem` were begun; 0 for none, ATTEMPTS_UNREADABLE when the record
+    exists but cannot be read."""
+    path = _attempts_path(result_dir, stem)
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        return ATTEMPTS_UNREADABLE
+    return int(text) if text.isdigit() and len(text) < 8 else ATTEMPTS_UNREADABLE
+
+
+def record_attempt(result_dir: Path, stem: str) -> int:
+    """Durably count one more begun send of `stem` (temp file, fsync, replace) and return the
+    count; OSError when it is not on disk, and then the send must not begin."""
+    path = _attempts_path(result_dir, stem)
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    count = min(attempts_begun(result_dir, stem), ATTEMPTS_UNREADABLE - 1) + 1
+    tmp = path.with_name(f".{stem}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        os.write(fd, str(count).encode("ascii"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    if os.name == "posix":  # a directory fd cannot be fsynced on Windows
+        dfd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    return count
+
+
+def forget_attempts(result_dir: Path, stem: str) -> None:
+    """Drop `stem`'s record once its delivery is confirmed; best effort."""
+    with contextlib.suppress(OSError, ValueError):
+        _attempts_path(result_dir, stem).unlink()
 
 
 def claim_pid(name: str) -> "int | None":

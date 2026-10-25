@@ -2692,7 +2692,8 @@ def _read_by(resp, deadline: float) -> bytes:
             raise TimeoutError("response body still arriving at its deadline")
         if sock is not None:
             sock.settimeout(left)
-        chunk = resp.read(4096)
+        # read1 returns what one socket read gave; read(n) would wait for all n bytes.
+        chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
@@ -5531,9 +5532,11 @@ def _lane_identity() -> str:
         return identity
     rec = agent_identity.published_lane_record(_STATE, GATEWAY_INSTANCE) or {}
     if rec.get("pid") != os.getpid() or rec.get("agent_id") != identity.strip() \
+            or rec.get("send_lock") != _delivery_destination.SEND_LOCK_PROTOCOL \
             or time.time() - rec.get("ts", 0) >= agent_identity.LANE_REFRESH_S:
         try:
-            _LANE_OWNED.update(agent_identity.publish_lane(_STATE, GATEWAY_INSTANCE, identity))
+            _LANE_OWNED.update(agent_identity.publish_lane(
+                _STATE, GATEWAY_INSTANCE, identity, send_lock=_delivery_destination.SEND_LOCK_PROTOCOL))
             _LANE_OWNED["failing"] = False
         except OSError as e:  # publish_lane has already tried to invalidate the old record
             if not _LANE_OWNED.get("failing"):
@@ -5610,7 +5613,7 @@ def _recover_orphan_proactive() -> None:
             pass
 
 
-def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
+def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> bool:
     """Retire a claimed nudge that was NOT delivered, without destroying it.
 
     Used by the terminal non-delivery paths (settled-empty, dead-lettered).
@@ -5618,17 +5621,19 @@ def _retire_proactive(claim: Path, original: Path, dest_dir: Path) -> None:
     reached the owner, so unlinking on an archive failure is harmless, whereas
     handing the claim back would re-send a duplicate. Here nothing was
     delivered, so the fallback is the opposite — hand it back as `.txt` rather
-    than unlink, since a duplicate on a later pass beats a lost message.
+    than unlink, since a duplicate on a later pass beats a lost message. True once retired.
     """
     try:
         dest_dir.mkdir(parents=True, exist_ok=True)
         claim.rename(dest_dir / f"{original.stem}-{int(time.time())}.txt")
+        return True
     except OSError as e:
         _log(f"could not retire proactive {original.name} ({diagnostics.describe(e)}) — re-queueing")
         try:
             claim.rename(original)
         except OSError:
             pass
+        return False
 
 
 def _resolve_send_failure(claim, original, exc) -> str:
@@ -5638,8 +5643,11 @@ def _resolve_send_failure(claim, original, exc) -> str:
     the park directory, then renders the bridge's log phrase. Single sends
     can't partially deliver, so `progressed` stays False here.
 
-    Returns the phrase for the caller's log line.
+    Returns the phrase for the caller's log line. The budget counts the begun sends on disk, so a
+    restart does not reset it.
     """
+    begun = _delivery_destination.attempts_begun(RESULTS_DIR, original.stem)
+    _PROACTIVE_ATTEMPTS[original.name] = max(_PROACTIVE_ATTEMPTS.get(original.name, 0), begun - 1)
     tried = _PROACTIVE_ATTEMPTS.get(original.name, 0)
     outcome = resolve_failed_send(
         claim, exc, _PROACTIVE_ATTEMPTS,
@@ -5757,11 +5765,21 @@ def _send_claimed(f: Path, claim: Path, withdrawn: Path, payload: dict, dest_roo
     the send lock: a producer withdrawing it sees either this whole outcome or no send at all."""
     if withdrawn.exists():
         _log(f"proactive {f.name} was withdrawn by its producer before it was sent — archiving, no send")
-        _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
-        withdrawn.unlink(missing_ok=True)
+        if _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR):
+            withdrawn.unlink(missing_ok=True)  # kept while the file is back in the queue
         return
     try:
-        resp = _req("POST", "/v1/room", payload, timeout=15)
+        _delivery_destination.record_attempt(RESULTS_DIR, f.stem)
+    except (OSError, ValueError) as e:
+        try:
+            claim.rename(f)  # a send not counted on disk is not begun
+        except OSError:
+            pass
+        _log(f"proactive {f.name} not sent: its attempt could not be recorded ({diagnostics.describe(e)})")
+        return
+    try:
+        resp = _req("POST", "/v1/room", payload, timeout=15,
+                    deadline=time.monotonic() + _delivery_destination.SEND_DEADLINE_S)
         # A bare 200 is NOT proof of delivery: the gateway can swallow a
         # room-send failure server-side (bad room id, kicked agent,
         receipt = classify_response(200, resp, id_keys=("event_id",))
@@ -5809,6 +5827,7 @@ def _send_claimed(f: Path, claim: Path, withdrawn: Path, payload: dict, dest_roo
     except OSError:
         claim.unlink(missing_ok=True)
     _PROACTIVE_ATTEMPTS.pop(f.name, None)
+    _delivery_destination.forget_attempts(RESULTS_DIR, f.stem)
     withdrawn.unlink(missing_ok=True)  # a withdrawal that came after the send
     _ENGINE_COUNTS["legacy_sends"] += 1
     _log(f"delivered proactive {f.name} to {dest_room}")
@@ -5946,7 +5965,7 @@ def _post_proactive() -> None:
         payload = {"op": "message", "room_id": dest_room, "body": body,
                    **({"thread_root": thread_root} if thread_root else {})}
         try:
-            with _delivery_destination.send_lock(RESULTS_DIR):
+            with _delivery_destination.send_lock(RESULTS_DIR, _delivery_destination.DRAIN_LOCK_WAIT_S):
                 _send_claimed(f, claim, withdrawn, payload, dest_room, room_override, noticed)
         except _delivery_destination.SendLockUnavailable as e:
             try:
