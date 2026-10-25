@@ -241,6 +241,36 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertFalse((self.lane.results / "proactive-1.txt").exists())
         self.assertEqual(claim.read_text(), "UNSENT BODY B\n", "kept for an operator")
 
+    def test_a_claim_that_vanishes_or_is_a_symlink_has_no_generation_and_is_unknown(self):
+        self.assertIsNone(gb._file_generation(self.lane.results / "missing"))
+        target = self.lane.results / "elsewhere"
+        target.write_text("x\n")
+        link = self.lane.results / "proactive-1.sending.1.1"
+        link.symlink_to(target)
+        self.assertEqual(gb._claim_receipt(link, "proactive-1"), ("unknown", None))
+
+    def test_a_parked_claim_swapped_in_flight_and_unrestorable_is_kept_for_an_operator(self):
+        item_id = gb._proactive_item_id("proactive-1", "parked")
+        outbox._write_item(self.lane.results / ".outbox-ag2space-proactive", item_id,
+                           {"item_id": item_id, "status": "PARKED", "attempts": 0, "payload": "parked\n"})
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("parked\n")
+        calls = []
+        real = gb.undelivered_quarantine.rename_noreplace
+
+        def move_then_refuse_the_way_back(src, dst):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError(5, "Input/output error")
+            real(src, dst)
+            Path(dst).write_text("a different generation\n")
+
+        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move_then_refuse_the_way_back):
+            self.lane.restart()
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.lane.posts), 0)
+
     def test_a_claim_with_no_record_at_all_is_still_requeued(self):
         claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
         claim.write_text("never sent\n")
