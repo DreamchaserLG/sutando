@@ -108,9 +108,8 @@ def proactive_filename(ts, channel: "str | None" = None) -> str:
     return f"proactive-{ts}.to-{channel}.txt"
 
 
-# A message about one task names it: proactive-about-<task id>--<ts>[.to-<channel>].txt. The
-# gateway threads it in that task's conversation and re-checks the task before it is sent.
-# `~` joins a named gateway instance to its task id (task-<instance>~<id>).
+# A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
+# [.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
 _ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
 
 
