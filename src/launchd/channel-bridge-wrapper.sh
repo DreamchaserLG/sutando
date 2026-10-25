@@ -137,7 +137,7 @@ hold_for_credentials() {
   # One notice per rejection the owner has not yet acted on, across wrapper relaunches.
   if [ ! -f "$AUTH_HELD" ] || [ "$(_stamp "$DELIBERATE")" -gt "$(_stamp "$AUTH_HELD")" ]; then
     publish_notice auth-failed \
-      "⚠️ The $CHANNEL bridge is stopped: the provider rejected its token ($AUTH_KEYS). Store a valid one with \`vault set <KEY> <value>\`, then restart Sutando (bash src/restart.sh). It will not retry until then."
+      "⚠️ The $CHANNEL bridge is stopped: the provider rejected its token ($AUTH_KEYS). Store a valid one with \`vault set <KEY> <value>\`, then restart Sutando (bash src/restart.sh); a stale token in that channel's .env wins over the vault, so clear it there too. It will not retry until then."
   fi
   printf '%s\n%s\n' "$NOW" "$$" > "$AUTH_HELD"
   since="$NOW"
