@@ -12,7 +12,7 @@ exposes a tiny HTTP protocol; this client pulls *your* tasks down into the local
 Full spec: docs/remote-gateway-protocol.md
 
   Protocol (versioned, Bearer-auth):
-  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&capabilities=voice-outcome-v1
+  GET  {REMOTE_TASK_URL}/v1/tasks?wait=<sec>&capabilities=voice-outcome-v1,room-context-v1
        → 200 {"tasks": [ {<task fields...>}, ... ]}   (long-poll; [] on timeout)
   POST {REMOTE_TASK_URL}/v1/tasks/<task-id>/ack
        → body {"id": "<task-id>"}  → 200 on accepted
@@ -460,7 +460,7 @@ ACK_FIRST_MANIFEST_FILE = _STATE / f"remote-task-ack-first-manifest{_INST_SUFFIX
 # Declared in the heartbeat and carried on every poll and result; it stands for `dm_only`,
 # `consolidated_into` and acknowledging an `ack_first` task before publishing it.
 VOICE_OUTCOME_CONTRACT = "voice-outcome-v1"
-_POLL_PROOF = f"&capabilities={VOICE_OUTCOME_CONTRACT}"
+_POLL_PROOF = f"&capabilities={VOICE_OUTCOME_CONTRACT},{room_context.CONTRACT}"
 # The only source the broker serves with `ack_first`.
 _VOICE_ASK_SOURCE = "matrixrtc-voice"
 # The lane's `ask_sutando` correlation ids, under which a relay ask is served.

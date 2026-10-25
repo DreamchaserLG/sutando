@@ -123,11 +123,11 @@ array when this validator/consumer is present. It declares bounded packet
 preparation, validation and view support, not current actor authorization,
 strict shared-core memory isolation or proof that a model retained the data.
 A shared credential's heartbeat alone cannot prove which process consumes a poll.
-The only established poll capability encoding is the scalar
-`capabilities=voice-outcome-v1`; that proof stays unchanged. Advertising room
-context on every poll remains dependent on an authoritative multi-capability
-parser contract. Consumers must not guess comma-separated or repeated-key syntax,
-and a producer must not infer per-poll room-context support from this heartbeat.
+Every poll also declares both active consumer contracts in one comma-separated
+query value: `capabilities=voice-outcome-v1,room-context-v1`. The broker parses
+exact tokens across comma-separated values and repeated `capabilities` keys;
+this client uses the single-value form and keeps the existing wait and bearer
+authentication. A producer must not infer per-poll support from the heartbeat.
 
 Both objects carry exactly the same binding fields:
 
@@ -167,6 +167,9 @@ and non-sensitive `reason` are bounded strings. `partial` may additionally carry
 
 Unavailable and denied packets carry no content sections. An empty message array
 with a cursor remains partial; it does not prove an empty room or complete thread.
+A producer must omit `category` for an older strict consumer without that field's
+support; the `room-context-v1` token alone does not distinguish those versions.
+Neither producer nor consumer may trim or coerce an invalid category into validity.
 
 The bridge validates the packet before publishing, writes compact JSON headers
 above `task:`, then uses the existing stamping, atomic publication, dispatch and
@@ -215,11 +218,14 @@ queued and a true before-inference freshness guarantee require an authoritative
 pre-turn producer check. Deployment must not claim those guarantees from this patch.
 
 **`capabilities` (the poll's proof).** Every poll carries
-`&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
-declares (below). One agent's credential may be used by more than one bridge, so
+`&capabilities=voice-outcome-v1,room-context-v1`, preserving the voice-outcome
+contract alongside bounded room-context support. One agent's credential may be
+used by more than one bridge, so
 an AG2 Space broker serves a voice relay ask only to a poll that names the
 contract itself, and serves a poll without it the tasks behind that ask; a relay
 that predates the parameter ignores it.
+Tasks received without either reserved context field keep the existing legacy
+behavior; this query change does not construct or fetch a replacement briefing.
 
 **`ack_first` (acknowledging first).** An AG2 Space broker marks a voice relay ask
 it serves with `"ack_first": true`, at most one per response. The bridge handles
@@ -422,9 +428,8 @@ body: {
 
 `room-context-v1` declares the bounded room-context consumer contract described
 above. It adds no authority and no new endpoint; it is a process capability
-announcement, not per-poll proof. The room-context poll negotiation remains
-blocked on the authoritative parser contract, while the voice poll proof and
-result payload shapes remain unchanged.
+announcement, not per-poll proof. The client repeats the declaration on each poll
+beside `voice-outcome-v1`; result payload shapes remain unchanged.
 
 `voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
 acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
