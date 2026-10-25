@@ -2655,6 +2655,32 @@ class StartSparrow(Base):
         self.assertIsNone(old.poll(), "a drain is not replaced on a read error")
         self.assertIn("unreadable", r.stderr)
 
+    def test_keepawake_keeps_a_drain_whose_stale_lane_record_declares_the_send_lock(self):
+        # A drain whose record went stale over a few slow sends in one pass still has the protocol.
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)
+        rec = json.loads((self.state / "auth" / "lane-identity.json").read_text())
+        rec["ts"] -= agent_identity.LANE_FRESH_S + 15
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(rec))
+        self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_STALE)
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a stale record that declares the protocol replaces nothing")
+
+    def test_keepawake_replaces_a_drain_whose_stale_lane_record_lacks_the_send_lock(self):
+        old = self.old_sparrow()
+        self.acquired(old, 5)  # within the grace period: only the record itself is evidence
+        self.lane_of(old)
+        rec = json.loads((self.state / "auth" / "lane-identity.json").read_text())
+        rec["ts"] -= agent_identity.LANE_FRESH_S + 15
+        (self.state / "auth" / "lane-identity.json").write_text(json.dumps(rec))
+        want = keepalive.health_command(str(self.reply_stub))
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
     def test_keepawake_keeps_a_drain_whose_lane_record_is_invalid(self):
         # A modern drain's corrupt record, failed-write tombstone or emptied one is no proof the
         # live owner lacks the protocol, nor is a symlink or FIFO, whose open must not block.
@@ -4773,6 +4799,8 @@ class Hold(Base):
     def test_lane_state_tells_absent_invalid_unreadable_fresh_and_stale_apart(self):
         ai = agent_identity
         state = self.home / "state"
+        self.assertEqual(len({ai.LANE_ABSENT, ai.LANE_INVALID, ai.LANE_UNREADABLE}), 3,
+                         "absent, invalid and unreadable are distinct outcomes")
         self.assertEqual(ai.lane_state(None, ""), (ai.LANE_ABSENT, None))
         self.assertEqual(ai.lane_state(state, ""), (ai.LANE_ABSENT, None), "no auth dir")
         auth = state / "auth"
