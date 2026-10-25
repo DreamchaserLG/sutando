@@ -2864,7 +2864,7 @@ class StartSparrow(Base):
     def test_keepawake_reports_no_success_until_a_successor_owns_the_lock(self):
         old, _rec = self.legacy()
         fake = FakeSystemd(state="active", main_pid=old.pid)
-        with mock.patch.object(keepalive, "START_WAIT_S", 1.0):
+        with mock.patch.object(keepalive, "START_WAIT_S", 0):
             r, line, stop = self.keepawake_unit(fake, lambda cmd: subprocess.CompletedProcess(cmd, 0, "", ""))
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("no successor holds the lock", r.stderr)
@@ -2990,7 +2990,8 @@ class StartSparrow(Base):
         if sync_second:  # the action then falls in the same whole second as `t0`
             time.sleep(1.02 - time.time() % 1)
         t0 = time.time()
-        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 0.5), \
+        # The restart sets the successor's state before it returns, so the first poll decides.
+        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 0), \
                 mock.patch.object(keepalive, "sparrow_env", return_value={"REMOTE_HEALTH_COMMAND": want}):
             r = self.cli("keepalive", "keepawake")
         self.done_with(old)
