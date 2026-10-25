@@ -18,13 +18,14 @@ except ImportError:  # Windows
     fcntl = None
 
 from .outbox import ITEMS_DIR, list_items, valid_pid
+from .proactive_routing import PROACTIVE_OUTBOX_DIRNAME
 from .result_markers import parse_markers
 
 # Destination FORMAT validation is the bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
 MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
 # The proactive lane's outbox root: one item per file stem and body, `<stem>~<digest>`.
-RECEIPT_DIR = ".outbox-ag2space-proactive"
+RECEIPT_DIR = PROACTIVE_OUTBOX_DIRNAME
 # Where the drain parks a line it will never send, as `<stem>-<epoch>.txt`.
 UNDELIVERED_DIR = "undelivered"
 # The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>.<ns>`.
