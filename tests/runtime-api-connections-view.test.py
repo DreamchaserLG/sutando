@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Tests for the runtime-API connections surface (connections_view.py + dispatcher wiring).
 
-Contract under test: `connection.list` / `connection.add` (preview, then confirm) /
-`connection.remove` / `connection.set_primary` / `connection.reconnect` dispatch to
-src/connections.py, return rows with a vault key name and never a secret, answer a
-moved identity with CONFLICT, and refuse malformed params with ProtocolError.
+Contract under test: `connection.list` / `connection.known_servers` / `connection.add`
+(preview, then confirm) / `connection.remove` / `connection.set_primary` /
+`connection.disconnect` / `connection.reconnect` dispatch to src/connections.py, return
+rows with a vault key name and never a secret, answer a moved identity and a disconnect
+of the primary with CONFLICT, and refuse malformed params with ProtocolError.
 The vault, the gateway probe and the spawn are fakes.
 
 Run: python3 tests/runtime-api-connections-view.test.py
@@ -19,6 +20,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -179,6 +181,48 @@ class ViewTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.call("connection.reconnect", instance="nope")
 
+    def test_disconnect_keeps_the_row_and_reconnect_resumes_it(self):
+        self.call("connection.add", token=TOKEN_A, confirm=True, expected_server="alpha-fixture.net")
+        self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.disconnect", instance="alpha-fixture-net")
+        self.assertEqual(cm.exception.code, CONFLICT)
+        self.assertTrue(str(cm.exception).startswith("primary_cannot_disconnect"))
+        out = self.call("connection.disconnect", instance="beta-fixture-net")
+        row = out["connection"]
+        self.assertEqual((row["instance"], row["disabled"], row["state"], row["reason"]),
+                         ("beta-fixture-net", True, "disconnected", "disabled"))
+        self.assertNotIn("secret-", json.dumps(out))
+        self.assertIn("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET", self.vault.store, "the token stays")
+        listed = self.call("connection.list")["connections"]
+        self.assertEqual([(r["instance"], r["disabled"], r["state"]) for r in listed],
+                         [("alpha-fixture-net", False, "pending"), ("beta-fixture-net", True, "disconnected")])
+        self.assertEqual([r.get("agent_display_name") for r in listed], [None, None], "identity fields are spelled out")
+        out = self.call("connection.reconnect", instance="beta-fixture-net")
+        self.assertEqual((out["launch"]["ok"], self.spawned), (True, ["beta-fixture-net"]))
+        listed = self.call("connection.list")["connections"]
+        self.assertEqual([(r["instance"], r["disabled"], r["state"]) for r in listed],
+                         [("alpha-fixture-net", False, "pending"), ("beta-fixture-net", False, "pending")])
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.disconnect", instance="nope")
+        self.assertEqual(cm.exception.code, -32602)
+
+    def test_known_servers_joins_the_registry_with_the_rows(self):
+        fixtures = [dotspace.DotSpace(server="alpha-fixture.net"), dotspace.DotSpace(server="beta-fixture.net")]
+        with unittest.mock.patch.object(dotspace, "registered_instances", lambda: fixtures):
+            self.assertEqual(self.call("connection.known_servers"), {"servers": [
+                {"server": "alpha-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False},
+                {"server": "beta-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False}]})
+            self.call("connection.add", token=TOKEN_B, confirm=True, expected_server="beta-fixture.net")
+            out = self.call("connection.known_servers")["servers"]
+        self.assertEqual([(s["server"], s["connected"], s["instance"], s["primary"]) for s in out],
+                         [("alpha-fixture.net", False, None, False), ("beta-fixture.net", True, "beta-fixture-net", True)])
+        self.assertNotIn("token_ref", json.dumps(out))
+        (self.ws / "state" / "connections.json").write_text("{nope")
+        with self.assertRaises(ProtocolError) as cm:
+            self.call("connection.known_servers")
+        self.assertEqual(cm.exception.code, -32603)
+
     def test_param_validation(self):
         for params in ({}, {"token": ""}, {"token": 3}, {"token": TOKEN_A, "confirm": "yes"},
                        {"token": TOKEN_A, "confirm": True}, {"token": TOKEN_A, "confirm": True, "expected_server": ""}):
@@ -187,7 +231,7 @@ class ViewTests(unittest.TestCase):
         with self.assertRaises(ProtocolError) as cm:
             self.call("connection.add", token="opaque-bearer")
         self.assertIn("no gateway URL", str(cm.exception))
-        for method in ("connection.remove", "connection.set_primary", "connection.reconnect"):
+        for method in ("connection.remove", "connection.set_primary", "connection.disconnect", "connection.reconnect"):
             with self.assertRaises(ProtocolError):
                 self.call(method)
             with self.assertRaises(ProtocolError) as cm:

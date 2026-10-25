@@ -153,6 +153,39 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("primary")
         self.assertEqual((proc.returncode, proc.stdout), (2, ""), "no primary: exit 2, nothing printed")
 
+    def test_disconnect_keeps_the_token_and_known_servers_joins_the_rows(self):
+        self.run_cli("add", TOKEN_A, "--yes", "--expected-server", "alpha-fixture.net")
+        self.run_cli("add", TOKEN_B, "--yes", "--expected-server", "beta-fixture.net")
+        proc = self.run_cli("disconnect", "alpha-fixture-net")
+        self.assertEqual(proc.returncode, 1, "the primary is refused, like remove without --force")
+        self.assertIn("primary_cannot_disconnect", proc.stderr)
+        proc = self.run_cli("disconnect", "beta-fixture-net")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("disconnected beta-fixture-net", proc.stdout)
+        self.assertIn("reconnect to resume", proc.stdout)
+        self.assert_no_secret(proc)
+        self.assertTrue((self.keychain / "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET").exists(), "the token stays in the vault")
+        rows = json.loads(self.run_cli("list", "--json").stdout)
+        self.assertEqual([(r["instance"], r["disabled"], r["state"], r["reason"]) for r in rows],
+                         [("alpha-fixture-net", False, "pending", None), ("beta-fixture-net", True, "disconnected", "disabled")])
+        self.assertIn("disconnected (disabled)", self.run_cli("list").stdout)
+        self.assertEqual(self.run_cli("launch-plan").stdout.count("\n"), 1, "the plan omits the disabled row")
+        self.assertIn("alpha-fixture-net\t", self.run_cli("launch-plan").stdout)
+        proc = self.run_cli("disconnect", "nope")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no connection", proc.stderr)
+
+        proc = self.run_cli("known-servers", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        servers = json.loads(proc.stdout)
+        self.assertTrue(servers, "the resolver's registry is never empty")
+        self.assertTrue(all(set(s) == {"server", "connected", "instance", "primary", "disabled"} for s in servers))
+        self.assertTrue(all(s["connected"] is False for s in servers), "fixture servers are registered nowhere")
+        self.assert_no_secret(proc)
+        proc = self.run_cli("known-servers")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.startswith("SERVER"))
+
     def test_import_env_then_launch_plan(self):
         extra = {"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_DEV": TOKEN_B}
         proc = self.run_cli("import-env", env_extra=extra)
@@ -281,6 +314,23 @@ class InProcess(unittest.TestCase):
         rc, out, _ = self.run_main(["launch-plan"], launch_plan=lambda env, workspace=None: [
             {"instance": "dev", "token_ref": "AG2_REMOTE_TOKEN_DEV", "channel_dir": "dev-ag2space", "primary": True}])
         self.assertEqual(out, "dev\tAG2_REMOTE_TOKEN_DEV\tdev-ag2space\t1\n")
+
+    def test_disconnect_and_known_servers_print_the_unit_result(self):
+        rc, out, _ = self.run_main(["disconnect", "dev"], disconnect=lambda inst, workspace=None: {
+            "instance": inst, "token_ref": "AG2_REMOTE_TOKEN_DEV", "disabled": True, "stopped_pid": 31337})
+        self.assertEqual((rc, out), (0, "disconnected dev (stopped pid 31337; token kept in vault as AG2_REMOTE_TOKEN_DEV; "
+                                        "reconnect to resume)\n"))
+        servers = [{"server": "s.space", "connected": True, "instance": "s-space", "primary": True, "disabled": False},
+                   {"server": "dev.s.space", "connected": False, "instance": None, "primary": False, "disabled": False}]
+        rc, out, _ = self.run_main(["known-servers"], known_servers=lambda ws: servers)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.splitlines()[0].split(), ["SERVER", "CONNECTED", "INSTANCE", "PRIMARY", "DISABLED"])
+        self.assertEqual(out.splitlines()[1].split(), ["s.space", "yes", "s-space", "yes", "no"])
+        self.assertEqual(out.splitlines()[2].split(), ["dev.s.space", "no", "-", "no", "no"])
+        rc, out, _ = self.run_main(["known-servers", "--json"], known_servers=lambda ws: servers)
+        self.assertEqual(json.loads(out), servers)
+        rc, out, _ = self.run_main(["known-servers"], known_servers=lambda ws: [])
+        self.assertEqual(out, "no known servers\n")
 
 
 if __name__ == "__main__":

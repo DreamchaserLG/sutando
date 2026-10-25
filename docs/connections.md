@@ -20,6 +20,8 @@ startup (`src/startup-runtime.sh`) all call that module and never touch the file
 | `verified` | Whether the server came from the gateway's own answer (below) rather than from the gateway hostname. |
 | `server_source` | Where `server` came from: `identity` (the DotSpace the resolver registers for the gateway host, confirmed by the gateway's own agent listing), `resolver` (the registered DotSpace alone), or `gateway` (the host itself, provisional). |
 | `agent_mxid` | The agent's identity at that server, when the gateway named it. |
+| `agent_display_name`, `agent_avatar_url`, `owner_mxid` | Optional, from the same listing entry as `agent_mxid` and only on a verified preview: the entry's `display_name`, its `avatar_url` (stored only as an `mxc://` URI) and its `owner` mxid. Absent until the gateway sends them; never a secret. The list spells every one of them out, `null` when unknown. |
+| `disabled` | `true` after `disconnect`: the bridge is stopped and the launch plan skips the row, token and launch record kept, until `reconnect` clears it. Absent on older rows, which load as enabled. |
 
 The record is validated on every read (schema, bounds, one primary, unique instance /
 token_ref / server) and published atomically under a lock file beside it, so a reader
@@ -98,11 +100,19 @@ under `state/connections-launch/<instance>.json`:
 |---|---|
 | `pending` | Saved; no sidecar yet (bridge not up, or never launched). |
 | `connected` | The sidecar says `connected: true`. |
-| `disconnected` | The sidecar says `connected: false` for a non-auth reason. |
+| `disconnected` | The sidecar says `connected: false` for a non-auth reason; or, with `reason: disabled`, the row was disconnected by the owner (whatever a stale sidecar still says). |
 | `failed` | With `reason`: `no_token`, `launch_failed`, `auth_rejected` (the sidecar reports a 401/403 or a pending re-enrol). |
 
-`reconnect(instance)` stops the one bridge holding that instance's singleton lock and
-launches it again; the other connections keep running. `remove_connection(instance)`
+`disconnect(instance)` stops the one bridge holding that instance's singleton lock (the
+same stop `remove_connection` and `reconnect` use) and marks the row `disabled`; the row,
+its vault key and its launch record stay, so the owner can come back without a new token.
+The launch plan omits a disabled row, so a core restart leaves it down. The primary cannot
+be disconnected while it is primary (`PrimaryCannotDisconnect`, HTTP 409
+`primary_cannot_disconnect`, CLI exit 1): make another row primary first. Disconnecting a
+disabled row is a no-op. `reconnect(instance)` clears the flag, stops the bridge if one is
+running, learns the identity its token answers to now and launches it again; the other
+connections keep running. A plain `launch` of a disabled row is refused by name
+("disconnected; reconnect it"). `remove_connection(instance)`
 stops that bridge the same way, then drops the row, its vault key and its launch record,
 and nothing else; the primary needs `force`, and no remaining row inherits the flag. A
 removed env-imported row is remembered in the record's `removed_env` list, so
@@ -116,9 +126,11 @@ the tombstone.
 creates a row once for `REMOTE_TASK_TOKEN` and each `AG2_REMOTE_TOKEN_<INST>` in the
 environment (copying the secret into the vault unless one is already there; never
 overwriting a row), then launches one bridge per `launch-plan` line through
-`scripts/connections.py launch <instance>`. The plan lists every row with an instance
-plus any env token the import could not record, so an unavailable vault degrades to
-the previous behaviour instead of losing a gateway. An unreadable record never reads
+`scripts/connections.py launch <instance>`. The plan lists every enabled row with an
+instance (a disabled row stays down, and its env token is not re-planned either) plus any
+env token the import could not record, so an unavailable vault degrades to the previous
+behaviour instead of losing a gateway. The plan is startup's only source of what to launch,
+so `disconnect` needs nothing from the shell. An unreadable record never reads
 as "no secondaries": `launch-plan` exits non-zero naming the parse error, startup prints
 a ⚠ line and launches each `AG2_REMOTE_TOKEN_<INST>` with `launch --env-only`, from the
 variable alone. The legacy unsuffixed bridge keeps its own launch path.
@@ -133,20 +145,34 @@ with `REMOTE_PROACTIVE_ROOM` empty, so exactly one bridge posts nudges. Otherwis
 passes through untouched, unset included: the bridge reads the desktop's device env only when it
 is unset, so an exported empty value would silence nudges on a plain install.
 
+## Known servers
+
+`known_servers()` is the Add picker's offer: every DotSpace the resolver registers
+(`dotspace.registered_instances()`: the configured `core.dotspace.instances` list, else
+the built-in default; `src/dotspace.py` is the one place those names live), one entry per
+server in registry order, joined read-only with the rows:
+`{"server", "connected": <a row exists>, "instance": <that row's slug or null>, "primary", "disabled"}`.
+Nothing is fetched and no vault key name is in the answer. A server with no row is what the
+picker offers; one with a row is already in the directory (and, when `disabled`, resumes
+through reconnect rather than a new add). A row for an unregistered server is in the list,
+not here.
+
 ## Surfaces
 
-- CLI: `scripts/connections.py list | add | set-primary | remove | reconnect | launch | import-env | launch-plan`.
-- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.reconnect`.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | remove | disconnect | reconnect | launch | import-env | launch-plan`.
+- Runtime API (Unix socket, JSON-RPC): `connection.list`, `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves), `connection.remove`, `connection.set_primary`, `connection.disconnect`, `connection.reconnect`.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 
   | Route | Body | Answer |
   |---|---|---|
-  | `GET /api/v1/connections` | — | 200 `{"connections": [rows joined with status, state, server_source; no secrets]}` |
+  | `GET /api/v1/connections` | — | 200 `{"connections": [rows joined with status, state, server_source, disabled, identity fields; no secrets]}` |
+  | `GET /api/v1/connections/known-servers` | — | 200 `{"servers": [{"server", "connected", "instance", "primary", "disabled"}]}`; matched before any `<instance>` route (405 for another method, never a slug lookup) |
   | `POST /api/v1/connections` | `{"token", "confirm": false}` | 200 `{"preview": {...}}` |
   | `POST /api/v1/connections` | `{"token", "confirm": true, "expected_server", "added_by": "ui"}` | 201 `{"created": true, "connection": row}`; 200 `{"created": false, ...}` for an existing row; 409 `{"error": "mismatch", "server_from_token", "expected_server"}`; 400 `{"error": ...}`; 503 `{"error": "vault_unavailable"}` |
   | `DELETE /api/v1/connections/<instance>[?force=1]` | — | 204; 409 `{"error": "primary"}`; 404 |
   | `POST /api/v1/connections/<instance>/primary` | `{}` | 200 `{"connection": row}` |
-  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}` |
+  | `POST /api/v1/connections/<instance>/disconnect` | `{}` | 200 `{"connection": row}` (`disabled: true`, state `disconnected`); 409 `{"error": "primary_cannot_disconnect"}`; 404 |
+  | `POST /api/v1/connections/<instance>/reconnect` | `{}` | 202 `{"launch": record}`; clears `disabled` |
 
 ### Authorization for the HTTP routes
 

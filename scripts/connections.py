@@ -7,7 +7,10 @@
                                Without --yes: print the preview and ask before saving.
   set-primary INSTANCE         move proactive/owner-DM defaults to this connection
   remove INSTANCE [--force]    drop the row and its vault key; the primary needs --force
-  reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge
+  disconnect INSTANCE          stop that bridge and keep the row, token and launch record out of
+                               the plan until reconnect; refused on the primary
+  reconnect INSTANCE --repo DIR --logs-dir DIR   stop and relaunch that one bridge (re-enables it)
+  known-servers [--json]       the resolver's DotSpace instances, each with its row if one exists
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
@@ -96,6 +99,28 @@ def cmd_remove(args) -> int:
     return 0
 
 
+def cmd_disconnect(args) -> int:
+    row = connections.disconnect(args.instance, workspace=args.workspace)
+    stopped = f"stopped pid {row['stopped_pid']}; " if row.get("stopped_pid") else ""
+    print(f"disconnected {args.instance} ({stopped}token kept in vault as {row['token_ref']}; "
+          "reconnect to resume)")
+    return 0
+
+
+def cmd_known_servers(args) -> int:
+    servers = connections.known_servers(args.workspace)
+    if args.json:
+        print(json.dumps(servers, indent=2, sort_keys=True))
+        return 0
+    head = ("SERVER", "CONNECTED", "INSTANCE", "PRIMARY", "DISABLED")
+    body = [(s["server"], "yes" if s["connected"] else "no", s["instance"] or "-",
+             "yes" if s["primary"] else "no", "yes" if s["disabled"] else "no") for s in servers]
+    widths = [max(len(str(line[i])) for line in [head, *body]) for i in range(len(head))]
+    fmt = "  ".join("{:<%d}" % w for w in widths)
+    print("\n".join(fmt.format(*line).rstrip() for line in [head, *body]) if servers else "no known servers")
+    return 0
+
+
 def cmd_launch(args) -> int:
     record = connections.launch(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace,
                                 env_only=args.env_only)
@@ -159,6 +184,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("set-primary"); s.add_argument("instance"); s.set_defaults(fn=cmd_set_primary)
     s = sub.add_parser("remove"); s.add_argument("instance"); s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_remove)
+    s = sub.add_parser("disconnect"); s.add_argument("instance"); s.set_defaults(fn=cmd_disconnect)
+    s = sub.add_parser("known-servers"); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)

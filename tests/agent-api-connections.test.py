@@ -10,7 +10,9 @@ carry a wildcard CORS grant. With the bearer: GET lists rows joined with status
 (server_source included, never a secret); POST previews, then creates on
 confirm (201 / 200 existing / 409 mismatch, token_rejected, vault_key_in_use /
 400 / 503 vault); DELETE <instance> is 204 or 409 primary; POST
-<instance>/primary is 200; POST <instance>/reconnect is 202.
+<instance>/primary is 200; POST <instance>/disconnect is 200 or 409
+primary_cannot_disconnect; POST <instance>/reconnect is 202; GET known-servers
+is 200 and is never read as an instance.
 
 Run: python3 tests/agent-api-connections.test.py
 """
@@ -164,6 +166,8 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("POST", "/api/v1/connections", {"token": TOKEN_A, "confirm": True, "expected_server": "alpha-fixture.net"}),
                            ("DELETE", "/api/v1/connections/x?force=1", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
+                           ("GET", "/api/v1/connections/known-servers", None),
+                           ("POST", "/api/v1/connections/x/disconnect", {}),
                            ("POST", "/api/v1/connections/x/reconnect", {})):
     s, b, h = req(method, path, body, auth=False)
     check(f"{method} {path} without a bearer is 401", s == 401, f"{s} {b}")
@@ -296,6 +300,39 @@ s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/unknown", {})
 check("unknown sub-route is 404", s == 404, f"{s} {b}")
 s, b, _ = req("POST", "/api/v1/connections", b"{not json")
 check("invalid JSON is 400", s == 400, f"{s} {b}")
+
+print("== known servers, disconnect, reconnect ==")
+dotspace.registered_instances = lambda: [dotspace.DotSpace(server="alpha-fixture.net"),
+                                         dotspace.DotSpace(server="gamma-fixture.net")]
+s, b, _ = req("GET", "/api/v1/connections/known-servers")
+check("known-servers is 200 with the registry joined to the rows", s == 200 and b == {"servers": [
+    {"server": "alpha-fixture.net", "connected": True, "instance": "alpha-fixture-net", "primary": True, "disabled": False},
+    {"server": "gamma-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False}]}, f"{s} {b}")
+check("known-servers leaks no secret or vault key", no_secret(b) and "token_ref" not in json.dumps(b))
+s, b, _ = req("POST", "/api/v1/connections/known-servers", {})
+check("POST known-servers is 405, never a slug lookup", s == 405, f"{s} {b}")
+s, b, _ = req("DELETE", "/api/v1/connections/known-servers")
+check("DELETE known-servers is 405, never a removal", s == 405, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/disconnect", {})
+check("disconnecting the primary is 409 primary_cannot_disconnect", (s, b) == (409, {"error": "primary_cannot_disconnect"}), f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+check("disconnect is 200 with the disabled row", s == 200 and (b["connection"]["disabled"], b["connection"]["state"],
+      b["connection"]["reason"]) == (True, "disconnected", "disabled"), f"{s} {b}")
+check("disconnect leaks no secret", no_secret(b))
+check("the token stays in the vault", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET" in FakeVault.store)
+s, b, _ = req("GET", "/api/v1/connections")
+check("the list shows the flag and the state", [(r["instance"], r["disabled"], r["state"]) for r in b["connections"]]
+      == [("alpha-fixture-net", False, "connected"), ("beta-fixture-net", True, "disconnected")], b)
+check("every row spells out the identity fields", all(k in r for r in b["connections"] for k in C.IDENTITY_FIELDS))
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/disconnect", {})
+check("disconnecting twice is still 200", s == 200 and b["connection"]["disabled"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/nope/disconnect", {})
+check("disconnecting an unknown instance is 404", s == 404, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/reconnect", {})
+check("reconnect is 202 and re-enables", s == 202 and b["launch"]["ok"] is True and SPAWNED == ["beta-fixture-net"], f"{s} {b} {SPAWNED}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the flag is cleared", [r["disabled"] for r in b["connections"]] == [False, False], b)
+SPAWNED.clear()
 
 print("== primary, reconnect, delete ==")
 s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})

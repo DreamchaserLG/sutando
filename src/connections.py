@@ -22,6 +22,10 @@ and refuse a record over `MAX_BYTES` or off-schema on read. `status_for` joins a
 read-only with the bridge's own `state/gateway-status[.<instance>].json` and the launch
 record `launch` leaves, into one `state`: pending, connected, disconnected or failed.
 
+`disconnect` marks a row `disabled` and stops its bridge, keeping the row, the vault secret
+and the launch record: the plan skips a disabled row, so a restart leaves it down until
+`reconnect` clears the flag. The primary cannot be disconnected while it is primary.
+
 A row's `server_source` says where its server came from: `identity` (the resolver's
 registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
 `resolver` (the registered DotSpace alone) or `gateway` (the host itself, provisional). Two
@@ -72,6 +76,9 @@ _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
              "server_source")
+# What the gateway's agent listing says about the one agent a verified preview names; never a secret.
+IDENTITY_FIELDS = ("agent_mxid", "agent_display_name", "agent_avatar_url", "owner_mxid")
+AVATAR_SCHEME = "mxc://"
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
 # Names that never belong to a public homeserver; a probe there would scan the operator's own network.
@@ -104,6 +111,16 @@ class UnknownConnection(ConnectionsError):
 
 class PrimaryProtected(ConnectionsError):
     pass
+
+
+class PrimaryCannotDisconnect(PrimaryProtected):
+    """The primary row stays up while it is primary; make another row primary first."""
+
+    CODE = "primary_cannot_disconnect"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance or '<primary>'} is the primary connection; "
+                         "make another connection primary first")
 
 
 class InvalidToken(ConnectionsError):
@@ -350,7 +367,8 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
     registered = resolve_server(host, resolver)
     out = {"gateway_url": url, "gateway_host": host, "server": registered or host,
            "server_source": "resolver" if registered else "gateway",
-           "agent_mxid": None, "verified": False, "authenticated": None, "error": None}
+           "verified": False, "authenticated": None, "error": None}
+    out.update({k: None for k in IDENTITY_FIELDS})
     address = vetted_address(host, port, getaddrinfo)
     if address == "":
         raise InvalidToken("invalid_gateway")
@@ -370,11 +388,23 @@ def preview_connection(token: str, *, fetch: Optional[Callable] = None, resolver
         return out
     out["authenticated"] = True
     agents = answer.get("agents") if isinstance(answer, dict) else None
-    ids = [a.get("id") for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
+    named = [a for a in agents if isinstance(a, dict) and isinstance(a.get("id"), str)] \
         if isinstance(agents, list) else []
-    if registered and len(ids) == 1 and server_of_mxid(ids[0]) == registered:
-        out.update(agent_mxid=ids[0], server_source="identity", verified=True)
+    if registered and len(named) == 1 and server_of_mxid(named[0]["id"]) == registered:
+        out.update(_identity_of(named[0]), server_source="identity", verified=True)
     return out
+
+
+def _identity_of(agent: Mapping[str, object]) -> dict:
+    """The row fields a listing entry carries for its agent: the mxid, and when the gateway
+    sends them, `display_name`, an `mxc://` `avatar_url` and the `owner` mxid; else None."""
+    owner = agent.get("owner")
+    avatar = agent.get("avatar_url")
+    name = agent.get("display_name")
+    return {"agent_mxid": agent["id"],
+            "agent_display_name": name.strip() if isinstance(name, str) and name.strip() else None,
+            "agent_avatar_url": avatar if isinstance(avatar, str) and avatar.startswith(AVATAR_SCHEME) else None,
+            "owner_mxid": owner if isinstance(owner, str) and server_of_mxid(owner) else None}
 
 
 # ── vault ────────────────────────────────────────────────────────────────────
@@ -461,10 +491,16 @@ def _validate_row(row: object, index: int) -> dict:
         raise SchemaError(f"connections.json: row {index} instance {row['instance']!r} is not a slug")
     if row["added_by"] not in ADDED_BY:
         raise SchemaError(f"connections.json: row {index} added_by {row['added_by']!r} unknown")
-    if row.get("agent_mxid") is not None and not isinstance(row["agent_mxid"], str):
-        raise SchemaError(f"connections.json: row {index} agent_mxid is not a string")
+    for key in IDENTITY_FIELDS:
+        if row.get(key) is not None and not isinstance(row[key], str):
+            raise SchemaError(f"connections.json: row {index} {key} is not a string")
+    if row.get("agent_avatar_url") and not row["agent_avatar_url"].startswith(AVATAR_SCHEME):
+        raise SchemaError(f"connections.json: row {index} agent_avatar_url is not an {AVATAR_SCHEME} URI")
     if row["server_source"] not in SERVER_SOURCES:
         raise SchemaError(f"connections.json: row {index} server_source {row['server_source']!r} unknown")
+    # Absent on rows written before the flag existed: those load as enabled.
+    if "disabled" in row and not isinstance(row["disabled"], bool):
+        raise SchemaError(f"connections.json: row {index} field disabled is not a boolean")
     return row
 
 
@@ -554,13 +590,20 @@ def _now() -> str:
 
 def _row(*, server: str, instance: str, gateway_url: str, token_ref: str, primary: bool,
          added_by: str, verified: bool, server_source: str = "gateway",
-         agent_mxid: Optional[str] = None) -> dict:
+         identity: Optional[Mapping[str, object]] = None) -> dict:
     row = {"server": server, "instance": instance, "gateway_url": gateway_url,
            "token_ref": token_ref, "primary": primary, "added_by": added_by, "added_at": _now(),
-           "verified": verified, "server_source": server_source}
-    if agent_mxid:
-        row["agent_mxid"] = agent_mxid
+           "verified": verified, "server_source": server_source, "disabled": False}
+    _learn_fields(row, identity or {})
     return row
+
+
+def _learn_fields(row: dict, seen: Mapping[str, object]) -> None:
+    """Copy the identity fields a preview carries onto the row; an absent or empty one is left as is."""
+    for key in IDENTITY_FIELDS:
+        value = seen.get(key)
+        if isinstance(value, str) and value:
+            row[key] = value
 
 
 def _find(rows: list, instance: str) -> dict:
@@ -580,6 +623,32 @@ def list_connections(workspace: Optional[Path] = None) -> list:
 def removed_env_refs(workspace: Optional[Path] = None) -> list:
     """Env token names whose rows were removed; import_from_env leaves them alone."""
     return _read_record(record_path(workspace))[REMOVED_KEY]
+
+
+def known_servers(workspace: Optional[Path] = None, *, instances=None) -> list:
+    """Every DotSpace the resolver registers (`dotspace.registered_instances`: the configured
+    list, else the built-in default), one entry per server in registry order, joined with the
+    rows: `connected` is whether a row exists for it, `instance` that row's slug or None, and
+    `primary` / `disabled` that row's flags. Nothing is fetched; a server no row names is
+    the picker's offer, a server with a row is already in the directory."""
+    if instances is None:
+        try:
+            import dotspace  # type: ignore
+            instances = dotspace.registered_instances()
+        except Exception:  # noqa: BLE001 - without the resolver there is no registry to offer
+            instances = []
+    by_server = {r["server"]: r for r in list_connections(workspace)}
+    out, seen = [], set()
+    for d in instances:
+        server = str(getattr(d, "server", "") or "").lower()
+        if not server or server in seen:
+            continue
+        seen.add(server)
+        row = by_server.get(server)
+        out.append({"server": server, "connected": row is not None,
+                    "instance": row["instance"] if row else None,
+                    "primary": bool(row and row["primary"]), "disabled": bool(row and row.get("disabled"))})
+    return out
 
 
 def add_connection(token: str, *, added_by: str, expected_server: str, instance: Optional[str] = None,
@@ -630,7 +699,7 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
                        primary=not any(r["primary"] for r in rows), added_by=added_by,
                        verified=bool(seen.get("verified")),
                        server_source=str(seen.get("server_source") or "gateway"),
-                       agent_mxid=seen.get("agent_mxid"))
+                       identity=seen)
             rows.append(row)
             rec[REMOVED_KEY] = [x for x in rec[REMOVED_KEY] if x != ref]
     except Exception:
@@ -660,12 +729,17 @@ def _same_connection(rows: list, seen: Mapping[str, object]) -> Optional[dict]:
 
 
 def _rekey(row: dict, seen: Mapping[str, object]) -> bool:
-    """A verified identity replaces a provisional server in place; the instance slug stays."""
-    if row["server_source"] == "identity" or not seen.get("verified"):
+    """A verified identity replaces a provisional server in place; the instance slug stays. A row
+    already keyed by identity only refreshes its identity fields from a verified preview of the
+    same server, never its key."""
+    if not seen.get("verified"):
+        return False
+    if row["server_source"] == "identity":
+        if str(seen.get("server") or "") == row["server"]:
+            _learn_fields(row, seen)
         return False
     row.update(server=str(seen["server"]), server_source="identity", verified=True)
-    if seen.get("agent_mxid"):
-        row["agent_mxid"] = seen["agent_mxid"]
+    _learn_fields(row, seen)
     return True
 
 
@@ -719,6 +793,26 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
+
+
+def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
+    """Stop the bridge and mark the row disabled; the row, its vault key and its launch record
+    stay, so `reconnect` resumes it without a new token. The primary is refused while it is
+    primary (`PrimaryCannotDisconnect`). Disconnecting a disabled row is a no-op."""
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
+        if row["primary"]:
+            raise PrimaryCannotDisconnect(instance)
+        stopped = stop_bridge(instance, workspace=workspace, kill=kill) if instance else 0
+        row["disabled"] = True
+    out = dict(row)
+    out["stopped_pid"] = stopped
+    return out
+
+
+def _enable(instance: str, workspace: Optional[Path]) -> None:
+    with _transaction(workspace) as rec:
+        _find(rec["rows"], instance)["disabled"] = False
 
 
 def env_token_vars(environ: Mapping[str, str]) -> list:
@@ -791,8 +885,12 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
     return _read_json(status_read_path(name, _workspace(workspace)))
 
 
-def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object]) -> "tuple[str, Optional[str]]":
-    """(state, reason) from the bridge's sidecar and the last launch record."""
+def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
+                 disabled: bool = False) -> "tuple[str, Optional[str]]":
+    """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
+    `disconnected` with reason `disabled` whatever a stale sidecar still says."""
+    if disabled:
+        return "disconnected", "disabled"
     if launch and launch.get("ok") is False:
         return "failed", str(launch.get("reason") or "launch_failed")
     if not sidecar:
@@ -808,12 +906,16 @@ def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object]) ->
 
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
-    """The row plus `status` (connected, last_ok_ts from gateway-status) and the derived `state`."""
+    """The row plus `status` (connected, last_ok_ts from gateway-status), the derived `state`,
+    and every optional field spelled out (`disabled` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
     launch = _read_json(launch_record_path(inst, workspace))
-    state, reason = derive_state(sidecar, launch)
     out = dict(row)
+    out["disabled"] = bool(row.get("disabled"))
+    for key in IDENTITY_FIELDS:
+        out.setdefault(key, None)
+    state, reason = derive_state(sidecar, launch, out["disabled"])
     out["status"] = {"connected": bool(sidecar["connected"]) if "connected" in sidecar else None,
                      "last_ok_ts": sidecar.get("last_ok_ts")}
     out["state"] = state
@@ -826,10 +928,10 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
 
 def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
                 workspace: Optional[Path] = None) -> list:
-    """One entry per bridge the plan launches: every row with an instance (the legacy
-    unsuffixed bridge is the primary launch path's), then any AG2_REMOTE_TOKEN_<INST>
-    still without a row (an import the vault refused) unless its row was removed.
-    An unreadable record raises, so a caller never mistakes it for an empty plan."""
+    """One entry per bridge the plan launches: every enabled row with an instance (the legacy
+    unsuffixed bridge is the primary launch path's; a disabled row stays down), then any
+    AG2_REMOTE_TOKEN_<INST> still without a row (an import the vault refused) unless its row
+    was removed. An unreadable record raises, so a caller never mistakes it for an empty plan."""
     environ = os.environ if environ is None else environ
     record = _read_record(record_path(workspace))
     rows = record["rows"]
@@ -837,7 +939,7 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
     seen_inst = {r["instance"] for r in rows}
     seen_ref = {r["token_ref"] for r in rows} | set(record[REMOVED_KEY])
     for r in rows:
-        if not r["instance"]:
+        if not r["instance"] or r.get("disabled"):
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"]})
@@ -863,6 +965,8 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
+    if any(r["instance"] == instance and r.get("disabled") for r in list_connections(workspace)):
+        raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
     raise UnknownConnection(f"no connection {instance!r} to launch")
 
 
@@ -976,6 +1080,8 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     environ = os.environ if environ is None else environ
     rows = {r["instance"]: r for r in list_connections(workspace)}
     if instance in rows:
+        if rows[instance].get("disabled"):
+            _enable(instance, workspace)
         ref = rows[instance]["token_ref"]
         token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
         if token:

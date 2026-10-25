@@ -155,7 +155,28 @@ class Preview(unittest.TestCase):
         self.assertEqual(p, {"gateway_url": "https://chat.alpha-fixture.net", "gateway_host": "chat.alpha-fixture.net",
                              "server": "alpha-fixture.net", "server_source": "identity",
                              "agent_mxid": "@sutando:alpha-fixture.net", "verified": True,
+                             "agent_display_name": None, "agent_avatar_url": None,
+                             "owner_mxid": "@owner:alpha-fixture.net",
                              "authenticated": True, "error": None})
+
+    def test_identity_fields_come_from_the_one_verified_listing_entry_only(self):
+        def listing(**extra):
+            return lambda u, t, a=None: {"agents": [dict({"id": "@sutando:alpha-fixture.net"}, **extra)]}
+        p = C.preview_connection(TOKEN_A, fetch=listing(display_name="  Sutando  ", avatar_url="mxc://alpha-fixture.net/abc",
+                                                        owner="@owner:alpha-fixture.net"))
+        self.assertEqual((p["agent_display_name"], p["agent_avatar_url"], p["owner_mxid"]),
+                         ("Sutando", "mxc://alpha-fixture.net/abc", "@owner:alpha-fixture.net"))
+        p = C.preview_connection(TOKEN_A, fetch=listing(display_name="", avatar_url="https://cdn.example/a.png",
+                                                        owner="not-an-mxid"))
+        self.assertEqual((p["agent_display_name"], p["agent_avatar_url"], p["owner_mxid"]), (None, None, None),
+                         "an empty name, a non-mxc avatar and a non-mxid owner are dropped, not stored")
+        p = C.preview_connection(TOKEN_A, fetch=listing(display_name=7, avatar_url=["mxc://x/y"], owner={"id": "x"}))
+        self.assertEqual((p["agent_display_name"], p["agent_avatar_url"], p["owner_mxid"]), (None, None, None))
+        # An unverified listing names no identity at all, whatever its entries carry.
+        p = C.preview_connection(TOKEN_A, fetch=lambda u, t, a=None: {"agents": [
+            {"id": "@a:alpha-fixture.net", "owner": "@o:alpha-fixture.net"},
+            {"id": "@b:alpha-fixture.net", "owner": "@o:alpha-fixture.net"}]})
+        self.assertEqual([p[k] for k in C.IDENTITY_FIELDS], [None] * 4)
 
     def test_ambiguous_or_empty_fleet_leaves_the_registered_server_unverified(self):
         p = C.preview_connection(TOKEN_A, fetch=agents("@a:alpha-fixture.net", "@b:alpha-fixture.net"))
@@ -619,6 +640,11 @@ class Record(Base):
             (json.dumps({"schema_version": 1, "connections": [row(verified="yes")]}), "verified"),
             (json.dumps({"schema_version": 1, "connections": [row(server_source="guess")]}), "server_source"),
             (json.dumps({"schema_version": 1, "connections": [], "removed_env": "x"}), "removed_env"),
+            (json.dumps({"schema_version": 1, "connections": [row(disabled="yes")]}), "disabled is not a boolean"),
+            (json.dumps({"schema_version": 1, "connections": [row(agent_display_name=1)]}), "agent_display_name"),
+            (json.dumps({"schema_version": 1, "connections": [row(owner_mxid=["@o:a"])]}), "owner_mxid"),
+            (json.dumps({"schema_version": 1, "connections": [row(agent_avatar_url="https://cdn.example/a")]}),
+             "agent_avatar_url is not an mxc://"),
         ]
         for text, needle in cases:
             path.write_text(text)
@@ -682,6 +708,9 @@ class StatusJoin(Base):
         self.assertEqual(C.derive_state({"connected": False, "error": "HTTP 401"}, {}), ("failed", "auth_rejected"))
         self.assertEqual(C.derive_state({"connected": False, "reenroll": {"pending": True}}, {}),
                          ("failed", "auth_rejected"))
+        self.assertEqual(C.derive_state({"connected": True}, {"ok": True}, True), ("disconnected", "disabled"),
+                         "a disabled row is disconnected whatever a stale sidecar says")
+        self.assertEqual(C.derive_state({}, {"ok": False, "reason": "no_token"}, True), ("disconnected", "disabled"))
 
     def test_status_joins_the_instance_suffixed_file_and_launch_record(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
@@ -847,6 +876,212 @@ class Launching(Base):
                              workspace=self.ws, vault=self.vault, spawn=self.spawn,
                              kill=lambda *a: self.fail("nothing to kill"), fetch=unreachable)
         self.assertEqual(record["stopped_pid"], 0)
+
+
+class Identity(Base):
+    def test_add_stores_the_identity_fields_a_verified_preview_carries(self):
+        def listing(url, token, address=None):
+            return {"agents": [{"id": "@sutando:alpha-fixture.net", "display_name": "Sutando",
+                                "avatar_url": "mxc://alpha-fixture.net/av", "owner": "@owner:alpha-fixture.net"}]}
+        row, _ = self.add(fetch=listing)
+        self.assertEqual((row["agent_mxid"], row["agent_display_name"], row["agent_avatar_url"], row["owner_mxid"]),
+                         ("@sutando:alpha-fixture.net", "Sutando", "mxc://alpha-fixture.net/av", "@owner:alpha-fixture.net"))
+        listed = C.status_for(self.rows()[0], self.ws)
+        self.assertEqual(listed["owner_mxid"], "@owner:alpha-fixture.net")
+        self.assertNotIn("secret-alpha", json.dumps(listed))
+
+    def test_unverified_rows_list_the_identity_fields_as_none(self):
+        row, _ = self.add(fetch=unreachable)
+        self.assertEqual([k in row for k in C.IDENTITY_FIELDS], [False] * 4, "nothing unknown is written")
+        listed = C.status_for(row, self.ws)
+        self.assertEqual([listed[k] for k in C.IDENTITY_FIELDS], [None] * 4)
+        self.assertFalse(listed["disabled"])
+
+    def test_learn_refreshes_identity_fields_on_an_identity_row_without_rekeying_it(self):
+        row, _ = self.add(fetch=agents("@sutando:alpha-fixture.net"))
+        self.assertEqual((row["server_source"], row.get("agent_display_name")), ("identity", None))
+        seen = dict(C.preview_connection(TOKEN_A, fetch=unreachable), verified=True,
+                    agent_mxid="@sutando:alpha-fixture.net", agent_display_name="Renamed")
+        after = C.learn_identity(row["instance"], seen, workspace=self.ws)
+        self.assertEqual((after["server"], after["server_source"], after["agent_display_name"]),
+                         ("alpha-fixture.net", "identity", "Renamed"))
+        other = dict(seen, server="beta-fixture.net", agent_display_name="Elsewhere")
+        after = C.learn_identity(row["instance"], other, workspace=self.ws)
+        self.assertEqual((after["server"], after["agent_display_name"]), ("alpha-fixture.net", "Renamed"),
+                         "a verified preview of another server neither re-keys nor relabels the row")
+        after = C.learn_identity(row["instance"], dict(seen, verified=False, agent_display_name="Nope"), workspace=self.ws)
+        self.assertEqual(after["agent_display_name"], "Renamed", "an unverified preview teaches nothing")
+
+
+class Disconnect(Base):
+    def setUp(self):
+        super().setUp()
+        self.spawned = []
+
+        def spawn(argv, env, log_path):
+            self.spawned.append(env["GATEWAY_INSTANCE"])
+            return 4242
+        self.spawn = spawn
+        self.add()  # alpha is primary
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        C._record_launch("beta-fixture-net", self.ws, ok=True, pid=1)
+
+    def _hold_lock(self, instance, pid):
+        locks = self.ws / "state" / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        lock = locks / f"gateway-bridge.{instance}.lock"
+        lock.write_text(f"{pid}\n")
+        fd = os.open(str(lock), os.O_RDWR)
+        from file_lock import lock_fd
+        lock_fd(fd)
+        return fd
+
+    def test_disconnect_disables_stops_once_and_keeps_row_vault_and_launch_record(self):
+        fd = self._hold_lock("beta-fixture-net", 777)
+        killed = []
+
+        def kill(pid, sig):
+            killed.append((pid, sig))
+            from file_lock import unlock_fd
+            unlock_fd(fd)
+        try:
+            out = C.disconnect("beta-fixture-net", workspace=self.ws, kill=kill)
+        finally:
+            os.close(fd)
+        self.assertEqual(killed, [(777, 15)], "the stop helper ran exactly once")
+        self.assertEqual((out["instance"], out["disabled"], out["stopped_pid"]), ("beta-fixture-net", True, 777))
+        rows = {r["instance"]: r for r in self.rows()}
+        self.assertEqual((rows["beta-fixture-net"]["disabled"], rows["alpha-fixture-net"]["disabled"]), (True, False))
+        self.assertEqual(set(self.vault.store), {"AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET", "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"},
+                         "the token stays in the vault")
+        self.assertTrue(C.launch_record_path("beta-fixture-net", self.ws).exists())
+        self.assertNotIn("secret-beta", json.dumps(out))
+
+    def test_disconnecting_a_disabled_row_is_a_no_op(self):
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("nothing runs"))
+        again = C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("nothing runs"))
+        self.assertEqual((again["disabled"], again["stopped_pid"]), (True, 0))
+
+    def test_the_primary_cannot_be_disconnected_while_it_is_primary(self):
+        with self.assertRaises(C.PrimaryCannotDisconnect) as cm:
+            C.disconnect("alpha-fixture-net", workspace=self.ws, kill=lambda *a: self.fail("never stopped"))
+        self.assertTrue(str(cm.exception).startswith("primary_cannot_disconnect"))
+        self.assertIsInstance(cm.exception, C.PrimaryProtected)
+        self.assertFalse(self.rows()[0].get("disabled"))
+        C.set_primary("beta-fixture-net", workspace=self.ws)
+        out = C.disconnect("alpha-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        self.assertTrue(out["disabled"], "once another row is primary, the old primary can go down")
+        with self.assertRaises(C.UnknownConnection):
+            C.disconnect("nope", workspace=self.ws)
+
+    def test_a_disabled_row_is_disconnected_in_the_list_whatever_the_sidecar_says(self):
+        (self.ws / "state" / "gateway-status.beta-fixture-net.json").write_text(json.dumps({"connected": True, "last_ok_ts": 5}))
+        before = C.status_for(self.rows()[1], self.ws)
+        self.assertEqual((before["state"], before["disabled"]), ("connected", False))
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        after = C.status_for(self.rows()[1], self.ws)
+        self.assertEqual((after["state"], after["reason"], after["disabled"]), ("disconnected", "disabled", True))
+        self.assertEqual(after["status"], {"connected": True, "last_ok_ts": 5}, "the sidecar reading is still shown")
+        self.assertEqual((C.status_for(self.rows()[0], self.ws)["state"], C.status_for(self.rows()[0], self.ws)["disabled"]),
+                         ("pending", False))
+
+    def test_the_plan_omits_a_disabled_row_and_its_env_token(self):
+        self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        env = {"AG2_REMOTE_TOKEN_BETA_FIXTURE_NET": TOKEN_B}
+        self.assertEqual([e["instance"] for e in C.launch_plan(env, workspace=self.ws)], ["alpha-fixture-net"],
+                         "a restart leaves it down; the env token does not bring it back either")
+        with self.assertRaises(C.ConnectionsError) as cm:
+            C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                     workspace=self.ws, vault=self.vault, spawn=self.spawn)
+        self.assertIn("disconnected; reconnect it", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, C.UnknownConnection)
+        self.assertEqual(self.spawned, [])
+
+    def test_reconnect_clears_the_flag_and_launches(self):
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                             workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+        self.assertEqual((record["ok"], record["pid"], record["stopped_pid"]), (True, 4242, 0))
+        self.assertEqual(self.spawned, ["beta-fixture-net"])
+        row = C.status_for(self.rows()[1], self.ws)
+        self.assertEqual((row["disabled"], row["state"]), (False, "pending"))
+        self.assertEqual([e["instance"] for e in C.launch_plan({}, workspace=self.ws)], ["alpha-fixture-net", "beta-fixture-net"])
+        # A failed row still reconnects as before, enabled rows untouched by the flag path.
+        self.vault.store.pop("AG2_REMOTE_TOKEN_BETA_FIXTURE_NET")
+        with self.assertRaises(C.LaunchFailed):
+            C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                        workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+        self.assertEqual(C.status_for(self.rows()[1], self.ws)["state"], "failed")
+        self.vault.store["AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"] = TOKEN_B
+        record = C.reconnect("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={},
+                             workspace=self.ws, vault=self.vault, spawn=self.spawn, kill=lambda *a: None, fetch=unreachable)
+        self.assertTrue(record["ok"])
+
+    def test_old_records_without_the_flag_load_as_enabled(self):
+        path = C.record_path(self.ws)
+        payload = json.loads(path.read_text())
+        for r in payload["connections"]:
+            r.pop("disabled")
+        path.write_text(json.dumps(payload))
+        rows = self.rows()
+        self.assertEqual([("disabled" in r) for r in rows], [False, False])
+        self.assertEqual([C.status_for(r, self.ws)["disabled"] for r in rows], [False, False])
+        self.assertEqual(len(C.launch_plan({}, workspace=self.ws)), 2)
+        self.assertEqual(C.known_servers(self.ws, instances=[dotspace.DotSpace(server="beta-fixture.net")])[0]["disabled"], False)
+
+    def test_remove_still_drops_a_disabled_row_with_its_key(self):
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        gone = C.remove_connection("beta-fixture-net", workspace=self.ws, vault=self.vault)
+        self.assertEqual((gone["instance"], gone["stopped_pid"]), ("beta-fixture-net", 0))
+        self.assertEqual(set(self.vault.store), {"AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET"})
+        self.assertFalse(C.launch_record_path("beta-fixture-net", self.ws).exists())
+
+
+class KnownServers(Base):
+    INSTANCES = [dotspace.DotSpace(server="alpha-fixture.net", gateway_host="chat.alpha-fixture.net"),
+                 dotspace.DotSpace(server="beta-fixture.net", gateway_host="relay.beta-fixture.net"),
+                 dotspace.DotSpace(server="gamma-fixture.net")]
+
+    def test_empty_record_offers_every_registered_server_unconnected(self):
+        self.assertEqual(C.known_servers(self.ws, instances=self.INSTANCES), [
+            {"server": "alpha-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False},
+            {"server": "beta-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False},
+            {"server": "gamma-fixture.net", "connected": False, "instance": None, "primary": False, "disabled": False},
+        ])
+
+    def test_rows_join_by_server_with_their_flags(self):
+        self.add()
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"), instance="beta")
+        C.disconnect("beta", workspace=self.ws, kill=lambda *a: None)
+        out = C.known_servers(self.ws, instances=self.INSTANCES)
+        self.assertEqual([(s["server"], s["connected"], s["instance"], s["primary"], s["disabled"]) for s in out], [
+            ("alpha-fixture.net", True, "alpha-fixture-net", True, False),
+            ("beta-fixture.net", True, "beta", False, True),
+            ("gamma-fixture.net", False, None, False, False)])
+        self.assertNotIn("secret", json.dumps(out))
+        self.assertNotIn("token_ref", json.dumps(out), "the picker sees no vault key names")
+
+    def test_each_server_appears_once_in_registry_order(self):
+        twice = [*self.INSTANCES, dotspace.DotSpace(server="ALPHA-fixture.net"), dotspace.DotSpace(server="")]
+        self.assertEqual([s["server"] for s in C.known_servers(self.ws, instances=twice)],
+                         ["alpha-fixture.net", "beta-fixture.net", "gamma-fixture.net"])
+
+    def test_default_registry_comes_from_the_resolver(self):
+        out = C.known_servers(self.ws)
+        servers = [s["server"] for s in out]
+        self.assertEqual(servers, [e["server"] for e in dotspace.DEFAULT_INSTANCES],
+                         "with no config section, the built-in instances, once each")
+        self.assertEqual(len(set(servers)), len(servers))
+        self.assertTrue(all(s["connected"] is False for s in out))
+        with unittest.mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(C.known_servers(self.ws), [], "without the resolver there is nothing to offer")
+
+    def test_a_broken_record_is_a_schema_error_not_an_empty_offer(self):
+        C.record_path(self.ws).parent.mkdir(parents=True)
+        C.record_path(self.ws).write_text("{nope")
+        with self.assertRaises(C.SchemaError):
+            C.known_servers(self.ws, instances=self.INSTANCES)
 
 
 class Edges(Base):

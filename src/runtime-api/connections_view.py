@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Connections surface for the Sutando Server: connection.list / add / remove / set_primary / reconnect.
+"""Connections surface for the Sutando Server: connection.list / known_servers / add / remove /
+set_primary / disconnect / reconnect.
 
 Thin binding over the connections DOMAIN module (src/connections.py), the one
 writer of `state/connections.json`. The composer injects the resolved workspace,
@@ -8,8 +9,9 @@ itself (the module does, through the injected `vault`), and returns rows that
 carry a vault key name, never a secret. The methods are the daemon-native form
 of the HTTP resource: GET = list, POST without confirm = preview, POST with
 confirm = create (201 ↔ created true, 200 ↔ existing row), DELETE = remove,
-POST <instance>/primary = set_primary, POST <instance>/reconnect = reconnect;
-a confirm whose identity moved answers CONFLICT, the 409.
+POST <instance>/primary = set_primary, POST <instance>/disconnect = disconnect,
+POST <instance>/reconnect = reconnect, GET known-servers = known_servers; a confirm
+whose identity moved, and a disconnect of the primary, answer CONFLICT, the 409.
 
 Mutation sits on the same footing as task.submit: the Unix socket is the
 owner's, and no device grant is required.
@@ -51,6 +53,14 @@ class ConnectionsView:
         except connections.SchemaError as e:
             raise ProtocolError(-32603, str(e))
         return {"connections": [connections.status_for(r, self.workspace) for r in rows]}
+
+    # ── connection.known_servers ────────────────────────────────────────────
+    def known_servers(self) -> dict:
+        """{servers: [...]} — the resolver's DotSpace instances joined with the rows; nothing fetched."""
+        try:
+            return {"servers": connections.known_servers(self.workspace)}
+        except connections.SchemaError as e:
+            raise ProtocolError(-32603, str(e))
 
     # ── connection.add ──────────────────────────────────────────────────────
     def add(self, params: dict) -> dict:
@@ -94,6 +104,17 @@ class ConnectionsView:
         instance = self._instance(params)
         try:
             row = connections.set_primary(instance, workspace=self.workspace)
+        except connections.ConnectionsError as e:
+            raise ProtocolError(-32602, str(e))
+        return {"connection": connections.status_for(row, self.workspace)}
+
+    # ── connection.disconnect ───────────────────────────────────────────────
+    def disconnect(self, params: dict) -> dict:
+        instance = self._instance(params)
+        try:
+            row = connections.disconnect(instance, workspace=self.workspace, kill=self.kill)
+        except connections.PrimaryCannotDisconnect as e:
+            raise ProtocolError(CONFLICT, str(e))
         except connections.ConnectionsError as e:
             raise ProtocolError(-32602, str(e))
         return {"connection": connections.status_for(row, self.workspace)}

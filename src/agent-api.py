@@ -189,9 +189,10 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
                      logs_dir: Optional[Path] = None, vault=None, fetch=None, spawn=None,
                      kill=None, getaddrinfo=None) -> "tuple[int, Optional[dict]]":
     """(status, payload) for one request under CONNECTIONS_PREFIX; payload None = empty body.
-    The HTTP shape of the connections domain: GET lists, POST previews or (confirm) creates,
-    DELETE removes, POST <instance>/primary moves the primary, POST <instance>/reconnect
-    relaunches. Dispatch only; every rule lives in src/connections.py."""
+    The HTTP shape of the connections domain: GET lists, GET known-servers offers the registry,
+    POST previews or (confirm) creates, DELETE removes, POST <instance>/primary moves the primary,
+    POST <instance>/disconnect stops and disables, POST <instance>/reconnect relaunches.
+    Dispatch only; every rule lives in src/connections.py."""
     ws = Path(workspace) if workspace is not None else WORKSPACE_DIR
     repo = Path(repo) if repo is not None else REPO_DIR
     logs_dir = Path(logs_dir) if logs_dir is not None else ws / "logs"
@@ -201,6 +202,11 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
         if method == "GET" and not parts:
             rows = _connections.list_connections(ws)
             return 200, {"connections": [_connections.status_for(r, ws) for r in rows]}
+        # A fixed name, matched before any <instance> route so it is never read as a slug.
+        if parts == ["known-servers"]:
+            if method != "GET":
+                return 405, {"error": "method not allowed"}
+            return 200, {"servers": _connections.known_servers(ws)}
         if method == "POST" and not parts:
             token = body.get("token")
             if not isinstance(token, str) or not token.strip():
@@ -235,6 +241,12 @@ def connections_http(method: str, path: str, body: dict, query: Optional[dict] =
             return 204, None
         if len(parts) == 2 and method == "POST" and parts[1] == "primary":
             row = _connections.set_primary(parts[0], workspace=ws)
+            return 200, {"connection": _connections.status_for(row, ws)}
+        if len(parts) == 2 and method == "POST" and parts[1] == "disconnect":
+            try:
+                row = _connections.disconnect(parts[0], workspace=ws, kill=kill)
+            except _connections.PrimaryCannotDisconnect:
+                return 409, {"error": _connections.PrimaryCannotDisconnect.CODE}
             return 200, {"connection": _connections.status_for(row, ws)}
         if len(parts) == 2 and method == "POST" and parts[1] == "reconnect":
             record = _connections.reconnect(parts[0], repo=repo, logs_dir=logs_dir, workspace=ws,
