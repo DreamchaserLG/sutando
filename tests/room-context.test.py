@@ -347,11 +347,55 @@ class GatewayTest(unittest.TestCase):
             self.assertIn("HISTORY_SENTINEL", rendered)
             self.assertIn("ACTUAL_ASK", rendered)
             self.assertIn("transient", rendered)
+            self.assertIn("Once the README obligation is satisfied", rendered)
+            self.assertIn("fully supported by the briefing needs no extra reads", rendered)
         self.assertNotIn("room_ops.py read", text)
         hatch = task_fields.task_fields(path, self.gateway.RESULTS_DIR)
         self.assertEqual(Path(hatch["task_file"]), path)
         self.assertIn("README_SENTINEL", rc.view(Path(hatch["task_file"]).read_text()))
         self.assertEqual(self.gateway._write_task(task)[0], h["id"])
+
+    def test_card_only_task_delivers_readme_and_anchored_thread_guidance_without_changing_the_ask(self):
+        ask = "How does this compare with our earlier decision?"
+        def card_only(task):
+            task["task"] = ask
+            for key in ("readme", "members", "messages"):
+                task["room_context"].pop(key, None)
+        _, path, text = self.write(card_only)
+        h, message, operator = task_io.parse_task(str(path))
+        self.assertEqual(message, ask)
+        self.assertEqual(rc.from_headers(h)[2], "accepted")
+        for rendered in (rc.view(text), cc.wrap_untrusted(h["id"], h, message, operator),
+                         relay_loop.build_payload(h["id"], h, message, operator)[1],
+                         session_adapter.build_text(h["id"], h, message, operator)[1]):
+            self.assertIn(ask, rendered)
+            self.assertIn("Before the first substantive act", rendered)
+            self.assertIn("README if it is not supplied in the current validated briefing", rendered)
+            self.assertIn("If the question depends on omitted prior conversation", rendered)
+            self.assertIn("only the relevant thread anchored at the current question", rendered)
+            self.assertIn("this same agent in this task's source room", rendered)
+            self.assertIn("current room policy", rendered)
+            self.assertIn("bypass denied sections", rendered)
+            self.assertIn("bulk history fetch", rendered)
+            self.assertNotIn("README_SENTINEL", rendered)
+            self.assertNotIn("HISTORY_SENTINEL", rendered)
+        self.assertNotIn("room_ops.py read", text)
+        self.assertEqual(path.read_text(), text)
+
+    def test_briefing_sufficient_plain_question_delivers_no_extra_read_guidance(self):
+        ask = "What is this room called?"
+        _, path, text = self.write(lambda task: task.update(task=ask))
+        h, message, operator = task_io.parse_task(str(path))
+        packet, _, reason = rc.from_headers(h)
+        self.assertEqual(reason, "accepted")
+        self.assertEqual(packet["room"]["name"], "Test project")
+        self.assertIn("readme", packet)
+        payload = cc.wrap_untrusted(h["id"], h, message, operator)
+        self.assertIn(ask, payload)
+        self.assertIn("Test project", payload)
+        self.assertIn("Once the README obligation is satisfied", payload)
+        self.assertIn("fully supported by the briefing needs no extra reads", payload)
+        self.assertNotIn("room_ops.py read", text)
 
     def test_invalid_expired_denied_unavailable_never_restore_history_read(self):
         for mode in ("missing-binding", "wrong-room", "expired", "denied", "unavailable", "null"):

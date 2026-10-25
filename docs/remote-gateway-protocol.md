@@ -202,11 +202,18 @@ The Claude and Codex standby notifier prompts direct context-enabled tasks throu
 this view. Optional Codex and Claude cloud/routine renderers also revalidate before
 rendering. Codex connector sessions include actor, room, tier, policy, membership,
 visibility and status in their context-enabled session key; legacy routing is kept.
-Managed views and owner-task guidance say to use the briefing first. Missing or
-fresh facts and actions may use targeted MCP tools as the same acting agent under
-the current room policy. They forbid bulk history replacement and bypassing denied
-sections with other credentials. These instructions do not grant tool access or
-enforce authorization; the tool backend must enforce current permissions.
+Managed views and owner-task guidance say to use the briefing first. Before the
+first substantive act, read the permitted room README if it is not supplied in the
+current validated briefing. A card-only packet does not remove that obligation.
+When the question depends on omitted prior conversation, reconstruct only the
+relevant thread anchored at the current question through targeted MCP tools as the
+same agent in the task's source room under current room policy. Once the README
+obligation is satisfied, a plain question fully supported by the briefing needs no
+extra reads. Denied or unavailable data requires a stated limitation, never a bulk
+history replacement, other identity/credential or denied-section bypass. These
+instructions do not grant tool access or enforce authorization; the tool backend
+must enforce current permissions. Payload tests prove delivery of these instructions,
+not model compliance or an authenticated post-restart read-and-reply round trip.
 
 **Current limits:** no authoritative context producer or authenticated join-to-reply
 round trip is established by these consumers. A model that directly reads a canonical
