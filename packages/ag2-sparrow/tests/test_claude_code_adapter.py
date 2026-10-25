@@ -2156,7 +2156,7 @@ class AgentRootBase(ConnectBase):
 BASE = "https://backend.example/api"
 CODE = "acp.code-MMMM3333"
 BEARER = "redeemed-bearer-NNNN4444"
-RELAY = "https://relay.example/relay"
+RELAY = "https://relay.backend.example/relay"  # in BASE's domain
 
 
 class _Resp:
