@@ -265,16 +265,18 @@ def _spawn_sparrow(cfg: dict) -> "tuple[bool, str]":
     return False, f"{exe} exited {code} at once ({why})"
 
 
-def restart_listener(cfg: dict, bound: "tuple[int, dict] | None" = None) -> "tuple[bool, str]":
+def restart_listener(cfg: dict, bound: "tuple | None" = None) -> "tuple[bool | None, str]":
     """Through the user service install wrote when there is one, else a detached Sparrow. With
-    `bound` (old pid, its lock record), only an in-place restart of that generation: the unit
-    must run it as MainPID and the lock still prove it, else nothing is reset or restarted."""
+    `bound`, only the transition keepawake proved, re-read after the unit's own state: ("running",
+    old pid, its lock) restarts the unit only while it runs that generation, else (False, why);
+    ("stopped", old pid) starts it only while it is down and no live Sparrow holds the lock, else
+    (None, why), a current generation left untouched. Neither resets nor restarts on a mismatch."""
     owner = _unit_owner()
     if owner == UNIT_UNREACHABLE:
         return False, (f"{_cli.service_path()} is installed but systemctl --user did not answer; "
                        "no detached Sparrow is started beside that service")
     if bound is not None and owner != "ours":
-        return False, f"{_cli.SERVICE_NAME} no longer runs the old Sparrow (pid {bound[0]}); nothing was restarted"
+        return False, f"{_cli.SERVICE_NAME} is no longer this install's unit; nothing was restarted"
     if owner == "ours":
         # A unit left failed by its start limit stays down until reset.
         props = _cli._unit_props()
@@ -282,9 +284,10 @@ def restart_listener(cfg: dict, bound: "tuple[int, dict] | None" = None) -> "tup
             return False, (f"systemctl --user show {_cli.SERVICE_NAME} did not give a well-formed state; "
                            "it was neither reset nor restarted")
         if bound is not None:
-            why = _generation_moved(cfg, props, *bound)
+            why = _generation_moved(cfg, props, *bound[1:]) if bound[0] == "running" \
+                else _not_stopped(cfg, props, bound[1])
             if why:
-                return False, f"{why}; nothing was reset or restarted"
+                return (False if bound[0] == "running" else None), f"{why}; nothing was reset or restarted"
         _cli._systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
         r = _cli._systemctl(("--user", "restart", "ag2-sparrow.service"))
         if _cli._ok(r):
@@ -293,18 +296,30 @@ def restart_listener(cfg: dict, bound: "tuple[int, dict] | None" = None) -> "tup
     return _spawn_sparrow(cfg)
 
 
-_IDENTITY = ("pid", "acquired_at", "start", "send_lock")
+_IDENTITY = ("pid", "acquired_at", "start", "proc_start", "send_lock")
 
 
 def _generation_moved(cfg: dict, props: dict, old: int, lock: dict) -> "str | None":
     """Why the unit or the lock no longer runs the legacy generation `old` took as `lock`; None
-    while the unit still has it as an active MainPID and the lock still proves that drain."""
-    if props["ActiveState"] not in ("active", "reloading") or props["MainPID"] != old:
+    while the unit is exactly active with it as MainPID and the lock still proves that drain."""
+    if props["ActiveState"] != "active" or props["MainPID"] != old:
         return (f"{_cli.SERVICE_NAME} no longer runs the old Sparrow (pid {old}): "
                 f"ActiveState={props['ActiveState']}, MainPID={props['MainPID']}")
     now = _cli._lock_record(_state_dir(cfg), _instance(cfg)) or {}
     if any(now.get(k) != lock.get(k) for k in _IDENTITY) or drain_predates_send_lock(cfg) != old:
         return f"the lock no longer names the legacy drain (pid {old}) keepawake selected"
+    return None
+
+
+def _not_stopped(cfg: dict, props: dict, old: int) -> "str | None":
+    """Why the unit may not be started after `old` stopped: it is not down, or a live Sparrow
+    holds the lock (a current generation came up meanwhile). None while both are clear."""
+    if props["ActiveState"] not in ("inactive", "failed") or props["MainPID"] != 0:
+        return (f"{_cli.SERVICE_NAME} came up while the old Sparrow (pid {old}) stopped: "
+                f"ActiveState={props['ActiveState']}, MainPID={props['MainPID']}")
+    holder = _cli.live_lock_holder(_cli._lock_record(_state_dir(cfg), _instance(cfg)))
+    if holder is not None:
+        return f"Sparrow pid {holder} took the lock while the old Sparrow (pid {old}) stopped"
     return None
 
 
@@ -364,13 +379,35 @@ def proven_sparrow(cfg: dict, pid: int, lock: "dict | None") -> bool:
 
 
 def stop_holder(cfg: dict, pid: int) -> bool:
-    """_stop `pid` once the lock, re-read right before the signal, proves it its Sparrow
-    (proven_sparrow); else nothing is sent."""
-    if not proven_sparrow(cfg, pid, _cli._lock_record(_state_dir(cfg), _instance(cfg))):
-        print(f"error: pid {pid} is not proven to be the Sparrow holding the lock; it was not "
-              "signalled", file=sys.stderr)
+    """SIGTERM the lock holder `pid` through a pidfd opened before the lock is re-read and proved
+    (proven_sparrow, and the record's precise proc_start where it names one), then wait; nothing
+    is signalled without that handle or that proof."""
+    try:
+        handle = _pidfd_open(pid)
+    except ProcessLookupError:
+        return True
+    except OSError as e:
+        print(f"error: no stable process handle for pid {pid} (pidfd_open: {diagnostics.describe(e)}); "
+              "it was not signalled", file=sys.stderr)
         return False
-    return _stop(pid)
+    if handle is None:
+        print(f"error: no stable process handle for pid {pid} on this platform (no pidfd); it was "
+              "not signalled: stop Sparrow by hand", file=sys.stderr)
+        return False
+    try:
+        lock = _cli._lock_record(_state_dir(cfg), _instance(cfg))
+        why = None if proven_sparrow(cfg, pid, lock) else \
+            f"pid {pid} is not proven to be the Sparrow holding the lock"
+        # A legacy lock predates proc_start; one that names it must match it exactly.
+        if why is None and "proc_start" in (lock or {}):
+            why = unproven_holder(lock, pid)
+        if why:
+            print(f"error: {why}; it was not signalled", file=sys.stderr)
+            return False
+        return _stop(pid, handle)
+    finally:
+        if isinstance(handle, int):
+            os.close(handle)
 
 
 def _pidfd_open(pid: int) -> "int | None":
@@ -757,14 +794,20 @@ def _successor(cfg: dict, old: "tuple[int, str | None]", since: float) -> "tuple
         return None, f"the old Sparrow (pid {pid}) still holds the lock"
     if start is None or not proven_sparrow(cfg, pid, lock):
         return None, f"pid {pid} holds the lock but is not proven to be the Sparrow that took it"
+    gen = (lock or {}).get("proc_start")
+    if not isinstance(gen, str) or not gen or process_start(pid) != gen:
+        return None, f"pid {pid} is not proven to be the generation its lock names (proc_start)"
     status = _status_snapshot(state, instance) or {}
-    if status.get("pid") != pid or status.get("start") != start:
+    if status.get("pid") != pid or status.get("start") != start or status.get("proc_start") != gen:
         return None, f"the status file was not written by Sparrow pid {pid}"
     at = bounded_number(status.get("written_at"), 0, 1e11)
     if at is None or not since < at <= time.time() + _cli.SPARROW_STATUS_FUTURE_SKEW_S:
         return None, f"Sparrow pid {pid} has written no status since the restart"
     if status.get("connected") is not True:
         return None, f"Sparrow pid {pid} is running but not connected"
+    now = _cli._lock_record(state, instance) or {}
+    if any(now.get(k) != lock.get(k) for k in _IDENTITY) or process_start(pid) != gen:
+        return None, f"the lock moved off Sparrow pid {pid} while its status was read"
     return pid, f"Sparrow pid {pid} now holds the lock and is connected"
 
 
@@ -784,8 +827,9 @@ def replace_old_drain(cfg: dict, old: int) -> "tuple[bool | None, str]":
     """Replace `old`, the legacy drain keepawake selected, re-proving it at the action: None when
     the lock no longer names it (the generation rolled: nothing is touched). The unit is
     restarted in place only when it is active with `old` as its MainPID, and restart_listener
-    re-proves both right before it; otherwise `old` is an outside holder, stopped through _stop's
-    own proof first. True only once a successor holds the lock and is connected (_successor)."""
+    re-proves both right before it; otherwise `old` is an outside holder, stopped through
+    stop_holder first, and the unit started only while still down with no live holder. True only
+    once a successor holds the lock and is connected (_successor)."""
     owner = _unit_owner()
     if owner == "other":
         return False, "a hand-made unit runs it; restart that unit"
@@ -803,13 +847,16 @@ def replace_old_drain(cfg: dict, old: int) -> "tuple[bool | None, str]":
     runs_it = props is not None and props["ActiveState"] in ("active", "reloading") \
         and props["MainPID"] == old
     if runs_it:
-        ok, how = restart_listener(cfg, bound=(old, lock or {}))
+        ok, how = restart_listener(cfg, bound=("running", old, lock or {}))
     elif owner == "ours":
         print(f"replacing: Sparrow (pid {old}) predates the hold-line send lock and runs outside "
               f"{_cli.SERVICE_NAME} (ActiveState={props['ActiveState']}, MainPID={props['MainPID']})")
         if not stop_holder(cfg, old):
             return False, f"the old Sparrow (pid {old}) was not stopped; the unit was not restarted"
-        ok, how = restart_listener(cfg)
+        ok, how = restart_listener(cfg, bound=("stopped", old))
+        if ok is None:
+            print(f"not restarted: {how}")
+            ok = True  # the generation that came up is judged as the successor below
     else:
         ok, how = replace_sparrow(cfg, old, "predates the hold-line send lock")
     if not ok:

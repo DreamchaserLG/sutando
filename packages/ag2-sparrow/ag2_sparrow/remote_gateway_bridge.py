@@ -356,6 +356,7 @@ from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, 
 from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
 from .workspace_lock import retain as _ws_retain
 from .workspace_lock import _host_label as _stable_host_label
+from .workspace_lock import proc_start as _ws_proc_start
 
 TASKS_DIR = _task_dir()
 # Written by THIS bridge on replay, not by an agent — the guard must not
@@ -3839,6 +3840,18 @@ def _refresh_served_setup(reply) -> None:
     _SETUP_REFRESHER.maybe_refresh(diagnostics.revision_field(reply.get("setup_revision"), URL), agent)
 
 
+_OWN_PROC_START: dict = {}
+
+
+def _own_proc_start() -> "str | None":
+    """This process's precise start (workspace_lock.proc_start), the generation its lock names."""
+    pid = os.getpid()
+    if pid not in _OWN_PROC_START:
+        _OWN_PROC_START.clear()
+        _OWN_PROC_START[pid] = _ws_proc_start(pid)
+    return _OWN_PROC_START[pid]
+
+
 def _emit_gateway_status(connected: bool, *, error: str | None = None,
                          backoff_s: int = 0, poll_ok_ts: float | None = None) -> None:
     """Write `state/gateway-status.json` — the connection's own liveness, for a
@@ -3865,6 +3878,7 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             # Which process wrote it, and exactly when: a supervisor binds a restart's success to them.
             "pid": os.getpid(),
             "start": agent_identity.own_start(),
+            "proc_start": _own_proc_start(),
             "written_at": written_at,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),

@@ -57,6 +57,7 @@ def test_status_names_its_writer_and_its_sub_second_time():
         rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
         assert rec["pid"] == os.getpid()
         assert rec["start"] == m.agent_identity.own_start() and rec["start"]
+        assert rec["proc_start"] == m._ws_proc_start(os.getpid()) and rec["proc_start"]
         assert isinstance(rec["written_at"], float) and before <= rec["written_at"] <= time.time()
         assert rec["ts"] == int(rec["written_at"])
         print("PASS test_status_names_its_writer_and_its_sub_second_time")

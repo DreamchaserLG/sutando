@@ -2647,8 +2647,9 @@ class StartSparrow(Base):
     task = Keepalive.task
     # The status identity the bridge's writer records: its pid, start and sub-second write time.
     IDENT = ("import json, sys, time; sys.path.insert(0, sys.argv[2]); from ag2_sparrow.task_io import "
-             "start_time; p = int(sys.argv[1]); print(json.dumps({'pid': p, 'start': start_time(p), "
-             "'written_at': time.time()})[1:-1])")
+             "start_time; from ag2_sparrow.workspace_lock import proc_start; p = int(sys.argv[1]); "
+             "g = proc_start(p); print(json.dumps({'pid': p, 'start': start_time(p), 'proc_start': g, "
+             "'written_at': time.time()})[1:-1]); print(json.dumps(g))")
 
     def setUp(self):
         super().setUp()
@@ -2656,13 +2657,15 @@ class StartSparrow(Base):
         # Stands in for ag2-sparrow: takes the lock, reports itself connected, records its env,
         # stays up.
         lock = ('{"role": "gateway-bridge", "pid": %s, "host": "' + hatch_cli.workspace_lock._host_label()
-                + '", "workspace": "%s", "acquired_at": %s, "heartbeat_at": %s, "schema_version": 1}')
+                + '", "workspace": "%s", "acquired_at": %s, "heartbeat_at": %s, "schema_version": 1, '
+                '"proc_start": %s}')
         executable(self.bin / hatch_cli.SPARROW_COMMAND,
                    '#!/bin/sh\necho "$REMOTE_HEALTH_COMMAND" > ' + str(self.seen) + "\n"
                    'mkdir -p "$AGENT_CONNECT_STATE_DIR/locks"\nnow=$(date +%s)\n'
-                   f"printf '{lock}' $$ \"$(dirname \"$AGENT_CONNECT_STATE_DIR\")\" $now $now > "
+                   f'out=$("{sys.executable}" -c {shlex.quote(self.IDENT)} $$ "{PKG_ROOT}")\n'
+                   'ident=$(echo "$out" | head -1)\npst=$(echo "$out" | tail -1)\n'
+                   f"printf '{lock}' $$ \"$(dirname \"$AGENT_CONNECT_STATE_DIR\")\" $now $now \"$pst\" > "
                    '"$AGENT_CONNECT_STATE_DIR/locks/gateway-bridge.lock"\n'
-                   f'ident=$("{sys.executable}" -c {shlex.quote(self.IDENT)} $$ "{PKG_ROOT}")\n'
                    'printf \'{"connected": true, "ts": %s, "error": null, %s}\' "$now" "$ident" > '
                    '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
         for name, value in (("SPAWN_SETTLE_S", 0.3), ("START_WAIT_S", 5.0), ("STOP_WAIT_S", 5.0)):
@@ -2690,6 +2693,14 @@ class StartSparrow(Base):
             p = mock.patch.object(target, attr, fn)
             p.start()
             self.addCleanup(p.stop)
+        if not hasattr(os, "pidfd_open"):
+            # No pidfd (macOS): a stand-in handle, so stop_holder's proof runs; the signal is by pid.
+            real_stop = keepalive._stop
+            for attr, fn in (("_pidfd_open", lambda pid: ("handle", pid)),
+                             ("_stop", lambda pid, handle=None: real_stop(pid))):
+                p = mock.patch.object(keepalive, attr, fn)
+                p.start()
+                self.addCleanup(p.stop)
 
     def started_ago(self, proc, ago):
         self.starts[proc.pid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
@@ -3010,32 +3021,45 @@ class StartSparrow(Base):
         self.assertNotIn("now holds the lock and is connected", r.stdout)
         self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
 
-    def test_keepawake_takes_success_only_from_the_lock_holders_own_status_after_the_action(self):
-        # Negative controls beside the probe; the legitimate successor is the positive one.
+    def sparrow_proc(self):
+        """A live process running Sparrow's command line: (proc, start, precise proc_start)."""
         script = self.home / "successor" / hatch_cli.SPARROW_COMMAND
         script.parent.mkdir(parents=True, exist_ok=True)
         script.write_text("import time\ntime.sleep(30)\n")
+        argv = [sys.executable, str(script)]  # Sparrow's command line, in /proc and ps alike
+        proc = subprocess.Popen(argv)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        self.argvs[proc.pid] = argv
+        return proc, task_io.start_time(proc.pid), keepalive.process_start(proc.pid)
 
-        def sparrow_successor():
-            argv = [sys.executable, str(script)]  # Sparrow's command line, in /proc and ps alike
-            proc = subprocess.Popen(argv)
-            self.addCleanup(lambda: proc.poll() is None and proc.kill())
-            self.argvs[proc.pid] = argv
-            return proc, task_io.start_time(proc.pid)
+    def current_generation(self, fake=None):
+        """A connected current-protocol Sparrow holding the lock with its own status; the unit's
+        MainPID when `fake` is given."""
+        proc, st, gen = self.sparrow_proc()
+        self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st, proc_start=gen)
+        self.connected_status(ts=int(time.time()), pid=proc.pid, start=st, proc_start=gen,
+                              written_at=time.time())
+        if fake is not None:
+            fake.state, fake.main_pid = "active", proc.pid
+        return proc
+
+    def test_keepawake_takes_success_only_from_the_lock_holders_own_status_after_the_action(self):
+        # Negative controls beside the probe; the legitimate successor is the positive one.
         cases = {
-            "a status naming another process": lambda p, st: dict(pid=p + 1, start=st, written_at=time.time()),
-            "a status of a reused pid": lambda p, st: dict(pid=p, start="2001-01-01T00:00:00Z", written_at=time.time()),
-            "a status written before the action": lambda p, st: dict(pid=p, start=st, written_at=time.time() - 30),
-            "a status with whole-second time only": lambda p, st: dict(pid=p, start=st),
-            "a disconnected successor": lambda p, st: dict(pid=p, start=st, written_at=time.time(), connected=False),
-            "a legitimate successor": lambda p, st: dict(pid=p, start=st, written_at=time.time()),
+            "a status naming another process": lambda p, st, g: dict(pid=p + 1, start=st, proc_start=g, written_at=time.time()),
+            "a status of a reused pid": lambda p, st, g: dict(pid=p, start="2001-01-01T00:00:00Z", proc_start=g, written_at=time.time()),
+            "a status of another generation": lambda p, st, g: dict(pid=p, start=st, proc_start="boot:1", written_at=time.time()),
+            "a status written before the action": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time() - 30),
+            "a status with whole-second time only": lambda p, st, g: dict(pid=p, start=st, proc_start=g),
+            "a disconnected successor": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time(), connected=False),
+            "a legitimate successor": lambda p, st, g: dict(pid=p, start=st, proc_start=g, written_at=time.time()),
         }
         for case, fields in cases.items():
             with self.subTest(case):
                 def successor(fake, _t0, fields=fields):
-                    proc, st = sparrow_successor()
-                    self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st)
-                    self.connected_status(ts=int(time.time()), **fields(proc.pid, st))
+                    proc, st, gen = self.sparrow_proc()
+                    self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st, proc_start=gen)
+                    self.connected_status(ts=int(time.time()), **fields(proc.pid, st, gen))
                     fake.main_pid = proc.pid
                 r, line = self.keepawake_successor(successor)
                 (self.home / "keepalive-probe.log").unlink()
@@ -3045,6 +3069,136 @@ class StartSparrow(Base):
                 else:
                     self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
                     self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_certifies_no_successor_whose_lock_rolled_during_its_proof(self):
+        # Reviewer's probe: the lock rolls from A to B during A's process proof or its status
+        # read, while A's matching connected status stays.
+        for at in ("process proof", "status read"):
+            with self.subTest(at):
+                rolled, real_proof, real_read = [], keepalive.proven_sparrow, keepalive._status_snapshot
+
+                def roll():
+                    if not rolled and getattr(self, "succ", None) is not None:
+                        b, st, gen = self.sparrow_proc()
+                        self.take_lock(b.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st,
+                                       proc_start=gen)
+                        rolled.append(b.pid)
+
+                def proof(cfg, pid, lock, at=at):
+                    ok = real_proof(cfg, pid, lock)
+                    if at == "process proof" and pid == getattr(self.succ, "pid", None):
+                        roll()
+                    return ok
+
+                def read(state, instance, at=at):
+                    status = real_read(state, instance)
+                    if at == "status read":
+                        roll()
+                    return status
+
+                def successor(fake, _t0):
+                    self.succ = self.current_generation(fake)
+                self.succ = None
+                with mock.patch.object(keepalive, "proven_sparrow", side_effect=proof), \
+                        mock.patch.object(keepalive, "_status_snapshot", side_effect=read):
+                    r, line = self.keepawake_successor(successor)
+                (self.home / "keepalive-probe.log").unlink()
+                self.assertTrue(rolled, "the lock rolled to B")
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertNotIn(f"Sparrow pid {self.succ.pid} now holds the lock", r.stdout)
+                self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def stop_seam(self, opened=("handle", 0), lock_extra=None):
+        """keepawake against a legacy holder no unit runs, with _pidfd_open answering `opened`
+        (an object, None or an exception) and _stop recording, never signalling: (result, events)."""
+        old, rec = self.legacy()
+        if lock_extra:
+            self.lock_path().write_text(json.dumps({**rec, **lock_extra}))
+        events, real_proof = [], keepalive.proven_sparrow
+
+        def open_(pid):
+            events.append(("open", pid))
+            if isinstance(opened, Exception):
+                raise opened
+            return opened
+
+        def proof(cfg, pid, lock):
+            events.append(("proof", pid))
+            return real_proof(cfg, pid, lock)
+
+        def stop(pid, handle=None):
+            events.append(("signal", pid, handle))
+            return False
+        want = keepalive.health_command(str(self.reply_stub))
+        with mock.patch.object(keepalive, "_pidfd_open", side_effect=open_), \
+                mock.patch.object(keepalive, "proven_sparrow", side_effect=proof), \
+                mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
+            r, _line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list, "never a bare-pid SIGTERM")
+        self.assertIsNone(old.poll())
+        self.done_with(old)
+        return r, [e for e in events if e[1] == old.pid]
+
+    def test_stop_holder_signals_only_through_a_handle_opened_before_its_proof(self):
+        r, events = self.stop_seam(opened=("handle", 4242))
+        kinds = [e[0] for e in events]
+        self.assertIn("signal", kinds, events)
+        last_proof = max(i for i, k in enumerate(kinds) if k == "proof")
+        self.assertLess(kinds.index("open"), last_proof, "the handle is opened before the proof it binds")
+        self.assertEqual(events[kinds.index("signal")][2], ("handle", 4242), "the signal goes through that handle")
+
+    def test_stop_holder_signals_nothing_without_a_stable_handle(self):
+        for case, opened in (("no pidfd on this platform", None), ("pidfd_open failed", OSError(errno.EMFILE, "x"))):
+            with self.subTest(case):
+                r, events = self.stop_seam(opened=opened)
+                self.assertNotIn("signal", [e[0] for e in events], events)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("no stable process handle", r.stderr)
+
+    def test_stop_holder_signals_nothing_when_the_lock_names_another_precise_generation(self):
+        # Same pid and same whole-second start, but the lock's proc_start is another process's.
+        r, events = self.stop_seam(lock_extra={"proc_start": "boot-of-another:1"})
+        self.assertNotIn("signal", [e[0] for e in events], events)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_keepawake_leaves_a_generation_that_came_up_while_the_outside_holder_stopped(self):
+        # Reviewer's probe: the unit starts healthy generation B during the stop wait.
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake, real_stop, came = FakeSystemd(state="inactive"), keepalive._stop, []
+
+        def stop(pid, handle=None):
+            done = real_stop(pid, handle)
+            if pid == old.pid:
+                came.append(self.current_generation(fake))
+            return done
+        want = keepalive.health_command(str(self.reply_stub))
+        with self.service(fake), \
+                mock.patch.object(keepalive, "_stop", side_effect=stop), \
+                mock.patch.object(keepalive, "START_WAIT_S", 0.5):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertEqual(old.wait(5), -signal.SIGTERM, "the outside holder was stopped")
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertEqual(fake.ran("reset-failed"), [])
+        self.assertIsNone(came[0].poll(), "the new generation is left running")
+        self.assertIn("not restarted:", r.stdout)
+        self.assertIn(f"Sparrow pid {came[0].pid} now holds the lock and is connected", r.stdout)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.done_with(old)
+
+    def test_keepawake_restarts_nothing_while_the_unit_is_reloading(self):
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="reloading", main_pid=old.pid)
+        r, line, stop = self.keepawake_unit(fake)
+        self.assertEqual(fake.ran("restart"), [])
+        self.assertEqual(fake.ran("reset-failed"), [])
+        stop.assert_not_called()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+        self.assertIsNone(old.poll())
+        self.done_with(old)
 
     def acquired(self, proc, ago):
         """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back by
