@@ -125,7 +125,9 @@ def current(c, where="current") -> None:
     # The audience the page was written for, which a later refresh renders in; null when no record says.
     need(c["audience"] in (None,) + AUDIENCES, f"{where}: audience")
     if c["source"] == "manual-selection":
-        need(is_id(c["review_id"]) and "v1_entry_sha256" not in c, f"{where}: manual-selection")
+        # Nothing records the audience of a page picked after marker loss: null, never a guess.
+        need(is_id(c["review_id"]) and "v1_entry_sha256" not in c and c["audience"] is None,
+             f"{where}: manual-selection")
     else:
         need(c["source"] in V1_SOURCES, f"{where}: source")
         need(c["review_id"] is None and is_hex(c.get("v1_entry_sha256")), f"{where}: v1 source")
@@ -1014,12 +1016,16 @@ class SchemaTransitionTest(unittest.TestCase):
             "select:<kind> without its unselected entry": [(["rooms", "!lost", "unselected"], [])],
             "select:none without its unselected entries": [(["rooms", "!lost", "unselected"], [])],
             "an opaque entry with an unknown audience": [(["rooms", "!lost", "current", "audience"], "owner")],
+            "a manual selection with a dm audience": [(["rooms", "!lost", "current", "audience"], "dm")],
+            "a manual selection with a room audience": [(["rooms", "!lost", "current", "audience"], "room")],
+            "accepted proposed with an audience its review didn't have": [(cur + ["proposed", "audience"], "room")],
         }
         source = {"select over a changed, unreviewed C": lost, "select over a C whose chosen candidate changed": lost,
                   "an active keep-old without its Rejected entry": old,
                   "select:<kind> without its current": lost, "select:<kind> without its unselected entry": lost,
                   "select:none without its unselected entries": none,
-                  "an opaque entry with an unknown audience": lost}
+                  "an opaque entry with an unknown audience": lost, "a manual selection with a dm audience": lost,
+                  "a manual selection with a room audience": lost}
         for name, edits in cases.items():
             with self.subTest(name):
                 bad = source.get(name, new)
@@ -1106,6 +1112,8 @@ class SchemaTransitionTest(unittest.TestCase):
         j0(j0m, R)
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "proposed"], {"kind": None}))
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "plan"], [3]))
+        for audience in ("owner", "", None, 1):
+            self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R, "journal", "proposed", "audience"], audience))
         self.assertRaises(Invalid, marker, self.mutate(j0m, ["rooms", R], {"journal": j0m["rooms"][R]["journal"]}))
         keep_new(m, R)
         self.assertRaises(Invalid, marker, self.mutate(m, ["rooms", R, "current"], {"opaque": False}))
@@ -1163,6 +1171,9 @@ class ConversionMatrixTest(unittest.TestCase):
             ("html-a", "v1-complete", "r9", "room"), None),
         "complete, head, audience dm": ({"kind": "html-a", "hash": "h", "revision": "r9", "audience": "dm"},
                                         ("html-a", "v1-complete", "r9", "dm"), None),
+        "creating, a previous with its audience": (
+            {"state": "creating", "operation_id": "op", "audience": "dm", "previous": {**PREV, "audience": "room"}},
+            ("html-p", "v1-previous", "r6", "room"), (None, "op", "creating")),
         "pending, a previous with its audience": (
             {"kind": "html-a", "state": "pending", "audience": "dm", "previous": {**PREV, "audience": "room"}},
             ("html-p", "v1-previous", "r6", "room"), ("html-a", None, "pending")),

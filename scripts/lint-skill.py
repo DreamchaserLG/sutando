@@ -140,14 +140,15 @@ def _lint_manifest(skill_dir: Path) -> tuple[list[str], list[str]]:
                 warn(f"supervised_worker.interpreter.config '{interp['config']}' "
                      "is not declared in the config block")
 
-    # Script fields core discovers by name (src/skill_roots.py): each must be a relative .py file
+    # Script fields core discovers by name (src/skill_roots.py): each must be a relative script
     # that resolves inside the skill, symlinks followed, the containment discovery applies.
-    for field in ("pending_questions_store", "orphan_reaper"):
+    for field, exts in (("pending_questions_store", (".py",)), ("orphan_reaper", (".py",)),
+                        ("on_launch", (".py", ".sh"))):
         pqs = m.get(field)
         if pqs is None:
             continue
-        if not isinstance(pqs, str) or not pqs.endswith(".py") or not pqs[:-3]:
-            err(f"{field} must be a relative path to a .py script")
+        if not isinstance(pqs, str) or not any(pqs.endswith(e) and pqs[:-len(e)] for e in exts):
+            err(f"{field} must be a relative path to a {' or '.join(exts)} script")
         elif pqs.startswith("/") or ".." in Path(pqs).parts or any(c.isspace() for c in pqs):
             err(f"{field} must stay inside the skill directory")
         elif not (skill_dir / pqs).is_file():

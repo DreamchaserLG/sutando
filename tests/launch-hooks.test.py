@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""src/launch_hooks.py directly: the runner starts each injected hook detached (a .py under the
+given python, anything else under bash, in its own session, stdin empty, output in its log) and
+returns at once; a hook that cannot start is reported and the rest still start; the edge starts
+exactly the enabled, contained `on_launch` declarers and never fails. Also the field's contract in
+the canonical schema and in scripts/lint-skill.py. The dispatcher's wiring is pinned end to end in
+tests/tutorial-refresh-trigger.test.py."""
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import warnings
+from pathlib import Path
+from unittest import mock
+
+# The runner drops each child unwaited on purpose; Popen's "still running" warning is that, by design.
+warnings.filterwarnings("ignore", "subprocess .* is still running", ResourceWarning)
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+import launch_hooks as lh, skill_roots, workspace_default  # noqa: E401,E402
+
+_spec = importlib.util.spec_from_file_location("lint_skill_launch", REPO / "scripts" / "lint-skill.py")
+lint = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(lint)
+
+PY_HOOK = """import json, os, sys, time
+gate = os.environ.get("HOOK_GATE")
+while gate and not os.path.exists(gate):
+    time.sleep(0.05)
+out = os.path.join(os.environ["HOOK_OUT"], os.path.basename(__file__) + ".json")
+json.dump({"exe": sys.executable, "sid": os.getsid(0), "stdin": sys.stdin.read()}, open(out, "w"))
+print("py hook ran")
+"""
+SH_HOOK = """out="$HOOK_OUT/$(basename "$0").json"
+printf '{"bash": "%s", "sid": %s, "stdin": "%s"}' "$BASH_VERSION" "$("$HOOK_PY" -c 'import os; print(os.getsid(0))')" "$(cat)" > "$out"
+echo "sh hook ran"
+"""
+
+
+def wait_for(path: Path, timeout: float = 30) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError, ValueError):
+            return json.loads(path.read_text())
+        time.sleep(0.05)
+    raise AssertionError(f"{path} never written")
+
+
+class _Tmp(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="launch-hooks-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.out, self.logs = self.tmp / "out", self.tmp / "logs"
+        self.out.mkdir()
+        self.env = {**os.environ, "HOOK_OUT": str(self.out), "HOOK_PY": sys.executable}
+
+    def hook(self, name: str, body: str) -> Path:
+        path = self.tmp / "hooks" / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(body)
+        return path
+
+
+class RunnerTest(_Tmp):
+    def test_a_py_hook_runs_under_the_given_python_and_anything_else_under_bash_detached(self):
+        py, sh = self.hook("one.py", PY_HOOK), self.hook("two.sh", SH_HOOK)
+        # This process's stdin carries data; a hook must not inherit it.
+        r, w = os.pipe()
+        os.write(w, b"leaked")
+        os.close(w)
+        saved = os.dup(0)
+        os.dup2(r, 0)
+        try:
+            started = lh.start([("one", py), ("two", sh)], self.logs, sys.executable, self.env)
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            os.close(r)
+        self.assertEqual([n for n, _ in started], ["one", "two"])
+        a, b = wait_for(self.out / "one.py.json"), wait_for(self.out / "two.sh.json")
+        self.assertEqual(Path(a["exe"]).resolve(), Path(sys.executable).resolve())
+        self.assertTrue(b["bash"], "the .sh hook ran under bash")
+        self.assertEqual([a["sid"], b["sid"]], [pid for _, pid in started], "each hook leads its own session")
+        self.assertNotIn(os.getsid(0), (a["sid"], b["sid"]))
+        self.assertEqual((a["stdin"], b["stdin"]), ("", ""))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not all(
+                (self.logs / f"launch-hook-{n}.log").exists()
+                and "ran" in (self.logs / f"launch-hook-{n}.log").read_text() for n in ("one", "two")):
+            time.sleep(0.05)
+        self.assertIn("py hook ran", (self.logs / "launch-hook-one.log").read_text())
+        self.assertIn("sh hook ran", (self.logs / "launch-hook-two.log").read_text())
+
+    def test_start_returns_while_the_hook_still_runs(self):
+        gate = self.tmp / "gate"
+        env = {**self.env, "HOOK_GATE": str(gate)}
+        self.addCleanup(gate.touch)  # whatever happens, the hook can finish
+        got = []
+        caller = threading.Thread(target=lambda: got.append(
+            lh.start([("slow", self.hook("slow.py", PY_HOOK))], self.logs, sys.executable, env)), daemon=True)
+        caller.start()
+        caller.join(10)
+        self.assertFalse(caller.is_alive(), "start() waited on the hook")
+        (_, pid), = got[0]
+        os.kill(pid, 0)  # still running: nobody waited for it
+        self.assertFalse((self.out / "slow.py.json").exists())
+        gate.touch()
+        wait_for(self.out / "slow.py.json")
+
+    def test_a_hook_that_cannot_start_is_reported_and_the_others_still_start(self):
+        bad, good = self.hook("bad.py", PY_HOOK), self.hook("good.sh", SH_HOOK)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            started = lh.start([("bad", bad), ("good", good)], self.logs, str(self.tmp / "no-such-python"), self.env)
+        self.assertEqual([n for n, _ in started], ["good"])
+        self.assertIn("launch-hooks: bad: not started (FileNotFoundError)", err.getvalue())
+        wait_for(self.out / "good.sh.json")
+
+
+class EdgeTest(_Tmp):
+    def skill(self, root: Path, name: str, manifest: dict, script: str = "", body: str = PY_HOOK) -> None:
+        d = root / name
+        (d / "scripts").mkdir(parents=True)
+        if script:
+            (d / script).write_text(body)
+        (d / "manifest.json").write_text(json.dumps(manifest))
+
+    def test_main_starts_every_enabled_contained_declarer_and_nothing_else(self):
+        roots = self.tmp / "skills"
+        self.skill(roots, "alpha", {"on_launch": "scripts/a.py"}, "scripts/a.py")
+        self.skill(roots, "beta", {"on_launch": "scripts/b.sh"}, "scripts/b.sh", SH_HOOK)
+        self.skill(roots, "off", {"on_launch": "scripts/c.py", "enabled": False}, "scripts/c.py")
+        self.skill(roots, "escape", {"on_launch": "../alpha/scripts/a.py"})
+        self.skill(roots, "missing", {"on_launch": "scripts/none.py"})
+        self.skill(roots, "plain", {"name": "plain"})
+        err = io.StringIO()
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.tmp / "ws"), \
+                mock.patch.object(skill_roots, "skill_roots", return_value=[roots]), \
+                mock.patch.dict(os.environ, {"HOOK_OUT": str(self.out), "HOOK_PY": sys.executable}), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(lh.main(), 0)
+        self.assertEqual(re.findall(r"started (\w+)", err.getvalue()), ["alpha", "beta"])
+        wait_for(self.out / "a.py.json")
+        wait_for(self.out / "b.sh.json")
+        self.assertEqual(sorted(p.name for p in (self.tmp / "ws" / "logs").iterdir()),
+                         ["launch-hook-alpha.log", "launch-hook-beta.log"])
+
+    def test_main_exits_0_when_the_scan_fails(self):
+        err = io.StringIO()
+        with mock.patch.object(workspace_default, "resolve_workspace", side_effect=RuntimeError("no config")), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(lh.main(), 0)
+        self.assertIn("launch-hooks: none started (RuntimeError)", err.getvalue())
+
+
+class ContractTest(_Tmp):
+    schema = json.loads((REPO / "schemas" / "skill-manifest.schema.json").read_text())
+
+    def test_the_schema_declares_the_field_and_the_tutorial_manifest_fits_it(self):
+        props = self.schema["properties"]
+        self.assertIs(self.schema["additionalProperties"], False)
+        manifest = json.loads((REPO / "skills" / "tutorial" / "manifest.json").read_text())
+        self.assertEqual([k for k in manifest if k not in props], [])
+        pattern = props[lh.FIELD]["pattern"]
+        for good in ("scripts/on_launch.py", "scripts/x.sh", "hook.py"):
+            self.assertTrue(re.match(pattern, good), good)
+        for bad in ("../x.py", "/abs/x.py", "scripts/../x.py", "scripts/a b.py", "scripts/x.txt", "", "x.py/.."):
+            self.assertFalse(re.match(pattern, bad), bad)
+        self.assertTrue(re.match(pattern, manifest[lh.FIELD]))
+
+    def test_the_linter_validates_the_field_rather_than_only_allowing_it(self):
+        def run(value, link=None):
+            d = self.tmp / "sk"
+            shutil.rmtree(d, ignore_errors=True)
+            (d / "scripts").mkdir(parents=True)
+            (d / "scripts" / "hook.py").write_text("# hook\n")
+            (d / "scripts" / "hook.sh").write_text("# hook\n")
+            if link:
+                (d / "scripts" / "link.py").symlink_to(link)
+            (d / "manifest.json").write_text(json.dumps({"name": "sk", "version": "1.0.0", "owner": "x",
+                                                         "stability": "experimental", lh.FIELD: value}))
+            errors, _ = lint._lint_manifest(d)
+            return [e for e in errors if lh.FIELD in e]
+        outside = self.tmp / "outside.py"
+        outside.write_text("# not the skill's\n")
+        self.assertEqual(run("scripts/hook.py"), [])
+        self.assertEqual(run("scripts/hook.sh"), [])
+        self.assertIn("does not exist", run("scripts/none.py")[0])
+        self.assertIn("must stay inside the skill directory", run("/etc/hook.py")[0])
+        self.assertIn("must stay inside the skill directory", run("../outside.py")[0])
+        self.assertIn("must stay inside the skill directory", run("scripts/../../outside.py")[0])
+        self.assertIn("must resolve inside the skill directory", run("scripts/link.py", outside)[0])
+        self.assertIn("relative path to a .py or .sh script", run("scripts/hook.txt")[0])
+        self.assertIn("relative path to a .py or .sh script", run(7)[0])
+        errors, warnings = lint._lint_manifest(REPO / "skills" / "tutorial")
+        self.assertEqual((errors, warnings), ([], []))
+
+
+if __name__ == "__main__":
+    unittest.main(warnings="ignore")
