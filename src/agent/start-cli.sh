@@ -173,4 +173,7 @@ if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
 
+# Every launch, terminal (startup.sh execs here) or desktop, refreshes outdated Getting started pages.
+[ -f "$REPO/skills/tutorial/scripts/refresh-on-start.sh" ] && bash "$REPO/skills/tutorial/scripts/refresh-on-start.sh" || true
+
 exec bash "$launcher" "$@"

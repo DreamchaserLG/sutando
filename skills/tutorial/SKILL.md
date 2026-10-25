@@ -99,7 +99,8 @@ not retry the page in the same turn.
 
 Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
 in another room, publish it there with `--audience room`: the page then says "your agent" instead
-of your name. Summon only whoever the owner asked for. Either way the page holds your name or "your
+of your name. The room's entry records the audience, and a later run without `--audience` keeps
+it. Summon only whoever the owner asked for. Either way the page holds your name or "your
 agent" and fixed text, nothing from the owner's accounts, and the question about their work stays
 in chat.
 
@@ -148,10 +149,16 @@ each room's entry.
   older render, so a pre-digest page the owner edited inside is upgraded with the rest. A write that landed on a page someone edited meanwhile is taken back the
   way it was made, in place (the replaced page replaced back, an appended piece removed); when that
   call cannot fit, nothing more is written and the result names the page's hash as left. Creation goes through the same journal, and a run settles any journal
-  before it reads its own name, list, prompts or media. It summons no one. `src/startup.sh` runs it in every room with an entry on each engine start, an
-  update included, so an owner's page gains the steps a release added. `--all-rooms` makes one
-  `--if-newer` run per room the marker records; a room that fails leaves the others refreshed, and
-  the result lists each room's outcome (log: `logs/tutorial-refresh.log` in the workspace). By hand:
+  before it reads its own name, list, prompts or media. It summons no one. Every engine launch runs it in every room with an entry, an update included,
+  so an owner's page gains the steps a release added: `src/agent/start-cli.sh`, the dispatcher both
+  `src/startup.sh` and the desktop app launch through, starts `scripts/refresh-on-start.sh`, which
+  runs `--all-rooms` detached. That is one `--if-newer` run per room the marker records; a room that
+  fails leaves the others refreshed, and the result lists each room's outcome (log:
+  `logs/tutorial-refresh.log` in the workspace). Each page is rebuilt in the audience recorded for
+  its room (`dm` or `room`). An entry written before audiences were recorded is rewritten only in
+  the setup app's DM room; elsewhere it is reported `skipped` ("audience unknown") and left as is.
+  A room whose recorded page was deleted is `skipped` ("page deleted"); a refresh never creates a
+  page. By hand:
 
   ```bash
   python3 skills/tutorial/scripts/getting_started.py publish --all-rooms --if-newer

@@ -20,8 +20,10 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   validate (markup, a placeholder other than `{name}`, a missing field) is reported on stderr and
   the skill's own file is used.
 - **Revisions and `--if-newer`.** The list carries a revision (`tutorial.YYYY-MM-DD.N`), which the
-  page records in its ownership tag. `publish --all-rooms --if-newer`, which `src/startup.sh` starts
-  on every engine start (an update included), runs once per room with an entry and rebuilds a
+  page records in its ownership tag. `publish --all-rooms --if-newer`, which every engine launch starts
+  (`src/agent/start-cli.sh`, the dispatcher both `src/startup.sh` and the desktop app go through,
+  runs `skills/tutorial/scripts/refresh-on-start.sh`), runs once per room with an entry, in the
+  audience recorded for it, never recreates a deleted page, and rebuilds a
   page only when the list's revision is newer than the page's, with the prompts and roles the page
   was last built with; a current page is left alone even when a rebuild would differ.
 - **Owner edits are kept.** Before any rewrite the page's text is compared with the hash recorded

@@ -9,10 +9,14 @@
       -> {"ok": true, "action": "created"|"updated"|"unchanged", "kind": "html-<id>", "summoned": bool,
           "name": the name used, "revision": the feature list's, "list": "file" or the --list source,
           "media": the asset names the page points at room media for}
-  getting_started.py publish --all-rooms --if-newer [options as above, but no --room]
+  getting_started.py publish --all-rooms --if-newer [options as above, but no --room or --audience]
       -> {"ok": every room's run succeeded, "action": "refreshed", "rooms": {room: {"code": exit code,
-          ...that room's result}}}: one --if-newer run per room the marker has an entry for, which
-          src/startup.sh starts after every engine start, so an update's newer list reaches every page
+          ...that room's result}}}: one --if-newer run per room the marker has an entry for, in the
+          audience recorded for it. refresh-on-start.sh starts it from src/agent/start-cli.sh, the
+          dispatcher every launch goes through (startup.sh and the desktop app), so an update's newer
+          list reaches every page. A refresh never recreates a deleted page ("skipped", "page
+          deleted"), and never rewrites a legacy entry with no recorded audience outside the setup
+          app's DM ("skipped", "audience unknown").
 
 The page (tour_page.py) is a short interactive AG2 Space tour rendered from the skill's feature
 list (feature-list.json: nine steps for every core, plus the Claude Code history import step when
@@ -632,10 +636,10 @@ def _record(marker: Path, rooms: Dict[str, dict], room: str, entry: dict) -> Non
 
 
 def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[str, str], roles: object,
-           media: Dict[str, str]) -> dict:
+           media: Dict[str, str], audience: str) -> dict:
     """A room's complete entry for `page` and the inputs it was built from."""
     entry = {"kind": kind, "state": "complete", "hash": content_hash(page),
-             "revision": (read_marker(page) or (None, features.revision))[1]}
+             "revision": (read_marker(page) or (None, features.revision))[1], "audience": audience}
     if prompts:
         entry["prompts"] = prompts
     if role_labels(roles):
@@ -648,7 +652,7 @@ def _entry(kind: Optional[str], page: str, features: FeatureList, prompts: Dict[
 # What a journal (an `updating` rewrite, or a `creating`/`pending` create) carries beyond the
 # complete entry it becomes; `done` is the number of calls that ran, `mode` fill or rewrite.
 JOURNAL_KEYS = ("target", "before", "source", "steps", "done", "previous", "mode", "whole", "piece", "name", "core",
-                "audience", "agent")
+                "agent")
 
 
 def _steps(journal: dict) -> List[tuple]:
@@ -836,10 +840,11 @@ def recover(commons: Commons, marker: Path, owner: Optional[str] = None) -> Opti
 
 
 def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = None,
-            summon: bool = False, core: str = "unknown", audience: str = "dm",
+            summon: bool = False, core: str = "unknown", audience: Optional[str] = "dm",
             agent: Optional[str] = None, prompts: object = None, roles: object = None,
             features: Optional[FeatureList] = None, if_newer: bool = False,
-            media: object = None) -> dict:
+            media: object = None, dm_room: Optional[str] = None) -> dict:
+    """`audience` None means the room's recorded one; a refresh skips a page it can't place."""
     features = features or tour_page.FEATURES
     slots = tour_page.prompt_slots(features)
     with _locked(marker):
@@ -847,6 +852,17 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         settled = _recover(commons, marker, rooms, owner)
         if settled:
             return settled
+        known = rooms.get(commons.room, {})
+
+        def skipped(reason: str) -> dict:
+            return {"ok": True, "action": "skipped", "reason": reason, "kind": known.get("kind"),
+                    "summoned": False, "revision": features.revision, "media": []}
+        unplaced = False
+        if audience is None:
+            # A legacy entry recorded no audience: the setup app's DM is a DM; any other room's
+            # page is compared as a DM's but never rewritten under that guess.
+            audience = known.get("audience") if known.get("audience") in AUDIENCES else "dm"
+            unplaced = if_newer and bool(known) and known.get("audience") not in AUDIENCES and commons.room != dm_room
         if if_newer and not clean_prompts(prompts, slots):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
@@ -857,9 +873,11 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         media = clean_media({**(recorded if isinstance(recorded, dict) else {}),
                              **(media if isinstance(media, dict) else {})}, features)
         page = render_page(name, core, audience, agent, prompts, roles, features, media)
-        entry = _entry(None, page, features, prompts, roles, media)
+        entry = _entry(None, page, features, prompts, roles, media, audience)
         pages = commons.listed_pages()
         step = plan(rooms, commons.room, pages)
+        if if_newer and known and step["action"] in ("reconcile", "create"):
+            return skipped("page deleted")  # its recorded page is gone: a refresh never recreates it
         adopted = upgrade = False
         if step["action"] == "reconcile":
             found = commons.reconcile(pages, agent)
@@ -919,6 +937,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
                 action = "kept"  # a page this script cannot vouch for, or edited since: theirs stays
             elif if_newer and not upgrade and not newer(features.revision, page_revision):
                 action = "unchanged"
+            elif unplaced:
+                return skipped("audience unknown")
             elif not rewritable(current, page, commons.env):
                 raise PublishError(too_large(kind, current, commons.env))
             else:
@@ -931,7 +951,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         # A page equal to this run's render records its inputs (a revision-only bump catches up);
         # a gated unchanged or kept run records nothing: inputs that were not applied stay out.
         if action in ("created", "updated") or action == "unchanged" and current == page:
-            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media))
+            _record(marker, rooms, commons.room, _entry(kind, page, features, prompts, roles, media, audience))
     result = {"ok": True, "action": action, "kind": kind, "summoned": False, "revision": features.revision,
               "media": sorted(media)}
     if adopted:
@@ -984,8 +1004,9 @@ def _personal_args(parser: argparse.ArgumentParser) -> None:
 def publish_all_rooms(args: argparse.Namespace, raw: List[str]) -> int:
     """`publish --if-newer` in each room with an entry, one run per room, so one room's failure
     leaves the others refreshed. Exits with the worst room's code."""
-    if args.room or not args.if_newer:
-        print("getting_started: --all-rooms takes --if-newer and no --room", file=sys.stderr)
+    if args.room or args.audience or not args.if_newer:
+        print("getting_started: --all-rooms takes --if-newer, and no --room or --audience (each room keeps "
+              "its own)", file=sys.stderr)
         return 2
     rest = [a for a in raw if a != "--all-rooms"]
     results, worst = {}, 0
@@ -1030,8 +1051,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
                    help="the Sutando core (default auto: what the engine resolves); claude adds the "
                         "Claude Code import section, unknown leaves it out")
-    u.add_argument("--audience", choices=AUDIENCES, default="dm",
-                   help="dm (default): the owner's DM; room: any other room, where the page says \"your agent\"")
+    u.add_argument("--audience", choices=AUDIENCES, default=None,
+                   help="dm: the owner's DM; room: any other room, where the page says \"your agent\" "
+                        "(default: the audience recorded for the room, else dm)")
     _personal_args(u)
     u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
     u.add_argument("--if-newer", action="store_true",
@@ -1047,7 +1069,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "publish" and args.all_rooms:
         return publish_all_rooms(args, raw)
     if args.command == "publish":
-        args = with_inputs(args, load_inputs(inputs_path(_workspace())))
+        inputs = load_inputs(inputs_path(_workspace()))
+        args = with_inputs(args, inputs)
         if not args.room:
             print("getting_started: no --room, and no saved tutorial inputs name one", file=sys.stderr)
             return 2
@@ -1103,7 +1126,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             result = publish(commons, marker, name, args.owner, args.summon,
                              detect_core() if args.core == "auto" else args.core, args.audience,
-                             agent, prompts, args.roles, features, args.if_newer, media)
+                             agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"))
         except (PublishError, ValueError) as exc:
             print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
             return 4
@@ -1112,6 +1135,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"getting_started: finished the rewrite of {result['kind']} in {args.room} that an earlier run "
               "left cut short, from its record; this run's own inputs were not applied; run again to apply them",
               file=sys.stderr)
+    if result["action"] == "skipped":
+        print(f"getting_started: {args.room} skipped: {result['reason']}; its page is left as it is", file=sys.stderr)
     if result.get("edited"):
         print(f"getting_started: {result['kind']} in {args.room} was edited since this script last wrote it, "
               "or is not a page it wrote; kept as is, not rewritten", file=sys.stderr)
