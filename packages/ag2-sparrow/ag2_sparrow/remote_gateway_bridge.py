@@ -5709,33 +5709,46 @@ def _recover_orphan_proactive() -> None:
             _move_decided(f, f.with_name(f".{target.stem}{_DELIVERED_INFIX}{time.time_ns()}"), generation,
                           "hidden as delivered")
         elif receipt == "PARKED":  # terminal: never resent, kept where parked files go
-            _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
-                          / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
+            parked = _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
+                                   / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
+            if parked is not None and _claim_receipt(parked, target.stem)[0] not in ("PARKED", "unknown"):
+                # an operator requeued it after the receipt was read: its body goes back live
+                _log(f"proactive claim {f.name} was requeued while it was being parked; handed back")
+                _hand_back(parked, target)
         else:  # unknown / unreadable: it may have been sent; kept for an operator
             _log_backoff(("proactive-orphan-receipt", f.name),
                          f"proactive claim {f.name}: its outbox record cannot be read cleanly; kept as "
                          "its claim for an operator, not re-queued")
 
 
-def _move_decided(claim: Path, dest: Path, generation: str, what: str) -> None:
+def _move_decided(claim: Path, dest: Path, generation: str, what: str) -> "Path | None":
     """Move `claim` to `dest` only as the generation its receipt was read from: a
-    no-replace rename, then a check; a file that replaced the claim goes back."""
+    no-replace rename, then a check; a file that replaced the claim goes back, or,
+    when its name was retaken, to a neutral hidden name no pass reads as delivered or
+    parked. Returns where the decided file now is, else None."""
     try:
         dest.parent.mkdir(parents=True, exist_ok=True)
         undelivered_quarantine.rename_noreplace(claim, dest)
     except OSError as e:
         _log(f"proactive claim {claim.name} could not be {what} ({diagnostics.describe(e)}); kept as its "
              "claim, never re-queued")
-        return
+        return None
     if _file_generation(dest) == generation:
-        return
+        return dest
     try:  # not the bytes the receipt was read for: never hidden or parked under their item
         undelivered_quarantine.rename_noreplace(dest, claim)
         where = claim.name
     except OSError:
         where = dest.name
+        try:
+            neutral = claim.with_name(f".{claim.name.split('.sending')[0]}.changed-{time.time_ns()}")
+            undelivered_quarantine.rename_noreplace(dest, neutral)
+            where = neutral.name
+        except OSError:
+            pass
     _log(f"proactive claim {claim.name} changed after its receipt was read; it was not {what} and is kept "
          f"as {where} for an operator")
+    return None
 
 
 def _file_generation(path: Path) -> "str | None":

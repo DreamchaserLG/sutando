@@ -268,8 +268,79 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move_then_refuse_the_way_back):
             self.lane.restart()
         self.assertFalse((self.lane.results / "proactive-1.txt").exists())
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3, "the way back failed, so the file is set aside under a neutral name")
+        self.assertEqual(len(list(self.lane.results.glob(".proactive-1.changed-*"))), 1)
         self.assertEqual(len(self.lane.posts), 0)
+
+    def test_a_replaced_claim_whose_way_back_is_retaken_is_never_archived_as_delivered(self):
+        item_id = gb._proactive_item_id("proactive-1", "delivered")
+        outbox.record_delivered(self.lane.results / ".outbox-ag2space-proactive", item_id)
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered\n")
+        real_receipt, real_move = gb._claim_receipt, gb.undelivered_quarantine.rename_noreplace
+        calls = []
+
+        def read_then_replace(*a, **kw):
+            got = real_receipt(*a, **kw)
+            tmp = claim.with_name(".swap")
+            tmp.write_text("UNSENT B\n")
+            os.replace(tmp, claim)
+            return got
+
+        def retake_before_the_way_back(src, dst):
+            calls.append(src)
+            if len(calls) == 2:
+                Path(dst).write_text("CONCURRENT C\n")
+            real_move(src, dst)
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
+                mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", retake_before_the_way_back):
+            self.lane.restart()
+        self.lane.drain()
+        self.assertEqual(claim.read_text(), "CONCURRENT C\n")
+        self.assertEqual(list(self.lane.results.glob(".proactive-1.delivered-*")), [])
+        kept = [p for p in self.lane.results.glob(".proactive-1*.changed-*")]
+        self.assertEqual([p.read_text() for p in kept], ["UNSENT B\n"], "kept neutral for an operator")
+        archived = list((self.lane.results / "archive").glob("proactive-1*"))
+        self.assertFalse(any("UNSENT B" in p.read_text() for p in archived), "B was never delivered")
+        self.assertEqual(len(self.lane.posts), 0)
+
+    def test_an_operator_requeue_between_the_parked_receipt_and_the_move_keeps_the_body_live(self):
+        root = self.lane.results / ".outbox-ag2space-proactive"
+        item_id = gb._proactive_item_id("proactive-1", "parked body")
+        outbox._write_item(root, item_id, {"item_id": item_id, "status": "PARKED", "attempts": 0,
+                                           "payload": "parked body\n"})
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("parked body\n")
+        real = gb._claim_receipt
+        seen = []
+
+        def read_then_operator_requeues(*a, **kw):
+            got = real(*a, **kw)
+            if not seen:
+                seen.append(got[0])
+                self.assertEqual(outbox.requeue_item_with_epoch(root, item_id)[0], outbox.RequeueOutcome.REQUEUED)
+                self.assertEqual(gb.undelivered_quarantine.restore(self.lane.results, "proactive-1")[0],
+                                 gb.undelivered_quarantine.RestoreOutcome.NOTHING_QUARANTINED)
+            return got
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_operator_requeues):
+            self.lane.restart()
+        self.assertEqual(seen, ["PARKED"])
+        self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "parked body\n",
+                         "an acknowledged requeue leaves its body live")
+        self.assertEqual(list((self.lane.results / "undelivered").glob("proactive-1-*.txt")), [])
+        self.assertFalse(claim.exists())
+
+    def test_a_still_parked_claim_stays_parked_after_the_recheck(self):
+        root = self.lane.results / ".outbox-ag2space-proactive"
+        item_id = gb._proactive_item_id("proactive-1", "parked body")
+        outbox._write_item(root, item_id, {"item_id": item_id, "status": "PARKED", "attempts": 0,
+                                           "payload": "parked body\n"})
+        (self.lane.results / f"proactive-1.sending.{_dead_pid()}.1").write_text("parked body\n")
+        self.lane.restart()
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists())
+        self.assertEqual(len(list((self.lane.results / "undelivered").glob("proactive-1-*.txt"))), 1)
 
     def test_a_claim_with_no_record_at_all_is_still_requeued(self):
         claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"

@@ -2089,6 +2089,50 @@ class TestRound12RenderBinding(ClassifyBase):
         self.assertEqual(notices, [])
         self.assertEqual(len(list((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))), 1)
 
+    def test_a_landing_replaced_after_the_post_render_fstat_keeps_the_journal(self):
+        tt = self.mod.task_transition
+        self.ws.task("task-a.txt", f"timestamp: {iso(NOW - 900)}\nsource: chat\ntask: recover me\n")
+        real_set = tt._Journal.set
+
+        def die_once_placed(self_, **fields):
+            real_set(self_, **fields)
+            if fields.get("stage") == "placed":
+                raise KeyboardInterrupt("killed before the notice")
+
+        with unittest.mock.patch.object(tt._Journal, "set", die_once_placed), \
+                self.assertRaises(KeyboardInterrupt):
+            self.apply()
+        archived = self.ws.root / "tasks" / "archive" / "task-a.txt"
+        real_render, real_fstat = self.mod._render_recovered, os.fstat
+        armed, swapped = [], []
+
+        def fstat_then_swap(fd):
+            st = real_fstat(fd)
+            if armed and not swapped and os.path.stat.S_ISREG(st.st_mode):
+                swapped.append(1)
+                tmp = archived.with_name(".swap")
+                tmp.write_text("timestamp: 2026-09-11T13:25:00Z\nsource: chat\ntask: REPLACEMENT ASK\n")
+                os.replace(tmp, archived)
+            return st
+
+        def arming_render(workspace, now):
+            render = real_render(workspace, now)
+
+            def after_render(*a, **kw):
+                body = render(*a, **kw)
+                armed.append(1)
+                return body
+            return after_render
+
+        with unittest.mock.patch.object(self.mod, "_render_recovered", side_effect=arming_render), \
+                unittest.mock.patch.object(os, "fstat", side_effect=fstat_then_swap):
+            out = self.apply()
+        notices = sorted((self.ws.root / "results").glob("proactive-orphan-recovery-*.txt"))
+        self.assertTrue(swapped)
+        self.assertTrue(out["errors"], out)
+        self.assertEqual(notices, [], "no notice for bytes no longer at the landing")
+        self.assertEqual(len(list((self.ws.root / "tasks" / "archive").glob(".notice-*.json"))), 1)
+
 
 class TestWorkerHeld(ClassifyBase):
     """A task the router delegated is a worker's, not a core orphan (2026-09-18 boot: four

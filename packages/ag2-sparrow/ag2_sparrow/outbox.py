@@ -965,8 +965,11 @@ def receipt_state(root: Path, item_id: str) -> str:
     malformed, not a regular file, or not a status a writer stores. Judged and read
     through one descriptor that follows no symlink, so it validates what it reads."""
     import stat as _stat
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:  # no no-follow primitive: a link could not be refused
+        return "unknown"
     try:
-        fd = os.open(_item_path(Path(root), item_id), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(_item_path(Path(root), item_id), os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         return "absent"
     except OSError:

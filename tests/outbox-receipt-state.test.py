@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -121,6 +122,40 @@ class ReceiptState(unittest.TestCase):
                     got = mod.receipt_state(root, "proactive-1")
                 self.assertTrue(done)
                 self.assertEqual(got, "unknown")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_a_fifo_record_is_unknown_and_never_blocks_the_reader(self):
+        import subprocess
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                path = self.record(mod)
+                path.unlink()
+                os.mkfifo(path)
+                code = ("import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); "
+                        f"from {mod.__name__} import receipt_state; from pathlib import Path; "
+                        "print(receipt_state(Path(sys.argv[3]), 'proactive-1'))")
+                try:
+                    done = subprocess.run([sys.executable, "-c", code, str(REPO / "src"),
+                                           str(REPO / "packages" / "ag2-sparrow"), str(self.root)],
+                                          capture_output=True, text=True, timeout=5)
+                except subprocess.TimeoutExpired:
+                    path.unlink()
+                    self.fail("receipt_state blocked opening a FIFO")
+                path.unlink()
+                self.assertEqual(done.stdout.strip(), "unknown", done.stderr)
+
+    def test_without_a_no_follow_primitive_a_linked_record_is_unknown(self):
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__):
+                tmp = tempfile.TemporaryDirectory()
+                self.addCleanup(tmp.cleanup)
+                self.root = Path(tmp.name)
+                path = self.record(mod)
+                real = path.with_name("real.json")
+                path.rename(real)
+                path.symlink_to(real)
+                with mock.patch.object(os, "O_NOFOLLOW", 0, create=True):
+                    self.assertEqual(mod.receipt_state(self.root, "proactive-1"), "unknown")
 
     @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
     def test_an_unreadable_record_is_unknown_not_absent(self):

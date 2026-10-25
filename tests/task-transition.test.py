@@ -19,8 +19,10 @@ import contextlib
 import json
 import multiprocessing
 import os
+import stat
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -2022,6 +2024,104 @@ class TestRound12(Base):
         self.assertTrue(done)
         self.assertEqual(sorted(x.read_text() for x in retired.iterdir()),
                          ["EARLIER EVIDENCE\n", "NEWLY RETIRED\n"])
+
+
+class TestRound13(Base):
+    """Thirteenth round (#4399): the late landing swap, the FIFO landing, and a replaced
+    refusal claim retired by a pass that died."""
+
+    recover = TestJournalRecovery.recover
+
+    def landing(self, body="landed\n"):
+        self.archive.mkdir()
+        (self.archive / "task-a.txt").write_text(body)
+        dirs = tt._Dirs(self.tasks, self.archive)
+        self.addCleanup(dirs.close)
+        return dirs
+
+    def test_a_landing_replaced_while_it_is_read_is_not_returned(self):
+        dirs = self.landing("ORIGINAL\n")
+        real_fstat, done = os.fstat, []
+
+        def swap_after_the_first_fstat(fd):
+            st = real_fstat(fd)
+            if not done and stat.S_ISREG(st.st_mode) and fd not in (dirs.tasks_fd, dirs.archive_fd):
+                done.append(1)
+                _replace(self.archive / "task-a.txt", "REPLACEMENT")
+            return st
+
+        with mock.patch.object(os, "fstat", side_effect=swap_after_the_first_fstat):
+            self.assertIsNone(tt._read_landing(dirs, "task-a.txt"))
+        self.assertTrue(done)
+
+    def test_a_landing_rewritten_in_place_while_it_is_read_is_not_returned(self):
+        dirs = self.landing("ORIGINAL\n")
+        real_fstat, done = os.fstat, []
+
+        def rewrite_after_the_first_fstat(fd):
+            st = real_fstat(fd)
+            if not done and stat.S_ISREG(st.st_mode) and fd not in (dirs.tasks_fd, dirs.archive_fd):
+                done.append(1)
+                with open(self.archive / "task-a.txt", "a") as fh:
+                    fh.write("more\n")
+            return st
+
+        with mock.patch.object(os, "fstat", side_effect=rewrite_after_the_first_fstat):
+            self.assertIsNone(tt._read_landing(dirs, "task-a.txt"))
+
+    def test_an_untouched_landing_reads_back(self):
+        dirs = self.landing("fine\n")
+        got = tt._read_landing(dirs, "task-a.txt")
+        self.assertEqual(got[1], b"fine\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_a_fifo_landing_is_refused_without_blocking(self):
+        self.archive.mkdir()
+        os.mkfifo(self.archive / "task-a.txt")
+        dirs = tt._Dirs(self.tasks, self.archive)
+        self.addCleanup(dirs.close)
+        out = []
+        t = threading.Thread(target=lambda: out.append(tt._read_landing(dirs, "task-a.txt")), daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():  # unblock the stuck open so the process can exit
+            fd = os.open(self.archive / "task-a.txt", os.O_RDWR)
+            os.close(fd)
+            t.join(2)
+            self.fail("_read_landing blocked opening a FIFO")
+        self.assertEqual(out, [None])
+
+    def test_without_a_no_follow_primitive_a_landing_is_not_read(self):
+        dirs = self.landing("fine\n")
+        with mock.patch.object(tt, "_NOFOLLOW", 0):
+            self.assertIsNone(tt._read_landing(dirs, "task-a.txt"))
+
+    def test_a_replaced_refusal_claim_retired_by_a_dead_pass_keeps_the_journal_and_reports(self):
+        _task(self.tasks, "task-a.txt", "ORIGINAL ASK")
+        refuse = lambda n, read: "now done" if read != n else None  # noqa: E731
+        with mock.patch.object(tt.task_archive, "give_back", side_effect=OSError(5, "give-back failed")):
+            self.run_transition(["task-a.txt"], _naming, still_safe=refuse)
+        self.assertEqual(len(self.journals()), 1)
+        fired = []
+
+        def at(where, name):
+            if where == "before_retire" and ".claim-" in name and not fired:
+                fired.append(name)
+                _replace(self.tasks / name, "REPLACEMENT B")
+            elif where == "after_retire" and fired and name == fired[0]:
+                raise OSError(5, "the pass dies right after the claim name was retired")
+
+        with mock.patch.object(tt.task_archive, "_checkpoint", side_effect=at):
+            interrupted = self.recover()
+        self.assertTrue(any("interrupted" in e for e in interrupted["errors"]), interrupted)
+        self.assertTrue(fired)
+        out = self.recover()
+        self.assertTrue(any("replaced its claim" in e for e in out["errors"]), out)
+        self.assertEqual(len(self.journals()), 1, "the journal waits for the operator")
+        self.assertTrue(self.replacement_survives())
+
+    def replacement_survives(self) -> bool:
+        return any(x.is_file() and "REPLACEMENT" in x.read_text() for x in self.tasks.rglob("*"))
 
 
 if __name__ == "__main__":

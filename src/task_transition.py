@@ -650,7 +650,11 @@ def _finish_return(dirs: _Dirs, name: str, claim: str, generation: str) -> "str 
     if not has_claim and not has_live:
         return (f"lost track of {name!r}: it was refused and being given back, but neither "
                 f"tasks/{name} nor tasks/{claim} exists — check tasks/archive/")
-    if not has_claim:
+    if not has_claim:  # retired by a pass that died: a replacement it set aside is still the operator's
+        strays = _retired_strays(dirs, claim, generation)
+        if strays:
+            return (f"lost track of {name!r}: it is back under its name, but a file that replaced "
+                    f"its claim is kept as {', '.join(_retired(x) for x in strays)}")
         return None
     with task_archive.retired_dir(dirs.archive_fd) as rfd:
         if not has_live:
@@ -674,15 +678,26 @@ class _LandingChanged(OSError):
 def _read_landing(dirs: _Dirs, where: str) -> "tuple[str, bytes, float] | None":
     """(generation, bytes, mtime) of a landing read through one descriptor that follows
     no symlink; None when it is gone."""
+    if not _NOFOLLOW:  # no no-follow primitive: a link could not be refused
+        return None
     try:
-        fd = os.open(where, os.O_RDONLY | _NOFOLLOW, dir_fd=dirs.archive_fd)
+        fd = os.open(where, os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0), dir_fd=dirs.archive_fd)
     except FileNotFoundError:
+        return None
+    except OSError:
         return None
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode):
             return None
-        return _generation(st), fh.read(), st.st_mtime
+        data = fh.read()
+        try:  # still this file under this name once read
+            after, named = os.fstat(fh.fileno()), os.lstat(where, dir_fd=dirs.archive_fd)
+        except OSError:
+            return None
+        if _generation(after) != _generation(st) or _generation(named) != _generation(st):
+            return None
+        return _generation(st), data, st.st_mtime
 
 
 def _barriers(dirs: _Dirs) -> None:
