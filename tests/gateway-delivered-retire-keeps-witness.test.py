@@ -743,6 +743,84 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                     lane.drain()
                 self.assertEqual(len(lane.posts), 1, "a further restart and drains send nothing")
 
+    def _held_original(self, kind: str):
+        """A dead owner's terminal claim A, with a writer's descriptor held on its inode across recovery."""
+        lane = Lane(gb, scratch("gw-later-generations-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        a_body = f"{kind.lower()} A"
+        a_id = gb._proactive_item_id("proactive-1", a_body)
+        outbox._write_item(root, a_id, {"item_id": a_id, "status": kind, "attempts": 0, "payload": a_body + "\n"})
+        claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text(a_body + "\n")
+        writer = os.open(claim, os.O_WRONLY)
+        self.addCleanup(os.close, writer)
+        original = os.fstat(writer).st_ino
+
+        def write(body: bytes):
+            os.ftruncate(writer, 0)
+            os.pwrite(writer, body, 0)
+
+        def visible_inodes():
+            paths = [*lane.results.glob("proactive-1*"), *lane.results.glob(".proactive-1.delivered-*"),
+                     *(lane.results / "archive").glob("proactive-1*"), *(lane.results / "undelivered").glob("proactive-1*")]
+            return {os.lstat(p).st_ino for p in paths}
+        return lane, root, a_id, write, lambda: self.assertNotIn(original, visible_inodes(), "the original stays hidden")
+
+    def test_a_generation_written_after_restart_returns_is_sent_once_by_ordinary_drains(self):
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                for _ in range(6):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "B sent once, with no restart")
+                hidden()
+                lane.restart()
+                for _ in range(3):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "no repeat")
+                self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
+
+    def test_a_generation_written_after_the_last_was_delivered_is_sent_and_leaves_its_archive(self):
+        """B is delivered first (by drains, or as the reviewed head does, by a second restart); C is
+        then written through the same descriptor and must go out once without touching B's archive."""
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                for _ in range(3):
+                    lane.drain()
+                lane.restart()
+                for _ in range(3):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"])
+                b_archive = [p for p in (lane.results / "archive").glob("proactive-1*") if p.read_text() == "UNSENT B\n"]
+                self.assertEqual(len(b_archive), 1)
+                write(b"UNSENT C\n")
+                for _ in range(6):
+                    lane.drain()
+                lane.restart()
+                for _ in range(6):
+                    lane.drain()
+                self.assertEqual(b_archive[0].read_text(), "UNSENT B\n", "B's archive keeps B's bytes")
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B", "UNSENT C"], "C sent once")
+                hidden()
+                self.assertEqual(outbox.receipt_state(root, a_id), kind, "A keeps its disposition")
+                for body in ("UNSENT B", "UNSENT C"):
+                    self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", body)), "DELIVERED")
+
+    def test_an_unchanged_retained_original_costs_a_drain_only_a_stat(self):
+        lane = Lane(gb, scratch("gw-decided-cost-"))
+        r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
+        r.write_text("x\n")
+        for _ in range(2):  # the first records its bytes (a rename, which moves ctime); the second settles
+            lane.drain()
+        with mock.patch.object(gb, "_reconcile_decided", side_effect=AssertionError("read again")):
+            lane.drain()
+            lane.drain()
+
     def test_a_staged_claim_is_invisible_to_every_delivered_scanner(self):
         """Each reader of results/ names that could take a staged claim for a delivered (or drained)
         file: the gateway's reaper, its archive probe (which the dispatch veto also asks) and its drain,
@@ -871,13 +949,17 @@ class DecidedClaimEdges(unittest.TestCase):
         gb._reconcile_decided(r)
         self.assertTrue(r.is_dir())
 
-    def test_new_bytes_that_cannot_be_reclaimed_are_kept_where_they_are(self):
+    def test_new_bytes_are_published_as_a_snapshot_even_when_they_cannot_be_recorded(self):
         r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-e0.1"
         r.write_text("new bytes\n")
         with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", side_effect=OSError(5, "EIO")):
             gb._reconcile_decided(r)
-        self.assertEqual(r.read_text(), "new bytes\n")
-        self.assertFalse((self.res / "proactive-1.txt").exists())
+        self.assertEqual(r.read_text(), "new bytes\n", "the original stays where it is")
+        claims = [c for c in self.res.glob("proactive-1.sending.*")]
+        self.assertEqual([c.read_text() for c in claims], ["new bytes\n"], "its bytes went out as a snapshot")
+        self.assertNotEqual(os.lstat(claims[0]).st_ino, os.lstat(r).st_ino)
+        gb._reconcile_decided(r)  # unrecorded: the existing copy is found, nothing is published twice
+        self.assertEqual(len(list(self.res.glob("proactive-1.sending.*"))), 1)
 
     def test_a_requeue_is_not_handed_back_over_a_newer_live_file(self):
         r = self.retained(b"body\n")
