@@ -129,19 +129,18 @@ emit_restart_alert() {
   publish_notice restarted "⚠️ The $CHANNEL bridge exited and was automatically restarted."
 }
 # Exit 0 is no way out: KeepAlive is unconditional, so launchd would relaunch at once.
-# Hold here, with no child, until a deliberate restart newer than this hold.
+# Hold, with no child, until a deliberate-restart stamp newer than the one this child launched under.
 hold_for_credentials() {
   NOW="$(date +%s)"
-  local since
   echo "[$CHANNEL-bridge-wrapper] held: credential rejected ($AUTH_KEYS); vault set <KEY> <value>, then bash src/restart.sh" >&2
-  # One notice per rejection the owner has not yet acted on, across wrapper relaunches.
-  if [ ! -f "$AUTH_HELD" ] || [ "$(_stamp "$DELIBERATE")" -gt "$(_stamp "$AUTH_HELD")" ]; then
-    publish_notice auth-failed \
+  # The held file records the stamp each rejection ran under: one notice per owner restart, across relaunches.
+  if [ ! -f "$AUTH_HELD" ] || [ "$LAUNCH_STAMP" -gt "$(_stamp "$AUTH_HELD")" ]; then
+    # The launch stamp in the name keeps a retry's notice from overwriting one sent the same second.
+    publish_notice "auth-failed-r$LAUNCH_STAMP" \
       "⚠️ The $CHANNEL bridge is stopped: the provider rejected its token ($AUTH_KEYS). Store a valid one with \`vault set <KEY> <value>\`, then restart Sutando (bash src/restart.sh); a stale token in that channel's .env wins over the vault, so clear it there too. It will not retry until then."
   fi
-  printf '%s\n%s\n' "$NOW" "$$" > "$AUTH_HELD"
-  since="$NOW"
-  while [ "$STOPPING" = 0 ] && [ "$(_stamp "$DELIBERATE")" -le "$since" ]; do
+  printf '%s\n%s\n' "$LAUNCH_STAMP" "$$" > "$AUTH_HELD"
+  while [ "$STOPPING" = 0 ] && [ "$(_stamp "$DELIBERATE")" -le "$LAUNCH_STAMP" ]; do
     sleep "$AUTH_HOLD_POLL_S" &
     CHILD_PID=$!
     set +e
@@ -189,6 +188,7 @@ stop_wrapper() {
 trap stop_wrapper TERM INT HUP
 RESTART_DELAY="${SUTANDO_CHANNEL_BRIDGE_RESTART_DELAY:-10}"
 while [ "$STOPPING" = 0 ]; do
+  LAUNCH_STAMP="$(_stamp "$DELIBERATE")"
   "$PYTHON" "$REPO/src/$CHANNEL-bridge.py" &
   CHILD_PID=$!
   set +e
