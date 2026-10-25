@@ -4338,11 +4338,11 @@ class Hold(Base):
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
         real = Path.unlink
 
-        def unlink(path, *a, **k):
-            if path.name.startswith(f".{self.result_file.name}."):
-                raise PermissionError(13, "cleanup refused")
-            return real(path, *a, **k)
-        with mock.patch.object(Path, "unlink", unlink):
+        def refuse(path):
+            raise PermissionError(13, "cleanup refused")
+        with mock.patch.object(Path, "unlink", autospec=True, side_effect=lambda path, *a, **k: (
+                refuse(path) if path.name.startswith(f".{self.result_file.name}.")
+                else real(path, *a, **k))):
             r = self.reply_now()
         self.assertEqual(self.result_file.read_text(), "done")
         self.assertIn(r.returncode, (hatch_cli.REPLY_POSTED, hatch_cli.REPLY_UNCONFIRMED), r.stderr)
@@ -4586,8 +4586,6 @@ class Hold(Base):
         """A local HTTPS gateway with a throwaway self-signed cert; returns (url, client context)."""
         import http.server
         import ssl
-        if not shutil.which("openssl"):
-            self.skipTest("openssl not available")
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d)
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -4608,14 +4606,14 @@ class Hold(Base):
         import http.client
         from ag2_sparrow import remote_gateway_bridge as gb
         patch = mock.patch.object(http.client, "_create_https_context", lambda v: client)
-        started = time.monotonic()
+        started, raised = time.monotonic(), None
         with mock.patch.multiple(gb, URL=url, TOKEN="t"), (patch if client else contextlib.nullcontext()):
             try:
                 gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
                         deadline=time.monotonic() + budget)
             except Exception as e:  # noqa: BLE001 - the test reads what the deadline raised
-                return e, time.monotonic() - started
-        return None, time.monotonic() - started
+                raised = e
+        return raised, time.monotonic() - started
 
     def test_the_deadline_covers_slow_https_headers(self):
         import http.server
@@ -4630,9 +4628,7 @@ class Hold(Base):
                     except OSError:
                         return
                     time.sleep(0.1)
-
-            def log_message(self, *a):
-                pass
+            log_message = lambda *a: None  # noqa: E731
         url, client = self.tls_gateway(SlowHeaders)
         raised, took = self.bounded_req(url, 0.3, client)
         self.assertIsInstance(raised, TimeoutError, repr(raised))
@@ -4654,9 +4650,7 @@ class Hold(Base):
                     except OSError:
                         return
                     time.sleep(0.1)
-
-            def log_message(self, *a):
-                pass
+            log_message = lambda *a: None  # noqa: E731
         url, client = self.tls_gateway(SlowError)
         raised, took = self.bounded_req(url, 0.3, client)
         self.assertIsInstance(raised, urllib.error.HTTPError, repr(raised))
@@ -4697,6 +4691,79 @@ class Hold(Base):
             raised, took = self.bounded_req("http://slow-dns.example:9", 0.2)
         self.assertIsInstance(raised, TimeoutError, repr(raised))
         self.assertLess(took, 0.5, "a resolver that outlasts the deadline is not waited for")
+
+    def test_connect_by_reports_each_way_a_connection_fails_or_is_made(self):
+        import socket as sk
+        from ag2_sparrow import remote_gateway_bridge as gb
+        with self.assertRaises(TimeoutError):  # no budget left: nothing is started
+            gb._connect_by(("127.0.0.1", 9), time.monotonic() - 1, 5, None, [])
+        with mock.patch.object(sk, "getaddrinfo", side_effect=sk.gaierror(8, "no such host")):
+            with self.assertRaises(sk.gaierror):
+                gb._connect_by(("nowhere.invalid", 9), time.monotonic() + 5, 5, None, [])
+        listener = sk.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        socks = []
+        made = gb._connect_by(("127.0.0.1", listener.getsockname()[1]), time.monotonic() + 5, 5,
+                              ("127.0.0.1", 0), socks)
+        self.addCleanup(made.close)
+        self.assertEqual(socks, [made], "the socket is recorded for the deadline timer")
+
+    def test_an_unreadable_lane_record_is_distinct_from_a_missing_one(self):
+        state = self.home / "state"
+        self.assertEqual(agent_identity.lane_record(None, ""), (None, False))
+        self.assertEqual(agent_identity.lane_record(state, ""), (None, False), "no auth dir: missing")
+        auth = state / "auth"
+        auth.mkdir(parents=True)
+        self.assertEqual(agent_identity.lane_record(state, ""), (None, False), "no file: missing")
+        agent_identity.publish_lane(state, "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
+        rec, unreadable = agent_identity.lane_record(state, "")
+        self.assertEqual((rec["agent_id"], unreadable), (AGENT, False))
+        real_open = os.open
+
+        def denied(path, *a, **k):
+            if path == "lane-identity.json":
+                raise PermissionError(13, "denied")
+            return real_open(path, *a, **k)
+        with mock.patch.object(agent_identity.os, "open", denied):
+            self.assertEqual(agent_identity.lane_record(state, ""), (None, True), "open refused")
+            self.assertIsNone(agent_identity.published_lane_record(state, ""))
+        with mock.patch.object(agent_identity.os, "read", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(agent_identity.lane_record(state, ""), (None, True), "read failed")
+
+    def test_hold_that_cannot_take_the_send_lock_records_nothing(self):
+        self.add_task(self.TID, "$ev1")
+        with mock.patch.object(delivery_destination, "send_lock",
+                               side_effect=delivery_destination.SendLockUnavailable("busy")):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.assertIn("send lock was not taken", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_hold_refuses_when_the_drain_is_swapped_after_the_line_is_queued(self):
+        self.add_task(self.TID, "$ev1")
+        lock = self.home / "state" / "locks" / "gateway-bridge.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+
+        def holder(pid):
+            now = int(time.time())
+            lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
+                                        "host": hatch_cli.workspace_lock._host_label(),
+                                        "heartbeat_at": now, "schema_version": 1}))
+        holder(os.getpid())
+        real = hatch_cli._publish_once
+
+        def publish_then_swap(path, body):
+            done = real(path, body)
+            holder(os.getppid())
+            return done
+        with mock.patch.object(hatch_cli, "_publish_once", publish_then_swap):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed", r.stderr)
+        self.assertIsNone(task_hold.read(self.results, self.TID), "no marker without the fence")
 
     def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
         import http.server
