@@ -1083,23 +1083,24 @@ def endpoint_problem(url: str, what: str) -> str:
     return ""
 
 
-def _host_family(host: str) -> str:
-    """The registrable part a backend and its relay share: the last two labels, or the host itself for an
-    IP address or a single-label name."""
-    labels = host.rstrip(".").lower().split(".")
-    return host.lower() if len(labels) < 3 or labels[-1].isdigit() or ":" in host else ".".join(labels[-2:])
+def _relay_host_ok(relay_host: str, base_host: str) -> bool:
+    """The relay is on the base's own host or under it. A shared parent domain is not enough: without the
+    public suffix list, two hosts under one suffix (a.co.uk, b.co.uk) cannot be told apart from one owner's."""
+    relay_host, base_host = relay_host.rstrip(".").lower(), base_host.rstrip(".").lower()
+    return bool(base_host) and (relay_host == base_host or relay_host.endswith("." + base_host))
 
 
 def relay_problem(base: str, relay_url: str, trusted_host: str = "") -> str:
-    """'' when the relay URL the backend returned may be written: https, and in the base's host family
+    """'' when the relay URL the backend returned may be written: https, and on the base's host (or under it)
     unless the owner named its host with --trust-relay-host; else why not."""
     why = endpoint_problem(relay_url, "the relay URL AG2 Space returned")
     if why:
         return why
     host = (urllib.parse.urlsplit(relay_url).hostname or "").lower()
-    if _host_family(host) != _host_family(urllib.parse.urlsplit(base).hostname or "") and host != trusted_host.lower():
-        return (f"the relay URL AG2 Space returned is on {host}, outside {urllib.parse.urlsplit(base).hostname}'s "
-                f"domain; if that relay is expected, connect again with a new code and --trust-relay-host {host}")
+    base_host = urllib.parse.urlsplit(base).hostname or ""
+    if not _relay_host_ok(host, base_host) and host != trusted_host.lower():
+        return (f"the relay URL AG2 Space returned is on {host}, not {base_host} or a host under it; if that relay "
+                f"is expected, connect again with a new code and --trust-relay-host {host}")
     return ""
 
 

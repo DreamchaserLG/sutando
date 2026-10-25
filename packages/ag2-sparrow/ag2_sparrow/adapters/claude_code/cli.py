@@ -748,8 +748,8 @@ def main(argv=None) -> int:
     c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
     c.add_argument("--code", help="the one-time code from AG2 Space (starts with acp.): - reads it from stdin; "
                    "omitted, connect asks for it. A code given here is kept by ps and shell history")
-    c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is outside --base's "
-                   "domain (only when AG2 Space told you to)")
+    c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is not --base's host "
+                   "or under it (only when AG2 Space told you to)")
     session_options(c)
     c.set_defaults(func=connect)
     run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "

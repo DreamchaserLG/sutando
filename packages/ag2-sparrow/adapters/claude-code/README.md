@@ -367,8 +367,8 @@ The code is never needed on the command line, where ps and shell history
 would keep it: `connect` asks for it, or reads it from stdin with `--code -`.
 `--code <code>` still works and says so with a warning. `--base` and the relay
 URL the backend returns must be https (plain http only on a loopback host, for
-tests), and a relay outside `--base`'s domain is refused unless you name its
-host with `--trust-relay-host`; a refused relay URL is never written.
+tests), and a relay that is not on `--base`'s host or a host under it is
+refused unless you name its host with `--trust-relay-host`; a refused relay URL is never written.
 
 `connect` first checks the CLI version, tmux, the plugin and the Claude login,
 so a machine that cannot run the agent never spends the single-use code. It

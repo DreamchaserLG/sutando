@@ -2415,6 +2415,19 @@ class RedeemEdges(unittest.TestCase):
             urllib.error.HTTPError(req.full_url, 418, "x", {}, io.BytesIO(b"")))
         self.assertEqual(cm.redeem_code(BASE, CODE, opener=teapot)[1], "AG2 Space refused the code (HTTP 418)")
 
+    def test_a_relay_must_be_on_the_bases_host_or_under_it_never_a_sibling_under_a_public_suffix(self):
+        ok = (("https://api.example.co.uk/api", "https://api.example.co.uk/relay"),
+              ("https://example.co.uk/api", "https://relay.example.co.uk/relay"),
+              ("https://chat.ag2.space/api", "https://chat.ag2.space/relay"))
+        for base, relay in ok:
+            self.assertEqual(cm.relay_problem(base, relay), "", (base, relay))
+        for base, relay in (("https://example.co.uk/api", "https://evil.co.uk/relay"),
+                            ("https://api.example.co.uk/api", "https://relay.example.co.uk/relay"),
+                            ("https://example.co.uk/api", "https://notexample.co.uk/relay")):
+            with self.subTest(relay=relay):
+                self.assertIn("--trust-relay-host", cm.relay_problem(base, relay))
+        self.assertEqual(cm.relay_problem("https://example.co.uk/api", "https://evil.co.uk/relay", "evil.co.uk"), "")
+
     def test_retry_after_is_bounded_and_ignored_when_not_a_number(self):
         self.assertEqual(cm._retry_after({"retry_after": 0}, 4), 1.0)
         self.assertEqual(cm._retry_after({"retry_after": True}, 4), 4)
