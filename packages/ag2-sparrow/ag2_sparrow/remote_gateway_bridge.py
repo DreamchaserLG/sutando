@@ -5711,10 +5711,13 @@ def _recover_orphan_proactive() -> None:
         elif receipt == "PARKED":  # terminal: never resent, kept where parked files go
             parked = _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
                                    / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
-            if parked is not None and _claim_receipt(parked, target.stem)[0] not in ("PARKED", "unknown"):
-                # an operator requeued it after the receipt was read: its body goes back live
+            now = _claim_receipt(parked, target.stem)[0] if parked is not None else "PARKED"
+            if now == "QUEUED":  # the one state an operator's requeue publishes: its body goes back live
                 _log(f"proactive claim {f.name} was requeued while it was being parked; handed back")
                 _hand_back(parked, target)
+            elif now != "PARKED":  # its prior send is uncertain, so a vanished or changed record never resends
+                _log(f"proactive claim {f.name}: its outbox item read {now} after it was parked; kept parked "
+                     "for an operator, not re-queued")
         else:  # unknown / unreadable: it may have been sent; kept for an operator
             _log_backoff(("proactive-orphan-receipt", f.name),
                          f"proactive claim {f.name}: its outbox record cannot be read cleanly; kept as "
@@ -5722,33 +5725,37 @@ def _recover_orphan_proactive() -> None:
 
 
 def _move_decided(claim: Path, dest: Path, generation: str, what: str) -> "Path | None":
-    """Move `claim` to `dest` only as the generation its receipt was read from: a
-    no-replace rename, then a check; a file that replaced the claim goes back, or,
-    when its name was retaken, to a neutral hidden name no pass reads as delivered or
-    parked. Returns where the decided file now is, else None."""
+    """Move `claim` to `dest` only as the generation its receipt was read from. It is first
+    taken under this process's own claim name and checked there, so no other bytes ever reach
+    `dest`, and a crash leaves a claim the next restart re-decides. Returns `dest`, else None."""
+    staged = claim.with_name(f"{claim.name.split('.sending')[0]}.sending.{os.getpid()}.{time.time_ns()}")
     try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        undelivered_quarantine.rename_noreplace(claim, dest)
+        undelivered_quarantine.rename_noreplace(claim, staged)
     except OSError as e:
         _log(f"proactive claim {claim.name} could not be {what} ({diagnostics.describe(e)}); kept as its "
              "claim, never re-queued")
         return None
-    if _file_generation(dest) == generation:
-        return dest
-    try:  # not the bytes the receipt was read for: never hidden or parked under their item
-        undelivered_quarantine.rename_noreplace(dest, claim)
-        where = claim.name
+    if _file_generation(staged) != generation:
+        _log(f"proactive claim {claim.name} changed after its receipt was read; it was not {what} and is "
+             f"kept as the claim {_unstage(staged, claim)}")
+        return None
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        undelivered_quarantine.rename_noreplace(staged, dest)
+    except OSError as e:
+        _log(f"proactive claim {claim.name} could not be {what} ({diagnostics.describe(e)}); kept as the "
+             f"claim {_unstage(staged, claim)}, never re-queued")
+        return None
+    return dest
+
+
+def _unstage(staged: Path, claim: Path) -> str:
+    """Back to its own claim name when that is free; else it stays a claim under the staged name."""
+    try:
+        undelivered_quarantine.rename_noreplace(staged, claim)
+        return claim.name
     except OSError:
-        where = dest.name
-        try:
-            neutral = claim.with_name(f".{claim.name.split('.sending')[0]}.changed-{time.time_ns()}")
-            undelivered_quarantine.rename_noreplace(dest, neutral)
-            where = neutral.name
-        except OSError:
-            pass
-    _log(f"proactive claim {claim.name} changed after its receipt was read; it was not {what} and is kept "
-         f"as {where} for an operator")
-    return None
+        return staged.name
 
 
 def _file_generation(path: Path) -> "str | None":
@@ -5764,9 +5771,11 @@ def _claim_receipt(claim: Path, stem: str) -> "tuple[str, str | None]":
     that state was read for), from one descriptor that follows no symlink: "absent" when
     it was never an outbox item, "unknown" when that cannot be told."""
     try:
-        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(claim, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(fd, "rb") as fh:
             st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):  # a FIFO or device would block or lie: kept for an operator
+                return "unknown", None
             route, _, body = _proactive_route(fh.read().decode("utf-8"))
     except (OSError, UnicodeDecodeError):
         return "unknown", None

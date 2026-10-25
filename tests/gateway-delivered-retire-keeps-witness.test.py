@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import stat
 import subprocess
 import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,6 +38,10 @@ PREFIX = "proactive-orphan-recovery-"
 
 class Crash(RuntimeError):
     """The publisher dies here."""
+
+
+class Killed(BaseException):
+    """The process dies here: no handler in the code under test may absorb it."""
 
 
 def _dead_pid() -> int:
@@ -268,8 +274,10 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", move_then_refuse_the_way_back):
             self.lane.restart()
         self.assertFalse((self.lane.results / "proactive-1.txt").exists())
-        self.assertEqual(len(calls), 3, "the way back failed, so the file is set aside under a neutral name")
-        self.assertEqual(len(list(self.lane.results.glob(".proactive-1.changed-*"))), 1)
+        self.assertEqual(len(calls), 2, "the way back failed, so the file stays under its staged claim")
+        kept = list(self.lane.results.glob("proactive-1.sending.*"))
+        self.assertEqual([p.read_text() for p in kept], ["a different generation\n"])
+        self.assertEqual(list((self.lane.results / "undelivered").glob("proactive-1-*.txt")), [])
         self.assertEqual(len(self.lane.posts), 0)
 
     def test_a_replaced_claim_whose_way_back_is_retaken_is_never_archived_as_delivered(self):
@@ -299,8 +307,8 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.lane.drain()
         self.assertEqual(claim.read_text(), "CONCURRENT C\n")
         self.assertEqual(list(self.lane.results.glob(".proactive-1.delivered-*")), [])
-        kept = [p for p in self.lane.results.glob(".proactive-1*.changed-*")]
-        self.assertEqual([p.read_text() for p in kept], ["UNSENT B\n"], "kept neutral for an operator")
+        kept = [p for p in self.lane.results.glob("proactive-1.sending.*") if p != claim]
+        self.assertEqual([p.read_text() for p in kept], ["UNSENT B\n"], "kept as a claim, re-decided later")
         archived = list((self.lane.results / "archive").glob("proactive-1*"))
         self.assertFalse(any("UNSENT B" in p.read_text() for p in archived), "B was never delivered")
         self.assertEqual(len(self.lane.posts), 0)
@@ -347,6 +355,107 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         claim.write_text("never sent\n")
         self.lane.restart()
         self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "never sent\n")
+
+
+    def test_a_dead_owners_fifo_claim_never_wedges_the_restart(self):
+        fifo = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        os.mkfifo(fifo)
+        restart = threading.Thread(target=self.lane.restart, daemon=True)
+        restart.start()
+        restart.join(2.0)
+        wedged = restart.is_alive()
+        if wedged:  # supply a writer so the blocked reader returns and the suite can go on
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+            restart.join(5.0)
+        self.assertFalse(wedged, "the restart blocked opening a FIFO claim")
+        self.assertTrue(stat.S_ISFIFO(os.lstat(fifo).st_mode), "kept as its claim for an operator")
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists())
+
+    def _delivered_claim_swapped_to_unsent_b(self):
+        item_id = gb._proactive_item_id("proactive-1", "delivered A")
+        outbox.record_delivered(self.lane.results / ".outbox-ag2space-proactive", item_id)
+        claim = self.lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("delivered A\n")
+        real = gb._claim_receipt
+
+        def read_then_replace(*a, **kw):
+            got = real(*a, **kw)
+            if got[0] == "DELIVERED":
+                tmp = claim.with_name(".swap")
+                tmp.write_text("UNSENT B\n")
+                os.replace(tmp, claim)
+            return got
+        return claim, read_then_replace
+
+    def _b_is_never_archived_unsent(self):
+        hidden = [h.read_text() for h in self.lane.results.glob(".proactive-1.delivered-*")]
+        self.assertNotIn("UNSENT B\n", hidden, "unsent B hidden as delivered")
+        for _ in range(2):
+            self.lane.drain()
+        archived = [p.read_text() for p in (self.lane.results / "archive").glob("proactive-1*")]
+        posted = [p.get("body") for p in self.lane.posts].count("UNSENT B")
+        self.assertEqual(archived.count("UNSENT B\n"), posted, f"B archived without its POST ({posted})")
+        self.assertLessEqual(posted, 1)
+
+    def test_a_crash_right_after_the_first_rename_never_archives_unsent_bytes(self):
+        claim, read_then_replace = self._delivered_claim_swapped_to_unsent_b()
+        real_move = gb.undelivered_quarantine.rename_noreplace
+
+        def die_after_first_rename(src, dst):
+            real_move(src, dst)
+            raise Killed("killed after the first rename")
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
+                mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", die_after_first_rename):
+            with self.assertRaises(Killed):
+                self.lane.restart()
+        dead = _dead_pid()
+        for c in self.lane.results.glob("proactive-1.sending.*"):  # its owner died with the crash
+            rest = c.name.split(".sending.", 1)[1].split(".", 1)
+            c.rename(c.with_name(f"proactive-1.sending.{dead}.{rest[1] if len(rest) > 1 else '0'}"))
+        self._b_is_never_archived_unsent()
+        self.lane.restart()
+        self._b_is_never_archived_unsent()
+
+    def test_a_failed_rollback_and_set_aside_never_leaves_unsent_bytes_as_delivered(self):
+        claim, read_then_replace = self._delivered_claim_swapped_to_unsent_b()
+        real_move = gb.undelivered_quarantine.rename_noreplace
+        calls = []
+
+        def only_the_first_rename_succeeds(src, dst):
+            calls.append(src)
+            if len(calls) == 1:
+                return real_move(src, dst)
+            raise FileExistsError(17, "File exists")
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=read_then_replace), \
+                mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", only_the_first_rename_succeeds):
+            self.lane.restart()
+        self._b_is_never_archived_unsent()
+
+    def test_a_parked_record_that_vanishes_before_the_recheck_is_never_resent(self):
+        root = self.lane.results / ".outbox-ag2space-proactive"
+        item_id = gb._proactive_item_id("proactive-1", "parked body")
+        outbox._write_item(root, item_id, {"item_id": item_id, "status": "PARKED", "attempts": 0,
+                                           "payload": "parked body\n"})
+        (self.lane.results / f"proactive-1.sending.{_dead_pid()}.1").write_text("parked body\n")
+        real = gb._claim_receipt
+        receipts = []
+
+        def delete_after_the_parked_read(*a, **kw):
+            got = real(*a, **kw)
+            receipts.append(got[0])
+            if got[0] == "PARKED":
+                outbox._item_path(root, item_id).unlink()
+            return got
+
+        with mock.patch.object(gb, "_claim_receipt", side_effect=delete_after_the_parked_read):
+            self.lane.restart()
+        self.assertEqual(receipts, ["PARKED", "absent"])
+        self.assertFalse((self.lane.results / "proactive-1.txt").exists(), "never handed back live")
+        self.assertEqual(len(list((self.lane.results / "undelivered").glob("proactive-1-*.txt"))), 1)
+        self.lane.drain()
+        self.assertEqual(self.lane.posts, [], "a PARKED send is never repeated")
 
 
 if __name__ == "__main__":
