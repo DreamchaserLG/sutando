@@ -15,14 +15,17 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 import dataclasses
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from file_lock import lock_fd, unlock_fd
-from workspace_default import resolve_workspace
+try:
+    from ..file_lock import lock_fd, unlock_fd   # the vendored package layout
+except ImportError:
+    from file_lock import lock_fd, unlock_fd     # the repo's src/ on sys.path
 
 from . import renotify
 from .schema import (
@@ -58,11 +61,57 @@ def _activity(task_ids, to_phase: str, reason: str) -> None:
         pass
 
 
+# Per process, keyed by store root: ids warned about while still failing, and
+# the (count, error, time) last published for health-check.
+_ARCHIVE_WARNED: Dict[str, set] = {}
+_ARCHIVE_PUBLISHED: Dict[str, tuple] = {}
+# The status is rewritten at least this often, so a reader can tell a stopped
+# writer (older than ARCHIVE_STATUS_STALE_S) from a steady state.
+ARCHIVE_STATUS_REFRESH_S = 300
+ARCHIVE_STATUS_STALE_S = 600
+
+
+def archive_status_path(store_root: Path) -> Path:
+    """Beside the store, like the archive dir, so the store holds only records."""
+    root = Path(store_root)
+    return root.with_name(root.name + "-archive-status.json")
+
+
+def archive_health(store_root: Path, now: Optional[float] = None) -> Optional[Dict]:
+    """What health-check reads: live record count plus the published archive
+    failures, or None when this host has no store. `stale` means a report exists
+    but the writer stopped refreshing it, so its count is unknown."""
+    root = Path(store_root)
+    if not root.is_dir():
+        return None
+    status: Dict = {}
+    try:
+        status = json.loads(archive_status_path(root).read_text())
+    except (OSError, ValueError):
+        pass
+    if not isinstance(status, dict):
+        status = {}
+    failures = int(status.get("failures") or 0)
+    updated = status.get("updated_at")
+    now = time.time() if now is None else now
+    stale = bool(status) and (not isinstance(updated, (int, float))
+                              or now - updated > ARCHIVE_STATUS_STALE_S)
+    return {"live": sum(1 for _ in root.glob("hitl_*.json")),
+            "failures": failures,
+            "error": str(status.get("error") or ""),
+            "updated_at": updated,
+            "reported": bool(status),
+            "stale": stale}
+
+
 def default_store(workspace: Optional[Path] = None) -> Path:
     """Where every hitl component on a host keeps requirements: the hook driver
-    writes here, the supervisor projects from here. One store, one card."""
-    ws = Path(workspace) if workspace is not None else resolve_workspace()
-    return ws / "state" / "hitl" / "requirements"
+    writes here, the supervisor projects from here. One store, one card. With no
+    workspace the repo's resolver is imported here, so a vendored copy never needs it."""
+    if workspace is None:
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace()
+    return Path(workspace) / "state" / "hitl" / "requirements"
 
 
 class HitlStore:
@@ -118,6 +167,12 @@ class HitlStore:
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+        # The replace is visible before it is durable; the directory fsync makes it so, or says it could not.
+        dfd = os.open(str(self.root), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def _load_raw(self, req_id: str) -> Dict:
         if not self.valid_id(req_id):
@@ -140,6 +195,34 @@ class HitlStore:
             self.archive_root.mkdir(parents=True, exist_ok=True)
             os.replace(src, self.archive_root / src.name)
             return True
+
+    def report_archive_failures(self, failures: Dict[str, BaseException], now: float) -> None:
+        """Take one pulse's archive failures: warn once per failing spell of an id,
+        and publish the status for health-check when it changed or needs a refresh."""
+        key = str(self.root)
+        warned = _ARCHIVE_WARNED.setdefault(key, set())
+        for req_id, err in failures.items():
+            if req_id not in warned:
+                logging.getLogger("hitl.store").warning("hitl: could not archive %s: %s", req_id, err)
+        # An id that succeeded or left the live set warns again if it fails later.
+        _ARCHIVE_WARNED[key] = set(failures)
+        first = next(iter(failures.values()), None)
+        error = f"{type(first).__name__}: {first}" if first is not None else ""
+        last = _ARCHIVE_PUBLISHED.get(key)
+        if last and last[:2] == (len(failures), error) and now - last[2] < ARCHIVE_STATUS_REFRESH_S:
+            return
+        target = archive_status_path(self.root)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".tmp-archive-status-")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"failures": len(failures), "error": error, "updated_at": now}, f)
+            os.replace(tmp, target)
+        except OSError:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+            return  # reporting never blocks delivery; retried next pulse
+        _ARCHIVE_PUBLISHED[key] = (len(failures), error, now)
 
     def load(self, req_id: str) -> Optional[HumanRequirement]:
         raw = self._load_raw(req_id)
@@ -213,12 +296,15 @@ class HitlManager:
     def get(self, req_id: str) -> Optional[HumanRequirement]:
         return self.store.load(req_id)
 
-    def apply_action(self, reply: ActionReply) -> Action:
-        """Validate the two-layer stale gate; on pass, mark in_progress.
+    def apply_action(self, reply: ActionReply, patch=None) -> Action:
+        """Validate the three-layer stale gate; on pass, mark in_progress.
 
         Returns the matched Action for the caller (driver) to execute.
         Raises StaleRequirementError / MalformedActionError otherwise —
-        a stale click must never reach the runtime.
+        a stale click must never reach the runtime. `patch(req)`, when given,
+        runs after the reload and before the one save, so what it sets on the
+        requirement lands in the same write as the acceptance; it is pure and
+        merge-preserving and touches nothing else.
         """
         with self.store.locked():
             req = self.store.load(reply.hitl_id)
@@ -231,6 +317,8 @@ class HitlManager:
             if reply.answer is not None:
                 req.answer = reply.answer
             req.transition(STATUS_IN_PROGRESS)
+            if patch is not None:
+                patch(req)
             self.store.save(req)
             return action
 
