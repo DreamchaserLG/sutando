@@ -343,8 +343,7 @@ s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/primary", {})
 check("a disabled row made primary is 409 disabled_cannot_be_primary", (s, b) == (409, {"error": "disabled_cannot_be_primary"}), f"{s} {b}")
 s, b, _ = req("GET", "/api/v1/connections")
 check("the primary did not move", [r["primary"] for r in b["connections"]] == [True, False], b)
-# A bridge that keeps its lease (the production writer): the route's kill fake signals nothing,
-# so the stop deadline passes.
+# A production-writer lease the route's kill fake cannot clear: the stop deadline passes.
 from _helpers import bridge_lease  # noqa: E402
 _holder = bridge_lease.start(WS, "alpha-fixture-net")
 C.STOP_TIMEOUT_S, _saved_timeout = 0.3, C.STOP_TIMEOUT_S
