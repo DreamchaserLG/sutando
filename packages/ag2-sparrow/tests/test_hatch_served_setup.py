@@ -1069,6 +1069,7 @@ print(json.dumps({"files": files, "status": json.load(open(m.GATEWAY_STATUS_FILE
         media, rotated = "media-tok-77", "rotated-secret-99"
         token_file = self.home / "token"
         token_file.write_text("REMOTE_TASK_TOKEN=start-secret-55\n")  # the startup token; then a rotation
+        token_file.chmod(0o600)
         url = "https://longusername1:pw-123456@gw.example/relay"
         out = self.bridge("""
 import json

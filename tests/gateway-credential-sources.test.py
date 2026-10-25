@@ -119,6 +119,7 @@ class Fixture:
         _write_env(self.channel, channel)
         if token_file:
             self.token_file.write_text(f"REMOTE_TASK_TOKEN={token_file}\n")
+            self.token_file.chmod(0o600)  # a token file is read only when it is private
         self.env = {k: (str(self.token_file) if v == "TOKENFILE" else v) for k, v in env.items()}
         self.env.update(AG2_DEVICE_ENV=str(self.device), CLAUDE_CONFIG_DIR=str(self.config))
         values = [v for d in (env, device, channel) for k, v in d.items()
@@ -647,8 +648,9 @@ class DiscoveryCases:
         self.assertEqual((split.token, split.token_source, split.url, split.token_key),
                          (FILE_TOKEN, "token_file", GW, "REMOTE_TASK_TOKEN_FILE"), "the split layout's URL rides along")
         blank = self.o.discover(env, files, read_token_file=lambda p: "# rotating\n", vault_lookup=lambda k: VAULT_TOKEN)
-        self.assertEqual((blank.token, blank.token_source, blank.fatal), ("", "none", ""),
+        self.assertEqual((blank.token, blank.token_source), ("", "none"),
                          "a blank token file never falls through to the channel .env or the vault")
+        self.assertIn("/t, which holds no token", blank.fatal)
         with_env = self.o.discover(dict(env, REMOTE_TASK_TOKEN=ENV_TOKEN), files, read_token_file=lambda p: "",
                                    vault_lookup=lambda k: VAULT_TOKEN)
         self.assertEqual((with_env.token, with_env.token_source), (ENV_TOKEN, "env"), "only the env tier may follow it")
@@ -669,6 +671,32 @@ class DiscoveryCases:
                 self.assertEqual((none.token, none.token_source), ("", "none"),
                                  "a seat with no token file holds no token: not the env's, the core's file's or the vault's")
                 self.assertTrue(none.fatal)
+        homeless = self.o.discover({k: v for k, v in seat.items() if k != "AG2_DEVICE_ENV"}, [], read_token_file=read)
+        self.assertIn("AG2_DEVICE_ENV does not name its .env", homeless.fatal)
+
+    def test_a_32_hex_gateway_instance_is_a_seat_and_never_takes_the_envs_token_or_url(self):
+        env = {"GATEWAY_INSTANCE": "e" * 32, "AG2_DEVICE_ENV": "/seat/.env", "REMOTE_TASK_TOKEN": ENV_TOKEN,
+               "REMOTE_TASK_URL": "https://core-gw.example/relay", "REMOTE_TASK_TOKEN_FILE": "/seat/token"}
+        self.assertTrue(self.o.is_seat(env))
+        self.assertFalse(self.o.is_seat({"GATEWAY_INSTANCE": "dev"}), "a named instance is no seat")
+        missing = self.o.discover(env, [], read_token_file=lambda p: (None, ""), vault_lookup=lambda k: VAULT_TOKEN)
+        self.assertEqual((missing.token, missing.token_source), ("", "none"))
+        self.assertIn("does not exist", missing.fatal)
+        own = self.o.discover(env, [], read_token_file=lambda p: f"{GW}|{FILE_TOKEN}\n")
+        self.assertEqual((own.token, own.url, own.url_key, own.fatal), (FILE_TOKEN, GW, "", ""),
+                         "the seat's own URL, never the inherited REMOTE_TASK_URL")
+
+    def test_an_empty_or_malformed_token_file_is_fatal_with_its_own_reason(self):
+        seat = {"REMOTE_TASK_SEAT": "1", "AG2_DEVICE_ENV": "/seat/.env", "REMOTE_TASK_TOKEN_FILE": "/seat/token"}
+        empty = self.o.discover(seat, [], read_token_file=lambda p: "\n")
+        self.assertIn("/seat/token, which holds no token; a seat has no other credential source", empty.fatal)
+        bare = self.o.discover(seat, [], read_token_file=lambda p: f"{FILE_TOKEN}\n")
+        self.assertIn("carries no gateway URL", bare.fatal)
+        split = self.o.discover(seat, [], read_token_file=lambda p: f"REMOTE_TASK_URL={GW}\n{FILE_TOKEN}\n")
+        self.assertEqual((split.token, split.url, split.fatal), (FILE_TOKEN, GW, ""), "the split layout carries one")
+        host = self.o.discover({"REMOTE_TASK_TOKEN_FILE": "/t"}, [("/dev", {"REMOTE_TASK_TOKEN": DEVICE_TOKEN})],
+                               read_token_file=lambda p: "# rotating\n", vault_lookup=lambda k: VAULT_TOKEN)
+        self.assertIn("/t, which holds no token and no REMOTE_TASK_TOKEN is set", host.fatal)
 
     def test_the_seat_writer_owns_the_layout_and_never_returns_the_bearer(self):
         bearer = "seat-bearer-HHHH8888"
@@ -697,6 +725,11 @@ class DiscoveryCases:
                     self.assertTrue(why)
                     self.assertNotIn(bearer, why)
             self.assertEqual((chan / "token").read_text(), f"{GW}|rotated-IIII9999\n", "a refused write changes nothing")
+            with mock.patch.object(self.o.os, "replace", side_effect=OSError("disk full")), \
+                    self.assertRaises(OSError):
+                self.o.write_seat_credentials(seat, **dict(args, bearer="never-landed-PPPP6666"))
+            self.assertEqual(sorted(p.name for p in chan.iterdir()), [".env", "token"], "a failed write leaves no temp file")
+            self.assertEqual((chan / "token").read_text(), f"{GW}|rotated-IIII9999\n")
         self.assertRegex(self.o.mint_gateway_instance(), r"^[0-9a-f]{32}$")
         self.assertNotEqual(self.o.mint_gateway_instance(), self.o.mint_gateway_instance())
 
@@ -720,9 +753,9 @@ class DiscoveryCases:
         self.assertEqual(self.o.seat_bridge_environ("/d/.env", lambda p: (None, ""))[0], {}, "an absent file is no seat")
         refused = self.o.seat_bridge_environ("/s/.env", lambda p: (None, "not UTF-8"))
         self.assertEqual((refused[0], refused[1]), ({}, self.o.refusal_note("/s/.env", "not UTF-8")))
-        for key in ("AGENT_MXID", "GATEWAY_INSTANCE", "REMOTE_TASK_TIER"):
+        for key in ("AGENT_MXID", "GATEWAY_INSTANCE", "REMOTE_TASK_TIER", "REMOTE_TASK_TOKEN_FILE"):
             with self.subTest(missing=key):
-                env, why = self.o.seat_bridge_environ("/s/.env", text({k: v for k, v in values.items() if k != key}))
+                env, why = self.o.seat_bridge_environ("/s/.env", text(dict(values, **{key: ""})))
                 self.assertEqual(env, {})
                 self.assertIn(key, why)
 
@@ -787,6 +820,11 @@ print(json.dumps({"token": m.TOKEN, "source": m._FOUND.token_source, "url": m.UR
 BRIDGE_MAIN = BRIDGE.replace("print(json.dumps({", "try:\n    m.main()\n    exited = None\n"
                              "except SystemExit as e:\n    exited = str(e.code)\n"
                              'print(json.dumps({"exited": exited, ')
+
+
+# A seat's refused startup, with the backoff recorded instead of slept.
+SEAT_MAIN = BRIDGE_MAIN.replace("try:\n    m.main()", "slept = []\nm.time.sleep = slept.append\ntry:\n    m.main()").replace(
+    'print(json.dumps({"exited": exited, ', 'print(json.dumps({"exited": exited, "slept": slept, ')
 
 
 class RealSinks(unittest.TestCase):
@@ -896,12 +934,16 @@ class RealSinks(unittest.TestCase):
                 fx.env.update(launch)
                 fx.candidates = [seat_bearer] if not missing else []
                 # main() only where startup must refuse: a seat that holds a token would go on to poll.
-                out, err = self.bridge(fx, BRIDGE_MAIN if missing else BRIDGE, timeout=20)
+                out, err = self.bridge(fx, SEAT_MAIN if missing else BRIDGE, timeout=20)
                 self.assertNotEqual(out["token"], core)
                 self.assertNotIn(core, (out["header"] or "") + err + (out.get("exited") or ""))
                 if missing:
                     self.assertEqual((out["token"], out["source"]), ("", "none"))
                     self.assertIn("does not exist", out["exited"])
+                    self.assertEqual(out["slept"], [60], "a seat that cannot start backs off before it exits")
+                    status = json.loads(next((fx.root / "state").glob("gateway-status*.json")).read_text())
+                    self.assertFalse(status["connected"])
+                    self.assertIn("does not exist", status["error"], "the reason is in the status, not only stderr")
                 else:
                     self.assertEqual((out["token"], out["source"], out["url"]), (seat_bearer, "token_file", seat_gw))
                     self.assertNotIn(seat_bearer, err, "the bearer is never logged")
@@ -922,6 +964,7 @@ class RealSinks(unittest.TestCase):
             fx = Fixture(Path(td), ROWS[0])
             bad = fx.root / "bad-token"
             bad.write_bytes(b"REMOTE_TASK_TOKEN=\xff\xfe-not-utf8\n")
+            bad.chmod(0o600)
             fx.env["REMOTE_TASK_TOKEN_FILE"] = str(bad)
             out, _err = self.bridge(fx, BRIDGE.replace("print(json.dumps({",
                                                       'print(json.dumps({"rotated": m._read_token_file(m.TOKEN_FILE), '))
@@ -947,6 +990,7 @@ class RealSinks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             fx = Fixture(Path(td), ROWS[0])
             fx.token_file.write_text(f"REMOTE_TASK_TOKEN={ENV_TOKEN}\n")
+            fx.token_file.chmod(0o600)
             fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
             path = json.dumps(str(fx.token_file))
             script = BRIDGE.replace("print(json.dumps({", (
@@ -965,6 +1009,7 @@ class RealSinks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             fx = Fixture(Path(td), ROWS[0])
             fx.token_file.write_text(f"REMOTE_TASK_TOKEN={ENV_TOKEN}\n")
+            fx.token_file.chmod(0o600)
             fx.env["REMOTE_TASK_TOKEN_FILE"] = str(fx.token_file)
             path = json.dumps(str(fx.token_file))
             script = BRIDGE.replace("print(json.dumps({", (
@@ -1315,6 +1360,8 @@ class RealSinks(unittest.TestCase):
             path.write_bytes(f"REMOTE_TASK_TOKEN={DEVICE_TOKEN}\n".encode() + b"\xff\xfe\n")
         else:
             path.mkdir()
+        if path.is_file():
+            path.chmod(0o600)  # refused for its content, not its mode
 
     def test_a_refused_named_device_file_fails_closed(self):
         reasons = {"fifo": "not a regular file", "oversize": "over 1048576 bytes",
@@ -1382,6 +1429,24 @@ class BoundedRead(unittest.TestCase):
         self.assertFalse(t.is_alive(), f"{path} blocked the read")
         return box[0]
 
+    def test_a_private_read_refuses_a_symlink_a_shared_mode_and_another_owner(self):
+        for name, copy in self.COPIES.items():
+            with self.subTest(copy=name), tempfile.TemporaryDirectory() as td:
+                real = Path(td) / "token"
+                real.write_text("https://gw.example/relay|s-1\n")
+                real.chmod(0o600)
+                self.assertEqual(copy.read_private(str(real)), ("https://gw.example/relay|s-1\n", ""))
+                link = Path(td) / "link"
+                link.symlink_to(real)
+                self.assertIn("a symlink", copy.read_private(str(link))[1])
+                self.assertEqual(copy.read_regular(str(link))[1], "", "only the private read refuses a link")
+                real.chmod(0o644)
+                self.assertEqual(copy.read_private(str(real)), (None, "mode 0644; a private credential file must be 0600"))
+                real.chmod(0o600)
+                with mock.patch.object(copy.os, "geteuid", return_value=os.geteuid() + 1):
+                    self.assertIn("not this user", copy.read_private(str(real))[1])
+                self.assertEqual(copy.read_private(str(Path(td) / "absent")), (None, ""))
+
     def test_only_a_bounded_regular_file_is_read(self):
         for name, m in self.COPIES.items():
             with self.subTest(copy=name), tempfile.TemporaryDirectory() as td:
@@ -1432,6 +1497,7 @@ OWNER_READERS = {"env_files": (1, ("read_text",)), "bridge_carried_config": (1, 
 # Where credential I/O may happen: the adapters' edge, as (module, function).
 # The shared systemd reachability probe discards what show-environment prints.
 IO_ALLOWED = {("remote_gateway_bridge.py", "_read_env_file"), ("remote_gateway_bridge.py", "_read_text"),
+              ("remote_gateway_bridge.py", "_read_token_file_text"),
               ("remote_gateway_bridge.py", "_vault_lookup"), ("service_manager.py", "systemd_user_available"),
               ("gateway_credential_io.py", "read_file"), ("gateway_credential_io.py", "vault_lookup"),
               ("gateway_credential_io.py", "_vault"), ("gateway_credential_io.py", "_vault_once")}

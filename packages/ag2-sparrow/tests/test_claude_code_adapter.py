@@ -2202,6 +2202,18 @@ class ConnectAgentRoot(AgentRootBase):
             self.assertIn(line + "\n", unit)
         self.assertNotIn(bearer, unit + cli.config_path().read_text(), "the bearer stays in the seat's token file")
 
+    def test_a_seat_naming_another_agent_than_install_resolved_is_refused(self):
+        from ag2_sparrow import gateway_credential_sources as owner
+        seat = self.home / "seat"
+        self.assertEqual(owner.write_seat_credentials(seat, agent_id="@other.agent:ag2.space", instance="d" * 32,
+                                                      tier="owner", relay_url="https://gw.example/relay", bearer="b-1"), "")
+        with mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+            rc, _out, err = self.install_default(self.bridged(), "--token-env-file",
+                                                 str(seat / "channels" / "ag2space" / ".env"))
+        self.assertNotEqual(rc, 0)
+        self.assertIn(f"names @other.agent:ag2.space, not {AGENT}", err)
+        self.assertFalse(cm.service_path(cli.BRIDGE).exists())
+
     def test_a_malformed_seat_env_file_is_refused_before_the_bridge_is_wired(self):
         seat_env = self.home / "seat" / ".env"
         seat_env.parent.mkdir(parents=True)

@@ -283,10 +283,17 @@ SEAT_INSTANCE_RE = re.compile(r"[0-9a-f]{32}")
 SEAT_CLEARED = ("AGENT_ID", "AG2SPACE_USER_ID", "AG2_REMOTE_TIER", "GATEWAY_CREDENTIALS_INJECTED")
 
 
+def named_token_file(env: Mapping[str, str]) -> str:
+    """The token file REMOTE_TASK_TOKEN_FILE names in `env`, '' when none: a file that holds the credential
+    alone, which a reader opens private (read_private), unlike a channel .env standing in for one."""
+    return env.get(TOKEN_FILE_KEY) or ""
+
+
 def is_seat(env: Mapping[str, str]) -> bool:
-    """Whether `env` is a seat bridge's: its token comes from its token file alone and its channel .env is
-    AG2_DEVICE_ENV alone, never the host's channel dir or vault."""
-    return bool(env.get(SEAT_KEY))
+    """Whether `env` is a seat bridge's: SEAT_KEY, or a GATEWAY_INSTANCE in the seat's 32-hex form (a named
+    instance such as `dev` is none). Its token and URL come from its token file alone, its channel .env is
+    AG2_DEVICE_ENV alone, never the host's channel dir, environment token or vault."""
+    return bool(env.get(SEAT_KEY)) or bool(SEAT_INSTANCE_RE.fullmatch(env.get("GATEWAY_INSTANCE") or ""))
 
 
 def seat_channel_dir(seat) -> str:
@@ -605,10 +612,10 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
         fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which does not exist; a seat has no other "
                      "credential source. Reconnect the agent")
     if seat and not token_file_env:
-        fatal.append(f"this bridge is a seat ({SEAT_KEY}) but REMOTE_TASK_TOKEN_FILE is unset; a seat reads its "
-                     "token from its own token file only")
+        fatal.append("this bridge is a seat but REMOTE_TASK_TOKEN_FILE is unset; a seat reads its token from its "
+                     "own token file only")
     if seat and not env.get("AG2_DEVICE_ENV"):
-        fatal.append(f"this bridge is a seat ({SEAT_KEY}) but AG2_DEVICE_ENV does not name its .env")
+        fatal.append("this bridge is a seat but AG2_DEVICE_ENV does not name its .env")
     # A named token file decides alone: refused, no tier stands in; blank or not yet written, only the env may.
     seat_without_file = seat and (not token_file_env or token_file_missing)
     closed = (("token_file", "env", "file", "vault") if token_file_reason or seat_without_file
@@ -656,7 +663,15 @@ def discover(env: Mapping[str, str], files: "Sequence[EnvFile]" = (), *,
             break
     raw = found["raw"]
     url_from_token, token = contract.parse_onboarding_token(raw)
-    env_url, url_key = first_env(env, URL_KEYS)
+    env_url, url_key = ("", "") if seat else first_env(env, URL_KEYS)  # a seat's URL is its token file's
+    file_ok = token_file_env and not (token_file_reason or token_file_missing)
+    if file_ok and not raw:
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, which holds no token"
+                     + ("; a seat has no other credential source. Reconnect the agent" if seat else
+                        " and no REMOTE_TASK_TOKEN is set. Reconnect the agent or fix that file"))
+    elif seat and raw and not (url_from_token or found["file_url"]):
+        fatal.append(f"REMOTE_TASK_TOKEN_FILE names {token_file_env}, whose token carries no gateway URL; a seat's "
+                     "token file is one line, <relay_url>|<bearer>. Reconnect the agent")
     url = next((v for v in ({"env": env_url, "token": url_from_token, "file": found["file_url"]}[n]
                             for n in tiers["url"]) if v), "")
     token_file_path = next((v for v in ({"env": token_file_env, "file": found["source_file"]}[n]

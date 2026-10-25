@@ -307,7 +307,7 @@ from .task_archive import find_task_file
 from .local_task_protocol import find_archived_task
 from . import (agent_identity, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations)
-from .bounded_file_read import read_regular, read_regular_text
+from .bounded_file_read import read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -515,6 +515,13 @@ CHANNEL_DIR = gateway_credential_sources.channel_dir(os.environ)
 def _read_env_file(path: str):
     """A credential file's (text, refusal reason): bounded_file_read.read_regular."""
     return read_regular(path)
+
+
+def _read_token_file_text(path: str):
+    """A token file's (text, refusal reason). The REMOTE_TASK_TOKEN_FILE holds the credential alone, so it is
+    read_private (this user's, 0600, no link); a channel .env standing in as the rotation file, read_regular."""
+    named = gateway_credential_sources.named_token_file(os.environ)
+    return read_private(path) if path and path == named else read_regular(path)
 
 
 def _channel_env_candidates():
@@ -1823,7 +1830,7 @@ def _read_text(path: str) -> str:
 _SECRETS = diagnostics.REGISTRY  # the one registry every sink withholds from
 # The vault is located only if no earlier source holds a token.
 _FOUND = gateway_credential_sources.discover(
-    os.environ, _channel_env_candidates(), read_token_file=_read_env_file,
+    os.environ, _channel_env_candidates(), read_token_file=_read_token_file_text,
     vault_lookup=lambda key: (_vault_lookup() or (lambda _k: ""))(key), registry=_SECRETS)
 for _note in _FOUND.notes + ((_FOUND.fatal,) if _FOUND.fatal else ()):
     print(f"[remote-gateway-bridge] {_note}", file=sys.stderr, flush=True)
@@ -2142,6 +2149,9 @@ _ack_disabled_until = 0.0   # 0 = enabled; else epoch until which acks are skipp
 # Auth-rejection recovery: when the gateway rejects the bearer (401/403 — the
 # key was revoked or expired), the historical behavior is an immediate FATAL
 TOKEN_FILE = _FOUND.token_file
+# A seat that cannot start says why in its status, then waits this long before exiting, so a manager that
+# respawns on any exit (launchd KeepAlive, systemd Restart=always) retries it about once a minute, not hot.
+SEAT_FATAL_BACKOFF_S = 60
 AUTH_RECHECK_INTERVAL = int(os.environ.get("REMOTE_AUTH_RECHECK_INTERVAL") or "30")
 # Registry-loss self-claim (backend #595): the code is device-visible only;
 # binding requires the owner's concierge approval. Disable: REMOTE_REENROLL=0.
@@ -2739,7 +2749,7 @@ def _http_error_body(e) -> str:
 def _read_token_file(path: str) -> str:
     """The onboarding string from a token file, or "" (missing, refused or empty: no rotation); a
     refused file is named on stderr, path and reason only. token_file_token decides the shape."""
-    text, reason = read_regular(path)
+    text, reason = _read_token_file_text(path)
     if reason:
         print(f"[remote-gateway-bridge] {gateway_credential_sources.refusal_note(path, reason)}; "
               "no rotation", file=sys.stderr, flush=True)
@@ -2749,7 +2759,7 @@ def _read_token_file(path: str) -> str:
 def _read_token_file_url(path: str) -> str:
     """The URL of a split-layout token file, or "": the reload path needs it so a split file
     rewritten to a DIFFERENT gateway is caught by the cross-gateway guard."""
-    return gateway_credential_sources.token_file_url(_read_text(path))
+    return gateway_credential_sources.token_file_url(_read_token_file_text(path)[0] or "")
 
 
 def _reload_rotated_token() -> bool:
@@ -7591,6 +7601,9 @@ def main() -> None:
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
     if _FOUND.fatal:
+        _emit_gateway_status(False, error=f"FATAL: {_FOUND.fatal}")
+        if gateway_credential_sources.is_seat(os.environ):
+            time.sleep(SEAT_FATAL_BACKOFF_S)
         sys.exit(f"FATAL: {_FOUND.fatal}")
     if not TOKEN:
         sys.exit("FATAL: set REMOTE_TASK_TOKEN (the onboarding string, or a bare secret with REMOTE_TASK_URL).")
