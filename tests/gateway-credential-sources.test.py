@@ -948,6 +948,36 @@ class RealSinks(unittest.TestCase):
                     self.assertEqual((out["token"], out["source"], out["url"]), (seat_bearer, "token_file", seat_gw))
                     self.assertNotIn(seat_bearer, err, "the bearer is never logged")
 
+    def test_a_host_reads_its_named_channel_env_as_before_and_only_a_seat_reads_it_private(self):
+        core = f"{GW}|core-token-QQQQ7777"
+        script = BRIDGE.replace("print(json.dumps({", 'print(json.dumps({"fatal": m._FOUND.fatal, ')
+        for shape in ("0644", "symlink"):
+            for seat in (False, True):
+                with self.subTest(shape=shape, seat=seat), tempfile.TemporaryDirectory() as td:
+                    fx = Fixture(Path(td), ("core", {}, {}, {}, "", None, ("", "", "", "")))
+                    real = fx.root / "real.env"
+                    real.write_text(f"REMOTE_TASK_TOKEN={core}\n")
+                    real.chmod(0o644 if shape == "0644" else 0o600)
+                    named = fx.channel
+                    named.unlink()
+                    if shape == "symlink":
+                        named.symlink_to(real)
+                    else:
+                        named.write_text(real.read_text())
+                        named.chmod(0o644)
+                    # startup-runtime.sh: the core's channel .env is both the token file and the env token's source.
+                    fx.env.update(REMOTE_TASK_TOKEN_FILE=str(named), REMOTE_TASK_TOKEN=core)
+                    if seat:
+                        fx.env.update(REMOTE_TASK_SEAT="1", AG2_DEVICE_ENV=str(fx.root / "seat.env"))
+                    fx.candidates = []
+                    out, _err = self.bridge(fx, script)
+                    if seat:
+                        self.assertEqual((out["token"], out["source"]), ("", "none"))
+                        self.assertIn("mode 0644" if shape == "0644" else "a symlink", out["fatal"])
+                    else:
+                        self.assertEqual((out["token"], out["source"], out["fatal"]),
+                                         ("core-token-QQQQ7777", "token_file", ""), "a live core starts as before")
+
     def test_a_missing_device_file_is_skipped_and_the_media_marker_is_carried(self):
         with tempfile.TemporaryDirectory() as td:
             fx = Fixture(Path(td), ROWS[2])

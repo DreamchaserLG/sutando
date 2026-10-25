@@ -277,9 +277,9 @@ naming the staged definition, followed by that definition (with its versioned
 
 The token stays out of the hook, its config and the wake payload. When
 `REMOTE_TASK_TOKEN_FILE` is set, Sparrow reads its startup token from that
-file first, and re-reads it after the relay rejects the token. The file must
-be this user's own, mode 600, and not a symlink. A set file it cannot read,
-or refuses for any of those, stops startup: no other source stands in. A file with no token,
+file first, and re-reads it after the relay rejects the token. A set file it
+cannot read stops startup: no other source stands in. A seat's token file
+(below) must also be this user's own, mode 600, and not a symlink. A file with no token,
 or not yet written, leaves only `REMOTE_TASK_TOKEN` in the environment, never
 a channel `.env` or the vault. Without it, Sparrow reads `REMOTE_TASK_TOKEN` from its
 environment or, failing that, from the `.env` file named by `AG2_DEVICE_ENV`.

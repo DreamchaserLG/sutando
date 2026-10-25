@@ -284,8 +284,8 @@ SEAT_CLEARED = ("AGENT_ID", "AG2SPACE_USER_ID", "AG2_REMOTE_TIER", "GATEWAY_CRED
 
 
 def named_token_file(env: Mapping[str, str]) -> str:
-    """The token file REMOTE_TASK_TOKEN_FILE names in `env`, '' when none: a file that holds the credential
-    alone, which a reader opens private (read_private), unlike a channel .env standing in for one."""
+    """The token file REMOTE_TASK_TOKEN_FILE names in `env`, '' when none. A seat's holds its credential alone
+    and is opened private (read_private); a host's may be its channel .env, read as any other."""
     return env.get(TOKEN_FILE_KEY) or ""
 
 

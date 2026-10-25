@@ -518,10 +518,11 @@ def _read_env_file(path: str):
 
 
 def _read_token_file_text(path: str):
-    """A token file's (text, refusal reason). The REMOTE_TASK_TOKEN_FILE holds the credential alone, so it is
-    read_private (this user's, 0600, no link); a channel .env standing in as the rotation file, read_regular."""
-    named = gateway_credential_sources.named_token_file(os.environ)
-    return read_private(path) if path and path == named else read_regular(path)
+    """A token file's (text, refusal reason). A seat's own token file holds its credential alone, so a seat reads
+    it read_private (this user's, 0600, no link); a host, whose named file may be its channel .env, read_regular."""
+    owner = gateway_credential_sources
+    seat_file = owner.is_seat(os.environ) and path == owner.named_token_file(os.environ)
+    return read_private(path) if path and seat_file else read_regular(path)
 
 
 def _channel_env_candidates():
