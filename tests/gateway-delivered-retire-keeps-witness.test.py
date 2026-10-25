@@ -1335,6 +1335,46 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.assertEqual(lane.posts, [], "the delivered send is matched, never repeated")
         self.assertFalse((lane.results / f"{stem}.txt").exists(), "never handed back live")
 
+    def _upgraded_marked_claim(self, legacy_payload: str, status: str = "DELIVERED"):
+        """A [channel:]-marked claim of a dead owner, written before the route joined the key, beside
+        the body-only item it was sent under."""
+        lane = Lane(gb, scratch("gw-legacy-route-"))
+        root = lane.results / ".outbox-ag2space-proactive"
+        legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
+        outbox._write_item(root, legacy, {"item_id": legacy, "status": status, "payload": legacy_payload,
+                                          "provider_ref": "$sent", "attempts": 1})
+        claim = lane.results / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("[channel: !RoomOne:ag2.space]\nSAME BODY\n")
+        return lane, claim
+
+    def test_an_upgraded_claim_whose_legacy_payload_cannot_be_read_is_kept_for_an_operator(self):
+        lane, claim = self._upgraded_marked_claim("not json")
+        lane.restart()
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual(lane.posts, [], "an unreadable legacy record may have been sent: never resent")
+        self.assertTrue(claim.exists(), "kept as its claim for an operator")
+
+    def test_an_upgraded_claim_matches_its_legacy_item_by_its_own_room_when_the_route_cannot_resolve(self):
+        payload = json.dumps({"body": "SAME BODY", "room_id": "!RoomOne:ag2.space"}, sort_keys=True)
+        lane, claim = self._upgraded_marked_claim(payload)
+        with mock.patch.object(gb, "_proactive_envelope", side_effect=RuntimeError("routing not loaded")):
+            lane.restart()
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual(lane.posts, [], "delivered under its legacy item: never resent")
+        self.assertFalse(claim.exists())
+        self.assertFalse((lane.results / "proactive-1.txt").exists(), "not handed back live")
+
+    def test_an_upgraded_claim_for_another_room_is_not_taken_as_its_legacy_item(self):
+        payload = json.dumps({"body": "SAME BODY", "room_id": "!RoomTwo:ag2.space"}, sort_keys=True)
+        lane, claim = self._upgraded_marked_claim(payload)
+        lane.restart()
+        for _ in range(3):
+            lane.drain()
+        self.assertEqual([(p.get("room_id"), p.get("body")) for p in lane.posts],
+                         [("!RoomOne:ag2.space", "SAME BODY")], "never sent there, so sent once to its own room")
+
     def test_the_marker_key_and_the_send_read_a_thread_marker_the_same_way(self):
         """A malformed [thread:] before a valid one: the send posts top level, and the item key agrees."""
         for text in ("[thread: not-an-event]\n[thread: $Valid]\nbody\n", "[thread: $Valid]\nbody\n",
@@ -1577,20 +1617,6 @@ class ParkAndIdentityEdges(unittest.TestCase):
         r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
         r.write_bytes(b"\xff\xfe body")
         self.assertIsNone(gb._retained_item(r))
-
-    def test_a_legacy_item_with_an_unreadable_payload_or_no_resolution_never_matches_blindly(self):
-        legacy = gb._proactive_item_id("proactive-1", "SAME BODY")
-        outbox._write_item(self.root, legacy, {"item_id": legacy, "status": "DELIVERED", "payload": "not json"})
-        self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !R:s]\nSAME BODY\n",
-                                                          "SAME BODY", "!R:s", None), ("unknown", None))
-        outbox._write_item(self.root, legacy, {"item_id": legacy, "status": "DELIVERED",
-                                               "payload": json.dumps({"room_id": "!R:s", "body": "SAME BODY"})})
-        with mock.patch.object(gb, "_proactive_envelope", side_effect=RuntimeError("no routing")):
-            self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !R:s]\nSAME BODY\n",
-                                                              "SAME BODY", "!R:s", None)[0], "DELIVERED",
-                             "the file's own room still matches")
-            self.assertEqual(gb._route_matched_legacy_receipt("proactive-1", "[channel: !Other:s]\nSAME BODY\n",
-                                                              "SAME BODY", "!Other:s", None), ("absent", None))
 
     def test_a_snapshot_name_it_does_not_own_or_cannot_take_is_left_alone(self):
         self.assertIsNone(gb._take_snapshot(self.res / "proactive-1.txt"))
