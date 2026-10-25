@@ -4260,8 +4260,9 @@ class Hold(Base):
         self.assertIn("was already posted before this answer", answers[0].stderr)
         self.assertNotIn("withdraw", answers[0].stderr, "the losing reply never claims a withdrawal")
 
-    def drain_with(self, req, archive=None, url=None, ready=None):
-        """One real drain pass; `req` stands in for the gateway unless `url` names a real one."""
+    def drain_with(self, req, archive=None, url=None, ready=None, own_env=True):
+        """One real drain pass; `req` stands in for the gateway unless `url` names a real one.
+        Without `own_env` it runs in the environment it finds, as a drain beside hold must."""
         from ag2_sparrow import remote_gateway_bridge as gb
         net = (mock.patch.multiple(gb, URL=url, TOKEN="t") if url else mock.patch.object(gb, "_req", req))
         seam = mock.patch.object(gb, "read_ready_result", ready) if ready else contextlib.nullcontext()
@@ -4272,10 +4273,10 @@ class Hold(Base):
                 mock.patch.object(gb, "PROACTIVE_CLAIM_GATE", None), mock.patch.object(gb, "_log"), \
                 mock.patch.object(gb, "_STATE", self.home / "state"), \
                 mock.patch.dict(gb._ROUTING, {"owner_dm": "", "loaded": True, "next": time.time() + 3600}), \
-                mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}):
+                (mock.patch.dict(os.environ, {"AGENT_MXID": AGENT}) if own_env else contextlib.nullcontext()):
             gb._post_proactive()
 
-    def drain_pass(self, posts, archive=None, fail=None, ready=None):
+    def drain_pass(self, posts, archive=None, fail=None, ready=None, own_env=True):
         """A drain pass whose gateway records each posted body, or raises `fail` after recording."""
         def req(method, path, payload=None, timeout=None, **_kw):
             if method == "POST":
@@ -4283,7 +4284,7 @@ class Hold(Base):
                 if fail is not None:
                     raise fail
             return {"ok": True, "event_id": "$evt"}
-        self.drain_with(req, archive=archive, ready=ready)
+        self.drain_with(req, archive=archive, ready=ready, own_env=own_env)
 
     def reply_now(self, *extra):
         with mock.patch.object(outbox, "_activity_completed", return_value=None):
@@ -4990,7 +4991,8 @@ class Hold(Base):
         def publish_then_drain_claims(path, body):
             done = real(path, body)
             seen["a"] = path
-            t = threading.Thread(target=self.drain_pass, args=(posts,), daemon=True)
+            t = threading.Thread(target=self.drain_pass, args=(posts,), kwargs={"own_env": False},
+                                 daemon=True)
             t.start()
             drain.append(t)
             deadline = time.monotonic() + 10
@@ -4999,17 +5001,12 @@ class Hold(Base):
             self.assertFalse(path.exists(), "the drain claimed the line")
             self.lock_holder(os.getppid())
             return done
-        saved = dict(os.environ)
-        try:
-            with mock.patch.object(delivery_destination, "DRAIN_LOCK_WAIT_S", 20.0), \
-                    mock.patch.object(hatch_cli, "_publish_once", publish_then_drain_claims):
-                r = self.hold(str(self.result_file), env={"AGENT_MXID": AGENT})
-            self.assertEqual(len(drain), 1, r.stdout + r.stderr)
-            drain[0].join(30)
-            self.assertFalse(drain[0].is_alive(), "the drain finished its send")
-        finally:
-            os.environ.clear()
-            os.environ.update(saved)
+        with mock.patch.object(delivery_destination, "DRAIN_LOCK_WAIT_S", 20.0), \
+                mock.patch.object(hatch_cli, "_publish_once", publish_then_drain_claims):
+            r = self.hold(str(self.result_file), env={"AGENT_MXID": AGENT})
+        self.assertEqual(len(drain), 1, r.stdout + r.stderr)
+        drain[0].join(30)
+        self.assertFalse(drain[0].is_alive(), "the drain finished its send")
         return r, seen["a"]
 
     def test_a_refused_hold_line_the_drain_claimed_before_the_lock_is_never_sent(self):
