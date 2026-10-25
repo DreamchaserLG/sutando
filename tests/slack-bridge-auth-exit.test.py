@@ -119,5 +119,20 @@ check(out == ("exit", 78), f"token_revoked -> exit 78 (got {out})")
 out, _ = outcome_of(lambda: mod._start_socket_mode(Handler(SlackApiError("internal_error"))))
 check(out == ("raised", "SlackApiError"), f"a non-auth API error stays a crash (got {out})")
 
+
+class UnreadableResponse:
+    def get(self, key):
+        raise RuntimeError("unreadable")
+
+
+class OpaqueError(Exception):
+    response = UnreadableResponse()
+
+
+check(not mod._slack_auth_error(OpaqueError("boom")),
+      "an unreadable response with no error in the message is not an auth answer")
+check(mod._slack_auth_error(OpaqueError("{'ok': False, 'error': 'not_authed'}")),
+      "an unreadable response falls back to the message's error code")
+
 print("PASS" if FAILS == 0 else f"{FAILS} FAILED")
 raise SystemExit(1 if FAILS else 0)

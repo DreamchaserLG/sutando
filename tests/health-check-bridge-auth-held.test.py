@@ -18,6 +18,9 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-hc-auth-held-")
+_ccd = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_ccd.mkdir(parents=True, exist_ok=True)
+(_ccd / "access.json").write_text("{}")
 
 spec = importlib.util.spec_from_file_location("health_check", REPO / "src" / "health-check.py")
 hc = importlib.util.module_from_spec(spec)
@@ -53,6 +56,29 @@ check(not str(held_row["detail"]).startswith(hc.DOWN_BRIDGE_DETAILS["discord-bri
       "held detail is not a fix_down_bridges restart candidate")
 src = (REPO / "src" / "health-check.py").read_text()
 check(held_row["detail"] in src, "the probe emits exactly this held detail")
+
+
+def slack_row(held: bool) -> dict:
+    """The real run_all_checks() slack row with no bridge process found."""
+    with tempfile.TemporaryDirectory() as td:
+        ws = Path(td)
+        (ws / "logs").mkdir()
+        sup = ws / "state" / "channel-bridge-supervisor"
+        sup.mkdir(parents=True)
+        if held:
+            (sup / "slack.auth-held").write_text(f"1700000000\n{os.getpid()}\n")
+        with mock.patch.object(hc, "WORKSPACE_DIR", ws), \
+                mock.patch.object(hc, "probe_pids", return_value=([], True)):
+            checks = hc.run_all_checks()
+    return next(c for c in checks if c.get("name") == "slack-bridge")
+
+
+row = slack_row(held=True)
+check(row["status"] == "fail" and row["detail"] == held_row["detail"],
+      f"run_all_checks reports a held bridge as held (got {row})")
+row = slack_row(held=False)
+check(row["detail"].startswith("configured but not running"),
+      f"run_all_checks without a stamp still reports the bridge down (got {row})")
 
 print("PASS" if FAILS == 0 else f"{FAILS} FAILED")
 raise SystemExit(1 if FAILS else 0)
