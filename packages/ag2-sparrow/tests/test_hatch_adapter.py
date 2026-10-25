@@ -2762,111 +2762,174 @@ class StartSparrow(Base):
     def lock_path(self):
         return self.state / "locks" / "gateway-bridge.lock"
 
-    def stop_refused(self, old):
-        """_stop on `old` against the lock now on disk: True when nothing was signalled."""
-        with mock.patch.object(keepalive.os, "kill") as kill, contextlib.redirect_stderr(io.StringIO()):
-            stopped = keepalive._stop(self.cfg(), old.pid)
-        return not stopped and not kill.called
+    BAD_LOCKS = ("a start the second after the lock", "acquired at Infinity",
+                 "acquired in the far future", "acquired after its heartbeat", "a string time",
+                 "another workspace", "no workspace", "another role", "another schema",
+                 "a declared start of another process", "another pid", "malformed JSON",
+                 "a symlink to another workspace's lock", "a FIFO", "an oversized lock")
+
+    def stamp(self, t):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def bad_lock(self, case, old, rec):
+        """Put `case` in place of `old`'s canonical lock `rec` (start times included)."""
+        lock, acquired = self.lock_path(), rec["acquired_at"]
+        if lock.is_symlink() or lock.exists():
+            lock.unlink()
+        self.starts[old.pid] = self.stamp(acquired - 5)
+        changes = {"acquired at Infinity": {"acquired_at": float("inf")},
+                   "acquired in the far future": {"acquired_at": 4000000000, "heartbeat_at": 4000000000},
+                   "acquired after its heartbeat": {"heartbeat_at": acquired - 10},
+                   "a string time": {"acquired_at": str(acquired)},
+                   "another workspace": {"workspace": str(self.home / "elsewhere")},
+                   "no workspace": {"workspace": None}, "another role": {"role": "gateway-bridge-x"},
+                   "another schema": {"schema_version": 2}, "another pid": {"pid": os.getppid()},
+                   "a declared start of another process": {"start": "2001-01-01T00:00:00Z"},
+                   "an oversized lock": {"pad": "x" * 5000}}
+        if case == "a start the second after the lock":
+            self.starts[old.pid] = self.stamp(acquired + 1)
+        if case == "malformed JSON":
+            lock.write_text("{")
+        elif case == "a FIFO":
+            os.mkfifo(lock)
+        elif case.startswith("a symlink"):
+            foreign = self.home / "other-ws" / "state" / "locks" / "gateway-bridge.lock"
+            foreign.parent.mkdir(parents=True, exist_ok=True)
+            foreign.write_text(json.dumps({**rec, "workspace": str(foreign.parents[2])}))
+            lock.symlink_to(foreign)
+        else:
+            lock.write_text(json.dumps({**rec, **changes.get(case, {})}))
+
+    def legacy(self):
+        """A released main's Sparrow and its canonical lock, held long enough to be replaced."""
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        return old, json.loads(self.lock_path().read_text())
+
+    def done_with(self, old):
+        if old.poll() is None:
+            old.kill()
+        old.wait(5)
+        if self.lock_path().is_symlink() or self.lock_path().exists():
+            self.lock_path().unlink()  # a FIFO left here would block the next fixture's write
 
     def test_stop_signals_only_the_proven_sparrow_of_the_lock_it_rereads(self):
-        old = self.old_sparrow()
-        self.acquired(old, 30)
-        rec = json.loads(self.lock_path().read_text())
-        acquired = rec["acquired_at"]
-        stamp = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))  # noqa: E731
-        for why, record, start in (
-                ("another pid", {**rec, "pid": os.getppid()}, None),
-                ("started the second after the lock", rec, stamp(acquired + 1)),
-                ("started the same second as the lock", rec, stamp(acquired)),
-                ("acquired at Infinity", {**rec, "acquired_at": float("inf")}, None),
-                ("acquired in the far future", {**rec, "acquired_at": 4000000000,
-                                                "heartbeat_at": 4000000000}, None),
-                ("acquired after its heartbeat", {**rec, "heartbeat_at": acquired - 10}, None),
-                ("a string time", {**rec, "acquired_at": str(acquired)}, None),
-                ("another workspace", {**rec, "workspace": str(self.home / "elsewhere")}, None),
-                ("no workspace", {**rec, "workspace": None}, None),
-                ("another role", {**rec, "role": "gateway-bridge-other"}, None),
-                ("another schema", {**rec, "schema_version": 2}, None),
-                ("a declared start of another process", {**rec, "start": "2001-01-01T00:00:00Z"}, None)):
-            with self.subTest(why):
-                self.lock_path().write_text(json.dumps(record))
-                if start:
-                    self.starts[old.pid] = start
-                self.assertTrue(self.stop_refused(old))
-                self.started_ago(old, 35)
-        self.lock_path().write_text("{")
-        self.assertIsNone(hatch_cli._lock_record(self.state, ""))
-        self.assertTrue(self.stop_refused(old))
-        self.lock_path().write_text(json.dumps(rec))
-        self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "the control is proven")
+        old, rec = self.legacy()
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                self.bad_lock(case, old, rec)
+                with mock.patch.object(keepalive.os, "kill") as kill, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    t = threading.Thread(target=keepalive._stop, args=(self.cfg(), old.pid), daemon=True)
+                    t.start()
+                    t.join(10)
+                self.assertFalse(t.is_alive(), "the reread blocked")
+                kill.assert_not_called()
+        self.lock_path().unlink()
+        for began in (rec["acquired_at"], rec["acquired_at"] - 30):  # same second, and earlier
+            with self.subTest(began=began):
+                self.lock_path().write_text(json.dumps(rec))
+                self.starts[old.pid] = self.stamp(began)
+                self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "same generation")
         self.starts[old.pid] = "not a time"
         self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec))
+        self.starts[old.pid] = self.stamp(-100)
+        self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "no bounded start epoch")
         self.starts[old.pid] = None
         with mock.patch.object(keepalive.agent_identity, "start_time", return_value=None):
             self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, rec), "no start: no proof")
         self.assertFalse(keepalive.proven_sparrow(self.cfg(), old.pid, None))
-        old.kill()
-        old.wait(5)
+        self.done_with(old)
 
-    def test_the_lock_reread_refuses_a_symlink_a_fifo_or_an_oversized_file(self):
-        old = self.old_sparrow()
-        self.acquired(old, keepalive.LANE_GRACE_S + 60)
-        rec = json.loads(self.lock_path().read_text())
-        foreign = self.home / "other-ws" / "state" / "locks" / "gateway-bridge.lock"
-        foreign.parent.mkdir(parents=True)
-        foreign.write_text(json.dumps({**rec, "workspace": str(foreign.parents[2])}))
+    def test_keepawake_signals_no_holder_its_lock_cannot_prove(self):
         want = keepalive.health_command(str(self.reply_stub))
-        for kind in ("symlink to another workspace's lock", "fifo", "oversized"):
-            with self.subTest(kind):
-                self.lock_path().unlink()
-                if kind.startswith("symlink"):
-                    self.lock_path().symlink_to(foreign)
-                elif kind == "fifo":
-                    os.mkfifo(self.lock_path())
-                else:
-                    self.lock_path().write_text(json.dumps({**rec, "pad": "x" * 5000}))
-                self.assertIsNone(hatch_cli._lock_record(self.state, ""))
-                self.assertTrue(self.stop_refused(old))
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.bad_lock(case, old, rec)
                 out = {}
-                with mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop:
+                with mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop, \
+                        mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
                     t = threading.Thread(target=lambda: out.update(
                         r=self.keepawake({"REMOTE_HEALTH_COMMAND": want})), daemon=True)
                     t.start()
                     t.join(20)
                 self.assertFalse(t.is_alive(), "keepawake blocked on the lock")
                 stop.assert_not_called()
-                self.assertIsNone(old.poll())
-        old.kill()
-        old.wait(5)
+                self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list)
+                self.assertIn(" listener=up restarted=0", out["r"][1])
+                self.assertIsNone(old.poll(), "the holder is left untouched")
+                self.done_with(old)
+        old, rec = self.legacy()  # the positive control: this lock's own legacy Sparrow
+        self.starts[old.pid] = self.stamp(rec["acquired_at"])
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
 
-    def test_keepawake_never_signals_a_legacy_sparrow_started_the_second_after_its_lock(self):
+    def test_a_legacy_sparrow_that_took_its_lock_a_tenth_of_a_second_after_starting_is_replaced(self):
+        # As a main-built Sparrow does: its whole-second start and a fractional lock time agree.
         old = self.old_sparrow()
-        self.acquired(old, keepalive.LANE_GRACE_S + 60)
-        acquired = json.loads(self.lock_path().read_text())["acquired_at"]
-        self.starts[old.pid] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(acquired + 1))
+        began = int(time.time()) - keepalive.LANE_GRACE_S - 60
+        self.starts[old.pid] = self.stamp(began)
+        rec = json.loads(self.lock_path().read_text())
+        for acquired in (began + 0.1, began + 0.9):
+            with self.subTest(acquired=acquired):
+                self.lock_path().write_text(json.dumps({**rec, "acquired_at": acquired}))
+                self.assertTrue(keepalive.proven_sparrow(self.cfg(), old.pid,
+                                                         hatch_cli._lock_record(self.state, "")))
+                with mock.patch.object(keepalive.os, "kill", side_effect=ProcessLookupError) as kill:
+                    self.assertTrue(keepalive._stop(self.cfg(), old.pid))
+                kill.assert_called_once_with(old.pid, signal.SIGTERM)
         want = keepalive.health_command(str(self.reply_stub))
         with mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop:
             r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
-        stop.assert_not_called()
-        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
-        self.assertIsNone(old.poll())
-        old.kill()
-        old.wait(5)
+        stop.assert_called_once()
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
 
-    def test_install_leaves_an_outside_sparrow_whose_lock_is_not_this_workspaces(self):
+    def test_unmanaged_health_problem_reads_the_lock_holder_and_its_environment(self):
         old = self.old_sparrow()
+        want = keepalive.health_command(str(self.reply_stub))
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        cfg = {**self.cfg(), "REPLY_COMMAND": str(self.reply_stub)}
+        with mock.patch.object(keepalive, "_command", return_value=str(self.reply_stub)), \
+                mock.patch.object(keepalive, "_unit_owner", return_value=None):
+            for env, problem in (({"REMOTE_HEALTH_COMMAND": want}, None),
+                                 ({"HOME": "x"}, keepalive.NO_HEALTH_COMMAND),
+                                 (None, keepalive.UNKNOWN_ENV)):
+                with self.subTest(problem=problem), \
+                        mock.patch.object(keepalive, "sparrow_env", return_value=env):
+                    self.assertEqual(keepalive.unmanaged_health_problem(cfg), (old.pid, problem))
+        with mock.patch.object(keepalive, "_unit_owner", return_value="ours"):
+            self.assertEqual(keepalive.unmanaged_health_problem(cfg), (None, None), "a unit runs it")
+        self.done_with(old)
+
+    def test_install_signals_no_outside_sparrow_its_lock_cannot_prove(self):
+        for case in self.BAD_LOCKS:
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.old_pid = old.pid
+                self.bad_lock(case, old, rec)
+                fake = FakeSystemd(state="inactive")
+                with self.service(fake), mock.patch.object(keepalive, "START_WAIT_S", 0.5), \
+                        mock.patch.object(keepalive.os, "kill", wraps=os.kill) as kill:
+                    t = threading.Thread(target=self.call_ensure, daemon=True)
+                    t.start()
+                    t.join(30)
+                self.assertFalse(t.is_alive(), "install blocked on the lock")
+                self.assertNotIn(mock.call(old.pid, signal.SIGTERM), kill.call_args_list)
+                self.assertIsNone(old.poll(), "the holder is left untouched")
+                self.done_with(old)
+        old, rec = self.legacy()  # the positive control: install replaces this lock's own Sparrow
         self.old_pid = old.pid
-        rec = json.loads(self.lock_path().read_text())
-        self.lock_path().write_text(json.dumps({**rec, "workspace": str(self.home / "elsewhere")}))
         fake = FakeSystemd(state="inactive")
-        with self.service(fake):
-            r = self.call_ensure()
-        self.assertEqual(r, 1, self.out + self.err)
-        self.assertIn("not proven to be the Sparrow holding the lock", self.err)
-        self.assertIsNone(old.poll(), "an ambiguous holder is left untouched")
-        self.assertEqual(fake.ran("restart"), [])
-        old.kill()
-        old.wait(5)
+
+        def restarted(cmd):
+            self.status(-1)
+            return fake(cmd)
+        with self.service(fake, on_restart=restarted):
+            self.assertEqual(self.call_ensure(), 0, self.out + self.err)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
 
     def test_keepawake_replaces_a_main_version_sparrow_that_publishes_no_lane_record(self):
         old = self.old_sparrow()

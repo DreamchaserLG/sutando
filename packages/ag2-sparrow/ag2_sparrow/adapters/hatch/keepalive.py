@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import calendar
 import datetime
+import math
 import json
 import os
 import shlex
@@ -313,8 +314,8 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
 def proven_sparrow(cfg: dict, pid: int, lock: "dict | None") -> bool:
     """`pid` runs Sparrow now and is the process that took `lock`, this workspace's canonical
     lock (cli.canonical_lock), not a later one given its pid: its start time is the one the lock
-    declares or, for a lock that declares none, a whole second before the lock was taken (start
-    times have one-second resolution, so the same second proves nothing). False whenever that
+    declares or, for a lock that declares none, a bounded epoch no later than the lock's (both
+    whole seconds, so the same second passes and the next one does not). False whenever that
     cannot be read."""
     if not _cli.canonical_lock(lock, _state_dir(cfg), _instance(cfg)) or lock.get("pid") != pid \
             or not is_sparrow_pid(pid):
@@ -328,7 +329,7 @@ def proven_sparrow(cfg: dict, pid: int, lock: "dict | None") -> bool:
         began = calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return False
-    return began + 1 <= lock["acquired_at"]
+    return bounded_number(began, 1, time.time()) is not None and began <= math.floor(lock["acquired_at"])
 
 
 def _stop(cfg: dict, pid: int) -> bool:
