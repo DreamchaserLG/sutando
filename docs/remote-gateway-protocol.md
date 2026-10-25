@@ -109,6 +109,84 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
+### Broker-supplied room context (consumer preparation)
+
+A broker may supply reserved `room_context_binding` and `room_context` objects
+alongside the actual `task`. This is a proposed consumer contract, dormant unless
+those fields arrive. It does not enable history reads, join greetings, subscriptions
+or background model execution. An authoritative producer must enforce the current acting
+agent's membership and Agent Native context-visibility policy before every delivery.
+The bridge's local HMAC is integrity telemetry, not that authorization.
+
+Both objects carry exactly the same binding fields:
+
+| Field | Contract |
+| --- | --- |
+| `schema_version` | Integer `1` |
+| `context_id` | Opaque nonempty identifier, at most 256 characters |
+| `agent_id` | Exact acting agent Matrix ID, not the task sender |
+| `room_id`, `task_id` | Exact outer destination and delivered task |
+| `anchor_event_id` | Exact `source_message_id`, or JSON null for an eventless task |
+| `access_tier` | `owner`, `team` or `guest`, matching the effective locally capped tier |
+| `policy_revision`, `membership_epoch` | Nonempty authoritative revisions, at most 256 characters |
+| `visibility` | `all` or `mentions` |
+| `observed_at`, `expires_at` | Integer Unix seconds; at most one hour lifetime, observed at most 60 seconds ahead, not expired |
+
+IDs are bounded to 1,024 characters. The binding is bounded to 8 KiB and the
+context to 32 KiB of UTF-8 JSON, with depth at most 12. Unknown versions, fields,
+malformed values and mismatches discard the entire context without discarding the
+actual request. If a local agent identity is configured, `agent_id` must match it.
+Binding fields come only from the authenticated broker response; they are never
+parsed out of user text and do not grant a new tier or a local capability.
+
+The context adds `status` (`partial`, `unavailable` or `denied`) and `coverage`:
+`completeness` is always `unknown`, `truncated` is a boolean, and optional `cursor`
+and non-sensitive `reason` are bounded strings. `partial` may additionally carry:
+
+- `room`: optional `name` (512 characters) and `topic` (2,048 characters).
+- `readme`: `text` (8,192 characters), `content_hash` (256 characters) and boolean
+  `truncated`. The producer must independently authorize this section.
+- `members`: at most 20 objects with exact `user_id` and optional `display_name`.
+- `messages`: at most 20 objects with `event_id`, `sender`, `body` (2,048 characters)
+  and `selection` (`mention` or `policy`), plus optional nonnegative
+  `origin_server_ts`, `thread_root` and `reply_to_event_id`. Mention visibility
+  requires `selection: mention` for every message, including referenced parents.
+
+Unavailable and denied packets carry no content sections. An empty message array
+with a cursor remains partial; it does not prove an empty room or complete thread.
+
+The bridge validates the packet before publishing, writes compact JSON headers
+above `task:`, then uses the existing stamping, atomic publication, dispatch and
+acknowledgement paths. Named gateway instances project the validated broker task ID
+to the same local task ID in both packet objects, so subsequent readers compare it
+exactly to the canonical local `id:`. This local mapping adds no authority.
+`room_context_status` is a bridge-generated status header; it is never accepted as a
+wire attestation. All three header names are confined in user-authored content.
+
+If either reserved wire field was present, invalid, expired, denied or unavailable
+context stays context-managed and cannot restore the old unconditional history-read
+prelude. Only tasks with neither reserved field retain that legacy behavior. Room
+data stays separate from the ask, and an optional render budget drops context before
+it can displace the original request. No new context cache, transcript journal or
+global/profile-memory write is introduced.
+
+`python3 src/room_context.py view <task-file>` prints a read-only view, rechecking
+expiry and exact bindings and replacing unusable context with an unavailable notice.
+It preserves the request and tier guardrails and never rewrites the signed source.
+The Claude and Codex standby notifier prompts direct context-enabled tasks through
+this view. Optional Codex and Claude cloud/routine renderers also revalidate before
+rendering. Codex connector sessions include actor, room, tier, policy, membership,
+visibility and status in their context-enabled session key; legacy routing is kept.
+
+**Current limits:** no authoritative context producer or authenticated join-to-reply
+round trip is established by these consumers. A model that directly reads a canonical
+file can see already queued context before running the view; the core's self-armed
+watcher and pointer-based optional runtimes remain instructions-based at that boundary.
+The shared owner session is unchanged and may retain prior conversation; removing or
+expiring a packet does not erase model/session memory. Current-policy revocation while
+queued and a true before-inference freshness guarantee require an authoritative
+pre-turn producer check. Deployment must not claim those guarantees from this patch.
+
 **`capabilities` (the poll's proof).** Every poll carries
 `&capabilities=voice-outcome-v1`, the voice-outcome contract the heartbeat also
 declares (below). One agent's credential may be used by more than one bridge, so

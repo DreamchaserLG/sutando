@@ -83,6 +83,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .dotspace import NO_FETCH as _NO_FETCH, dotspace_for as _dotspace_for
+from . import room_context
 
 # Prefer IPv4 for connections to any DotSpace gateway/relay (e.g. chat.ag2.space): they
 # publish AAAA records, but some hosts have IPv6 black-holed at the network
@@ -2276,6 +2277,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                "room_context_binding", "room_context",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -4202,9 +4204,26 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
     _recv = _reenroll_identity()
+    context_managed = "room_context" in task or "room_context_binding" in task
+    context, binding, context_reason = room_context.validate(
+        task.get("room_context"), task.get("room_context_binding"),
+        task_id=broker_tid, room_id=task.get("channel_id"), access_tier=sender_tier,
+        anchor_event_id=task.get("source_message_id") or None, agent_id=_recv)
+    if context is not None:
+        context["task_id"] = binding["task_id"] = tid
+    elif context_managed:
+        _log(f"room context omitted for {tid}: {context_reason}")
     _secret_types: tuple = ()
     for f in _TASK_FIELDS:
-        if f == "session_scope":
+        if f == "room_context_binding":
+            if context_managed:
+                lines.append(f"room_context_status: {context_reason}")
+            if context is not None:
+                lines.append("room_context_binding: " + room_context.dumps(binding))
+                lines.append("room_context: " + room_context.dumps(context))
+        elif f == "room_context":
+            continue
+        elif f == "session_scope":
             if task.get(f) == "room":
                 lines.append("session_scope: room")
         elif f == "source":
@@ -4324,7 +4343,7 @@ def _write_task(task: dict, hold: bool = False) -> "tuple[str, bool] | None":
         # a dedup requeue re-renders it there from the stored header (#3613).
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
-            _one_line(task.get("addressed_to") or "")))
+            _one_line(task.get("addressed_to") or ""), room_context_managed=context_managed))
     # Last, after every tier block: it keeps their limits and replaces their reply step.
     if task.get("owner_mentioned") == "true":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
