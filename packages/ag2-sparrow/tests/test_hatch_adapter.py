@@ -32,8 +32,9 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import gateway_credential_io, health_command as hc, outbox, service_manager as sm  # noqa: E402
-from ag2_sparrow.adapters.hatch import cli as hatch_cli, keepalive, task_fields  # noqa: E402
+from ag2_sparrow import agent_identity, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow.adapters.hatch import (  # noqa: E402
+    cli as hatch_cli, keepalive, runtime_text, task_fields)
 
 KEEPAWAKE_NOTE = "the agent keeps Sparrow running with %s keepalive keepawake from its scheduler"
 
@@ -143,6 +144,57 @@ def run_main(main, args, env):
 
 def py_env(home):
     return hermetic_env(home, PYTHONPATH=str(PKG_ROOT))
+
+
+def assert_bridge_identity(test, final_env, state_dir, want):
+    """The bridge's own resolver under `final_env` reports `want` while every identity tier it reads
+    beyond the env holds a foreign id: each file alias in both candidates, and the durable binding."""
+    from ag2_sparrow import remote_gateway_bridge as gw
+    device = Path(final_env["AG2_DEVICE_ENV"])
+    channel = Path(final_env["CLAUDE_CONFIG_DIR"], "channels", "ag2space", ".env")
+    record = Path(state_dir) / "auth" / "ag2space.json"
+    for path in (device, channel, record):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    device_text = device.read_text() if device.exists() else ""
+    unpinned = {k: v for k, v in final_env.items()
+                if k != agent_identity.PINNED_KEY and k not in agent_identity.ENV_KEYS}
+
+    def bridge(env):
+        with mock.patch.object(gw, "_STATE", Path(state_dir)), mock.patch.dict(os.environ, env, clear=True):
+            return gw._reenroll_identity()
+
+    tiers = [(f, k) for f in (device, channel) for k in agent_identity.FILE_KEYS] + [(record, "agent_id")]
+    try:
+        for tier in tiers + [None]:
+            device.write_text(device_text)
+            channel.unlink(missing_ok=True)
+            record.unlink(missing_ok=True)
+            for n, (path, key) in enumerate([tier] if tier else tiers):
+                if path == record:
+                    path.write_text(json.dumps({"agent_id": f"@foreign-{n}:ag2.space"}))
+                else:
+                    with path.open("a") as fh:
+                        fh.write(f"\n{key}=@foreign-{n}:ag2.space\n")
+            with test.subTest(tier=tier and (tier[0].name, tier[1]), want=want):
+                test.assertEqual(bridge(unpinned), "@foreign-0:ag2.space", "the planted tier is live unpinned")
+                test.assertEqual(bridge(final_env), want, "the launch decides the identity at every tier")
+    finally:
+        device.write_text(device_text)
+
+
+def unit_environment(unit, manager_env):
+    """The environment systemd gives the unit's process: the manager's, then Environment=, then
+    UnsetEnvironment= last."""
+    env = dict(manager_env)
+    for line in unit.splitlines():
+        if line.startswith("Environment="):
+            k, _, v = line[len("Environment="):].strip('"').partition("=")
+            env[k] = v
+    for line in unit.splitlines():
+        if line.startswith("UnsetEnvironment="):
+            for k in line[len("UnsetEnvironment="):].split():
+                env.pop(k, None)
+    return env
 
 
 class Base(unittest.TestCase):
@@ -506,6 +558,29 @@ class HookScript(Base):
         (m,) = self.payload()["matches"]
         self.assertEqual((m["task_id"], m["event_id"]), ("task-blue~task-1784700000001", "$blue"))
         self.assertEqual(m["result_file"], str(self.results / "task-blue~task-1784700000001.txt"))
+
+    def test_an_upgrade_notice_wakes_the_agent_once(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json\n")
+        r = self.run_script(ACTIVITY_FILE=str(self.home / "marker"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        p = self.payload()
+        self.assertEqual(p["notice"], "ag2-sparrow upgraded itself; REQUIRED hook: /h/def.json")
+        self.assertIn("REQUIRED hook: /h/def.json Report this to your owner", p["worker_note"])
+        self.assertIn("change nothing yourself", p["worker_note"])
+        self.assertFalse(notice.exists())
+        self.reset()
+        self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
+        self.run_script(ACTIVITY_FILE=str(self.home / "absent"))
+        self.assertNotIn("notice", self.payload())
+
+    def test_a_task_wake_leaves_the_notice_for_a_quiet_poll(self):
+        notice = self.sparrow_state / "hatch-wake-notice"
+        notice.write_text("hook changed\n")
+        self.add_task("task-1784700000001", "$reply")
+        self.run_script()
+        self.assertNotIn("notice", self.payload())
+        self.assertTrue(notice.exists())
 
     def test_heartbeat_with_sparrow_running_carries_no_sparrow_field(self):
         self.state.write_text(json.dumps({"seen_ids": [], "last_wake_ms": 1}))
@@ -1170,6 +1245,14 @@ class Cli(Base):
         code, detail = hatch_cli.check_sparrow(self.state, now=1010, instance="blue")
         self.assertEqual(code, hatch_cli.SPARROW_OK, detail)
 
+    def test_install_keeps_auto_upgrade_off(self):
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        cfg = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        self.assertNotIn("AUTO_UPGRADE", cfg.read_text())
+        cfg.write_text(cfg.read_text() + "AUTO_UPGRADE=0\n")
+        self.assertEqual(self.cli("install", "--mxid", AGENT).returncode, 0)
+        self.assertEqual(hatch_cli.read_config(cfg)["AUTO_UPGRADE"], "0")
+
     def test_install_records_the_reply_command_by_absolute_path(self):
         r = self.cli("install", "--mxid", AGENT)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -1307,6 +1390,58 @@ class Service(Base):
                         AGENT_CONNECT_STATE_DIR=str(self.state), **env)
             return run_main(hatch_cli.main, args, base)
 
+    def test_the_unit_gets_no_agent_mxid_when_none_was_saved_and_says_so(self):
+        fake = FakeSystemd()
+        env = py_env(self.home)
+        env.update(PATH=f"{self.bin}:{os.environ['PATH']}", USER="hatch",
+                   **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS})
+        for mxid in ("", "not-an-mxid", " @spaced:ag2.space"):
+            with self.subTest(mxid=mxid):
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(sm, "_run", side_effect=systemd_seam(fake)), \
+                        mock.patch.dict(os.environ, env, clear=True), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    hatch_cli.install_service(self.tasks, self.results, self.state, "", True, mxid=mxid)
+                self.assertTrue(self.unit.is_file(), out.getvalue() + err.getvalue())
+                unit = self.unit.read_text()
+                if mxid.strip() and hatch_cli.valid_mxid(mxid.strip()):
+                    self.assertIn(f"\nEnvironment=AGENT_MXID={mxid.strip()}\n", unit)
+                    self.assertIn("\nUnsetEnvironment=AGENT_ID\n", unit)
+                    self.assertNotIn(hatch_cli.NO_SAVED_MXID, err.getvalue())
+                else:
+                    self.assertNotIn("\nEnvironment=AGENT_MXID", unit, "no identity is invented for the unit")
+                    self.assertIn("\nUnsetEnvironment=AGENT_MXID AGENT_ID\n", unit,
+                                  "the manager's identity keys are unset, not merely left out")
+                    self.assertEqual(err.getvalue().count(hatch_cli.NO_SAVED_MXID), 1, err.getvalue())
+                for key in agent_identity.ENV_KEYS:
+                    self.assertNotIn(f"{key}={StartSparrow.CALLER}", unit, "the installer's own identity never reaches the unit")
+                self.assertNotIn("\nEnvironment=AGENT_ID", unit)
+
+    def test_the_units_final_environment_resolves_the_saved_identity_or_none_at_every_tier(self):
+        manager = {"HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.home / "caller-claude"),
+                   agent_identity.PINNED_KEY: "", **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS}}
+        for mxid, want in ((AGENT, AGENT), ("", "")):
+            with mock.patch.object(sm, "_run", side_effect=systemd_seam(FakeSystemd())), \
+                    mock.patch.dict(os.environ, {**py_env(self.home), "USER": "hatch",
+                                                 "PATH": f"{self.bin}:{os.environ['PATH']}"}, clear=True), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                hatch_cli.install_service(self.tasks, self.results, self.state, "", True, mxid=mxid)
+            final = unit_environment(self.unit.read_text(), manager)
+            self.assertEqual(final[agent_identity.PINNED_KEY], "1")
+            assert_bridge_identity(self, final, final["AGENT_CONNECT_STATE_DIR"], want)
+
+    def test_the_unit_carries_the_saved_identity_never_the_installers_ambient_one(self):
+        r = self.with_systemd(FakeSystemd(), "install", "--mxid", AGENT,
+                              env={"USER": "hatch", **{key: StartSparrow.CALLER for key in agent_identity.ENV_KEYS}})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        unit = self.unit.read_text()
+        self.assertIn(f"\nEnvironment=AGENT_MXID={AGENT}\n", unit)
+        self.assertIn("\nUnsetEnvironment=AGENT_ID\n", unit, "the alias the manager may pass is unset")
+        self.assertNotIn(StartSparrow.CALLER, unit)
+        self.assertNotIn("\nEnvironment=AGENT_ID", unit)
+        # UnsetEnvironment= applies after Environment=, so the saved identity is never also unset.
+        self.assertNotRegex(unit, r"UnsetEnvironment=.*AGENT_MXID")
+
     def test_a_number_its_consumer_cannot_take_stops_reloads_and_starts_nothing(self):
         # The exact answer: an active unit, a 5,000-digit MainPID and a start timestamp.
         for name, change in [("5000-digit pid", {"MainPID": "7" * 5000})] + list(StartSparrow.OVERSIZED.items()):
@@ -1391,6 +1526,106 @@ class Service(Base):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse(self.unit.exists())
         self.assertIn("contains ' ' (whitespace, a quote, a backslash, $ or ;)", r.stdout)
+
+    def test_no_start_never_starts_or_restarts_the_service(self):
+        fake = FakeSystemd()
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(fake.ran("enable"), [["--user", "enable", "ag2-sparrow.service"]])
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("inactive", [], []))
+        self.assertIn("not started (--no-start)", r.stdout)
+        # A changed unit: the live service is stopped for the write and left stopped.
+        self.unit.write_text(self.unit.read_text() + "# changed\n")
+        fake.state = "active"
+        fake.calls.clear()
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(fake.ran("stop")), 1)
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("inactive", [], []))
+        self.assertIn(f"stopped: {hatch_cli.SERVICE_NAME} before installing", r.stdout)
+        self.assertIn("not started (--no-start)", r.stdout)
+
+        # When that stop fails the old unit keeps running, and --no-start vetoes the restart.
+        class StopFails(FakeSystemd):
+            def __call__(self, cmd):
+                if cmd[0] == "systemctl" and cmd[2] == "stop":
+                    self.calls.append(cmd[1:])
+                    return subprocess.CompletedProcess(cmd, 1, "", "Job failed")
+                return super().__call__(cmd)
+        fake = StopFails(state="active", enabled=True)
+        self.unit.write_text(self.unit.read_text() + "# changed again\n")
+        r = self.with_systemd(fake, "install", "--mxid", AGENT, "--no-start",
+                              env={"USER": "hatch"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual((fake.state, fake.ran("restart"), fake.ran("start")),
+                         ("active", [], []))
+        self.assertIn("it keeps running the old unit (--no-start)", r.stdout)
+        self.assertIn("the unit changed but was not restarted (--no-start)", r.stdout)
+
+    def test_install_hands_no_start_to_the_service_step(self):
+        with mock.patch.object(hatch_cli, "install_service") as svc:
+            self.cli("install", "--mxid", AGENT, "--no-start")
+            self.assertIs(svc.call_args.kwargs["may_start"], False)
+            self.cli("install", "--mxid", AGENT)
+            self.assertIs(svc.call_args.kwargs["may_start"], True)
+
+    def test_an_install_that_starts_checks_a_failed_upgrades_hold_and_no_start_does_not(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        with mock.patch.object(hatch_cli, "install_service") as svc, \
+                mock.patch.object(self_upgrade, "release_hold", return_value=None) as release:
+            self.cli("install", "--mxid", AGENT, "--no-start")
+            release.assert_not_called()
+            self.cli("install", "--mxid", AGENT)
+            release.assert_called_once_with(self.state.resolve())
+            self.assertIs(svc.call_args.kwargs["may_start"], True)
+
+    def test_a_failed_recovery_hold_is_lifted_only_by_verified_files_and_before_any_start(self):
+        from ag2_sparrow.adapters.hatch import self_upgrade
+        journal = self.state / "hatch-upgrade.json"
+
+        def blocked():
+            self.state.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"attempted": {"0.6.0": {
+                "at": 1.0, "from": "0.5.4", "outcome": "restore-failed", "phase": "restore-failed"}},
+                "failed": {"target": "0.6.0", "from": "0.5.4", "installed": "0.6.0", "why": "w",
+                           "at": 1.0, "outcome": "restore-failed", "problems": ["p"]}}))
+
+        class Recording(FakeSystemd):
+            def __call__(me, cmd):
+                if cmd[0] == "systemctl" and "--now" in cmd:
+                    me.phase_at_start = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+                return FakeSystemd.__call__(me, cmd)
+        for problems in (["changed /site/ag2_sparrow/__init__.py"], []):
+            blocked()
+            fake = Recording()
+            with mock.patch.object(self_upgrade, "verify_installed", return_value=problems,
+                                   create=True), \
+                    mock.patch.object(keepalive, "ensure_sparrow", return_value=0):
+                r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+            phase = json.loads(journal.read_text())["attempted"]["0.6.0"]["phase"]
+            started = [c for c in fake.calls if "--now" in c or "start" in c[1:2] or "restart" in c[1:2]]
+            if problems:
+                self.assertEqual((r.returncode, started, phase), (1, [], "restore-failed"),
+                                 r.stdout + r.stderr)
+                self.assertIn("the installed files do not verify", r.stdout + r.stderr)
+                self.assertNotIn("cleared:", r.stdout)
+            else:
+                self.assertEqual((r.returncode, phase, fake.phase_at_start), (0, "acknowledged",
+                                 "acknowledged"), r.stdout + r.stderr)
+                self.assertIn("cleared: a failed self-upgrade's hold", r.stdout)
+        # An unreadable journal is never cleared by an install; Sparrow is not started.
+        journal.write_text('{"attempted":')
+        fake = FakeSystemd()
+        with mock.patch.object(keepalive, "ensure_sparrow", return_value=0) as ensure:
+            r = self.with_systemd(fake, "install", "--mxid", AGENT, env={"USER": "hatch"})
+        self.assertEqual((r.returncode, [c for c in fake.calls if "--now" in c]), (1, []))
+        ensure.assert_not_called()
+        self.assertIn("cannot be read", r.stdout + r.stderr)
+        self.assertEqual(journal.read_text(), '{"attempted":')
 
     def test_rerun_is_idempotent(self):
         fake = FakeSystemd()
@@ -1922,6 +2157,23 @@ class Keepalive(Base):
         self.assertEqual(self.health()["condition"], "healthy")
         self.assertIn("FAIL hook run: hook not running: last run", self.cli("verify").stdout)
 
+    def test_a_failed_upgrade_is_abnormal_and_verify_names_it(self):
+        from ag2_sparrow import __version__
+        self.installed()
+        self.sparrow_status()
+        self.keepawake_at(time.time() - 60)
+        self.hook_ran(age_s=5)
+        (self.state / "hatch-upgrade.json").write_text(json.dumps({"attempted": {"9.9": {
+            "at": time.time() - 60, "from": __version__, "outcome": "crashed", "phase": "crashed"}},
+            "failed": {"target": "9.9", "from": __version__, "at": time.time() - 30}}))
+        row = self.health()
+        self.assertEqual((row["condition"], row["reason"]), ("abnormal", "upgrade-failed"))
+        self.assertEqual(hc.validate(row), (row, None))
+        r = self.cli("verify")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("health=abnormal (upgrade-failed); an automatic ag2-sparrow upgrade failed",
+                      r.stdout)
+
     def test_a_hook_that_never_ran_ages_from_install(self):
         self.installed()
         self.keepawake_at(time.time())
@@ -1957,6 +2209,64 @@ class Keepalive(Base):
         self.assertEqual(shlex.split(command),
                          ["/opt/my tools/ag2-sparrow-hatch", "keepalive", "health"])
 
+    def test_a_started_sparrow_runs_as_the_saved_agent_mxid_and_gets_no_default_without_one(self):
+        self.installed()
+        stub = self.bin / "sparrow-stub"
+        executable(stub, '#!/bin/sh\necho "${AGENT_MXID-unset} ${AGENT_ID-unset}" > "$SPARROW_SEEN"\n')
+        cfg = self.call(lambda c: c)
+        self.assertEqual(cfg["AGENT_MXID"], AGENT)
+        # The runner's own identity, in every key the bridge's resolver reads before any file.
+        env = py_env(self.home)
+        env.update({key: f"@caller-{key.lower()}:ag2.space" for key in agent_identity.ENV_KEYS})
+        for i, (mxid, want) in enumerate(((AGENT, f"{AGENT} unset"), (None, "unset unset"),
+                                          ("not-an-mxid", "unset unset"), ("", "unset unset"))):
+            with self.subTest(saved=mxid):
+                seen = self.home / f"sparrow-env-{i}"  # one file per child: a late writer cannot cross over
+                env["SPARROW_SEEN"] = str(seen)
+                saved = {k: v for k, v in cfg.items() if k != "AGENT_MXID"}
+                if mxid is not None:
+                    saved["AGENT_MXID"] = mxid
+                err = io.StringIO()
+                with mock.patch.object(hatch_cli, "_find_console_script", return_value=str(stub)), \
+                        mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3), \
+                        mock.patch.dict(os.environ, env, clear=True), \
+                        contextlib.redirect_stderr(err):
+                    ok, how = keepalive._spawn_sparrow(saved)
+                self.assertTrue(ok or "exited 0" in how, how)  # a quick exit is the stub's own
+                deadline = time.monotonic() + 10
+                while not seen.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertEqual(seen.read_text().strip(), want, "the child sees the saved identity or none, never the caller's")
+                self.assertEqual(hatch_cli.NO_SAVED_MXID in err.getvalue(), mxid is None or want == "unset unset",
+                                 err.getvalue())
+
+    def test_a_started_sparrows_final_environment_resolves_the_saved_identity_or_none_at_every_tier(self):
+        self.installed()
+        stub = self.bin / "sparrow-env-stub"
+        executable(stub, f"#!{sys.executable}\nimport json, os\n"
+                         "json.dump(dict(os.environ), open(os.environ['SPARROW_SEEN'], 'w'))\n")
+        cfg = self.call(lambda c: c)
+        env = py_env(self.home)
+        env.update({key: f"@caller-{key.lower()}:ag2.space" for key in agent_identity.ENV_KEYS},
+                   CLAUDE_CONFIG_DIR=str(self.home / "caller-claude"))
+        for i, (mxid, want) in enumerate(((AGENT, AGENT), (None, ""))):
+            seen = self.home / f"sparrow-final-env-{i}"
+            env["SPARROW_SEEN"] = str(seen)
+            saved = {k: v for k, v in cfg.items() if k != "AGENT_MXID"}
+            if mxid:
+                saved["AGENT_MXID"] = mxid
+            with mock.patch.object(hatch_cli, "_find_console_script", return_value=str(stub)), \
+                    mock.patch.object(keepalive, "SPAWN_SETTLE_S", 0.3), \
+                    mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stderr(io.StringIO()):
+                ok, how = keepalive._spawn_sparrow(saved)
+            self.assertTrue(ok or "exited 0" in how, how)
+            deadline = time.monotonic() + 10
+            while not (seen.exists() and seen.stat().st_size) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            final = json.loads(seen.read_text())
+            self.assertEqual(final["CLAUDE_CONFIG_DIR"], env["CLAUDE_CONFIG_DIR"], "channel config is kept")
+            assert_bridge_identity(self, final, final.get("AGENT_CONNECT_STATE_DIR") or self.home / "state", want)
+
     def test_the_service_unit_carries_the_health_command(self):
         self.installed()
         fake = FakeSystemd()
@@ -1972,6 +2282,9 @@ class Keepalive(Base):
             self.assertIn(f'\nEnvironment="REMOTE_HEALTH_COMMAND={self.reply_stub} keepalive '
                           'health"\n', unit)
             self.assertIn(f"\nEnvironment=AGENT_CONNECT_TASK_DIR={self.tasks.resolve()}\n", unit)
+            self.assertIn(f"\nEnvironment=AGENT_MXID={AGENT}\n", unit,
+                          "the service's Sparrow runs as the identity install saved")
+            self.assertNotIn(hatch_cli.NO_SAVED_MXID, r.stdout + r.stderr)
             self.cli("install", "--mxid", AGENT, "--no-keepalive")
             unit = (self.home / ".config" / "systemd" / "user" / hatch_cli.SERVICE_NAME).read_text()
             self.assertNotIn("REMOTE_HEALTH_COMMAND", unit)
@@ -2443,6 +2756,103 @@ class StartSparrow(Base):
                           ("start", "restart", "stop", "enable", "daemon-reload")], [])
         self.assertIsNone(old.poll())
         self.assertFalse(self.seen.exists())
+
+    # A stand-in Sparrow that is the real bridge: its identity comes through the bridge's own resolver,
+    # the owner-routing record and the status file through the bridge's writers; only the gateway is faked.
+    REAL_BRIDGE = """import json, os, pathlib, sys, time
+from unittest import mock
+from ag2_sparrow import holder_lock as _hl
+_hl._home = lambda: os.environ["HOME"]
+from ag2_sparrow import remote_gateway_bridge as m
+rows = {"agents": [{"id": "%(agent)s", "owner": "@owner:ag2.space", "owner_dm_room": "!dm:ag2.space"},
+                   {"id": "%(caller)s", "owner": "@owner:ag2.space", "owner_dm_room": "!caller-dm:ag2.space"}]}
+dm = {"members": [{"user_id": "%(agent)s"}, {"user_id": "@owner:ag2.space"}]}
+with mock.patch.object(m, "_req", side_effect=lambda _m, path, *a, **k: dm if path == "/v1/room" else rows):
+    m.refresh_routing(force=True)
+m._emit_gateway_status(True)
+pathlib.Path(os.environ["AGENT_CONNECT_STATE_DIR"], "real-bridge.pid").write_text(str(os.getpid()))
+time.sleep(20)
+"""
+    CALLER = "@caller:ag2.space"
+
+    def test_a_token_only_install_binds_the_launched_bridge_and_wake_context_resolves_the_owner_dm(self):
+        """The chain install promises: a clean install with nothing but the relay token on disk starts a
+        bridge that binds as the installed identity, and wake-context then names the owner's DM. The
+        runner's shell carries another agent's identity, which must reach neither the bridge nor the
+        prompt: with no saved identity the bridge binds as nobody."""
+        relay = self.home / ".config" / "ag2-sparrow" / "relay.env"
+        relay.parent.mkdir(parents=True, exist_ok=True)
+        relay.write_text("REMOTE_TASK_TOKEN=https://gw.example/relay?tenant=a|fake-relay-token-0123456789abcdef\n")
+        relay.chmod(0o600)
+        executable(self.bin / hatch_cli.SPARROW_COMMAND,
+                   f"#!{sys.executable}\n" + self.REAL_BRIDGE % {"agent": AGENT, "caller": self.CALLER})
+        pid_file = self.state / "real-bridge.pid"
+
+        def stop_bridge():
+            if pid_file.exists():
+                pid = int(pid_file.read_text())
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                deadline = time.monotonic() + 5
+                while not hatch_cli.process_gone(pid) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                pid_file.unlink()
+        self.addCleanup(stop_bridge)
+
+        def run(*args, **extra):
+            env = py_env(self.home)
+            env.update(PATH=f"{self.bin}:{os.environ['PATH']}", AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                       AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_STATE_DIR=str(self.state),
+                       **{key: self.CALLER for key in agent_identity.ENV_KEYS}, **extra)
+            with mock.patch.object(keepalive, "ensure_sparrow", REAL_ENSURE_SPARROW), \
+                    mock.patch.object(keepalive, "START_WAIT_S", 30.0), \
+                    mock.patch.object(holder_lock, "_home", lambda: str(self.home)):
+                return run_main(hatch_cli.main, args, env)
+
+        r = run("install", "--mxid", AGENT, "--no-service")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("started:", r.stdout)
+        status = json.loads((self.state / "gateway-status.json").read_text())
+        self.assertEqual(status["agent_id"], AGENT, status)
+        self.assertTrue(status.get("gateway_binding"), "the launched bridge binds as the installed identity")
+        wake = run("wake-context")
+        self.assertEqual(wake.returncode, 0, wake.stdout + wake.stderr)
+        self.assertIn("owner_dm_room: !dm:ag2.space", wake.stdout)
+        self.assertNotIn("caller", wake.stdout)
+        self.assertNotIn(hatch_cli.NO_SAVED_MXID, r.stdout + r.stderr)
+
+        # The same chain with no saved identity (a config from before install saved one): the keepawake
+        # run restarts the bridge, which binds as nobody, so the prompt names no owner DM at all.
+        stop_bridge()
+        for name in ("gateway-status.json", "owner-routing.json"):
+            (self.state / name).unlink()
+        config = self.home / ".config" / "ag2-sparrow-hatch" / "config"
+        config.write_text(re.sub(r"^AGENT_MXID=.*\n", "", config.read_text(), flags=re.M))
+        # Every tier past the env carries the caller's identity too: the device file, the inherited
+        # channel .env and a durable binding.
+        aliases = "".join(f"{key}={self.CALLER}\n" for key in agent_identity.FILE_KEYS)
+        relay.write_text(relay.read_text() + aliases)
+        channel = self.home / "caller-claude" / "channels" / "ag2space" / ".env"
+        channel.parent.mkdir(parents=True)
+        channel.write_text(aliases)
+        (self.state / "auth").mkdir(exist_ok=True)
+        (self.state / "auth" / "ag2space.json").write_text(json.dumps({"agent_id": self.CALLER}))
+        r = run("keepalive", "keepawake", CLAUDE_CONFIG_DIR=str(self.home / "caller-claude"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("listener was down; restarted:", r.stdout)
+        self.assertIn(hatch_cli.NO_SAVED_MXID, r.stderr)
+        status, deadline = {}, time.monotonic() + 30
+        while not status.get("connected") and time.monotonic() < deadline:
+            with contextlib.suppress(OSError, ValueError):
+                status = json.loads((self.state / "gateway-status.json").read_text())
+            time.sleep(0.1)
+        self.assertTrue(status.get("connected"), status)
+        self.assertIsNone(status["agent_id"], "no saved identity: the bridge runs as nobody, not as the caller")
+        self.assertIsNone(status["gateway_binding"], status)
+        self.assertFalse((self.state / "owner-routing.json").exists())
+        wake = run("wake-context")
+        self.assertEqual(wake.returncode, 0, wake.stdout + wake.stderr)
+        self.assertNotIn("owner_dm_room:", wake.stdout)
 
     def test_no_service_never_replaces_a_service_sparrow_while_the_manager_does_not_answer(self):
         old = self.old_sparrow()
@@ -2969,7 +3379,10 @@ def project_scripts() -> set:
 
 class DocumentedCommands(unittest.TestCase):
     def test_every_command_the_worker_is_told_to_run_is_the_shipped_reply_command(self):
-        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        shipped = runtime_text.builtin()
+        prompt = " ".join([json.loads((HATCH / "hook-definition.json").read_text())["prompt"],
+                           shipped["prompt"], shipped["worker_note"], shipped["restart_hint"],
+                           *shipped["tier_notes"]])
         named = {span.split()[0] for span in re.findall(r"`([^`]+)`", prompt)}
         self.assertEqual(named, {hatch_cli.REPLY_PLACEHOLDER})
         self.assertIn(hatch_cli.REPLY_COMMAND, project_scripts())
@@ -2978,12 +3391,34 @@ class DocumentedCommands(unittest.TestCase):
         self.assertEqual(spans, {"'\"$REPLY\"'"})
         self.assertIn(f'REPLY="${{REPLY_COMMAND:-{hatch_cli.REPLY_COMMAND}}}"', SCRIPT.read_text())
 
+    def test_built_in_notes_are_the_hook_scripts_notes(self):
+        script = SCRIPT.read_text()
+
+        def note(name):
+            raw = re.search(rf"^{name}='(.*)'$", script, re.M).group(1)
+            return (raw.replace("'\"$ACTIVITY_FILE\"'", "<ACTIVITY_FILE>")
+                    .replace("'\"$REPLY\"'", "<REPLY_COMMAND>").replace("'\"'\"'", "'"))
+        shipped = runtime_text.builtin()
+        self.assertEqual(shipped["worker_note"], note("REMAINING_WORK_NOTE"))
+        # task_io owns the non-owner policy: the hook reads it and the built-in text is it.
+        self.assertIn('NON_OWNER_NOTE="$(timeout 10 "$PY" -m ag2_sparrow.task_io --non-owner-note',
+                      script)
+        self.assertEqual(shipped["tier_notes"], [task_io.non_owner_note()])
+        raw = json.loads((HATCH / "builtin-runtime-text.json").read_text())
+        self.assertNotIn("tier_notes", raw, "no second copy of the policy text")
+
+    def test_the_hook_prompt_sends_the_worker_to_wake_context(self):
+        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        self.assertIn("`<REPLY_COMMAND> wake-context`", prompt)
+        self.assertIn("if that command fails, follow the worker_note alone", prompt)
+
     def test_no_instruction_names_the_unshipped_ag2_space_cli(self):
         prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
-        self.assertNotIn("ag2-space ", prompt + SCRIPT.read_text())
+        self.assertNotIn("ag2-space ", prompt + SCRIPT.read_text()
+                         + json.dumps(runtime_text.builtin()))
 
     def test_prompt_has_each_item_answered_from_its_own_task_file(self):
-        prompt = json.loads((HATCH / "hook-definition.json").read_text())["prompt"]
+        prompt = runtime_text.builtin()["prompt"]
         for phrase in ("room_name, channel_kind", "Handle the items one at a time",
                        "read its task_file first", "its task: line is the whole message",
                        "Answer from that file; the snippet is only a preview",

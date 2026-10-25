@@ -1,4 +1,4 @@
-"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive`: set up, check and answer through the Hatch hook.
+"""`ag2-sparrow-hatch install|uninstall|verify|sparrow|reply|keepalive|wake-context`: set up, check and answer through the Hatch hook.
 
 install writes the hook script to ~/hooks/scripts/ (a registered hook's script is never
 rewritten: a changed one goes beside it), stages the hook definition for the agent's hooks
@@ -7,7 +7,8 @@ manager the ag2-sparrow user service that restarts Sparrow, and the keepalive's
 install record, then leaves Sparrow running and connected; verify checks that setup;
 sparrow checks only that Sparrow is running (the hook's heartbeat runs it); reply
 writes a worker's answer to its result_file and waits until Sparrow has sent it;
-keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log."""
+keepalive runs the scheduled task, prints Sparrow's health row, and reports on its log;
+wake-context prints the text a woken worker follows (served by the backend, else built in)."""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +29,7 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import _dirs, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
+from ... import _dirs, agent_identity, diagnostics, gateway_credential_io, gateway_credentials, gateway_instance, outbox, workspace_lock
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, valid_mxid
@@ -294,12 +295,15 @@ def install_hook(mxid: str, reply_command: str, force: bool) -> bool:
 
 def render_config(mxid: str, task_dir: Path, result_dir: Path, activity_file: Path,
                   python: str, state_dir: Path, gateway_instance: str = "",
-                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "") -> str:
+                  reply_command: str = "", cron_dir: str = "", keepalive_log: str = "",
+                  auto_upgrade: str = "") -> str:
     rows = (("AGENT_MXID", mxid), ("TASK_DIR", str(task_dir)), ("RESULT_DIR", str(result_dir)),
             ("ACTIVITY_FILE", str(activity_file)), ("SPARROW_PYTHON", python),
             ("STATE_DIR", str(state_dir)), ("GATEWAY_INSTANCE", gateway_instance),
             ("REPLY_COMMAND", reply_command), ("CRON_DIR", cron_dir),
             ("KEEPALIVE_LOG", keepalive_log))
+    # Written only when set, so an owner's AUTO_UPGRADE=0 survives a re-install.
+    rows += (("AUTO_UPGRADE", auto_upgrade),) if auto_upgrade else ()
     return "".join(f"{k}={shlex.quote(v)}\n" for k, v in rows)
 
 
@@ -380,9 +384,13 @@ def _why(r) -> str:
     return lines[-1] if lines else f"exit {r.returncode}"
 
 
-def render_service(exec_start: str, env: dict) -> str:
+def render_service(exec_start: str, env: dict, unset: "tuple[str, ...]" = ()) -> str:
+    """`unset` names variables the user manager may pass that the unit must not: UnsetEnvironment=
+    is applied last, after Environment=, so a name set here is never also in `unset`."""
     rows = "".join(f'Environment="{k}={v}"\n' if " " in v else f"Environment={k}={v}\n"
                    for k, v in env.items())
+    if unset:
+        rows += f"UnsetEnvironment={' '.join(unset)}\n"
     return (f"{SERVICE_MARKER}\n[Unit]\nDescription=ag2-sparrow (AG2 Space listener)\n"
             "# A Sparrow that dies 5 times in 5 minutes (e.g. a rejected token) is left failed.\n"
             "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
@@ -506,11 +514,23 @@ def keepawake_note(reply_command: str, keepalive_on: bool = True) -> str:
     return f"the agent keeps Sparrow running with {cmd} from its scheduler"
 
 
+NO_SAVED_MXID = ("NOTE sparrow: the install config holds no AGENT_MXID, so this Sparrow runs with no "
+                 "agent identity and cannot resolve the owner's DM; run ag2-sparrow-hatch install "
+                 "--mxid <mxid>")
+
+
+def saved_mxid(value) -> str:
+    """The AGENT_MXID install saved, '' when absent or not an MXID: Sparrow gets no default."""
+    mxid = (value or "").strip() if isinstance(value, str) else ""
+    return mxid if valid_mxid(mxid) else ""
+
+
 def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance: str,
-                    force: bool, health_command: str = "", reply_command: str = "") -> bool:
-    """Write, enable and start the ag2-sparrow user service. Each problem prints a NOTE saying
-    what was not done and how to finish by hand; True only when this install stopped the service
-    and left it stopped, which fails the install."""
+                    force: bool, health_command: str = "", reply_command: str = "",
+                    mxid: str = "", may_start: bool = True) -> bool:
+    """Write, enable and (unless not `may_start`) start the ag2-sparrow user service. Each
+    problem prints a NOTE saying what was not done and how to finish by hand; True only when this
+    install stopped the service and left it stopped, which fails the install."""
     def note(text: str) -> None:
         print(f"NOTE service: {text}")
 
@@ -536,6 +556,11 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
              "the token Sparrow uses")
     env = {"AG2_DEVICE_ENV": str(device_env), "AGENT_CONNECT_TASK_DIR": str(task_dir),
            "AGENT_CONNECT_RESULT_DIR": str(result_dir), "AGENT_CONNECT_STATE_DIR": str(state_dir)}
+    # The unit pins the identity to the saved MXID or none; the manager's identity keys are unset.
+    env.update(agent_identity.pinned_environ(saved_mxid(mxid)))
+    if not saved_mxid(mxid):
+        print(NO_SAVED_MXID, file=sys.stderr)
+    unset = tuple(k for k in agent_identity.ENV_KEYS if k not in env)
     if instance:
         env["GATEWAY_INSTANCE"] = instance
     try:
@@ -546,7 +571,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     except ValueError as e:
         note(f"{e}; no service was set up")
         return False
-    unit, text = service_path(), render_service(exec_start, env)
+    unit, text = service_path(), render_service(exec_start, env, unset)
     changed = True
     if unit.exists():
         old = unit.read_text(encoding="utf-8", errors="replace")
@@ -570,7 +595,9 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         r = _systemctl(("--user", "stop", "ag2-sparrow.service"))
         stopped = _ok(r)
         print(f"stopped: {SERVICE_NAME} before installing" if stopped else
-              f"NOTE service: stop failed ({_why(r)}); it is restarted after the install instead")
+              f"NOTE service: stop failed ({_why(r)}); "
+              + ("it is restarted after the install instead" if may_start else
+                 "it keeps running the old unit (--no-start)"))
     if changed:
         _write(unit, text, 0o644)
         print(f"installed: {unit}")
@@ -597,7 +624,7 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
     # failed/activating/deactivating: the unit's own Sparrow crashed or is restarting.
     outside = not stopped and state == "inactive" and _outside_sparrow(state_dir, instance, main_pid, ran)
     has_token = device_env.is_file()
-    start = has_token and not outside
+    start = may_start and has_token and not outside
     if start and state == "failed":
         _systemctl(("--user", "reset-failed", "ag2-sparrow.service"))
     r = _systemctl(("--user", "enable", "--now", "ag2-sparrow.service")) if start else \
@@ -606,7 +633,10 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"systemctl --user enable {SERVICE_NAME} failed ({_why(r)}); fix that and run "
              f"systemctl --user enable --now {SERVICE_NAME}")
         return False
-    if active and changed:
+    if active and changed and not may_start:
+        note(f"the unit changed but was not restarted (--no-start); run systemctl --user "
+             f"restart {SERVICE_NAME} to run it")
+    elif active and changed:
         r = _systemctl(("--user", "restart", "ag2-sparrow.service"))
         print(f"restarted: {SERVICE_NAME} with the new unit" if _ok(r) else
               f"NOTE service: restart failed ({_why(r)}); run systemctl --user restart "
@@ -619,6 +649,8 @@ def install_service(task_dir: Path, result_dir: Path, state_dir: Path, instance:
         note(f"{device_env} is missing, so the service was not started. Put your relay token "
              f"in it as one line REMOTE_TASK_TOKEN=<token>, chmod 600 it, then run: "
              f"systemctl --user start {SERVICE_NAME}")
+    elif not may_start and not active:
+        note(f"not started (--no-start); run systemctl --user start {SERVICE_NAME}")
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("linger: skipped (running as root)")
@@ -693,11 +725,17 @@ def _install(args) -> int:
                      if args.keepalive_log else "")
     config = render_config(args.mxid, task_dir.resolve(), result_dir.resolve(),
                            activity, sys.executable, state_dir.resolve(), instance,
-                           reply_command, cron, keepalive_log)
+                           reply_command, cron, keepalive_log,
+                           _installed_config().get("AUTO_UPGRADE", ""))
     _install_file(config_path(), config, 0o600, refuse_drift=False, force=True)
     activity.parent.mkdir(parents=True, exist_ok=True)
     owner = keepalive._unit_owner() if args.no_service else None
-    left_stopped = False
+    left_stopped, held = False, None
+    if not args.no_start:
+        from . import self_upgrade
+        held = self_upgrade.release_hold(state_dir.resolve())
+        if held:
+            print(f"error: Sparrow is not started: {held}", file=sys.stderr)
     if owner == keepalive.UNIT_UNREACHABLE:
         print(f"skipped: the ag2-sparrow user service (--no-service); {service_path()} is "
               "installed but systemctl --user did not answer, so whether that service runs Sparrow "
@@ -713,12 +751,16 @@ def _install(args) -> int:
         left_stopped = install_service(task_dir.resolve(), result_dir.resolve(), state_dir.resolve(), instance,
                                        args.force,
                                        "" if args.no_keepalive else keepalive.health_command(reply_command),
-                                       reply_command)
+                                       reply_command, mxid=args.mxid,
+                                       may_start=not (args.no_start or held))
     if args.no_keepalive:
         print("skipped: the keepalive task (--no-keepalive)")
     else:
         keepalive.install_tasks(read_config(config_path()), args.force)
-    if left_stopped:
+    if held:
+        rc = 1
+        print("skipped: starting and checking Sparrow (a failed self-upgrade holds it stopped)")
+    elif left_stopped:
         rc = 1
         print("skipped: starting and checking Sparrow (the service was left stopped above)")
     elif args.no_start:
@@ -1095,6 +1137,33 @@ def reply(args) -> int:
         time.sleep(0.25)
 
 
+def _register_device_secrets() -> None:
+    """Withhold every credential candidate this host could hand Sparrow (the process env and the
+    device file, each on its own): whichever one precedence picks, the others stay withheld."""
+    gateway_credential_io.register_candidates(
+        dict(os.environ, AG2_DEVICE_ENV=str(device_env_path())), diagnostics.REGISTRY)
+
+
+def wake_context(_args) -> int:
+    from . import runtime_text
+    _register_device_secrets()
+    cfg = _installed_config()
+    values = {"<AGENT_MXID>": cfg.get("AGENT_MXID") or "<AGENT_MXID>",
+              "<REPLY_COMMAND>": cfg.get("REPLY_COMMAND") or find_reply_command()
+              or REPLY_COMMAND,
+              "<ACTIVITY_FILE>": cfg.get("ACTIVITY_FILE")
+              or str(_home() / ".muse" / "last_active")}
+    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
+    instance = (cfg["GATEWAY_INSTANCE"] if "GATEWAY_INSTANCE" in cfg
+                else os.environ.get("GATEWAY_INSTANCE") or "").strip()
+    text, source = runtime_text.wake_context(
+        runtime_text.current_cache(state, instance), values,
+        runtime_text.owner_dm_room(state, instance, cfg.get("AGENT_MXID") or ""))
+    print(text, end="")
+    print(f"wake-context: {source}", file=sys.stderr)
+    return 0
+
+
 def _keepalive(args) -> int:
     from . import keepalive
     return keepalive.main(args)
@@ -1162,6 +1231,9 @@ def main(argv=None) -> int:
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
+    w = sub.add_parser("wake-context", help="print the prompt and worker note a woken worker "
+                       "follows (the backend's served copy when valid, else the built-in one)")
+    w.set_defaults(func=wake_context)
     args = ap.parse_args(argv)
     return args.func(args)
 
