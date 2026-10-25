@@ -13,6 +13,7 @@ from pathlib import Path
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+CONTRACT = "room-context-v1"
 BINDING_KEYS = frozenset((
     "schema_version", "context_id", "agent_id", "room_id", "task_id", "anchor_event_id",
     "access_tier", "policy_revision", "membership_epoch", "visibility", "observed_at", "expires_at",

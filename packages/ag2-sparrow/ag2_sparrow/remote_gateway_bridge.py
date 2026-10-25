@@ -3631,7 +3631,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
             "inflight": len(inflight),
             "package_version": _PACKAGE_VERSION,
             "capabilities": ["task-ack", "heartbeat", "result-skip-markers",
-                             "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT],
+                             "core-status", "team-collaborator", VOICE_OUTCOME_CONTRACT,
+                             room_context.CONTRACT],
         }
         # Only include when present so a status-less node never clobbers the
         # broker's last-known core-status (the broker only records on presence).

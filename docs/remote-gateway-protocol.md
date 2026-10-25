@@ -118,6 +118,17 @@ or background model execution. An authoritative producer must enforce the curren
 agent's membership and Agent Native context-visibility policy before every delivery.
 The bridge's local HMAC is integrity telemetry, not that authorization.
 
+The bridge advertises `room-context-v1` in the existing heartbeat `capabilities`
+array when this validator/consumer is present. It declares bounded packet
+preparation, validation and view support, not current actor authorization,
+strict shared-core memory isolation or proof that a model retained the data.
+A shared credential's heartbeat alone cannot prove which process consumes a poll.
+The only established poll capability encoding is the scalar
+`capabilities=voice-outcome-v1`; that proof stays unchanged. Advertising room
+context on every poll remains dependent on an authoritative multi-capability
+parser contract. Consumers must not guess comma-separated or repeated-key syntax,
+and a producer must not infer per-poll room-context support from this heartbeat.
+
 Both objects carry exactly the same binding fields:
 
 | Field | Contract |
@@ -390,9 +401,15 @@ body: {
   "tier": "<REMOTE_TASK_TIER>",
   "inflight": <int>,            // tasks currently claimed but not yet resulted
   "capabilities": ["task-ack", "heartbeat", "result-skip-markers", "core-status",
-                   "team-collaborator", "voice-outcome-v1"]
+                   "team-collaborator", "voice-outcome-v1", "room-context-v1"]
 }
 ```
+
+`room-context-v1` declares the bounded room-context consumer contract described
+above. It adds no authority and no new endpoint; it is a process capability
+announcement, not per-poll proof. The room-context poll negotiation remains
+blocked on the authoritative parser contract, while the voice poll proof and
+result payload shapes remain unchanged.
 
 `voice-outcome-v1` declares the voice-outcome contract: the poll's proof and
 acknowledging an `ack_first` task before publishing it under `GET /v1/tasks`, and
