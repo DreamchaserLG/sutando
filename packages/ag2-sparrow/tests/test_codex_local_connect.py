@@ -1023,22 +1023,28 @@ class ConnectCode(Base):
                 self.assertFalse(self.seat().exists())
                 self.assertFalse(cli.config_path().exists())
 
-    def test_503_and_202_are_retried_then_given_up_with_the_code_still_valid(self):
+    def test_503_and_202_are_retried_then_redeemed(self):
         sleeps = []
         backend = Backend(503, (202, {"state": "redeeming", "retry_after": 3}))
         rc, _out, err = self.connect(backend, sleeps=sleeps)
         self.assertEqual(rc, 0, err)
         self.assertEqual((len(backend.calls), sleeps), (3, [1, 3.0]))
+
+    def test_503_or_202_throughout_gives_up_with_the_code_still_valid(self):
         sleeps = []
         rc, _out, err = self.connect(Backend(*[503] * 10), sleeps=sleeps)
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
         self.assertEqual(sleeps, list(cm.REDEEM_BACKOFF_S))
         self.assertIn("the code is still valid", err)
-        rc, _out, err = self.connect(Backend(*[(202, {"retry_after": 999})] * 10), sleeps=[])
+        self.assertFalse(self.seat().exists())
+        sleeps = []
+        rc, _out, err = self.connect(Backend(*[(202, {"retry_after": 999})] * 10), sleeps=sleeps)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(sleeps, [cm.RETRY_AFTER_MAX_S] * len(cm.REDEEM_BACKOFF_S), "capped")
         self.assertIn("still redeeming the code; run connect again with the same code", err)
         self.assertFalse(self.seat().exists())
 
-    def test_the_code_from_stdin_a_prompt_or_argv_with_a_warning(self):
+    def test_no_code_is_refused_off_a_terminal_and_asked_for_on_one(self):
         class Tty(io.StringIO):
             def isatty(self):
                 return True
@@ -1049,6 +1055,8 @@ class ConnectCode(Base):
         with mock.patch.object(cm.getpass, "getpass", return_value=CODE) as asked:
             rc, _out, err = self.connect(Backend(), stdin=Tty(""), code_args=())
         self.assertEqual((rc, asked.call_count), (0, 1), err)
+
+    def test_a_code_on_the_command_line_still_works_but_warns(self):
         rc, _out, err = self.connect(Backend(), None, code_args=("--code", CODE))
         self.assertEqual(rc, 0, err)
         self.assertIn("warning: a code on the command line is kept by ps and shell history", err)
