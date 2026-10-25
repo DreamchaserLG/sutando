@@ -811,6 +811,57 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 for body in ("UNSENT B", "UNSENT C"):
                     self.assertEqual(outbox.receipt_state(root, gb._proactive_item_id("proactive-1", body)), "DELIVERED")
 
+    def _fault_then_clear(self, fault):
+        """B written after restart; three drains under `fault`, then ordinary drains with it cleared."""
+        for kind in ("DELIVERED", "PARKED"):
+            with self.subTest(kind=kind):
+                lane, root, a_id, write, hidden = self._held_original(kind)
+                lane.restart()
+                write(b"UNSENT B\n")
+                real, calls = gb._reconcile_decided, []
+
+                def counted(r):
+                    calls.append(r.name)
+                    return real(r)
+                with fault(), mock.patch.object(gb, "_reconcile_decided", counted):
+                    for n in range(3):
+                        lane.drain()
+                        self.assertEqual(len(calls), n + 1, "each failed drain retries once, no storm")
+                self.assertEqual(lane.posts, [], "nothing sent while the fault holds")
+                for _ in range(2):
+                    lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"],
+                                 "a later ordinary drain sends B once the fault clears")
+                for _ in range(3):
+                    lane.drain()
+                lane.restart()
+                lane.drain()
+                self.assertEqual([p.get("body") for p in lane.posts], ["UNSENT B"], "no repeat")
+                self.assertEqual(outbox.receipt_state(root, a_id), kind)
+                hidden()
+
+    def test_a_snapshot_that_cannot_be_placed_is_retried_by_a_later_drain(self):
+        self._fault_then_clear(lambda: mock.patch.object(
+            gb, "_publish_text_whole", side_effect=OSError(28, "No space left on device")))
+
+    def test_an_unreadable_generation_is_retried_by_a_later_drain(self):
+        self._fault_then_clear(lambda: mock.patch.object(
+            gb, "_claim_receipt", return_value=("unknown", None, None)))
+
+    def test_a_retained_original_that_is_gone_leaves_no_seen_entry(self):
+        lane = Lane(gb, scratch("gw-decided-prune-"))
+        r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"
+        r.write_text("x\n")
+        for _ in range(2):
+            lane.drain()
+        key = (os.lstat(next(lane.results.glob(".proactive-1.decided-*"))).st_dev,
+               os.lstat(next(lane.results.glob(".proactive-1.decided-*"))).st_ino)
+        self.assertIn(key, gb._DECIDED_SEEN)
+        for p in lane.results.glob(".proactive-1.decided-*"):
+            p.unlink()  # only the test removes one; the bridge never does
+        lane.drain()
+        self.assertNotIn(key, gb._DECIDED_SEEN)
+
     def test_an_unchanged_retained_original_costs_a_drain_only_a_stat(self):
         lane = Lane(gb, scratch("gw-decided-cost-"))
         r = lane.results / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-ex.1"

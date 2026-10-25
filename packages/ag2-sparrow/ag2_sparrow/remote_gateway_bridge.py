@@ -5795,63 +5795,72 @@ _DECIDED_SEEN: "dict[tuple[int, int], tuple[int, int, int]]" = {}
 
 
 def _reconcile_changed_decided() -> None:
-    """Each drain: reconcile only the retained originals whose stat changed since last seen."""
+    """Each drain: reconcile only the retained originals whose stat changed since last settled. A
+    stat is recorded only once its reconcile settled, so a failed one is read again next drain."""
+    present = set()
     for r in RESULTS_DIR.glob(f".proactive-*{_DECIDED_INFIX}*"):
         try:
             st = os.lstat(r)
         except OSError:
             continue
-        seen = (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-        if _DECIDED_SEEN.get((st.st_dev, st.st_ino)) == seen:
+        key, seen = (st.st_dev, st.st_ino), (st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        present.add(key)
+        if _DECIDED_SEEN.get(key) == seen:
             continue
-        _reconcile_decided(r)  # the stat taken first is what is recorded: a write during it is seen next pass
-        _DECIDED_SEEN[(st.st_dev, st.st_ino)] = seen
+        if _reconcile_decided(r):  # the stat taken first is recorded: a write during the read is seen next pass
+            _DECIDED_SEEN[key] = seen
+    for gone in _DECIDED_SEEN.keys() - present:
+        del _DECIDED_SEEN[gone]
 
 
-def _reconcile_decided(retained: Path) -> None:
+def _reconcile_decided(retained: Path) -> bool:
     """A decided claim's retained original, on every restart and on each drain that sees it change.
     The original stays hidden for good: bytes in it that are new since last recorded are published
     as a private snapshot claim and decided from their own receipt; the same bytes go back live
-    only once the item reads QUEUED at a resend epoch above the one the decision recorded."""
+    only once the item reads QUEUED at a resend epoch above the one the decision recorded.
+    True once settled; False when a step failed and must be tried again."""
     m = _DECIDED_RE.fullmatch(retained.name)
     if m is None:
-        return
+        return True  # not a name this reconciler owns
     stem, ns = m.group("stem"), m.group("ns")
     state, generation, epoch_now = _claim_receipt(retained, stem)
     if generation is None:
         _log_backoff(("proactive-decided", retained.name),
                      f"proactive {retained.name} cannot be read; kept for an operator")
-        return
+        return False
     if generation[:32] != m.group("digest"):
         data = _read_claim_bytes(retained)
         if data is None or hashlib.sha256(data).hexdigest() != generation:
-            return  # still being written: the next pass reads it again
+            return False  # still being written: the next pass reads it again
         claim = None
         if not _copy_exists(stem, data):
             claim = RESULTS_DIR / f"{stem}.sending.{os.getpid()}.{time.time_ns()}"
             if not _place_snapshot(data, claim, stem):
-                return
+                return False
+        recorded = True
         try:  # recorded only once its snapshot exists: a crash between re-finds that copy
             undelivered_quarantine.rename_noreplace(
                 retained, retained.with_name(f".{stem}{_DECIDED_INFIX}{generation[:32]}-ex.{ns}"))
         except OSError as e:
+            recorded = False
             _log_backoff(("proactive-decided", retained.name),
                          f"proactive {retained.name} changed but its new bytes could not be recorded "
                          f"({diagnostics.describe(e)})")
         if claim is not None:
             _log(f"proactive {retained.name} holds new bytes; published as {claim.name} and decided")
             _decide_orphan_claim(claim)
-        return
+        return recorded
     decided = None if m.group("epoch") == "x" else int(m.group("epoch"))
     if not (state == "QUEUED" and decided is not None and epoch_now is not None and epoch_now > decided):
-        return
+        return True
     data = _read_claim_bytes(retained)
     if data is None or hashlib.sha256(data).hexdigest() != generation or not _hand_back_decided(stem, data):
-        return
+        return False
     _log(f"proactive {stem} was requeued (resend epoch {epoch_now}) after it was decided; handed back")
     with contextlib.suppress(OSError):  # unrecorded, the next restart finds it handed back and records it
         undelivered_quarantine.rename_noreplace(
             retained, retained.with_name(f".{stem}{_DECIDED_INFIX}{m.group('digest')}-e{epoch_now}.{ns}"))
+    return True
 
 
 def _copy_exists(stem: str, data: bytes) -> bool:
