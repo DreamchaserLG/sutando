@@ -85,17 +85,17 @@ SPARROW = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow"
 
 
 class TestSparrowDelegation(unittest.TestCase):
-    """The gateway bridge's failure resolver is a binder, not a third copy."""
+    """The gateway bridge's proactive send keeps no retry of its own: the outbox decides."""
 
     def test_sparrow_delegates_the_transition(self):
-        self.assertIn("resolve_failed_send", SPARROW)
-        body = SPARROW.split("def _resolve_send_failure", 1)[1]
+        self.assertNotIn("def _resolve_send_failure", SPARROW)
+        body = SPARROW.split("def _send_proactive", 1)[1]
         body = body.split("\ndef ", 1)[0]
-        # The binder passes its pid-scoped body and park dir; it must not carry
-        # its own requeue or park move — that is how a third copy starts.
-        self.assertIn("resolve_failed_send(", body)
-        self.assertNotIn("os.link", body)
-        self.assertNotIn(".rename(", body)
+        # The outbox owns the claim, the retry and the outcome; the drain moves the file
+        # as the outcome says and keeps no attempt count, which is how a third copy starts.
+        self.assertIn("core.deliver_one(", body)
+        self.assertNotIn("MAX_TRANSIENT_ATTEMPTS", body)
+        self.assertNotIn("resolve_failed_send", body)
         self.assertNotIn("should_retry", body)
 
     def test_sparrow_parks_to_the_repo_wide_quarantine(self):
@@ -107,28 +107,27 @@ class TestSparrowDelegation(unittest.TestCase):
                                  AGENT_CONNECT_RESULT_DIR=str(Path(tmp) / "results"),
                                  AGENT_CONNECT_TASK_DIR=str(Path(tmp) / "tasks"),
                                  AGENT_CONNECT_STATE_DIR=str(Path(tmp) / "state"),
-                                 REMOTE_PROACTIVE_ROOM=""))
+                                 REMOTE_PROACTIVE_ROOM="", AGENT_MXID="@a:ag2.space"))
             self.assertEqual(out.returncode, 0, out.stderr)
             results = Path(tmp) / "results"
             self.assertEqual(out.stdout.strip(), "parked")
-            self.assertEqual(sorted(p.name for p in (results / "undelivered").iterdir()),
-                             ["proactive-park.txt"])
-            self.assertEqual((results / "undelivered" / "proactive-park.txt").read_text(), "body\n")
-            self.assertEqual(sorted(p.name for p in results.iterdir()), ["undelivered"])
+            (parked,) = (results / "undelivered").glob("proactive-park-*.txt")
+            self.assertIn("body", parked.read_text())
+            self.assertFalse(list(results.glob("proactive-park*.txt")), "nothing left queued")
 
 
-# A permanent send failure on a claimed proactive file, through the bridge's own binder.
+# A proactive file whose send times out, through the bridge's real drain: the outbox parks it.
 _PARK_PROBE = """
-import os, urllib.error
-from ag2_sparrow import remote_gateway_bridge as gb, delivery_destination as dd
+import time
+from ag2_sparrow import remote_gateway_bridge as gb
 gb.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-queued = gb.RESULTS_DIR / "proactive-park.txt"
-queued.write_text("body\\n")
-claim = dd.claim_path(queued, os.getpid())
-queued.rename(claim)
-err = urllib.error.HTTPError("u", 404, "gone", {}, None)
-gb._resolve_send_failure(claim, queued, err)
-print("parked" if (gb.RESULTS_DIR / "undelivered" / queued.name).is_file() else "not parked")
+(gb.RESULTS_DIR / "proactive-park.txt").write_text("[channel: !room:ag2.space]\\nbody\\n")
+def slow(*a, **k):
+    raise TimeoutError("no answer")
+gb._req, gb._log, gb.PROACTIVE_ROOM, gb.PROACTIVE_CLAIM_GATE = slow, lambda *a: None, "", None
+gb._ROUTING.update(owner_dm="", loaded=True, next=time.time() + 3600)
+gb._post_proactive()
+print("parked" if list((gb.RESULTS_DIR / "undelivered").glob("proactive-park-*.txt")) else "not parked")
 """
 
 

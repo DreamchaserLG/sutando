@@ -5,6 +5,7 @@ never accepts a destination the drain would skip."""
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import time
@@ -16,51 +17,29 @@ try:
 except ImportError:  # Windows
     fcntl = None
 
-from .outbox import valid_pid
+from .outbox import ITEMS_DIR, list_items, valid_pid
 from .result_markers import parse_markers
 
 # Destination FORMAT validation is the bridge's own job ("the bridge
 # validates the id format for its platform when applying" — result_markers).
 MATRIX_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
-# Where the drain records a confirmed proactive delivery, keyed by the file's stem.
+# The proactive lane's outbox root: one item per file stem and body, `<stem>~<digest>`.
 RECEIPT_DIR = ".outbox-ag2space-proactive"
 # Where the drain parks a line it will never send, as `<stem>-<epoch>.txt`.
 UNDELIVERED_DIR = "undelivered"
-# The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>`.
+# The drain claims a queued `<stem>.txt` by renaming it to `<stem>.sending.<pid>.<ns>`.
 CLAIM_INFIX = ".sending."
-# A producer withdraws a queued or claimed `<stem>.txt` by creating `<stem>.withdrawn` under
-# send_lock; the drain checks for it, sends and settles under the same lock.
-WITHDRAWN_SUFFIX = ".withdrawn"
 # A directory of its own, so no reader listing the results dir sees a lock file.
 SEND_LOCK_DIR = ".proactive-send-lock"
-# The protocol a drain that honours send_lock and the sentinel publishes in its lane record; a
-# producer relying on them refuses to act for a live drain without it.
-SEND_LOCK_PROTOCOL = 1
-# The drain's whole send under the lock: its POST deadline. The longest a producer waits for the
-# lock is above it plus settlement; the drain waits briefly and hands the file back.
-SEND_DEADLINE_S = 15.0
+# The protocol a drain that sends under send_lock publishes in its lane record; a producer relying
+# on it refuses to act for a live drain without it.
+SEND_LOCK_PROTOCOL = 2
+# The longest a producer waits for the send lock, above the drain's longest send under it; the
+# drain waits briefly and hands the file back.
 PRODUCER_LOCK_WAIT_S = 30.0
 DRAIN_LOCK_WAIT_S = 2.0
 _LOCK_POLL_S = 0.05
-# `<stem>` holds how many sends of that proactive file were begun, across restarts.
-ATTEMPTS_DIR = ".proactive-attempts"
-# An attempts record that cannot be read proves nothing: it counts as attempted beyond any budget.
-ATTEMPTS_UNREADABLE = 1 << 20
-# Where a parked file's count goes, beside the live one, so a re-queue starts a fresh budget.
-PARKED_SUFFIX = ".parked"
 
-
-def claim_path(queued: Path, pid: int) -> Path:
-    """The name the drain renames `queued` to while process `pid` sends it; ValueError for a pid
-    outside `valid_pid`, whose name `claim_pid` would reject."""
-    if valid_pid(pid) is None:
-        raise ValueError(f"pid {pid!r} is outside the pid domain")
-    return queued.with_suffix(f"{CLAIM_INFIX}{pid}")
-
-
-def withdrawn_path(queued: Path) -> Path:
-    """The sentinel that withdraws `queued` from the drain before it is sent."""
-    return queued.with_name(queued.stem + WITHDRAWN_SUFFIX)
 
 
 class SendLockUnavailable(OSError):
@@ -70,9 +49,9 @@ class SendLockUnavailable(OSError):
 @contextlib.contextmanager
 def send_lock(result_dir: Path, wait: "float | None" = None):
     """Exclusive lock on the fixed file `result_dir`/SEND_LOCK_DIR/lock, which is never unlinked, so
-    every process and restart locks the same inode. The drain holds it from its withdrawal check
-    through the send's settlement, and a producer holds it while it withdraws; acquisition is the
-    linearization point. Released on every exit; SendLockUnavailable when it cannot be taken
+    every process and restart locks the same inode. The drain holds it across the outbox's
+    dispatch-time recheck and send, and a producer holds it while it commits an answer or a
+    message about a task; acquisition is the linearization point. Released on every exit; SendLockUnavailable when it cannot be taken
     within `wait` seconds. A platform without flock (no Hatch there) skips it."""
     if fcntl is None:
         yield
@@ -101,104 +80,38 @@ def send_lock(result_dir: Path, wait: "float | None" = None):
         os.close(fd)
 
 
-def _attempts_path(result_dir: Path, stem: str) -> Path:
-    if not stem or "/" in stem or stem.startswith("."):
-        raise ValueError(f"not a proactive file stem: {stem!r}")
-    return Path(result_dir) / ATTEMPTS_DIR / stem
-
-
-def _read_count(path: Path) -> int:
-    try:
-        text = path.read_text(encoding="ascii").strip()
-    except FileNotFoundError:
-        return 0
-    except (OSError, ValueError):
-        return ATTEMPTS_UNREADABLE
-    return int(text) if text.isdigit() and len(text) < 8 else ATTEMPTS_UNREADABLE
-
-
-def _write_count(path: Path, count: int) -> None:
-    """Temp file, fsync, replace, then the directory; OSError when it is not on disk."""
-    path.parent.mkdir(mode=0o700, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        os.write(fd, str(count).encode("ascii"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    if os.name == "posix":  # a directory fd cannot be fsynced on Windows
-        dfd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-
-
-def attempts_begun(result_dir: Path, stem: str) -> int:
-    """How many sends of `stem` began since it was last queued (its retry budget's count); 0 for
-    none, ATTEMPTS_UNREADABLE when the record exists but cannot be read."""
-    return _read_count(_attempts_path(result_dir, stem))
-
-
-def attempts_ever(result_dir: Path, stem: str) -> int:
-    """Every begun send of `stem`, parked budgets included: what a report of its outcome counts."""
-    live = attempts_begun(result_dir, stem)
-    parked = _read_count(_attempts_path(result_dir, stem).with_name(stem + PARKED_SUFFIX))
-    return ATTEMPTS_UNREADABLE if ATTEMPTS_UNREADABLE in (live, parked) else live + parked
-
-
-def record_attempt(result_dir: Path, stem: str) -> int:
-    """Durably count one more begun send of `stem` and return the count; OSError when it is not
-    on disk, and then the send must not begin. An unreadable record is kept, never overwritten."""
-    begun = attempts_begun(result_dir, stem)
-    if begun >= ATTEMPTS_UNREADABLE:
-        raise OSError(f"the attempt record of {stem} is unreadable; it is kept, not overwritten")
-    _write_count(_attempts_path(result_dir, stem), begun + 1)
-    return begun + 1
-
-
-def park_attempts(result_dir: Path, stem: str) -> None:
-    """At a park: move `stem`'s count into its parked record, so a file re-queued later gets a
-    fresh budget while attempts_ever still counts what began. An unreadable count stays where it
-    is and keeps refusing sends. Best effort: a count left in place only keeps the line parked."""
-    live = attempts_begun(result_dir, stem)
-    if live == 0 or live >= ATTEMPTS_UNREADABLE:
-        return
-    path = _attempts_path(result_dir, stem)
-    parked = path.with_name(stem + PARKED_SUFFIX)
-    with contextlib.suppress(OSError):
-        before = _read_count(parked)
-        _write_count(parked, live + (0 if before >= ATTEMPTS_UNREADABLE else before))
-        path.unlink()
-
-
-def forget_attempts(result_dir: Path, stem: str) -> None:
-    """Drop `stem`'s records, live and parked, once its delivery is confirmed; best effort."""
-    with contextlib.suppress(OSError, ValueError):
-        path = _attempts_path(result_dir, stem)
-        path.unlink(missing_ok=True)
-        path.with_name(stem + PARKED_SUFFIX).unlink(missing_ok=True)
-
-
 def claim_pid(name: str) -> "int | None":
-    """The pid of a drain claim name; None for any other name, so no reader treats a
-    file the drain neither creates nor recovers as a claim."""
+    """The pid of a drain claim name, `<stem>.sending.<pid>` or `<stem>.sending.<pid>.<ns>`; None
+    for any other name, so no reader treats a file the drain neither creates nor recovers as a claim."""
     parts = name.rsplit(CLAIM_INFIX, 1)
-    if len(parts) != 2 or not (parts[1].isascii() and parts[1].isdigit()):
+    if len(parts) != 2 or not parts[1].isascii():
         return None
-    pid = valid_pid(int(parts[1]))
-    # Only the spelling claim_path writes: no leading zeros.
-    return pid if pid is not None and str(pid) == parts[1] else None
+    pid_text, dot, ns = parts[1].partition(".")
+    if not pid_text.isdigit() or (dot and not ns.isdigit()):
+        return None
+    pid = valid_pid(int(pid_text))
+    return pid if pid is not None and str(pid) == pid_text else None
 
 
 def claim_base(name: str) -> "str | None":
-    """The queued stem a drain claim name came from (the inverse of claim_path); None for any name
-    claim_path never writes. `<stem>.sending.x.sending.<pid>` is a claim of `<stem>.sending.x`."""
+    """The queued stem a drain claim name came from; None for any name the drain never writes.
+    `<stem>.sending.x.sending.<pid>` is a claim of `<stem>.sending.x`."""
     if claim_pid(name) is None:
         return None
     return name.rsplit(CLAIM_INFIX, 1)[0]
+
+
+def lane_items(result_dir: Path, stem: str) -> "list[dict]":
+    """The proactive outbox's items for the file `stem` (one per body it was queued with).
+    ValueError when any item record cannot be read: it could be this file's, so it proves nothing."""
+    items = Path(result_dir) / RECEIPT_DIR / ITEMS_DIR
+    for path in (items.glob("*.json") if items.is_dir() else ()):
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise ValueError(f"unreadable proactive outbox item {path.name}") from e
+    return [rec for rec in list_items(Path(result_dir) / RECEIPT_DIR)
+            if str(rec.get("item_id") or "").startswith(f"{stem}~")]
 
 
 def route(body: str, skip_after_channel: bool = True) -> "tuple[str, str | None, str]":

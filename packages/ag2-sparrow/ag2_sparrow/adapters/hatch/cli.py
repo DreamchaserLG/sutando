@@ -34,6 +34,8 @@ from ... import (_dirs, agent_identity, delivery_destination, diagnostics, gatew
                  gateway_credentials, gateway_instance, outbox, result_ready, task_hold,
                  workspace_lock)
 from ...persisted_number import bounded_number
+from ...delivery_core import WITHDRAWN
+from ...proactive_routing import about_task_filename
 from ...result_markers import parse_markers
 from ...service_manager import _systemctl, _systemd_run, systemd_user_available  # noqa: F401
 from .task_fields import item_id, task_fields, valid_mxid
@@ -1098,7 +1100,9 @@ def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
 
 
 def _hold_notice(result_dir: Path, tid: str) -> Path:
-    return result_dir / f"proactive-hold-{tid}.txt"
+    """One fixed name per task, spelt as a message about it: the outbox withdraws it at its send
+    once the task is answered."""
+    return result_dir / about_task_filename(tid, 0)
 
 
 def task_settled(result_dir: Path, tid: str) -> bool:
@@ -1125,31 +1129,39 @@ def _line_state(result_dir: Path, tid: str, body: str) -> str:
     return "unknown"
 
 
-def hold_line_outcome(result_dir: Path, tid: str) -> str:
-    """Where `tid`'s hold line stands, by the drain's own state: 'delivered' (its receipt says so),
-    'undelivered' (still queued or claimed, or parked as never to be sent), else 'unconfirmed'
-    (gone with no receipt: the post may have happened and only the best-effort receipt failed)."""
-    notice = _hold_notice(result_dir, tid)
+def _line_items(result_dir: Path, notice: Path) -> "list[dict] | None":
+    """The proactive outbox's items for the line; None when they cannot be read (no proof)."""
     try:
-        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
-    except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
-        record = None
-    if record is not None and record.get("status") == "DELIVERED":
+        return delivery_destination.lane_items(result_dir, notice.stem)
+    except Exception:  # noqa: BLE001 — an unreadable outbox proves nothing
+        return None
+
+
+def hold_line_outcome(result_dir: Path, tid: str) -> str:
+    """Where `tid`'s hold line stands, by the proactive outbox: 'delivered'; 'withdrawn' (the
+    outbox withdrew it at its send, its task answered); 'undelivered' (queued, claimed, due a
+    retry after a definite refusal, or parked never sent); else 'unconfirmed' (a send that left
+    with no confirmed outcome, or gone with no record)."""
+    notice = _hold_notice(result_dir, tid)
+    items = _line_items(result_dir, notice)
+    if items is None:
+        return "unconfirmed"
+    if any(i.get("status") == "DELIVERED" for i in items):
         return "delivered"
-    pending = notice.exists() or _line_claimed(result_dir, notice)
-    return "undelivered" if pending or _line_parked(result_dir, notice) else "unconfirmed"
+    if any(outbox.dispatch_unsettled(i) or i.get("reason") == "outcome-unknown" for i in items):
+        return "unconfirmed"
+    if notice.exists() or _line_claimed(result_dir, notice) or any(
+            i.get("status") in ("QUEUED", "READY") for i in items):
+        return "undelivered"
+    parked = [str(i.get("reason") or "") for i in items if i.get("status") == "PARKED"]
+    if parked and all(r.startswith(f"{WITHDRAWN}:") for r in parked):
+        return "withdrawn"
+    return "undelivered" if parked else "unconfirmed"
 
 
 def _line_claimed(result_dir: Path, notice: Path) -> bool:
     return any(delivery_destination.claim_base(p.name) == notice.stem
                for p in result_dir.glob(f"{notice.stem}.sending.*"))
-
-
-def _line_parked(result_dir: Path, notice: Path) -> bool:
-    """Parked by the drain's failure resolver, which keeps the queued name exactly. The only other
-    park, `<stem>-<epoch>.txt` for an oversized body, never holds a hold line, and its name could be
-    another valid task's (`task-a` and `task-a-123`), so it is not matched."""
-    return (result_dir / delivery_destination.UNDELIVERED_DIR / notice.name).is_file()
 
 
 def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | None":
@@ -1175,12 +1187,11 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
         return "queued"
     if seen and not moved:
         return "unknown"  # some other or unready file holds the line's name
-    try:
-        record = outbox.read_item(result_dir / delivery_destination.RECEIPT_DIR, notice.stem)
-    except Exception:  # noqa: BLE001 — an unreadable receipt proves nothing
+    items = _line_items(result_dir, notice)
+    if items is None:
         return "unknown"
-    if record is not None:
-        return "delivered" if record.get("status") == "DELIVERED" else "unknown"
+    if items:
+        return "delivered" if any(i.get("status") == "DELIVERED" for i in items) else "unknown"
     if moved:
         return None
     return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
@@ -1316,11 +1327,7 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
               "still reads task-not-picked-up", file=sys.stderr)
         return REPLY_UNCONFIRMED
     if task_settled(result_dir, tid):
-        try:
-            _note_withdrawal(tid, _withdraw_line_locked(result_dir, tid))
-        except OSError as e:
-            print(f"note: the hold line of {tid} could not be withdrawn ({diagnostics.describe(e)})",
-                  file=sys.stderr)
+        _note_withdrawal(tid, _line_report(result_dir, tid))
         _release_quietly(result_dir, tid, token)
         print(f"NOT held: {tid} was answered meanwhile", file=sys.stderr)
         return REPLY_NOT_POSTED
@@ -1328,68 +1335,51 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
     return REPLY_POSTED
 
 
-# What a withdrawal reports for each outcome; "none" (no line was ever queued) says nothing.
+# What reply reports of the hold line once its answer is queued; "none" says nothing.
 WITHDRAW_NOTES = {
-    "withdrawn": "the hold line of {tid} was withdrawn before any send; it will not post",
-    "stopped": "the hold line of {tid} was withdrawn, but an earlier send of it has an unknown "
-               "outcome (the room may already show it); it will not be sent again",
+    "withdrawn": "the hold line of {tid} will not post: the drain withdraws it now that the task "
+                 "is answered",
     "posted": "the hold line of {tid} was already posted before this answer",
     "unsent": "the hold line of {tid} was parked unsent; it will not post",
-    "unconfirmed": "the hold line of {tid} left the queue before this answer; whether it "
-                   "posted is unconfirmed",
+    "unconfirmed": "the hold line of {tid} left the queue before this answer with an unconfirmed "
+                   "outcome (the room may already show it); it will not be sent again",
 }
 
 
-def _withdraw_line_locked(result_dir: Path, tid: str, undo: "list | None" = None) -> str:
-    """Take `tid`'s hold line off the queue and say where it stands; the caller holds the send
-    lock. "withdrawn" or "stopped" (no send of it will begin; "stopped" when one already began
-    with an unknown outcome), "posted", "unsent", "unconfirmed", or "none" (never queued).
-    OSError when a claimed line's sentinel cannot be written: nothing then stops its send.
-    Each step taken appends to `undo` a callable that reverts it, newest last."""
-    notice = _hold_notice(result_dir, tid)
-    begun = delivery_destination.attempts_ever(result_dir, notice.stem)
-    queued = notice.exists()
-    text = result_ready.read_ready_result(notice) if queued else None
-    notice.unlink(missing_ok=True)
-    if undo is not None and text is not None:
-        undo.append(lambda: _publish_once(notice, text + "\n"))
-    if _line_claimed(result_dir, notice):
-        sentinel = delivery_destination.withdrawn_path(notice)
-        made = not sentinel.exists()
-        sentinel.touch()
-        if undo is not None and made:
-            undo.append(lambda: sentinel.unlink(missing_ok=True))
-        queued = True
-    if queued:
-        return "withdrawn" if begun == 0 else "stopped"
+def _line_report(result_dir: Path, tid: str) -> str:
+    """Where `tid`'s hold line stands for reply's report, read under the send lock once the answer
+    is queued: no send of it can start or be under way, so the outbox's state is its outcome."""
     if not task_hold.notice_marked(result_dir, tid):
         return "none"
     outcome = hold_line_outcome(result_dir, tid)
     if outcome == "delivered":
         return "posted"
-    return "unsent" if outcome == "undelivered" and begun == 0 else "unconfirmed"
+    if outcome == "unconfirmed":
+        return "unconfirmed"
+    notice = _hold_notice(result_dir, tid)
+    pending = notice.exists() or _line_claimed(result_dir, notice) or any(
+        i.get("status") in ("QUEUED", "READY") for i in _line_items(result_dir, notice) or [])
+    return "withdrawn" if outcome == "withdrawn" or pending else "unsent"
 
 
 def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path, item: str,
                           result_file: Path, body: str) -> "tuple[bool, str]":
-    """reply's commit under the send lock: claim the task, withdraw its hold line, queue the
-    answer. A failure at any step undoes the ones before it (the claim is released and the line
-    restored) and raises OSError, so a retry finds the task as it was."""
+    """reply's commit under the send lock: claim the task and queue the answer, which withdraws
+    its hold line at the outbox's dispatch-time recheck. A failed publication releases the claim
+    and raises OSError, so a retry finds the task, and its line, as they were."""
     _prune_claims(result_dir, task_dir)
     if not _claim(result_dir, tid):
         return False, "none"
     if outbox.item_status(root, item) is not None:
         return False, "none"
-    undo = [lambda: (_claims_dir(result_dir) / tid).unlink(missing_ok=True)]
     try:
-        where = _withdraw_line_locked(result_dir, tid, undo)
-        # False: another result holds the name, so the task is answered and its line stays withdrawn.
-        return _publish_once(result_file, body), where
+        committed = _publish_once(result_file, body)
     except BaseException:
-        for step in reversed(undo):
-            with contextlib.suppress(OSError):
-                step()
+        with contextlib.suppress(OSError):
+            (_claims_dir(result_dir) / tid).unlink(missing_ok=True)
         raise
+    # False: another result holds the name, so the task is answered either way.
+    return committed, _line_report(result_dir, tid)
 
 
 def _note_withdrawal(tid: str, where: str) -> None:
@@ -1422,15 +1412,15 @@ def reply(args) -> int:
         print(f"error: {why}", file=sys.stderr)
         return 2
     root = gateway_instance.outbox_root(result_dir, instance)
-    # One transaction with hold's commit and the drain's send: the hold line is withdrawn and the
-    # answer queued under the send lock, so no line is published or sent after the answer.
+    # One transaction with hold's commit and the drain's send: the answer is queued under the send
+    # lock, so the hold line is sent before it or withdrawn at its send, never after it.
     try:
         with delivery_destination.send_lock(result_dir):
             committed, where = _commit_answer_locked(result_dir, task_dir, tid, root, item,
                                                      result_file, body)
     except OSError as e:  # SendLockUnavailable included: every step taken was undone
         print(f"error: the answer was not committed ({diagnostics.describe(e)}); nothing "
-              "written and any hold line left as it was, run reply again", file=sys.stderr)
+              "written and its hold line left as it was, run reply again", file=sys.stderr)
         return 2
     _note_withdrawal(tid, where)
     if not committed:
