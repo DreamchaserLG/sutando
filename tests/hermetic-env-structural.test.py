@@ -470,7 +470,9 @@ def scanned_files() -> "list[Path]":
     files = {p for r in roots for p in r.rglob("*.py")}
     files |= set((REPO / "src").rglob("*.test.py")) | set((REPO / "skills").rglob("*.test.py"))
     files |= set((REPO / "skills").rglob("test_*.py"))
-    return sorted(p for p in files if p not in (HELPER, AUDITOR) and "node_modules" not in p.parts)
+    # old_main fixtures are verbatim copies of deployed code, run as their own process.
+    return sorted(p for p in files if p not in (HELPER, AUDITOR) and "node_modules" not in p.parts
+                  and (REPO / "tests" / "fixtures" / "old_main") not in p.parents)
 
 
 SAMPLE_FLAGGED = '''

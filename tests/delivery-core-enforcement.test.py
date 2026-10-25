@@ -450,6 +450,9 @@ class ReconcileSignatureAgreesWithContract(unittest.TestCase):
         offenders, scanned = [], 0
         for root in roots:
             for path in root.rglob("*.py"):
+                # old_main fixtures are verbatim copies of deployed code.
+                if (repo / "tests" / "fixtures" / "old_main") in path.parents:
+                    continue
                 try:
                     tree = ast.parse(path.read_text(encoding="utf-8"))
                 except (SyntaxError, UnicodeDecodeError):
