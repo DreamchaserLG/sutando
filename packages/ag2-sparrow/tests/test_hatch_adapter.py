@@ -4351,6 +4351,23 @@ class Hold(Base):
             gb._http_error_body(caught.exception)
         self.assertLess(time.monotonic() - started, 2.0, "an error body arriving slowly is cut at the deadline")
 
+    def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
+        import http.server
+        from ag2_sparrow import remote_gateway_bridge as gb
+
+        class Upgraded(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"reason": "room_upgraded", "replacement_room": "!new:ag2.space"}')
+        url = self.gateway(Upgraded)
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15, deadline=time.monotonic() + 5)
+        self.assertEqual(gb._room_upgraded_to(gb._http_error_body(caught.exception)), "!new:ag2.space")
+
     def test_a_send_that_began_counts_against_the_budget_before_the_post(self):
         # Each child process POSTs and dies before settling; orphan recovery runs between them.
         from ag2_sparrow import remote_gateway_bridge as gb

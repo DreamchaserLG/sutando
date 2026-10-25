@@ -61,6 +61,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import io
 import http.client
 import json
 import os
@@ -2752,10 +2753,11 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
             try:
                 opened = urllib.request.build_opener(Http, Https).open(req, timeout=timeout)
             except urllib.error.HTTPError as e:
+                # A buffer, not bytes: gateway_call's scrub keeps objects and empties bytes.
                 try:
-                    e.sparrow_body = e.read() or b""
+                    e.sparrow_body = io.BytesIO(e.read() or b"")
                 except Exception:  # noqa: BLE001 - a cut or broken error body reads as empty
-                    e.sparrow_body = b""
+                    e.sparrow_body = io.BytesIO()
                 raise
             with opened as resp:
                 return _parse_response(resp, _read_by(resp, deadline))
@@ -2788,7 +2790,7 @@ def _http_error_body(e) -> str:
     already read it within its deadline."""
     try:
         body = getattr(e, "sparrow_body", None)
-        return (body if body is not None else (e.read() or b"")).decode("utf-8", "replace")
+        return (body.getvalue() if body is not None else (e.read() or b"")).decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return ""
 
