@@ -5702,8 +5702,8 @@ def _recover_orphan_proactive() -> None:
                 continue
         target = f.with_name(name.split(".sending")[0] + ".txt")
         receipt, generation = _claim_receipt(f, target.stem)
-        if receipt == "absent":  # never an outbox item: the next drain decides, never over a newer file
-            _log(f"recovering orphan proactive claim {f.name}")
+        if receipt in ("absent", "QUEUED", "READY", "CLAIMED"):  # not terminal: back live, the outbox settles it
+            _log(f"recovering orphan proactive claim {f.name} (outbox item {receipt})")
             _hand_back(f, target)
         elif receipt == "DELIVERED":  # sent before its archive failed: hidden like any delivered file
             _move_decided(f, f.with_name(f".{target.stem}{_DELIVERED_INFIX}{time.time_ns()}"), generation,
@@ -5711,10 +5711,10 @@ def _recover_orphan_proactive() -> None:
         elif receipt == "PARKED":  # terminal: never resent, kept where parked files go
             _move_decided(f, undelivered_quarantine.quarantine_dir(RESULTS_DIR)
                           / undelivered_quarantine.quarantine_name(target.stem), generation, "parked")
-        else:  # QUEUED / READY / CLAIMED / unknown: it may be in flight or sent; never re-queued on a guess
+        else:  # unknown / unreadable: it may have been sent; kept for an operator
             _log_backoff(("proactive-orphan-receipt", f.name),
-                         f"proactive claim {f.name}: its outbox item is {receipt}; kept as its claim for an "
-                         "operator, not re-queued")
+                         f"proactive claim {f.name}: its outbox record cannot be read cleanly; kept as "
+                         "its claim for an operator, not re-queued")
 
 
 def _move_decided(claim: Path, dest: Path, generation: str, what: str) -> None:

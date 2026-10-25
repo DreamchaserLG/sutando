@@ -191,22 +191,34 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         self.lane.restart()
         self.assertEqual((self.lane.results / "proactive-1.txt").read_text(), "[no-send]\n")
 
-    def test_every_recorded_lifecycle_state_but_absent_keeps_the_claim_off_its_live_name(self):
+    def test_a_dead_owners_claim_follows_its_recorded_lifecycle_state(self):
+        """PARKED is terminal (parked, never live, never resent); QUEUED/READY/CLAIMED go back live
+        and the outbox settles them (at most one POST, from main's crash-receipt path)."""
         root = self.lane.results / ".outbox-ag2space-proactive"
         for status in ("QUEUED", "READY", "CLAIMED", "PARKED"):
             with self.subTest(status=status):
                 stem = f"proactive-{status.lower()}"
                 item_id = gb._proactive_item_id(stem, status)
-                outbox._write_item(root, item_id, {"item_id": item_id, "status": status, "attempts": 0})
+                outbox._write_item(root, item_id, {"item_id": item_id, "status": status, "attempts": 0,
+                                              "payload": f"{status}\n"})
                 claim = self.lane.results / f"{stem}.sending.{_dead_pid()}.1"
                 claim.write_text(f"{status}\n")
+                before = len(self.lane.posts)
                 self.lane.restart()
-                self.assertFalse((self.lane.results / f"{stem}.txt").exists(), f"{status} is not resent")
+                live = self.lane.results / f"{stem}.txt"
                 if status == "PARKED":
+                    self.assertFalse(live.exists(), "PARKED never goes back live")
+                    self.assertFalse(claim.exists())
                     parked = list((self.lane.results / "undelivered").glob(f"{stem}-*.txt"))
                     self.assertEqual([p.read_text() for p in parked], ["PARKED\n"])
+                    self.lane.drain()
+                    self.assertEqual(len(self.lane.posts), before, "PARKED is never resent")
                 else:
-                    self.assertEqual(claim.read_text(), f"{status}\n")
+                    self.assertEqual(live.read_text(), f"{status}\n", "back live for the outbox to settle")
+                    self.assertFalse(claim.exists())
+                    self.lane.drain()
+                    self.assertLessEqual(len(self.lane.posts) - before, 1, "at most one POST")
+                    self.assertFalse(live.exists(), "settled by the drain")
 
     def test_a_claim_replaced_after_its_receipt_was_read_is_not_hidden_as_delivered(self):
         item_id = gb._proactive_item_id("proactive-1", "delivered")
