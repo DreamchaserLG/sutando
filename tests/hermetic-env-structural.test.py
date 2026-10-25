@@ -867,6 +867,11 @@ class SelfTest(unittest.TestCase):
                 self.assertEqual(leaked, name != "isolated", got.stdout)
                 self.assertEqual(violations(sample) == [], not leaked, violations(sample))
 
+    def test_an_unparseable_file_naming_a_gateway_module_is_reported_each_time(self):
+        broken = "import remote_gateway_bridge\ndef (:\n"
+        self.assertEqual(violations(broken, "x.py"), ["x.py:0: unparseable"])
+        self.assertEqual(violations(broken, "x.py"), ["x.py:0: unparseable"])
+
     def test_a_mention_only_in_a_comment_or_docstring_is_out_of_scope(self):
         body = "import os, subprocess\nenv = os.environ.copy()\nsubprocess.run(['x'])\n"
         for head in ('"""Exercises the remote_gateway_bridge and Hatch (adapters/hatch)."""\n',
