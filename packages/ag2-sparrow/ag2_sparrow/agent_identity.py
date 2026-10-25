@@ -23,6 +23,7 @@ one (which has no `__`) and two such ids differ by their digest.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -158,16 +159,21 @@ def _lane_locked(dfd: int, instance: str):
         os.close(fd)
 
 
-def _read_at(dfd: int, name: str) -> "dict | None":
+def _read_at(dfd: int, name: str, strict: bool = False) -> "dict | None":
+    """The record, None when absent or not a record; with `strict` a failed open or read raises."""
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-    except OSError:
+    except OSError as e:
+        if strict and e.errno not in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
+            raise
         return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
         raw = os.read(fd, _LANE_MAX_BYTES + 1)
     except OSError:
+        if strict:
+            raise
         return None
     finally:
         os.close(fd)
@@ -268,25 +274,31 @@ def retract_lane(state_dir, instance: str, pid: "int | None" = None, ts: "float 
             _close(dfd)
 
 
-def published_lane_record(state_dir, instance: str, now: "float | None" = None) -> "dict | None":
-    """`instance`'s lane record, read under the lane lock, when well formed, not retracted, its own
-    (agent_id str, instance equal, a valid_pid) and fresh (a finite `ts` within LANE_FRESH_S of
-    `now`, at most LANE_SKEW_S ahead); None otherwise. Whether the pid is the live drain is the
-    reader's check."""
+def lane_record(state_dir, instance: str, now: "float | None" = None) -> "tuple[dict | None, bool]":
+    """(`published_lane_record`, unreadable): unreadable is True when the record could not be read,
+    which proves nothing about it, unlike an absent or invalid one."""
     if state_dir is None:
-        return None
+        return None, False
     try:
         dfd = _auth_dir(state_dir, create=False)
         if dfd is None:
-            return None
+            return None, False
         try:
             with _lane_locked(dfd, instance):
-                rec = _read_at(dfd, _lane_name(instance))
+                rec = _read_at(dfd, _lane_name(instance), strict=True)
         finally:
             _close(dfd)
     except OSError:
-        return None
-    return _valid_lane(rec, instance, time.time() if now is None else now)
+        return None, True
+    return _valid_lane(rec, instance, time.time() if now is None else now), False
+
+
+def published_lane_record(state_dir, instance: str, now: "float | None" = None) -> "dict | None":
+    """`instance`'s lane record, read under the lane lock, when well formed, not retracted, its own
+    (agent_id str, instance equal, a valid_pid) and fresh (a finite `ts` within LANE_FRESH_S of
+    `now`, at most LANE_SKEW_S ahead); None otherwise, including when it cannot be read. Whether
+    the pid is the live drain is the reader's check."""
+    return lane_record(state_dir, instance, now)[0]
 
 
 def resolve(state_dir, channel_value, environ=None) -> str:

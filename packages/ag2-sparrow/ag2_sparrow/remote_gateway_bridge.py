@@ -2714,20 +2714,30 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
         if deadline is None:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return _parse_response(resp, resp.read())
-        # The deadline covers every phase (status, headers, body, an error's body): at it, a
-        # timer shuts down the request's socket, which ends whatever read is blocked on it.
+        # Every phase shares the deadline: each step gets the budget left, and a timer shuts
+        # every socket made (the wrapped TLS one included) to end a blocked read.
         socks: "list[socket.socket]" = []
 
         def recorded(base):
             class Recorded(base):
                 def __init__(self, *a, **k):
                     super().__init__(*a, **k)
-                    create = self._create_connection
+                    self._create_connection = lambda addr, tmo=None, src=None: _connect_by(
+                        addr, deadline, tmo, src, socks)
 
-                    def made(*ca, **ck):
-                        socks.append(create(*ca, **ck))
-                        return socks[-1]
-                    self._create_connection = made
+                def connect(self):
+                    http.client.HTTPConnection.connect(self)
+                    ctx = getattr(self, "_context", None)
+                    if ctx is None:
+                        return
+                    # The wrapped socket replaces the raw one, so it is recorded for the timer and
+                    # its handshake, which the timer must be able to cut, runs after that.
+                    wrapped = ctx.wrap_socket(self.sock, do_handshake_on_connect=False,
+                                              server_hostname=self._tunnel_host or self.host)
+                    self.sock = wrapped
+                    socks.append(wrapped)
+                    wrapped.settimeout(_left(deadline, timeout))
+                    wrapped.do_handshake()
             return Recorded
 
         class Http(urllib.request.HTTPHandler):
@@ -2763,7 +2773,53 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
 def _shut_sockets(socks) -> None:
     for sock in list(socks):
         with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
+            # The base method: an SSLSocket's own shutdown drops its TLS object under a blocked read.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+
+
+def _left(deadline: float, cap: float) -> float:
+    """The seconds to the deadline, at most `cap`; TimeoutError once it has passed."""
+    left = min(cap, deadline - time.monotonic())
+    if left <= 0:
+        raise TimeoutError("request deadline reached")
+    return left
+
+
+def _connect_by(addr, deadline: float, cap, source, socks) -> "socket.socket":
+    """A connection to `addr` inside the request's deadline: resolution runs in a helper thread
+    we stop waiting for at it, and each address candidate gets only the budget left."""
+    host, port = addr
+    cap = cap if isinstance(cap, (int, float)) and cap > 0 else _REQ_TIMEOUT_S
+    found: "list" = []
+
+    def resolve():
+        try:
+            found.append(socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM))
+        except OSError as e:
+            found.append(e)
+    t = threading.Thread(target=resolve, daemon=True)
+    t.start()
+    t.join(_left(deadline, cap))
+    if not found:
+        raise TimeoutError("name resolution still unfinished at its deadline")
+    if isinstance(found[0], OSError):
+        raise found[0]
+    err: "OSError | None" = None
+    for family, kind, proto, _name, sa in found[0]:
+        sock = socket.socket(family, kind, proto)
+        socks.append(sock)
+        try:
+            sock.settimeout(_left(deadline, cap))
+            if source:
+                sock.bind(source)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            err = e
+            sock.close()
+            if isinstance(e, TimeoutError) and time.monotonic() >= deadline:
+                break
+    raise err or OSError("no address to connect to")
 
 
 def _parse_response(resp, body: bytes):

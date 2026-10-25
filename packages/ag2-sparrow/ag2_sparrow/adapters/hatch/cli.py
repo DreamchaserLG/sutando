@@ -1075,7 +1075,9 @@ def _publish_once(result_file: Path, body: str) -> bool:
     except FileExistsError:
         return False
     finally:
-        Path(tmp).unlink(missing_ok=True)
+        # After a successful link a failed cleanup must not read as an uncommitted answer.
+        with contextlib.suppress(OSError):
+            Path(tmp).unlink(missing_ok=True)
 
 
 def _wake_item(cfg: dict, result_file: Path) -> "tuple | None":
@@ -1148,7 +1150,8 @@ def hold_line_outcome(result_dir: Path, tid: str) -> str:
         return "unconfirmed"
     if any(i.get("status") == "DELIVERED" for i in items):
         return "delivered"
-    if any(outbox.dispatch_unsettled(i) or i.get("reason") == "outcome-unknown" for i in items):
+    if any(outbox.dispatch_unsettled(i) or i.get("reason") == "outcome-unknown"
+           or i.get("prior_outcome_unknown") for i in items):
         return "unconfirmed"
     if notice.exists() or _line_claimed(result_dir, notice) or any(
             i.get("status") in ("QUEUED", "READY") for i in items):
@@ -1197,25 +1200,27 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
     return "unknown" if task_hold.notice_marked(result_dir, tid) else "new"
 
 
-def _lane_has_send_lock(cfg: dict, instance: str) -> bool:
-    """The live drain's lane record declares the send-lock protocol hold and reply rely on; a
-    drain started from an older package does not, and keepawake replaces it."""
+def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
+    """One read of the live drain's lane: (pid, homeserver, declares the send-lock protocol hold
+    and reply rely on), or None when there is no such drain: no fresh record, its publisher gone,
+    or the lock names another live process. A drain from an older package lacks the protocol, and
+    keepawake replaces it."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    rec = agent_identity.published_lane_record(state, instance) or {}
-    return rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL
+    rec = agent_identity.published_lane_record(state, instance)
+    if rec is None or process_gone(rec["pid"]):
+        return None
+    holder = _lock_record(state, instance)
+    if holder is not None and live_lock_holder(holder) != rec["pid"]:
+        return None  # a lock names the live drain, and it is not the publisher
+    return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
+            rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
 
 
 def _lane_homeserver(cfg: dict, instance: str) -> str:
     """The homeserver the live drain of `instance` published; "" when there is none, it is another
     instance's, or its publisher is not that live drain, which `hold` refuses rather than guess."""
-    state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
-    rec = agent_identity.published_lane_record(state, instance)
-    if rec is None or process_gone(rec["pid"]):
-        return ""
-    holder = _lock_record(state, instance)
-    if holder is not None and live_lock_holder(holder) != rec["pid"]:
-        return ""  # a lock names the live drain, and it is not the publisher
-    return delivery_destination.homeserver_of(rec["agent_id"])
+    snap = _lane_snapshot(cfg, instance)
+    return snap[1] if snap else ""
 
 
 def _held_line(cfg: dict, instance: str) -> str:
@@ -1253,7 +1258,8 @@ def hold(args) -> int:
         lines.append(f"[thread: {fields['thread_root']}]")
     lines.append((f"{sender} " if valid_mxid(sender) else "") + _held_line(cfg, instance))
     body = "\n".join(lines) + "\n"
-    lane = _lane_homeserver(cfg, instance)
+    snap = _lane_snapshot(cfg, instance)
+    lane = snap[1] if snap else ""
     if not lane:
         print(f"NOT confirmed: can't confirm the room is deliverable yet, as no live Sparrow drain "
               f"has published its lane identity; no hold recorded and {tid} still reads "
@@ -1263,14 +1269,15 @@ def hold(args) -> int:
         print(f"error: task {tid} names no AG2 Space room Sparrow would deliver to",
               file=sys.stderr)
         return 2
-    if not _lane_has_send_lock(cfg, instance):
+    if not snap[2]:
         print(f"NOT confirmed: the running Sparrow predates the hold-line send lock, so a hold line "
               f"could not be withdrawn once answered; no hold recorded and {tid} still reads "
               f"task-not-picked-up. {restart_hint()}", file=sys.stderr)
         return REPLY_UNCONFIRMED
     try:
         with delivery_destination.send_lock(result_dir):
-            return _hold_under_lock(result_dir, tid, body)
+            return _hold_under_lock(result_dir, tid, body,
+                                    lambda: _lane_snapshot(cfg, instance) == snap)
     except delivery_destination.SendLockUnavailable as e:
         print(f"NOT confirmed: the hold-line send lock was not taken ({diagnostics.describe(e)}); "
               f"no hold recorded and {tid} still reads task-not-picked-up. Run hold again",
@@ -1278,9 +1285,19 @@ def hold(args) -> int:
         return REPLY_UNCONFIRMED
 
 
-def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
+def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> int:
     """hold's commit, run under the send lock that reply's commit also takes: no answer can land
-    between its settled check and the line's publication."""
+    between its settled check and the line's publication. `lane_unchanged()` re-reads the drain
+    the checks before the lock were made against, and a commit needs it still true."""
+
+    def fenced() -> bool:
+        if lane_unchanged():
+            return True
+        print(f"NOT confirmed: the Sparrow drain changed while hold waited for the send lock; "
+              f"no hold recorded and {tid} still reads task-not-picked-up. Run hold again",
+              file=sys.stderr)
+        return False
+
     try:
         if task_settled(result_dir, tid):
             print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
@@ -1301,6 +1318,8 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
                   "it was delivered; it is not queued again and the task still reads "
                   "task-not-picked-up", file=sys.stderr)
             return REPLY_UNCONFIRMED
+        if not fenced():
+            return REPLY_UNCONFIRMED
         owner = task_hold.mark_notice(result_dir, tid) if line == "new" else None
         if owner is not None:
             try:
@@ -1312,6 +1331,8 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str) -> int:
         if _line_state(result_dir, tid, body) not in ("queued", "delivered"):
             print(f"NOT confirmed: the hold line for {tid} is not proven queued; the task "
                   "still reads task-not-picked-up", file=sys.stderr)
+            return REPLY_UNCONFIRMED
+        if not fenced():
             return REPLY_UNCONFIRMED
         token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
     except (OSError, ValueError) as e:

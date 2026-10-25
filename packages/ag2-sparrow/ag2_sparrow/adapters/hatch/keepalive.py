@@ -350,13 +350,18 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
 def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | None":
     """The pid of the live, connected Sparrow that is not this package's drain: its own lane
     record lacks the send-lock protocol, or it has held its lock past LANE_GRACE_S with no lane
-    record at all, as a drain from before lane records (the released main) does. None otherwise."""
+    record at all, as a drain from before lane records (the released main) does. None otherwise,
+    and when the record cannot be read."""
     state, instance = _state_dir(cfg), _instance(cfg)
     holder = _cli._lock_record(state, instance)
     pid = _cli.live_lock_holder(holder)
     if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
-    rec = agent_identity.published_lane_record(state, instance)
+    rec, unreadable = agent_identity.lane_record(state, instance)
+    if unreadable:
+        # No proof the owner lacks the protocol: leave a healthy drain running.
+        print(f"lane record of Sparrow (pid {pid}) unreadable; not replacing it", file=sys.stderr)
+        return None
     if rec is not None and rec.get("pid") == pid:
         return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
     # This package's drain publishes its record on its first pass, every few seconds after.

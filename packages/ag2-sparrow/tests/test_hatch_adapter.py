@@ -2640,6 +2640,20 @@ class StartSparrow(Base):
         self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
 
+    def test_keepawake_keeps_a_drain_whose_lane_record_cannot_be_read(self):
+        old = self.old_sparrow()
+        self.acquired(old, keepalive.LANE_GRACE_S + 60)
+        self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL)  # current and valid
+        want = keepalive.health_command(str(self.reply_stub))
+
+        def denied(*a, **k):
+            raise PermissionError(13, "state directory unreadable")
+        with mock.patch.object(agent_identity, "_read_at", denied):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a drain is not replaced on a read error")
+        self.assertIn("unreadable", r.stderr)
+
     def test_keepawake_gives_a_just_started_sparrow_time_to_publish_its_lane(self):
         old = self.old_sparrow()
         self.acquired(old, 5)
@@ -4298,6 +4312,67 @@ class Hold(Base):
         self.drain_pass(posts)
         self.assertEqual(len(posts), 2, "the requeued line is sent again, once")
         self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "delivered")
+    def test_a_requeue_keeps_the_proof_that_an_earlier_send_may_have_landed(self):
+        from ag2_sparrow import outbox_cli
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        posts = []
+        self.drain_pass(posts, fail=TimeoutError("applied, then timed out"))
+        (item,) = delivery_destination.lane_items(self.results, self.notice.stem)
+        self.assertEqual(item["reason"], "outcome-unknown")
+        (parked,) = (self.results / "undelivered").glob(f"{self.notice.stem}-*.txt")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = outbox_cli.main(["--root", str(self.results / delivery_destination.RECEIPT_DIR),
+                                  "requeue", item["item_id"], "--body-id", self.notice.stem,
+                                  "--body-sha256", hashlib.sha256(parked.read_bytes()).hexdigest()])
+        self.assertEqual(rc, 0)
+        (item,) = delivery_destination.lane_items(self.results, self.notice.stem)
+        self.assertEqual(item["status"], "QUEUED")
+        self.assertEqual(hatch_cli.hold_line_outcome(self.results, self.TID), "unconfirmed")
+        note = self.reply_now().stderr  # before the resend: attempt 0 may already be in the room
+        self.assertIn("the room may already show it", note)
+        self.assertNotIn("will not post", note)
+
+    def test_an_answer_whose_temp_file_cleanup_fails_is_reported_as_written(self):
+        self.add_task(self.TID, "$ev1")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
+        real = Path.unlink
+
+        def unlink(path, *a, **k):
+            if path.name.startswith(f".{self.result_file.name}."):
+                raise PermissionError(13, "cleanup refused")
+            return real(path, *a, **k)
+        with mock.patch.object(Path, "unlink", unlink):
+            r = self.reply_now()
+        self.assertEqual(self.result_file.read_text(), "done")
+        self.assertIn(r.returncode, (hatch_cli.REPLY_POSTED, hatch_cli.REPLY_UNCONFIRMED), r.stderr)
+        self.assertNotIn("nothing written", r.stderr)
+
+    def test_hold_refuses_when_the_drain_is_swapped_while_it_waits_for_the_lock(self):
+        self.add_task(self.TID, "$ev1")
+        lock = self.home / "state" / "locks" / "gateway-bridge.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+
+        def holder(pid):
+            now = int(time.time())
+            lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
+                                        "host": hatch_cli.workspace_lock._host_label(),
+                                        "heartbeat_at": now, "schema_version": 1}))
+        holder(os.getpid())  # the record's publisher holds the singleton when hold first looks
+        real = delivery_destination.send_lock
+
+        @contextlib.contextmanager
+        def swapped(*a, **k):
+            with real(*a, **k):
+                holder(os.getppid())  # a successor takes it while hold waited for the lock
+                yield
+        with mock.patch.object(delivery_destination, "send_lock", swapped):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed", r.stderr)
+        self.assertFalse(self.notice.exists())
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
     def test_a_parked_line_that_was_sent_is_never_reported_unsent(self):
         from ag2_sparrow import remote_gateway_bridge as gb
         self.add_task(self.TID, "$ev1")
@@ -4506,6 +4581,122 @@ class Hold(Base):
                         deadline=time.monotonic() + 0.5)
             gb._http_error_body(caught.exception)
         self.assertLess(time.monotonic() - started, 2.0, "an error body arriving slowly is cut at the deadline")
+
+    def tls_gateway(self, handler):
+        """A local HTTPS gateway with a throwaway self-signed cert; returns (url, client context)."""
+        import http.server
+        import ssl
+        if not shutil.which("openssl"):
+            self.skipTest("openssl not available")
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-keyout", str(d / "k.pem"), "-out", str(d / "c.pem"), "-subj", "/CN=127.0.0.1",
+                        "-addext", "subjectAltName=IP:127.0.0.1"], check=True, capture_output=True)
+        serve = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        serve.load_cert_chain(d / "c.pem", d / "k.pem")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.socket = serve.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        client = ssl.create_default_context(cafile=str(d / "c.pem"))
+        return f"https://127.0.0.1:{server.server_address[1]}", client
+
+    def bounded_req(self, url, budget, client=None):
+        """gb._req against `url` with a `budget` s deadline; returns (raised, seconds)."""
+        import http.client
+        from ag2_sparrow import remote_gateway_bridge as gb
+        patch = mock.patch.object(http.client, "_create_https_context", lambda v: client)
+        started = time.monotonic()
+        with mock.patch.multiple(gb, URL=url, TOKEN="t"), (patch if client else contextlib.nullcontext()):
+            try:
+                gb._req("POST", "/v1/room", {"op": "message"}, timeout=15,
+                        deadline=time.monotonic() + budget)
+            except Exception as e:  # noqa: BLE001 - the test reads what the deadline raised
+                return e, time.monotonic() - started
+        return None, time.monotonic() - started
+
+    def test_the_deadline_covers_slow_https_headers(self):
+        import http.server
+
+        class SlowHeaders(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                for byte in b"HTTP/1.1 200 OK\r\nX-Slow: " + b"a" * 60:
+                    try:
+                        self.wfile.write(bytes([byte]))
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+
+            def log_message(self, *a):
+                pass
+        url, client = self.tls_gateway(SlowHeaders)
+        raised, took = self.bounded_req(url, 0.3, client)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 1.0, "TLS-wrapped headers arriving slowly are cut at the deadline")
+
+    def test_the_deadline_covers_a_slow_https_error_body(self):
+        import http.server
+
+        class SlowError(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(400)
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                for _ in range(30):
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                    except OSError:
+                        return
+                    time.sleep(0.1)
+
+            def log_message(self, *a):
+                pass
+        url, client = self.tls_gateway(SlowError)
+        raised, took = self.bounded_req(url, 0.3, client)
+        self.assertIsInstance(raised, urllib.error.HTTPError, repr(raised))
+        self.assertLess(took, 1.0, "a TLS-wrapped error body arriving slowly is cut at the deadline")
+
+    def test_the_deadline_covers_a_stalled_tls_handshake(self):
+        import socket as sk
+        quiet = sk.socket()
+        quiet.bind(("127.0.0.1", 0))
+        quiet.listen(5)  # accepts the connection and never speaks TLS
+        self.addCleanup(quiet.close)
+        raised, took = self.bounded_req(f"https://127.0.0.1:{quiet.getsockname()[1]}", 0.3)
+        self.assertIsNotNone(raised)
+        self.assertLess(took, 1.0, "a handshake that never answers is cut at the deadline")
+
+    def test_the_deadline_is_shared_by_every_connect_candidate(self):
+        import socket as sk
+        from ag2_sparrow import remote_gateway_bridge as gb
+        addrs = [(sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", 9)),
+                 (sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.2", 9))]
+
+        def stalled(sock, address):
+            time.sleep(sock.gettimeout())
+            raise TimeoutError("timed out")
+        with mock.patch.object(sk, "getaddrinfo", return_value=addrs), \
+                mock.patch.object(sk.socket, "connect", stalled):
+            raised, took = self.bounded_req("http://stalled.example:9", 0.3)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 0.45, "two candidates share one budget, not one each")
+
+    def test_the_deadline_covers_name_resolution(self):
+        import socket as sk
+
+        def slow_resolver(*a, **k):
+            time.sleep(0.8)
+            return [(sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", 9))]
+        with mock.patch.object(sk, "getaddrinfo", slow_resolver):
+            raised, took = self.bounded_req("http://slow-dns.example:9", 0.2)
+        self.assertIsInstance(raised, TimeoutError, repr(raised))
+        self.assertLess(took, 0.5, "a resolver that outlasts the deadline is not waited for")
 
     def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
         import http.server
