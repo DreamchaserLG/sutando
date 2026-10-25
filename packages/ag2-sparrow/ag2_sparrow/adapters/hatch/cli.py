@@ -1288,16 +1288,8 @@ def hold(args) -> int:
 def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> int:
     """hold's commit, run under the send lock that reply's commit also takes: no answer can land
     between its settled check and the line's publication. `lane_unchanged()` re-reads the drain
-    the checks before the lock were made against, and a commit needs it still true."""
-
-    def fenced() -> bool:
-        if lane_unchanged():
-            return True
-        print(f"NOT confirmed: the Sparrow drain changed while hold waited for the send lock; "
-              f"no hold recorded and {tid} still reads task-not-picked-up. Run hold again",
-              file=sys.stderr)
-        return False
-
+    the checks before the lock were made against, and a commit needs it still true. A line this
+    commit queued and then cannot fence is taken back unsent, so no successor drain posts it."""
     try:
         if task_settled(result_dir, tid):
             print(f"NOT held: {tid}.txt already has a reply or result", file=sys.stderr)
@@ -1318,12 +1310,13 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> i
                   "it was delivered; it is not queued again and the task still reads "
                   "task-not-picked-up", file=sys.stderr)
             return REPLY_UNCONFIRMED
-        if not fenced():
-            return REPLY_UNCONFIRMED
+        if not lane_unchanged():
+            return _drain_changed(tid)
         owner = task_hold.mark_notice(result_dir, tid) if line == "new" else None
+        ino = None
         if owner is not None:
             try:
-                _publish_once(notice, body)
+                ino = _ino(notice) if _publish_once(notice, body) else None
             except OSError:
                 task_hold.clear_notice(result_dir, tid, owner)
                 raise
@@ -1332,8 +1325,13 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> i
             print(f"NOT confirmed: the hold line for {tid} is not proven queued; the task "
                   "still reads task-not-picked-up", file=sys.stderr)
             return REPLY_UNCONFIRMED
-        if not fenced():
-            return REPLY_UNCONFIRMED
+        if not lane_unchanged():
+            if owner is None:
+                return _drain_changed(tid)
+            if not _retire_line(notice, ino):
+                return _drain_changed(tid, "; its line was already taken by the drain and may post")
+            task_hold.clear_notice(result_dir, tid, owner)
+            return _drain_changed(tid, "; its line was withdrawn unsent")
         token = task_hold.place(result_dir, tid, task_hold.OWNER_GO)
     except (OSError, ValueError) as e:
         print(f"NOT confirmed: the hold was not recorded ({e}); the task still reads "
@@ -1354,6 +1352,40 @@ def _hold_under_lock(result_dir: Path, tid: str, body: str, lane_unchanged) -> i
         return REPLY_NOT_POSTED
     print(f"held: {tid} marked waiting for your owner's go; Sparrow posts the one notice")
     return REPLY_POSTED
+
+
+def _drain_changed(tid: str, line_note: str = "") -> int:
+    print(f"NOT confirmed: the Sparrow drain changed while hold ran{line_note}; no hold recorded "
+          f"and {tid} still reads task-not-picked-up. Run hold again", file=sys.stderr)
+    return REPLY_UNCONFIRMED
+
+
+def _ino(path: Path) -> "int | None":
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def _retire_line(notice: Path, ino: "int | None") -> bool:
+    """Take back the line this hold queued at `notice` (inode `ino`): True once it is out of the
+    queue unsent. One rename, so a drain's claim of it either won first (False) or finds nothing;
+    a file that proves to be another one is linked back under its name."""
+    if ino is None:
+        return False
+    away = notice.with_name(f".{notice.name}.retired.{os.getpid()}")
+    try:
+        os.rename(notice, away)
+    except OSError:
+        return False
+    if _ino(away) == ino:
+        with contextlib.suppress(OSError):
+            away.unlink()
+        return True
+    with contextlib.suppress(OSError):
+        os.link(away, notice)
+        away.unlink()
+    return False
 
 
 # What reply reports of the hold line once its answer is queued; "none" says nothing.

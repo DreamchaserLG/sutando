@@ -10,9 +10,10 @@ A .env file's lines are parsed by the credential owner, gateway_credential_sourc
 
 `publish_lane` is the one writer of `<state>/auth/lane-identity[.<instance>].json`: the id the live
 drain of that gateway instance judges rooms by, with its instance, pid and a timestamp, never a
-credential. `published_lane_record` reads it back; `retract_lane` invalidates it. All three hold the
+credential. `lane_state` reads it back as fresh, stale, absent, invalid or unreadable, and
+`published_lane_record` is its fresh record; `retract_lane` invalidates it. All three hold the
 instance's `lane-identity[.<instance>].lock` beside it, and a record that cannot be removed is
-tombstoned or emptied, so a failed invalidation reads as missing rather than stale.
+tombstoned or emptied, so a failed invalidation reads as invalid, never as a live record.
 
 `root_segment` maps an id to one path segment, lowercase `[a-z0-9._-]`, no leading dot, at most
 `SEGMENT_MAX` bytes. A plain MXID `@local:server` whose parts are lowercase `[a-z0-9.-]` (first
@@ -23,7 +24,6 @@ one (which has no `__`) and two such ids differ by their digest.
 from __future__ import annotations
 
 import contextlib
-import errno
 import hashlib
 import json
 import os
@@ -33,6 +33,7 @@ import stat
 import time
 from pathlib import Path
 
+from . import bounded_file_read
 from . import gateway_credential_sources as _sources
 from .outbox import valid_pid
 from .persisted_number import bounded_number
@@ -159,29 +160,23 @@ def _lane_locked(dfd: int, instance: str):
         os.close(fd)
 
 
-def _read_at(dfd: int, name: str, strict: bool = False) -> "dict | None":
-    """The record, None when absent or not a record; with `strict` a failed open or read raises."""
+LANE_FRESH, LANE_STALE = "fresh", "stale"
+LANE_ABSENT, LANE_INVALID, LANE_UNREADABLE = "absent", "invalid", "unreadable"
+
+
+def _read_at(dfd: int, name: str) -> "tuple[dict | None, str]":
+    """(record, "") or (None, LANE_ABSENT / LANE_INVALID / LANE_UNREADABLE). It never blocks: a
+    FIFO, a symlink or any other non-regular file is refused as invalid before any read."""
+    text, why = bounded_file_read.read_regular(name, _LANE_MAX_BYTES, dir_fd=dfd, follow=False)
+    if text is None:
+        if not why:
+            return None, LANE_ABSENT
+        return None, LANE_UNREADABLE if bounded_file_read.unreadable(why) else LANE_INVALID
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-    except OSError as e:
-        if strict and e.errno not in (errno.ENOENT, errno.ELOOP, errno.ENOTDIR):
-            raise
-        return None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        raw = os.read(fd, _LANE_MAX_BYTES + 1)
-    except OSError:
-        if strict:
-            raise
-        return None
-    finally:
-        os.close(fd)
-    try:
-        rec = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return None
-    return rec if isinstance(rec, dict) else None
+        rec = json.loads(text)
+    except ValueError:
+        return None, LANE_INVALID
+    return (rec, "") if isinstance(rec, dict) else (None, LANE_INVALID)
 
 
 def _write_at(dfd: int, name: str, record: dict) -> None:
@@ -219,16 +214,14 @@ def _invalidate_at(dfd: int, name: str, instance: str) -> None:
     os.close(fd)
 
 
-def _valid_lane(rec: "dict | None", instance: str, now: float) -> "dict | None":
-    if not isinstance(rec, dict) or rec.get("instance") != (instance or "") or rec.get("retracted"):
+def _well_formed(rec: dict, instance: str) -> "tuple[dict, float] | None":
+    if rec.get("instance") != (instance or "") or rec.get("retracted"):
         return None
     pid, agent = rec.get("pid"), rec.get("agent_id")
     ts = bounded_number(rec.get("ts"), -_LANE_TS_MAX, _LANE_TS_MAX)
     if not isinstance(agent, str) or valid_pid(pid) is None or ts is None:
         return None
-    if not now - LANE_FRESH_S <= ts <= now + LANE_SKEW_S:
-        return None  # a drain that can no longer write cannot refresh it
-    return {**rec, "agent_id": agent.strip()}
+    return {**rec, "agent_id": agent.strip()}, ts
 
 
 def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None) -> dict:
@@ -265,7 +258,7 @@ def retract_lane(state_dir, instance: str, pid: "int | None" = None, ts: "float 
         try:
             with _lane_locked(dfd, instance):
                 if pid is not None:
-                    rec = _read_at(dfd, _lane_name(instance)) or {}
+                    rec = _read_at(dfd, _lane_name(instance))[0] or {}
                     if rec.get("instance") != (instance or "") or rec.get("pid") != pid \
                             or (ts is not None and rec.get("ts") != ts):
                         return
@@ -274,31 +267,41 @@ def retract_lane(state_dir, instance: str, pid: "int | None" = None, ts: "float 
             _close(dfd)
 
 
-def lane_record(state_dir, instance: str, now: "float | None" = None) -> "tuple[dict | None, bool]":
-    """(`published_lane_record`, unreadable): unreadable is True when the record could not be read,
-    which proves nothing about it, unlike an absent or invalid one."""
+def lane_state(state_dir, instance: str, now: "float | None" = None) -> "tuple[str, dict | None]":
+    """(state, record) of `instance`'s lane record, read under the lane lock. LANE_FRESH or
+    LANE_STALE (ts outside LANE_FRESH_S of `now`, or over LANE_SKEW_S ahead) carry the well-formed
+    record: agent_id a str, its instance, a valid_pid, a finite ts, not retracted. Otherwise None
+    with LANE_ABSENT (no file), LANE_INVALID (a file that is no such record: corrupt, a tombstone,
+    a symlink, not regular) or LANE_UNREADABLE (it could not be read, which proves nothing)."""
     if state_dir is None:
-        return None, False
+        return LANE_ABSENT, None
     try:
         dfd = _auth_dir(state_dir, create=False)
         if dfd is None:
-            return None, False
+            return LANE_ABSENT, None
         try:
             with _lane_locked(dfd, instance):
-                rec = _read_at(dfd, _lane_name(instance), strict=True)
+                rec, why = _read_at(dfd, _lane_name(instance))
         finally:
             _close(dfd)
     except OSError:
-        return None, True
-    return _valid_lane(rec, instance, time.time() if now is None else now), False
+        return LANE_UNREADABLE, None
+    if why:
+        return why, None
+    formed = _well_formed(rec, instance)
+    if formed is None:
+        return LANE_INVALID, None
+    rec, ts = formed
+    now = time.time() if now is None else now
+    # A drain that can no longer write cannot refresh it.
+    return (LANE_FRESH if now - LANE_FRESH_S <= ts <= now + LANE_SKEW_S else LANE_STALE), rec
 
 
 def published_lane_record(state_dir, instance: str, now: "float | None" = None) -> "dict | None":
-    """`instance`'s lane record, read under the lane lock, when well formed, not retracted, its own
-    (agent_id str, instance equal, a valid_pid) and fresh (a finite `ts` within LANE_FRESH_S of
-    `now`, at most LANE_SKEW_S ahead); None otherwise, including when it cannot be read. Whether
-    the pid is the live drain is the reader's check."""
-    return lane_record(state_dir, instance, now)[0]
+    """`instance`'s lane record when lane_state reads it LANE_FRESH, else None. Whether the pid is
+    the live drain is the reader's check."""
+    state, rec = lane_state(state_dir, instance, now)
+    return rec if state == LANE_FRESH else None
 
 
 def resolve(state_dir, channel_value, environ=None) -> str:

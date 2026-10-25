@@ -351,18 +351,17 @@ def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | No
     """The pid of the live, connected Sparrow that is not this package's drain: its own lane
     record lacks the send-lock protocol, or it has held its lock past LANE_GRACE_S with no lane
     record at all, as a drain from before lane records (the released main) does. None otherwise,
-    and when the record cannot be read."""
+    and when the record is invalid or cannot be read: neither proves the protocol is missing."""
     state, instance = _state_dir(cfg), _instance(cfg)
     holder = _cli._lock_record(state, instance)
     pid = _cli.live_lock_holder(holder)
     if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
-    rec, unreadable = agent_identity.lane_record(state, instance)
-    if unreadable:
-        # No proof the owner lacks the protocol: leave a healthy drain running.
-        print(f"lane record of Sparrow (pid {pid}) unreadable; not replacing it", file=sys.stderr)
+    lane, rec = agent_identity.lane_state(state, instance)
+    if lane in (agent_identity.LANE_INVALID, agent_identity.LANE_UNREADABLE):
+        print(f"lane record of Sparrow (pid {pid}) {lane}; not replacing it", file=sys.stderr)
         return None
-    if rec is not None and rec.get("pid") == pid:
+    if lane == agent_identity.LANE_FRESH and rec.get("pid") == pid:
         return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
     # This package's drain publishes its record on its first pass, every few seconds after.
     acquired = (holder or {}).get("acquired_at")

@@ -16,7 +16,7 @@ import stat
 import time
 from pathlib import Path
 
-from . import gateway_instance, local_task_protocol
+from . import bounded_file_read, gateway_instance, local_task_protocol
 from .persisted_number import bounded_number
 
 HOLD_DIR = ".task-holds"
@@ -77,21 +77,12 @@ def _open_dir(result_dir: Path, create: bool) -> "int | None":
 
 
 def _read_at(dfd: int, name: str) -> "dict | None":
-    try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-    except OSError:
+    text = bounded_file_read.read_regular(name, _MAX_BYTES, dir_fd=dfd, follow=False)[0]
+    if text is None:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
-        raw = os.read(fd, _MAX_BYTES + 1)
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
-    try:
-        record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
-    except (UnicodeDecodeError, ValueError):
+        record = json.loads(text, parse_constant=lambda c: None)
+    except ValueError:
         return None
     if not (isinstance(record, dict) and isinstance(record.get("reason"), str)
             and _REASON_RE.fullmatch(record["reason"]) and _valid_since(record.get("since"))

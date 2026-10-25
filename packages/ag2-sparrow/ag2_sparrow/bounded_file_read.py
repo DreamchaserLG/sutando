@@ -3,8 +3,9 @@
 A FIFO, device or directory named where a credential file is expected is refused before any read
 (opened non-blocking, then fstat), and a file over the size bound is refused too, so startup can
 never hang on a path someone pointed at the wrong thing. read_regular says why it refused, so a
-caller can name the refusal instead of treating it as absence. Stdlib only; vendored byte-identical
-into the ag2-sparrow package by tools/sync_from_src.py.
+caller can name the refusal instead of treating it as absence; `unreadable` tells a failed open or
+read from a refusal of what the file is. With `follow=False` a symlink is refused, not followed.
+Stdlib only; vendored byte-identical into the ag2-sparrow package by tools/sync_from_src.py.
 """
 from __future__ import annotations
 
@@ -17,14 +18,26 @@ MAX_BYTES = 1 << 20
 _ABSENT = (errno.ENOENT, errno.ENOTDIR)
 
 
-def read_regular(path: str, limit: int = MAX_BYTES) -> Tuple[Optional[str], str]:
-    """(text, "") when `path` was read; (None, "") when it does not exist; (None, reason) when it
-    exists but was refused: not a regular file, over `limit` bytes, unreadable or not UTF-8."""
+def unreadable(reason: str) -> bool:
+    """True for a refusal that says nothing about the file's content: its open or read failed."""
+    return reason.startswith("unreadable")
+
+
+def read_regular(path: str, limit: int = MAX_BYTES, dir_fd: Optional[int] = None,
+                 follow: bool = True) -> Tuple[Optional[str], str]:
+    """(text, "") when `path` (relative to `dir_fd` when given) was read; (None, "") when it does
+    not exist; (None, reason) when it exists but was refused: not a regular file, a symlink with
+    `follow=False`, over `limit` bytes, unreadable or not UTF-8."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, flags, dir_fd=dir_fd)
     except OSError as e:
         if e.errno in _ABSENT:
             return None, ""
+        if not follow and e.errno == errno.ELOOP:
+            return None, "a symlink"
         return None, f"unreadable ({errno.errorcode.get(e.errno, 'error')})"
     except (ValueError, TypeError):
         return None, "not a usable path"

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import contextlib
+import errno
 import io
 import textwrap
 import threading
@@ -35,7 +36,7 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 HATCH = PKG_ROOT / "ag2_sparrow" / "adapters" / "hatch"
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import agent_identity, delivery_destination, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_hold, task_io  # noqa: E402
+from ag2_sparrow import agent_identity, bounded_file_read, delivery_destination, gateway_credential_io, health_command as hc, holder_lock, outbox, service_manager as sm, task_hold, task_io  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers  # noqa: E402
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
     cli as hatch_cli, keepalive, runtime_text, task_fields)
@@ -2654,6 +2655,39 @@ class StartSparrow(Base):
         self.assertIsNone(old.poll(), "a drain is not replaced on a read error")
         self.assertIn("unreadable", r.stderr)
 
+    def test_keepawake_keeps_a_drain_whose_lane_record_is_invalid(self):
+        # A modern drain's corrupt record, failed-write tombstone or emptied one is no proof the
+        # live owner lacks the protocol, nor is a symlink or FIFO, whose open must not block.
+        lane = self.state / "auth" / "lane-identity.json"
+        target = self.home / "lane-target.json"
+        target.write_text("{}")
+        for kind, make in (("malformed", lambda: lane.write_text("{")),
+                           ("emptied", lambda: lane.write_text("")),
+                           ("tombstone", lambda: lane.write_text(
+                               json.dumps({"instance": "", "retracted": True}))),
+                           ("symlink", lambda: lane.symlink_to(target)),
+                           ("fifo", lambda: os.mkfifo(lane))):
+            with self.subTest(kind):
+                old = self.old_sparrow()
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                lane.unlink(missing_ok=True)
+                make()
+                want = keepalive.health_command(str(self.reply_stub))
+                out = {}
+                t = threading.Thread(target=lambda: out.update(
+                    r=self.keepawake({"REMOTE_HEALTH_COMMAND": want})), daemon=True)
+                t.start()
+                t.join(20)
+                self.assertFalse(t.is_alive(), "keepawake blocked on the lane record")
+                r, line = out["r"]
+                self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+                self.assertIsNone(old.poll(), "an invalid record replaces no drain")
+                self.assertIn("lane record of Sparrow", r.stderr)
+                self.assertIn("invalid; not replacing it", r.stderr)
+                old.kill()
+                old.wait(5)
+
     def test_keepawake_gives_a_just_started_sparrow_time_to_publish_its_lane(self):
         old = self.old_sparrow()
         self.acquired(old, 5)
@@ -4692,6 +4726,32 @@ class Hold(Base):
         self.assertIsInstance(raised, TimeoutError, repr(raised))
         self.assertLess(took, 0.5, "a resolver that outlasts the deadline is not waited for")
 
+    def test_connect_by_moves_past_an_address_family_this_host_cannot_open(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        import socket as sk
+        listener = sk.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        candidates = [(sk.AF_INET6, sk.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                      (sk.AF_INET, sk.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        real, families = sk.socket, []
+
+        def restricted(family=-1, *a, **k):
+            families.append(family)
+            if family == sk.AF_INET6:
+                raise OSError(errno.EAFNOSUPPORT, "Address family not supported")
+            return real(family, *a, **k)
+        socks = []
+        with mock.patch.object(gb.socket, "getaddrinfo", return_value=candidates), \
+                mock.patch.object(gb.socket, "socket", restricted):
+            made = gb._connect_by(("localhost", port), time.monotonic() + 5, 5, None, socks)
+        self.addCleanup(made.close)
+        self.assertEqual(families, [sk.AF_INET6, sk.AF_INET])
+        self.assertEqual(made.getpeername(), ("127.0.0.1", port))
+        self.assertEqual(socks, [made], "only a socket actually made is recorded")
+
     def test_connect_by_reports_each_way_a_connection_fails_or_is_made(self):
         import socket as sk
         from ag2_sparrow import remote_gateway_bridge as gb
@@ -4710,27 +4770,54 @@ class Hold(Base):
         self.addCleanup(made.close)
         self.assertEqual(socks, [made], "the socket is recorded for the deadline timer")
 
-    def test_an_unreadable_lane_record_is_distinct_from_a_missing_one(self):
+    def test_lane_state_tells_absent_invalid_unreadable_fresh_and_stale_apart(self):
+        ai = agent_identity
         state = self.home / "state"
-        self.assertEqual(agent_identity.lane_record(None, ""), (None, False))
-        self.assertEqual(agent_identity.lane_record(state, ""), (None, False), "no auth dir: missing")
+        self.assertEqual(ai.lane_state(None, ""), (ai.LANE_ABSENT, None))
+        self.assertEqual(ai.lane_state(state, ""), (ai.LANE_ABSENT, None), "no auth dir")
         auth = state / "auth"
         auth.mkdir(parents=True)
-        self.assertEqual(agent_identity.lane_record(state, ""), (None, False), "no file: missing")
-        agent_identity.publish_lane(state, "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
-        rec, unreadable = agent_identity.lane_record(state, "")
-        self.assertEqual((rec["agent_id"], unreadable), (AGENT, False))
+        self.assertEqual(ai.lane_state(state, ""), (ai.LANE_ABSENT, None), "no file")
+        lane = auth / "lane-identity.json"
+        for kind, text in (("malformed", "{"), ("emptied", ""), ("a list", "[]"),
+                           ("tombstone", json.dumps({"instance": "", "retracted": True})),
+                           ("not UTF-8", b"\xff"), ("oversized", " " * 5000 + "{}")):
+            with self.subTest(kind):
+                (lane.write_bytes if isinstance(text, bytes) else lane.write_text)(text)
+                self.assertEqual(ai.lane_state(state, ""), (ai.LANE_INVALID, None))
+                self.assertIsNone(ai.published_lane_record(state, ""))
+        rec = agent_identity.publish_lane(state, "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
+        st, got = ai.lane_state(state, "")
+        self.assertEqual((st, got["agent_id"]), (ai.LANE_FRESH, AGENT))
+        st, got = ai.lane_state(state, "", now=rec["ts"] + ai.LANE_FRESH_S + 1)
+        self.assertEqual((st, got["pid"]), (ai.LANE_STALE, os.getpid()))
+        self.assertIsNone(ai.published_lane_record(state, "", now=rec["ts"] + ai.LANE_FRESH_S + 1))
         real_open = os.open
 
         def denied(path, *a, **k):
             if path == "lane-identity.json":
                 raise PermissionError(13, "denied")
             return real_open(path, *a, **k)
-        with mock.patch.object(agent_identity.os, "open", denied):
-            self.assertEqual(agent_identity.lane_record(state, ""), (None, True), "open refused")
-            self.assertIsNone(agent_identity.published_lane_record(state, ""))
-        with mock.patch.object(agent_identity.os, "read", side_effect=OSError(5, "I/O error")):
-            self.assertEqual(agent_identity.lane_record(state, ""), (None, True), "read failed")
+        with mock.patch.object(bounded_file_read.os, "open", denied):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "open refused")
+            self.assertIsNone(ai.published_lane_record(state, ""))
+        with mock.patch.object(bounded_file_read.os, "read", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "read failed")
+        with mock.patch.object(ai, "_auth_dir", side_effect=OSError(5, "I/O error")):
+            self.assertEqual(ai.lane_state(state, ""), (ai.LANE_UNREADABLE, None), "dir failed")
+
+    def test_a_fifo_lane_record_is_refused_without_blocking_the_reader(self):
+        auth = self.home / "state" / "auth"
+        auth.mkdir(parents=True)
+        os.mkfifo(auth / "lane-identity.json")
+        out = []
+        t = threading.Thread(target=lambda: out.append((
+            agent_identity.lane_state(self.home / "state", ""),
+            agent_identity.published_lane_record(self.home / "state", ""))), daemon=True)
+        t.start()
+        t.join(2)
+        self.assertFalse(t.is_alive(), "the lane reader blocked on a FIFO")
+        self.assertEqual(out, [((agent_identity.LANE_INVALID, None), None)])
 
     def test_hold_that_cannot_take_the_send_lock_records_nothing(self):
         self.add_task(self.TID, "$ev1")
@@ -4800,7 +4887,62 @@ class Hold(Base):
             r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
         self.assertIn("drain changed", r.stderr)
+        self.assertIn("its line was withdrawn unsent", r.stderr)
         self.assertIsNone(task_hold.read(self.results, self.TID), "no marker without the fence")
+        self.assertFalse(self.notice.exists(), "the refused hold's line is not left queued")
+        self.assertFalse(task_hold.notice_marked(self.results, self.TID))
+        holder(os.getpid())
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(posts, [], "no successor posts the line of a refused hold")
+        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED,
+                         "a later hold queues the line afresh")
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1)
+
+    def test_a_refused_hold_whose_line_a_drain_already_claimed_says_it_may_post(self):
+        self.add_task(self.TID, "$ev1")
+        real = hatch_cli._publish_once
+        claim = self.notice.with_name(f"{self.notice.stem}.sending.{os.getppid()}")
+
+        def publish_then_claim(path, body):
+            done = real(path, body)
+            os.rename(path, claim)  # a drain that ignores the send lock took it at once
+            return done
+        swapped = iter([True, True])
+        with mock.patch.object(hatch_cli, "_publish_once", publish_then_claim), \
+                mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
+                    (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("already taken by the drain and may post", r.stderr)
+        self.assertTrue(task_hold.notice_marked(self.results, self.TID), "never queued twice")
+        self.assertIsNone(task_hold.read(self.results, self.TID))
+
+    def test_a_refused_hold_leaves_a_line_an_earlier_hold_queued(self):
+        self.add_task(self.TID, "$ev1")
+        task_hold.mark_notice(self.results, self.TID)
+        self.notice.write_text(self.line())
+        swapped = iter([True, True])
+        with mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
+                (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("drain changed while hold ran; no hold recorded", r.stderr)
+        self.assertEqual(self.notice.read_text(), self.line(), "not this run's line to take back")
+
+    def test_retire_line_takes_back_only_the_file_it_queued(self):
+        notice = self.results / "proactive-x.txt"
+        self.assertFalse(hatch_cli._retire_line(notice, 1), "nothing there to take back")
+        self.assertFalse(hatch_cli._retire_line(notice, None), "no inode: nothing proven ours")
+        notice.write_text("another line")
+        self.assertFalse(hatch_cli._retire_line(notice, hatch_cli._ino(notice) + 1))
+        self.assertEqual(notice.read_text(), "another line", "another file is put back")
+        mine = lambda: sorted(p.name for p in self.results.iterdir() if "proactive-x" in p.name)
+        self.assertEqual(mine(), ["proactive-x.txt"])
+        self.assertTrue(hatch_cli._retire_line(notice, hatch_cli._ino(notice)))
+        self.assertEqual(mine(), [])
+        self.assertIsNone(hatch_cli._ino(notice))
 
     def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
         import http.server
@@ -5327,6 +5469,18 @@ class TaskHold(unittest.TestCase):
             token = task_hold.place(self.results, "task-1784700000001")
         self.assertIsNotNone(token)
         self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_a_fifo_at_a_hold_marker_reads_as_no_hold_without_blocking(self):
+        tid = "task-1784700000002"
+        self.dir.mkdir()
+        os.mkfifo(self.dir / f"{tid}.json")
+        out = []
+        t = threading.Thread(target=lambda: out.append(task_hold.read(self.results, tid)),
+                             daemon=True)
+        t.start()
+        t.join(2)
+        self.assertFalse(t.is_alive(), "the hold reader blocked on a FIFO")
+        self.assertEqual(out, [None])
 
     def test_ids_that_could_leave_the_hold_dir_are_refused(self):
         bad = ("../escaped", "task-../../escaped", "../../task-1", "/tmp/task-1", "task-a/b",

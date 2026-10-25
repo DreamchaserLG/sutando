@@ -2815,9 +2815,11 @@ def _connect_by(addr, deadline: float, cap, source, socks) -> "socket.socket":
         raise found[0]
     err: "OSError | None" = None
     for family, kind, proto, _name, sa in found[0]:
-        sock = socket.socket(family, kind, proto)
-        socks.append(sock)
+        sock = None
         try:
+            # Inside the try: a family this host cannot open moves on to the next candidate.
+            sock = socket.socket(family, kind, proto)
+            socks.append(sock)
             sock.settimeout(_left(deadline, cap))
             if source:
                 sock.bind(source)
@@ -2825,7 +2827,8 @@ def _connect_by(addr, deadline: float, cap, source, socks) -> "socket.socket":
             return sock
         except OSError as e:
             err = e
-            sock.close()
+            if sock is not None:
+                sock.close()
             if isinstance(e, TimeoutError) and time.monotonic() >= deadline:
                 break
     raise err or OSError("no address to connect to")
