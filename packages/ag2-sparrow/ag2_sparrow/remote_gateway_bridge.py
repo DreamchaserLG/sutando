@@ -3855,12 +3855,17 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
                 last_ok = (json.load(f) or {}).get("last_ok_ts")
         except (FileNotFoundError, ValueError, OSError):
             last_ok = None
-        now = int(time.time())
+        written_at = time.time()
+        now = int(written_at)
         if poll_ok_ts is not None:
             last_ok = int(poll_ok_ts)
         payload = {
             "connected": bool(connected),
             "ts": now,
+            # Which process wrote it, and exactly when: a supervisor binds a restart's success to them.
+            "pid": os.getpid(),
+            "start": agent_identity.own_start(),
+            "written_at": written_at,
             "last_ok_ts": last_ok,
             "backoff_s": int(backoff_s),
             "error": _one_line(gateway_credentials.redact_text(error, URL)) if error else None,

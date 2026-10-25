@@ -2497,6 +2497,10 @@ class StartSparrow(Base):
     cli, state = Cli.cli, Cli.state
     crons = Keepalive.crons
     task = Keepalive.task
+    # The status identity the bridge's writer records: its pid, start and sub-second write time.
+    IDENT = ("import json, sys, time; sys.path.insert(0, sys.argv[2]); from ag2_sparrow.task_io import "
+             "start_time; p = int(sys.argv[1]); print(json.dumps({'pid': p, 'start': start_time(p), "
+             "'written_at': time.time()})[1:-1])")
 
     def setUp(self):
         super().setUp()
@@ -2510,7 +2514,8 @@ class StartSparrow(Base):
                    'mkdir -p "$AGENT_CONNECT_STATE_DIR/locks"\nnow=$(date +%s)\n'
                    f"printf '{lock}' $$ \"$(dirname \"$AGENT_CONNECT_STATE_DIR\")\" $now $now > "
                    '"$AGENT_CONNECT_STATE_DIR/locks/gateway-bridge.lock"\n'
-                   'printf \'{"connected": true, "ts": %s, "error": null}\' "$now" > '
+                   f'ident=$("{sys.executable}" -c {shlex.quote(self.IDENT)} $$ "{PKG_ROOT}")\n'
+                   'printf \'{"connected": true, "ts": %s, "error": null, %s}\' "$now" "$ident" > '
                    '"$AGENT_CONNECT_STATE_DIR/gateway-status.json"\nsleep 3\n')
         for name, value in (("SPAWN_SETTLE_S", 0.3), ("START_WAIT_S", 5.0), ("STOP_WAIT_S", 5.0)):
             p = mock.patch.object(keepalive, name, value)
@@ -2525,8 +2530,12 @@ class StartSparrow(Base):
             return self.starts.get(pid) or real_start(pid)
 
         def proc(pid, name):
-            if name == "cmdline" and pid in self.argvs and not Path("/proc").is_dir():
-                return b"\0".join(a.encode() for a in self.argvs[pid]) + b"\0"
+            if name == "cmdline" and not Path("/proc").is_dir():
+                if pid in self.argvs:
+                    return b"\0".join(a.encode() for a in self.argvs[pid]) + b"\0"
+                # No /proc: ps gives a spawned fixture's argv, split on spaces.
+                out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True).stdout
+                return b"\0".join(out.split()) + b"\0" if out.strip() else None
             return real_proc(pid, name)
         for target, attr, fn in ((agent_identity, "start_time", start), (task_io, "start_time", start),
                                  (keepalive, "_proc", proc)):
@@ -2753,6 +2762,134 @@ class StartSparrow(Base):
         self.assertIsNone(new.poll())
         self.done_with(old)
         self.done_with(new)
+
+    def rolling(self, roll, at_show=2, **kw):
+        """FakeSystemd that calls `roll` as it answers its `at_show`th `show`."""
+        fake = FakeSystemd(**kw)
+        real, shows = fake.__call__, []
+
+        def call(cmd):
+            if cmd[0] == "systemctl" and cmd[2:3] == ["show"]:
+                shows.append(cmd)
+                if len(shows) == at_show:
+                    roll(fake)
+            return real(cmd)
+        return fake, call, shows
+
+    def test_keepawake_restarts_nothing_when_the_generation_rolls_at_the_final_show(self):
+        # Reviewer's probe: the lock and/or unit roll to a current protocol-3 generation while
+        # the action's own unit read answers, after the last legacy proof.
+        for case in ("lock and unit", "lock only", "unit only"):
+            with self.subTest(case):
+                old, rec = self.legacy()
+                self.old_pid = old.pid
+                new = self.old_sparrow()
+                self.lock_path().write_text(json.dumps(rec))
+
+                def roll(fake, new=new, rec=rec, case=case):
+                    if case != "unit only":
+                        self.lock_path().write_text(json.dumps({
+                            **rec, "pid": new.pid, "send_lock": delivery_destination.SEND_LOCK_PROTOCOL,
+                            "start": task_io.start_time(new.pid), "acquired_at": int(time.time())}))
+                    if case != "lock only":
+                        fake.main_pid = new.pid
+                fake, call, shows = self.rolling(roll, state="active", main_pid=old.pid)
+                want = keepalive.health_command(str(self.reply_stub))
+                with self.service(fake), mock.patch.object(sm, "_run", side_effect=systemd_seam(call)), \
+                        mock.patch.object(keepalive, "_stop", wraps=keepalive._stop) as stop, \
+                        mock.patch.object(keepalive, "_spawn_sparrow", wraps=keepalive._spawn_sparrow) as spawn:
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertGreaterEqual(len(shows), 2, "the roll happened at the action's unit read")
+                self.assertEqual(fake.ran("restart"), [], "the current generation is not restarted")
+                self.assertEqual(fake.ran("reset-failed"), [], "nor reset")
+                stop.assert_not_called()
+                spawn.assert_not_called()
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertTrue(line.endswith(" listener=up restarted=0 reason=drain-predates-send-lock"), line)
+                self.assertIsNone(old.poll())
+                self.assertIsNone(new.poll())
+                self.done_with(old)
+                self.done_with(new)
+                (self.home / "keepalive-probe.log").unlink()
+
+    def keepawake_successor(self, successor, sync_second=False):
+        """keepawake against a legacy holder its unit runs, whose restart makes `successor(fake)`
+        the lock's and status's state; returns (result, log line)."""
+        old, _rec = self.legacy()
+        self.old_pid = old.pid
+        fake = FakeSystemd(state="active", main_pid=old.pid)
+
+        def restart(cmd):
+            fake.calls.append(cmd[1:])
+            old.terminate()
+            successor(fake, t0)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        self.cli("install", "--mxid", AGENT, "--no-service")
+        want = keepalive.health_command(str(self.reply_stub))
+        if sync_second:  # the action then falls in the same whole second as `t0`
+            time.sleep(1.02 - time.time() % 1)
+        t0 = time.time()
+        with self.service(fake, on_restart=restart), mock.patch.object(keepalive, "START_WAIT_S", 1.5), \
+                mock.patch.object(keepalive, "sparrow_env", return_value={"REMOTE_HEALTH_COMMAND": want}):
+            r = self.cli("keepalive", "keepawake")
+        self.done_with(old)
+        return r, (self.home / "keepalive-probe.log").read_text().strip()
+
+    def take_lock(self, pid, **declares):
+        now = int(time.time())
+        self.lock_path().write_text(json.dumps({
+            **declares, "role": "gateway-bridge", "workspace": str(self.state.parent), "pid": pid,
+            "host": hatch_cli.workspace_lock._host_label(), "acquired_at": now, "heartbeat_at": now,
+            "schema_version": 1}))
+
+    def connected_status(self, **fields):
+        (self.state / "gateway-status.json").write_text(json.dumps({"connected": True, "error": None, **fields}))
+
+    def test_keepawake_reports_no_success_from_a_non_sparrow_pid_and_a_same_second_status(self):
+        # Reviewer's /bin/sleep probe: a live non-Sparrow pid in the lock, and a connected status
+        # dated before the action in the action's own second, naming no process.
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(lambda: sleeper.poll() is None and sleeper.kill())
+
+        def successor(fake, t0):
+            self.take_lock(sleeper.pid)
+            self.connected_status(ts=int(t0))
+            fake.main_pid = sleeper.pid
+        r, line = self.keepawake_successor(successor, sync_second=True)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("now holds the lock and is connected", r.stdout)
+        self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
+
+    def test_keepawake_takes_success_only_from_the_lock_holders_own_status_after_the_action(self):
+        # Negative controls beside the probe; the legitimate successor is the positive one.
+        def sparrow_successor():
+            proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            self.addCleanup(lambda: proc.poll() is None and proc.kill())
+            self.argvs[proc.pid] = [sys.executable, str(self.bin / hatch_cli.SPARROW_COMMAND)]
+            return proc, task_io.start_time(proc.pid)
+        cases = {
+            "a status naming another process": lambda p, st: dict(pid=p + 1, start=st, written_at=time.time()),
+            "a status of a reused pid": lambda p, st: dict(pid=p, start="2001-01-01T00:00:00Z", written_at=time.time()),
+            "a status written before the action": lambda p, st: dict(pid=p, start=st, written_at=time.time() - 30),
+            "a status with whole-second time only": lambda p, st: dict(pid=p, start=st),
+            "a disconnected successor": lambda p, st: dict(pid=p, start=st, written_at=time.time(), connected=False),
+            "a legitimate successor": lambda p, st: dict(pid=p, start=st, written_at=time.time()),
+        }
+        for case, fields in cases.items():
+            with self.subTest(case):
+                def successor(fake, _t0, fields=fields):
+                    proc, st = sparrow_successor()
+                    self.take_lock(proc.pid, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, start=st)
+                    self.connected_status(ts=int(time.time()), **fields(proc.pid, st))
+                    fake.main_pid = proc.pid
+                r, line = self.keepawake_successor(successor)
+                (self.home / "keepalive-probe.log").unlink()
+                if case == "a legitimate successor":
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+                else:
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertTrue(line.endswith(" restarted=0 reason=drain-predates-send-lock"), line)
 
     def acquired(self, proc, ago):
         """Rewrite `proc`'s lock record as main's workspace_lock writes it, taken `ago` s back by
