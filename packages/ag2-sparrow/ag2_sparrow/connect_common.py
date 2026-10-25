@@ -17,6 +17,7 @@ none, so each adapter owns its console script and the boundary rule holds. Stdli
 from __future__ import annotations
 
 import fcntl
+import getpass
 import json
 import os
 import platform
@@ -33,6 +34,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -1063,18 +1065,67 @@ def _uninstall_locked(shape: Shape, before_free=None, token_file=None) -> int:
 CODE_PREFIX = "acp."        # what AG2 Space issues for an agent run by a local CLI
 REDEEM_PATH = "/connect/poll"
 REDEEM_TIMEOUT_S = 15
-REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 before the next attempt
+REDEEM_BACKOFF_S = (1, 2, 4, 8, 16)     # one wait per 503 or 202 before the next attempt
+RETRY_AFTER_MAX_S = 30
 STANDALONE_TIER = "owner"   # no core on the host to cap it (plan 9.2); the key is required
+LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
+GONE = {"agent_revoked": "the agent was removed in AG2 Space; add it again there for a new code"}
+
+
+def endpoint_problem(url: str, what: str) -> str:
+    """'' when `url` is https (plain http only on a loopback host, for tests), else why not."""
+    why = _sources.gateway_url_problem(url or "")
+    if why:
+        return f"{what} {why}"
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() != "https" and parts.hostname not in LOOPBACK_HOSTS:
+        return f"{what} is not https; only a loopback host may use plain http"
+    return ""
+
+
+def _host_family(host: str) -> str:
+    """The registrable part a backend and its relay share: the last two labels, or the host itself for an
+    IP address or a single-label name."""
+    labels = host.rstrip(".").lower().split(".")
+    return host.lower() if len(labels) < 3 or labels[-1].isdigit() or ":" in host else ".".join(labels[-2:])
+
+
+def relay_problem(base: str, relay_url: str, trusted_host: str = "") -> str:
+    """'' when the relay URL the backend returned may be written: https, and in the base's host family
+    unless the owner named its host with --trust-relay-host; else why not."""
+    why = endpoint_problem(relay_url, "the relay URL AG2 Space returned")
+    if why:
+        return why
+    host = (urllib.parse.urlsplit(relay_url).hostname or "").lower()
+    if _host_family(host) != _host_family(urllib.parse.urlsplit(base).hostname or "") and host != trusted_host.lower():
+        return (f"the relay URL AG2 Space returned is on {host}, outside {urllib.parse.urlsplit(base).hostname}'s "
+                f"domain; if that relay is expected, connect again with a new code and --trust-relay-host {host}")
+    return ""
 
 
 def code_problem(base: str, code: str) -> str:
     """'' when `base` is a usable backend URL and `code` an agent code, else why not, without the code."""
-    why = _sources.gateway_url_problem(base or "")
+    why = endpoint_problem(base, "--base")
     if why:
-        return f"--base {why}"
+        return why
     if not (code or "").startswith(CODE_PREFIX) or len(code) <= len(CODE_PREFIX) or any(c.isspace() for c in code):
-        return f"--code is not an agent code (it starts with {CODE_PREFIX}); copy it from AG2 Space again"
+        return f"the code is not an agent code (it starts with {CODE_PREFIX}); copy it from AG2 Space again"
     return ""
+
+
+def read_code(arg, stdin=None, prompt=None) -> "tuple[str, str]":
+    """(code, '') or ('', why): `--code -` reads one line from stdin, no --code prompts on a terminal, and a
+    code on the command line still works with a warning, since ps and shell history keep it."""
+    stdin = stdin or sys.stdin
+    if arg == "-":
+        return stdin.readline(4096).strip(), ""
+    if arg is None:
+        if not stdin.isatty():
+            return "", "no code: pass --code - and pipe the code in, or run connect in a terminal to be asked for it"
+        return (prompt or getpass.getpass)("AG2 Space code: ").strip(), ""
+    print("warning: a code on the command line is kept by ps and shell history; next time use --code - or the "
+          "prompt", file=sys.stderr)
+    return arg.strip(), ""
 
 
 def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
@@ -1085,12 +1136,31 @@ def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
             with (opener or urllib.request.urlopen)(req, timeout=REDEEM_TIMEOUT_S) as resp:
                 return resp.status, resp.read(64 * 1024)
         except urllib.error.HTTPError as e:
-            return e.code, b""
+            try:
+                return e.code, e.read(64 * 1024) or b""
+            except Exception:  # noqa: BLE001 - an unreadable error body is only an empty one
+                return e.code, b""
+
+
+def _answer(raw: bytes) -> dict:
+    try:
+        got = json.loads((raw or b"").decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _retry_after(answer: dict, default: float) -> float:
+    value = answer.get("retry_after")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return default
+    return min(max(float(value), 1.0), RETRY_AFTER_MAX_S)
 
 
 def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | None, str]":
     """({relay_url, bearer, agent_id}, '') or (None, why). The bearer and URL are registered as secrets
-    before this returns, so no later line can print them; a 503 is retried on REDEEM_BACKOFF_S."""
+    before this returns, so no later line can print them. A 503 or a 202 (still redeeming) is retried on
+    REDEEM_BACKOFF_S, a 202's retry_after honoured up to RETRY_AFTER_MAX_S."""
     sleep = sleep or time.sleep
     url = base.rstrip("/") + REDEEM_PATH
     for wait in (*REDEEM_BACKOFF_S, None):
@@ -1099,24 +1169,24 @@ def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | 
         except (urllib.error.URLError, OSError, ValueError) as e:
             return None, (f"could not reach {base} ({diagnostics.describe(e)}); the code is still valid until it "
                           "expires, try again")
-        if status == 503 and wait is not None:
-            sleep(wait)
+        answer = _answer(raw)
+        if status in (202, 503) and wait is not None:
+            sleep(_retry_after(answer, wait) if status == 202 else wait)
             continue
+        if status == 202:
+            return None, "AG2 Space is still redeeming the code; run connect again with the same code in a minute"
         if status == 503:
             return None, "AG2 Space is busy (HTTP 503 on every try); the code is still valid, try again in a minute"
         if status == 404:
-            return None, "the code was already used or has expired; make a new one in AG2 Space"
+            reason = next((answer[k] for k in ("error", "reason", "state") if isinstance(answer.get(k), str)), "")
+            return None, GONE.get(reason, "the code was already used or has expired; make a new one in AG2 Space")
         if status != 200:
             return None, f"AG2 Space refused the code (HTTP {status})"
-        try:
-            got = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            got = None
-        fields = {k: got.get(k) for k in ("relay_url", "bearer", "agent_id")} if isinstance(got, dict) else {}
-        for value in (fields.get("bearer"), fields.get("relay_url")):
+        fields = {k: answer.get(k) for k in ("relay_url", "bearer", "agent_id")}
+        for value in (fields["bearer"], fields["relay_url"]):
             if isinstance(value, str) and value:
                 diagnostics.register_secret(value)
-        if not all(isinstance(v, str) and v.strip() for v in fields.values()) or len(fields) != 3:
+        if not all(isinstance(v, str) and v.strip() for v in fields.values()):
             return None, "AG2 Space's answer had no relay_url, bearer or agent_id; the code is spent, make a new one"
         diagnostics.register_gateway_url(fields["relay_url"])
         return {k: v.strip() for k, v in fields.items()}, ""

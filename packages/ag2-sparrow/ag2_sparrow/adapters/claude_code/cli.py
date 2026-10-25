@@ -432,22 +432,26 @@ def connect_preflight(args) -> str:
 def connect(args) -> int:
     """Preflight, redeem the code, write the agent's seat beside its root, then install exactly as `install`
     does with the seat's .env as the token env file. The bearer goes only into the seat's token file."""
-    problem = cm.code_problem(args.base, args.code) or connect_preflight(args)
+    code, problem = cm.read_code(args.code)
+    problem = problem or cm.code_problem(args.base, code) or connect_preflight(args)
     if problem:
         print(f"error: {problem}; the code was not used", file=sys.stderr)
         return EXIT_UNUSABLE
-    redeemed, problem = cm.redeem_code(args.base, args.code)
+    redeemed, problem = cm.redeem_code(args.base, code)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    root, problem = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
+    problem = cm.relay_problem(args.base, redeemed["relay_url"], args.trust_relay_host or "")
+    root, problem = ("", problem) if problem else cm.canonical_root(
+        str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
     seat_env, problem = ("", problem) if problem else cm.write_seat(bridge_home(root), redeemed)
     if problem:
         print(f"error: the code is spent but the seat was not written: {problem}; make a new code", file=sys.stderr)
         return EXIT_UNUSABLE
     print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat_env).parent} (mode 600)")
     print(cm.served_setup_line(SETUP_VENDOR))
-    rc = install(argparse.Namespace(**vars(args), work=None, inbox=None, token_env_file=seat_env, bridge_state_dir=None))
+    session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
+    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat_env, bridge_state_dir=None))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     return rc
@@ -742,7 +746,10 @@ def main(argv=None) -> int:
     c = sub.add_parser("connect", help="check this machine, redeem the one-time code from AG2 Space for the agent's "
                        "relay credential, write it to the agent's seat (mode 600), then install as install does")
     c.add_argument("--base", required=True, help="the AG2 Space backend URL the code was issued by")
-    c.add_argument("--code", required=True, help="the one-time code from AG2 Space (starts with acp.)")
+    c.add_argument("--code", help="the one-time code from AG2 Space (starts with acp.): - reads it from stdin; "
+                   "omitted, connect asks for it. A code given here is kept by ps and shell history")
+    c.add_argument("--trust-relay-host", help="accept a relay URL on this host although it is outside --base's "
+                   "domain (only when AG2 Space told you to)")
     session_options(c)
     c.set_defaults(func=connect)
     run_help = (f"what the manager runs: the launcher of one tmux-hosted session; refused unless {cm.MANAGED_VAR}=1 "

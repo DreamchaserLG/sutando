@@ -343,7 +343,7 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url> --code acp.<code> --plugin-dir <dir>   # or, by hand:
+ag2-sparrow-claude-local connect --base <url> --plugin-dir <dir>   # asks for the code; or, by hand:
 ag2-sparrow-claude-local install \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
   --claude-config-dir <dir> \
@@ -358,14 +358,23 @@ ag2-sparrow-claude-local uninstall
 are the agent's whole setup:
 
 ```bash
-ag2-sparrow-claude-local connect --base <AG2 Space backend URL> --code acp.<code> \
+ag2-sparrow-claude-local connect --base <AG2 Space backend URL> \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox
+# asks for the acp.<code>; or pipe it in with --code - (e.g. pbpaste | ... --code -)
 ```
+
+The code is never needed on the command line, where ps and shell history
+would keep it: `connect` asks for it, or reads it from stdin with `--code -`.
+`--code <code>` still works and says so with a warning. `--base` and the relay
+URL the backend returns must be https (plain http only on a loopback host, for
+tests), and a relay outside `--base`'s domain is refused unless you name its
+host with `--trust-relay-host`; a refused relay URL is never written.
 
 `connect` first checks the CLI version, tmux, the plugin and the Claude login,
 so a machine that cannot run the agent never spends the single-use code. It
-then redeems the code (`POST <base>/connect/poll`, a 503 retried with backoff,
-a used or expired code refused with one line) for the agent's id and relay
+then redeems the code (`POST <base>/connect/poll`; a 503, or a 202 "still
+redeeming" with its `retry_after`, retried with backoff; a used, expired or
+revoked code refused with one line) for the agent's id and relay
 credential. The credential owner writes it to the agent's seat beside its root,
 `<root>.bridge/channels/ag2space/`: a `.env` (`AGENT_MXID`, a
 `GATEWAY_INSTANCE` minted once and kept across reconnects,

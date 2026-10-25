@@ -2183,8 +2183,11 @@ class Backend:
     def __call__(self, req, timeout=None):
         self.calls.append((req.full_url, json.loads(req.data.decode()), req.get_method()))
         status = self.statuses.pop(0) if self.statuses else 200
+        status, body = status if isinstance(status, tuple) else (status, {})
+        if status == 202:
+            return _Resp(202, json.dumps(body).encode())
         if status != 200:
-            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(b""))
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(json.dumps(body).encode()))
         return _Resp(200, json.dumps(self.answer).encode())
 
 
@@ -2192,16 +2195,17 @@ class ConnectCode(AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
 
-    def connect(self, backend, fake=None, *extra, sleeps=None):
+    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
         fake = fake or self.bridged()
-        argv = ["connect", "--base", BASE, "--code", CODE, "--plugin-dir", str(self.plugin), "--claude-config-dir",
+        argv = ["connect", "--base", base, *code_args, "--plugin-dir", str(self.plugin), "--claude-config-dir",
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
+        stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
                     cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(argv)
         return rc, out.getvalue(), err.getvalue()
 
@@ -2213,7 +2217,8 @@ class ConnectCode(AgentRootBase):
         backend = Backend()
         rc, out, err = self.connect(backend)
         self.assertEqual(rc, 0, err)
-        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")])
+        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")], "read from stdin")
+        self.assertNotIn("warning", err, "a code from stdin is not on the command line")
         seat = self.seat()
         self.assertEqual(sorted(p.name for p in seat.iterdir()), [".env", "token"])
         for name in (".env", "token"):
@@ -2264,6 +2269,73 @@ class ConnectCode(AgentRootBase):
         self.assertEqual((len(backend.calls), sleeps), (len(cm.REDEEM_BACKOFF_S) + 1, list(cm.REDEEM_BACKOFF_S)))
         self.assertIn("the code is still valid", err)
         self.assertFalse(self.seat().exists())
+
+    def test_a_code_on_the_command_line_still_works_but_warns(self):
+        rc, _out, err = self.connect(Backend(), None, "--code", CODE)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("warning: a code on the command line is kept by ps and shell history", err)
+
+    def test_no_code_prompts_on_a_terminal_and_is_refused_without_one(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        with mock.patch.object(cm.getpass, "getpass", return_value=CODE) as asked:
+            rc, _out, err = self.connect(Backend(), stdin=Tty(""), code_args=())
+        self.assertEqual((rc, asked.call_count), (0, 1), err)
+        backend = Backend()
+        rc, _out, err = self.connect(backend, stdin=io.StringIO(""), code_args=())
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("pass --code - and pipe the code in", err)
+        backend = Backend()
+        rc, _out, err = self.connect(backend, stdin=io.StringIO(""))
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("not an agent code", err, "an empty stdin is no code")
+
+    def test_a_plain_http_base_is_refused_unless_it_is_loopback(self):
+        backend = Backend()
+        rc, _out, err = self.connect(backend, base="http://backend.example/api")
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("--base is not https", err)
+        loop = Backend(answer={"relay_url": "http://127.0.0.1:9/relay", "bearer": BEARER, "agent_id": AGENT})
+        rc, _out, err = self.connect(loop, base="http://127.0.0.1:9/api")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_relay_url_that_is_plain_http_or_off_domain_is_never_written(self):
+        for relay, extra, why in (("http://relay.example/relay", (), "is not https"),
+                                  ("https://elsewhere.test/relay", (), "--trust-relay-host elsewhere.test")):
+            with self.subTest(relay=relay):
+                rc, _out, err = self.connect(Backend(answer={"relay_url": relay, "bearer": BEARER, "agent_id": AGENT}))
+                self.assertEqual(rc, cli.EXIT_UNUSABLE)
+                self.assertIn(why, err)
+                self.assertIn("the code is spent but the seat was not written", err)
+                self.assertFalse(self.seat().exists())
+                self.assertNotIn(BEARER, err)
+        rc, _out, err = self.connect(Backend(answer={"relay_url": "https://elsewhere.test/relay", "bearer": BEARER,
+                                                     "agent_id": AGENT}), None, "--trust-relay-host", "elsewhere.test")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.seat() / "token").read_text(), f"https://elsewhere.test/relay|{BEARER}\n")
+
+    def test_a_202_still_redeeming_is_retried_honouring_retry_after(self):
+        sleeps = []
+        backend = Backend((202, {"state": "redeeming", "retry_after": 3}), (202, {"state": "redeeming"}))
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((len(backend.calls), sleeps), (3, [3.0, 2]), "retry_after, then the backoff")
+        sleeps = []
+        backend = Backend(*[(202, {"state": "redeeming", "retry_after": 999})] * 10)
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(sleeps, [cm.RETRY_AFTER_MAX_S] * len(cm.REDEEM_BACKOFF_S), "capped")
+        self.assertIn("still redeeming the code; run connect again with the same code", err)
+
+    def test_a_404_names_why_the_code_is_gone(self):
+        for body, why in (({"error": "gone"}, "already used or has expired; make a new one"),
+                          ({"error": "agent_revoked"}, "the agent was removed in AG2 Space; add it again"),
+                          ({}, "already used or has expired")):
+            with self.subTest(body=body):
+                rc, _out, err = self.connect(Backend((404, body)))
+                self.assertEqual(rc, cli.EXIT_UNUSABLE)
+                self.assertIn(why, err)
 
     def assert_code_unspent(self, backend, rc, err):
         self.assertEqual(rc, cli.EXIT_UNUSABLE)
