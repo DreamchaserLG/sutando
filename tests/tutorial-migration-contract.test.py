@@ -6,7 +6,9 @@
   and a cleanup by it under the lock keeps a deployed writer out, where a prefix cleanup does not.
 - Conversion inputs: every record the deployed writer leaves is one row of the conversion matrix.
 - The M3 gap: with the v1 path absent and no fence yet, a rolled-back writer rewrites its page, and
-  only the v1 inode (not its digest) shows it."""
+  only the v1 inode (not its digest) shows it.
+- The recovery table (§12): every state a crash or an I/O fault at any M-step can leave, from a legacy
+  source or from none, continues to the fence; a non-regular v1 path, or a later v1 write, refuses."""
 from __future__ import annotations
 
 import fcntl
@@ -16,6 +18,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import textwrap
@@ -42,6 +45,14 @@ def litter(directory: Path) -> set:
             if p.name != LOCK and LITTER.fullmatch(p.name) and p.is_file() and not p.is_symlink()}
 
 
+def revalidates(v1: Path, backup: Path, source: str) -> bool:
+    """§12's check before every M3 unlink, per lstat: both regular, one inode, both hashing to the source."""
+    a, b = os.lstat(v1), os.lstat(backup)
+    regular = stat.S_ISREG(a.st_mode) and stat.S_ISREG(b.st_mode)
+    same = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+    return regular and same and all(hashlib.sha256(p.read_bytes()).hexdigest() == source for p in (v1, backup))
+
+
 def prefix_litter(directory: Path) -> set:
     """The cleanup the review warns about: everything under the deployed temp prefix."""
     return {p.name for p in directory.iterdir() if p.name.startswith(".getting-started.") and p.is_file()}
@@ -61,6 +72,53 @@ HANG = textwrap.dedent('''
         time.sleep(300)
 ''')
 CREATE_FAILS = "        if os.environ.get('STUB_CREATE_FAIL'): raise RuntimeError('create lost')\n"
+
+# §12's recovery table: (v2 phase, source kind, v1 path, backup) -> action. v1 "same" is a regular
+# file of the backup's inode, "foreign" any other regular file; backup "ok" hashes to the source.
+RECOVERY = {
+    ("absent", None, "foreign", "absent"): "M1",
+    ("absent", None, "same", "ok"): "M2 legacy",
+    ("absent", None, "absent", "absent"): "M2 none",
+    ("converted", "legacy", "same", "ok"): "M3 unlink",
+    ("converted", "legacy", "absent", "ok"): "M3 mkdir",
+    ("converted", "legacy", "dir", "ok"): "M4",
+    ("converted", "none", "absent", "absent"): "M3 mkdir",
+    ("converted", "none", "dir", "absent"): "M4",
+    ("fenced", "legacy", "dir", "ok"): "normal",
+    ("fenced", "none", "dir", "absent"): "normal",
+    ("fenced", "legacy", "absent", "ok"): "M3 mkdir",
+    ("fenced", "none", "absent", "absent"): "M3 mkdir",
+}
+SPACE = [(v2, src, v1, bak) for v2 in ("absent", "converted", "fenced", "invalid")
+         for src in ((None,) if v2 in ("absent", "invalid") else ("legacy", "none"))
+         for v1 in ("absent", "same", "foreign", "dir", "symlink", "fifo", "socket")
+         for bak in ("absent", "ok", "bad", "symlink") if not (v1 == "same" and bak in ("absent", "symlink"))]
+
+
+def recover(state: tuple, table: dict = RECOVERY) -> str:
+    return table.get(state, "refuse")
+
+
+def step(state: tuple, action: str) -> tuple:
+    """The state one M-step leaves when it lands."""
+    v2, src, v1, bak = state
+    return {"M1": ("absent", None, "same", "ok"), "M2 legacy": ("converted", "legacy", v1, bak),
+            "M2 none": ("converted", "none", v1, bak), "M3 unlink": (v2, src, "absent", bak),
+            "M3 mkdir": (v2, src, "dir", bak), "M4": ("fenced", src, v1, bak)}[action]
+
+
+def reachable(start: tuple, table: dict = RECOVERY) -> set:
+    """Every state a crash, or an I/O fault that may or may not have landed, can leave at any boundary."""
+    seen, todo = set(), [start]
+    while todo:
+        state = todo.pop()
+        if state in seen:
+            continue
+        seen.add(state)
+        action = recover(state, table)
+        if action not in ("normal", "refuse"):
+            todo.append(step(state, action))
+    return seen
 
 
 class MigrationContractTest(unittest.TestCase):
@@ -200,6 +258,51 @@ class MigrationContractTest(unittest.TestCase):
         # inode, a new one from os.replace, tells the next v2 start that a deployed run wrote here.
         self.assertTrue(v1.is_file())
         self.assertFalse(os.path.samefile(v1, directory / "getting-started.v1.bak"))
+
+
+    def test_every_crash_state_of_either_source_continues_to_the_fence(self):
+        legacy, clean = ("absent", None, "foreign", "absent"), ("absent", None, "absent", "absent")
+        for start, end in ((legacy, ("fenced", "legacy", "dir", "ok")), (clean, ("fenced", "none", "dir", "absent"))):
+            states = reachable(start)
+            self.assertEqual([s for s in states if recover(s) == "refuse"], [], start)
+            self.assertEqual({s for s in states if recover(s) == "normal"}, {end})
+        self.assertIn(("converted", "none", "absent", "absent"), reachable(clean), "the clean M2-crash state")
+        # Revision 7 keyed every converted row on a backup: a clean first use wedged after M2.
+        r7 = {k: v for k, v in RECOVERY.items() if k[1] != "none"}
+        r7[("absent", None, "absent", "absent")] = "M2 none"
+        self.assertIn(("converted", "none", "absent", "absent"), [s for s in reachable(clean, r7)
+                                                                  if recover(s, r7) == "refuse"])
+
+    def test_a_non_regular_v1_path_or_a_later_v1_write_refuses_in_every_phase(self):
+        for state in SPACE:
+            v2, src, v1, bak = state
+            if v1 in ("symlink", "fifo", "socket") or bak == "symlink" or v2 == "invalid":
+                self.assertEqual(recover(state), "refuse", state)
+            if v1 == "foreign" and v2 != "absent":
+                self.assertEqual(recover(state), "refuse", state)
+        self.assertEqual(set(RECOVERY) - set(SPACE), set(), "a row outside the state space")
+
+    def test_a_deployed_save_of_identical_bytes_is_caught_by_the_inode_alone(self):
+        ws = self.tmp / "ws"
+        self.seed(ws)
+        directory = ws / "state" / "tutorial"
+        v1, backup = directory / "getting-started.json", directory / "getting-started.v1.bak"
+        source = hashlib.sha256(v1.read_bytes()).hexdigest()
+        os.link(v1, backup)
+        self.assertTrue(revalidates(v1, backup, source))
+        resave = ("import importlib.util, sys\nfrom pathlib import Path\n"
+                  "spec = importlib.util.spec_from_file_location('deployed', sys.argv[1])\n"
+                  "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+                  "m.save_marker(Path(sys.argv[2]), m.load_marker(Path(sys.argv[2])))\n")
+        subprocess.run([sys.executable, "-c", resave, str(self.script), str(v1)], env=self.env(),
+                       check=True, capture_output=True, timeout=60)
+        self.assertEqual(v1.read_bytes(), backup.read_bytes(), "the deployed save is byte-identical")
+        self.assertFalse(revalidates(v1, backup, source), "only the inode shows the write")
+        os.unlink(v1)
+        os.link(backup, v1)
+        with open(v1, "r+b") as fh:
+            fh.write(b" ")
+        self.assertFalse(revalidates(v1, backup, source), "same inode, other bytes")
 
 
 if __name__ == "__main__":
