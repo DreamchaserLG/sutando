@@ -343,6 +343,7 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
+ag2-sparrow-claude-local connect --base <url> --code acp.<code> --plugin-dir <dir>   # or, by hand:
 ag2-sparrow-claude-local install \
   --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox \
   --claude-config-dir <dir> \
@@ -352,6 +353,28 @@ ag2-sparrow-claude-local attach          # the live pane; detach with the tmux p
 ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on this machine
 ag2-sparrow-claude-local uninstall
 ```
+
+**Connect with a code.** On a host with no core, the two steps AG2 Space shows
+are the agent's whole setup:
+
+```bash
+ag2-sparrow-claude-local connect --base <AG2 Space backend URL> --code acp.<code> \
+  --plugin-dir packages/ag2-sparrow/adapters/claude-code/ag2space-inbox
+```
+
+`connect` first checks the CLI version, tmux, the plugin and the Claude login,
+so a machine that cannot run the agent never spends the single-use code. It
+then redeems the code (`POST <base>/connect/poll`, a 503 retried with backoff,
+a used or expired code refused with one line) for the agent's id and relay
+credential. The credential owner writes it to the agent's seat beside its root,
+`<root>.bridge/channels/ag2space/`: a `.env` (`AGENT_MXID`, a
+`GATEWAY_INSTANCE` minted once and kept across reconnects,
+`REMOTE_TASK_TOKEN_FILE`, `REMOTE_TASK_TIER=owner`) and a `token` file, both
+mode 600. The bearer is never printed and never on a command line. `connect`
+then runs install with `--token-env-file` set to that `.env`, so the bridge runs
+as that seat alone. A new code (AG2 Space's Reconnect) rewrites `token` in place.
+On a host whose bridges a supervisor runs (Sutando's), `connect` refuses: the
+worker pool owns the seats there.
 
 **The agent's root and its bridge.** One bridge serves one agent (its relay
 token), so each agent gets its own root and its own bridge. With no `--work`,

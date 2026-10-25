@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import functools
 import hashlib
 import hmac
 import io
@@ -26,6 +27,8 @@ import tempfile
 import time
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -2147,6 +2150,171 @@ class AgentRootBase(ConnectBase):
 
     def cfg(self):
         return cli.read_config(cli.config_path())
+
+
+
+BASE = "https://backend.example/api"
+CODE = "acp.code-MMMM3333"
+BEARER = "redeemed-bearer-NNNN4444"
+RELAY = "https://relay.example/relay"
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        return self.body
+
+
+class Backend:
+    """The E2 redemption endpoint: a list of statuses answered in order, then 200 with the credential."""
+
+    def __init__(self, *statuses, answer=None):
+        self.statuses, self.calls = list(statuses), []
+        self.answer = {"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT} if answer is None else answer
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req.full_url, json.loads(req.data.decode()), req.get_method()))
+        status = self.statuses.pop(0) if self.statuses else 200
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(b""))
+        return _Resp(200, json.dumps(self.answer).encode())
+
+
+class ConnectCode(AgentRootBase):
+    """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
+    owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
+
+    def connect(self, backend, fake=None, *extra, sleeps=None):
+        fake = fake or self.bridged()
+        argv = ["connect", "--base", BASE, "--code", CODE, "--plugin-dir", str(self.plugin), "--claude-config-dir",
+                str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
+                mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
+                    cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def seat(self):
+        return cli.bridge_home(self.root) / "channels" / "ag2space"
+
+    def test_a_code_is_redeemed_once_and_the_seat_feeds_the_installed_bridge(self):
+        self.relay.unlink()     # a fresh host: no device env, nothing but the code
+        backend = Backend()
+        rc, out, err = self.connect(backend)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")])
+        seat = self.seat()
+        self.assertEqual(sorted(p.name for p in seat.iterdir()), [".env", "token"])
+        for name in (".env", "token"):
+            self.assertEqual(stat.S_IMODE((seat / name).stat().st_mode), 0o600, name)
+        self.assertEqual((seat / "token").read_text(), f"{RELAY}|{BEARER}\n")
+        values = dict(ln.split("=", 1) for ln in (seat / ".env").read_text().splitlines())
+        self.assertEqual((values["AGENT_MXID"], values["REMOTE_TASK_TIER"], values["REMOTE_TASK_TOKEN_FILE"]),
+                         (AGENT, "owner", str(seat / "token")))
+        self.assertRegex(values["GATEWAY_INSTANCE"], r"^[0-9a-f]{32}$")
+        cfg = self.cfg()
+        self.assertEqual((cfg["ROOT"], cfg["TOKEN_ENV_FILE"], cfg["AGENT_ID"]), (str(self.root), str(seat / ".env"), AGENT))
+        unit = cm.service_path(cli.BRIDGE).read_text()
+        self.assertIn('Environment="REMOTE_TASK_SEAT=1"\n', unit)
+        self.assertIn(f'Environment="REMOTE_TASK_TOKEN_FILE={seat / "token"}"\n', unit)
+        self.assertIn("setup: built-in", out)
+        for text in (out, err, unit, cli.config_path().read_text(), (seat / ".env").read_text()):
+            self.assertNotIn(BEARER, text)
+
+    def test_the_instance_is_minted_once_and_kept_across_a_reconnect(self):
+        fake = self.bridged()
+        self.assertEqual(self.connect(Backend(), fake)[0], 0)
+        first = (self.seat() / ".env").read_text()
+        rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        rc, _out, err = self.connect(rotated, fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.seat() / ".env").read_text(), first, "same instance, same seat")
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
+
+    def test_a_used_or_expired_code_says_make_a_new_one_and_writes_nothing(self):
+        rc, _out, err = self.connect(Backend(404))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn("already used or has expired; make a new one in AG2 Space", err)
+        self.assertFalse(self.seat().exists())
+        self.assertFalse(cli.config_path().exists())
+
+    def test_a_503_is_retried_with_backoff_then_redeemed(self):
+        sleeps = []
+        backend = Backend(503, 503)
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((len(backend.calls), sleeps), (3, [1, 2]))
+
+    def test_a_backend_that_stays_503_gives_up_and_the_code_is_still_valid(self):
+        sleeps = []
+        backend = Backend(*[503] * 10)
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual((len(backend.calls), sleeps), (len(cm.REDEEM_BACKOFF_S) + 1, list(cm.REDEEM_BACKOFF_S)))
+        self.assertIn("the code is still valid", err)
+        self.assertFalse(self.seat().exists())
+
+    def assert_code_unspent(self, backend, rc, err):
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(backend.calls, [], "the backend is never asked")
+        self.assertIn("the code was not used", err)
+        self.assertFalse(self.seat().exists())
+
+    def test_a_logged_out_claude_never_spends_the_code(self):
+        (self.home / "claude-auth").write_text('{"loggedIn": false}')
+        backend = Backend()
+        rc, _out, err = self.connect(backend)
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("not logged in", err)
+
+    def test_a_missing_tmux_or_plugin_never_spends_the_code(self):
+        with mock.patch.object(launcher, "tmux_version", return_value=None):
+            backend = Backend()
+            rc, _out, err = self.connect(backend)
+            self.assert_code_unspent(backend, rc, err)
+        (self.plugin / ".claude-plugin" / "plugin.json").unlink()
+        backend = Backend()
+        rc, _out, err = self.connect(backend)
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("not a Claude Code plugin", err)
+
+    def test_a_host_with_a_core_is_refused_before_the_code_is_spent(self):
+        backend = Backend()
+        with mock.patch.object(_dirs, "bridge_host", return_value="sparrowd"):
+            rc, _out, err = self.connect(backend)
+        self.assert_code_unspent(backend, rc, err)
+
+    def test_a_malformed_code_or_base_is_refused_before_anything_runs(self):
+        for extra in (("--code", "web.code-1"), ("--base", "ftp://backend.example")):
+            with self.subTest(extra=extra):
+                backend = Backend()
+                rc, _out, err = self.connect(backend, None, *extra)
+                self.assertEqual((rc, backend.calls), (cli.EXIT_UNUSABLE, []))
+
+    def test_the_bearer_is_never_in_argv_of_any_command_connect_runs(self):
+        fake = self.bridged()
+        seen = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **kw):
+            seen.append(list(cmd))
+            return real_run(cmd, *a, **kw)
+        with mock.patch.object(subprocess, "run", side_effect=spy):
+            rc, _out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, 0, err)
+        for cmd in seen + fake.calls + [c for r in self.runners for c in r.calls]:
+            self.assertNotIn(BEARER, " ".join(map(str, cmd)))
 
 
 class ConnectAgentRoot(AgentRootBase):
