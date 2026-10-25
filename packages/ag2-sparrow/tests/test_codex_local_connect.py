@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import io
 import json
 import os
@@ -20,6 +21,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -33,7 +36,8 @@ isolate_os_environ()
 import fcntl  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
-from ag2_sparrow import connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
+from ag2_sparrow import gateway_credential_sources as _sources  # noqa: E402
 from ag2_sparrow.adapters.codex import codex_connector as cc, connect_cli as cli  # noqa: E402
 
 STUB = Path(cc.__file__).with_name("stub_app_server.py")
@@ -849,6 +853,310 @@ class FakeCodexWrapper(unittest.TestCase):
             r = subprocess.run([str(codex), "--version"], capture_output=True, text=True,
                                env={"PATH": "/usr/bin:/bin", "HOME": str(home)}, cwd=d)
             self.assertEqual((r.returncode, r.stdout), (0, "codex-cli 0.160.1\n"), r.stderr)
+
+
+AGENT = "@probe.agent:ag2.space"
+BASE = "https://backend.example/api"
+CODE = "acp.code-MMMM3333"
+BEARER = "redeemed-bearer-NNNN4444"
+RELAY = "https://relay.backend.example/relay"  # on a host under BASE's
+B = cli.BRIDGE
+
+
+class _Resp:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, n=-1):
+        return self.body
+
+
+class Backend:
+    """The redemption endpoint: the statuses answered in order, then 200 with the credential."""
+
+    def __init__(self, *statuses, answer=None):
+        self.statuses, self.calls = list(statuses), []
+        self.answer = {"relay_url": RELAY, "bearer": BEARER, "agent_id": AGENT} if answer is None else answer
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req.full_url, json.loads(req.data.decode()), req.get_method()))
+        status = self.statuses.pop(0) if self.statuses else 200
+        status, body = status if isinstance(status, tuple) else (status, {})
+        if status == 202:
+            return _Resp(202, json.dumps(body).encode())
+        if status != 200:
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(json.dumps(body).encode()))
+        return _Resp(200, json.dumps(self.answer).encode())
+
+
+class BridgeFake:
+    """The agent bridge's own manager state: commands naming its unit or label answer here, the rest go to
+    the launcher's `runner`."""
+
+    def __init__(self, runner):
+        self.runner, self.calls, self.active, self.enabled, self.registered = runner, [], False, False, False
+
+    def __call__(self, cmd, timeout=30):
+        if not any(B.service_name in a or B.agent_label in a for a in cmd):
+            return self.runner(cmd, timeout)
+        self.calls.append(list(cmd))
+        verb = cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
+        out = ""
+        if verb == "show":
+            loaded = cm.service_path(B).exists() or self.registered
+            words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
+                     "UnitFileState": "enabled" if self.enabled else "disabled"}
+            out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
+        elif verb in ("enable", "disable"):
+            self.enabled = verb == "enable"
+        elif verb in ("restart", "bootstrap"):
+            self.active = self.registered = True
+        elif verb in ("stop", "bootout"):
+            self.active = False
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+
+class ConnectCode(Base):
+    """`connect --base --code`: connect_bridge's preflight, redemption and seat, then install with the seat,
+    which wires the agent's bridge from the same launch env as claude-local's."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.home / ".ag2-sparrow" / "agents" / "probe.agent_ag2.space"
+        os.environ["AGENT_CONNECT_STATE_DIR"] = str(self.home / "host-state")   # served_elsewhere's, not the host's
+        scripts = mock.patch.object(cm, "console_script", side_effect=lambda shape: str(self.bin / shape.command))
+        scripts.start()
+        self.addCleanup(scripts.stop)
+
+    def fake(self):
+        r = Runner(None, 0, str(self.root))
+        self.runners.append(r)
+        return BridgeFake(r)
+
+    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
+        fake = fake or self.fake()
+        argv = ["connect", "--base", base, *code_args, "--codex-home", str(self.codex_home), *extra]
+        out, err = io.StringIO(), io.StringIO()
+        stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
+        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
+                mock.patch.object(cm, "redeem_code", side_effect=functools.partial(
+                    cm.redeem_code, sleep=lambda s: (sleeps if sleeps is not None else []).append(s))), \
+                mock.patch.object(sys, "stdin", stdin), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def seat(self):
+        return cb.bridge_home(self.root) / "channels" / "ag2space"
+
+    def assert_code_unspent(self, backend, rc, err):
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(backend.calls, [], "the backend is never asked")
+        self.assertIn("the code was not used", err)
+        self.assertFalse(self.seat().exists())
+        self.assertFalse(cli.config_path().exists())
+
+    def bearer_files(self):
+        found = []
+        for path in self.home.rglob("*"):
+            if path.is_file() and not path.is_symlink() and BEARER.encode() in path.read_bytes():
+                found.append(path)
+        return found
+
+    def test_a_code_is_redeemed_once_and_the_seat_feeds_the_bridge_install_wires(self):
+        self.relay.unlink()     # a fresh host: nothing but the code
+        backend = Backend()
+        rc, out, err = self.connect(backend)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(backend.calls, [(BASE + "/connect/poll", {"device_code": CODE}, "POST")])
+        self.assertNotIn("warning", err)
+        seat = self.seat()
+        self.assertEqual(sorted(p.name for p in seat.iterdir()), [".env", "token"])
+        for name in (".env", "token"):
+            self.assertEqual(stat.S_IMODE((seat / name).stat().st_mode), 0o600, name)
+        self.assertEqual((seat / "token").read_text(), f"{RELAY}|{BEARER}\n")
+        values = dict(ln.split("=", 1) for ln in (seat / ".env").read_text().splitlines())
+        self.assertEqual((values["AGENT_MXID"], values["REMOTE_TASK_TIER"], values["REMOTE_TASK_TOKEN_FILE"]),
+                         (AGENT, "owner", str(seat / "token")))
+        self.assertRegex(values["GATEWAY_INSTANCE"], r"^[0-9a-f]{32}$")
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual((cfg["ROOT"], cfg["TOKEN_ENV_FILE"], cfg["AGENT_ID"], cfg["BRIDGE"], cfg["INBOX_DIR"]),
+                         (str(self.root), str(seat / ".env"), AGENT, cb.UNIT, str(self.root / "tasks")))
+        unit = cm.service_path(B).read_text()
+        self.assertTrue(unit.startswith("# Written by ag2-sparrow-codex-local install"))
+        self.assertIn(f"ExecStart={self.bin / 'ag2-sparrow'}\n", unit)
+        for line in ("REMOTE_TASK_SEAT=1", f"REMOTE_TASK_TOKEN_FILE={seat / 'token'}", f"AGENT_MXID={AGENT}",
+                     f"AGENT_CONNECT_TASK_DIR={self.root}/tasks", f"AGENT_CONNECT_RESULT_DIR={self.root}/results",
+                     f"AGENT_CONNECT_STATE_DIR={self.root}.bridge/state"):
+            self.assertIn(f'Environment="{line}"\n', unit)
+        self.assertEqual(unit, cm.render_supervisor(B, cb.launch_env(dict(cfg))[0])[0], "connect_bridge's launch env")
+        self.assertIn("the managed launcher acquired the expected root", out)
+        self.assertIn(f"started: {B.service_name}", out)
+        self.assertIn("setup: built-in", out)
+        self.assertNotIn(BEARER, out + err)
+        self.assertEqual(self.bearer_files(), [seat / "token"], "the bearer is in the seat's token file and nowhere else")
+
+    def test_the_instance_is_minted_once_and_kept_across_a_reconnect(self):
+        fake = self.fake()
+        self.assertEqual(self.connect(Backend(), fake)[0], 0)
+        first = (self.seat() / ".env").read_text()
+        rotated = Backend(answer={"relay_url": RELAY, "bearer": "rotated-bearer-OOOO5555", "agent_id": AGENT})
+        rc, _out, err = self.connect(rotated, fake)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.seat() / ".env").read_text(), first)
+        self.assertEqual((self.seat() / "token").read_text(), f"{RELAY}|rotated-bearer-OOOO5555\n")
+
+    def test_a_404_says_why_the_code_is_gone_and_writes_nothing(self):
+        for body, why in (({"error": "gone"}, "already used or has expired; make a new one in AG2 Space"),
+                          ({"error": "agent_revoked"}, "the agent was removed in AG2 Space; add it again"),
+                          ({}, "already used or has expired")):
+            with self.subTest(body=body):
+                rc, _out, err = self.connect(Backend((404, body)))
+                self.assertEqual(rc, cli.EXIT_UNUSABLE)
+                self.assertIn(why, err)
+                self.assertFalse(self.seat().exists())
+                self.assertFalse(cli.config_path().exists())
+
+    def test_503_and_202_are_retried_then_given_up_with_the_code_still_valid(self):
+        sleeps = []
+        backend = Backend(503, (202, {"state": "redeeming", "retry_after": 3}))
+        rc, _out, err = self.connect(backend, sleeps=sleeps)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((len(backend.calls), sleeps), (3, [1, 3.0]))
+        sleeps = []
+        rc, _out, err = self.connect(Backend(*[503] * 10), sleeps=sleeps)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertEqual(sleeps, list(cm.REDEEM_BACKOFF_S))
+        self.assertIn("the code is still valid", err)
+        rc, _out, err = self.connect(Backend(*[(202, {"retry_after": 999})] * 10), sleeps=[])
+        self.assertIn("still redeeming the code; run connect again with the same code", err)
+        self.assertFalse(self.seat().exists())
+
+    def test_the_code_from_stdin_a_prompt_or_argv_with_a_warning(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        backend = Backend()
+        rc, _out, err = self.connect(backend, stdin=io.StringIO(""), code_args=())
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("pass --code - and pipe the code in", err)
+        with mock.patch.object(cm.getpass, "getpass", return_value=CODE) as asked:
+            rc, _out, err = self.connect(Backend(), stdin=Tty(""), code_args=())
+        self.assertEqual((rc, asked.call_count), (0, 1), err)
+        rc, _out, err = self.connect(Backend(), None, code_args=("--code", CODE))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("warning: a code on the command line is kept by ps and shell history", err)
+
+    def test_an_http_base_or_a_malformed_code_is_refused_before_anything_runs(self):
+        for kw in ({"base": "http://backend.example/api"}, {"base": "ftp://backend.example"},
+                   {"code_args": ("--code", "web.code-1")}):
+            with self.subTest(kw=kw):
+                backend = Backend()
+                rc, _out, err = self.connect(backend, **kw)
+                self.assert_code_unspent(backend, rc, err)
+        loop = Backend(answer={"relay_url": "http://127.0.0.1:9/relay", "bearer": BEARER, "agent_id": AGENT})
+        rc, _out, err = self.connect(loop, base="http://127.0.0.1:9/api")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_relay_url_that_is_http_or_off_host_is_never_written(self):
+        for relay, why in (("http://relay.backend.example/relay", "is not https"),
+                           ("https://backend.example.co.uk/relay", "--trust-relay-host backend.example.co.uk"),
+                           ("https://elsewhere.test/relay", "--trust-relay-host elsewhere.test")):
+            with self.subTest(relay=relay):
+                rc, _out, err = self.connect(Backend(answer={"relay_url": relay, "bearer": BEARER, "agent_id": AGENT}))
+                self.assertEqual(rc, cli.EXIT_UNUSABLE)
+                self.assertIn(why, err)
+                self.assertIn("the code is spent but the seat was not written", err)
+                self.assertFalse(self.seat().exists())
+                self.assertNotIn(BEARER, err)
+        rc, _out, err = self.connect(Backend(answer={"relay_url": "https://elsewhere.test/relay", "bearer": BEARER,
+                                                     "agent_id": AGENT}), None, "--trust-relay-host", "elsewhere.test")
+        self.assertEqual(rc, 0, err)
+
+    def test_every_preflight_refusal_leaves_the_code_unspent(self):
+        cases = (("logged out", lambda: (self.home / "codex-login-rc").write_text("1"), "not logged in under CODEX_HOME"),
+                 ("too old", lambda: (self.home / "codex-version").write_text("0.157.0"), "older than the 0.160.1"),
+                 ("no codex", lambda: self.codex.unlink(), "codex"),
+                 ("task dir set", lambda: os.environ.__setitem__("AGENT_CONNECT_TASK_DIR", str(self.home / "q")),
+                  "AGENT_CONNECT_TASK_DIR is set"))
+        for name, arrange, why in cases:
+            with self.subTest(name), mock.patch.dict(os.environ):
+                arrange()
+                backend = Backend()
+                rc, _out, err = self.connect(backend)
+                self.assert_code_unspent(backend, rc, err)
+                self.assertIn(why, err)
+            for f in ("codex-login-rc", "codex-version"):
+                (self.home / f).unlink(missing_ok=True)
+            write_fake_codex(self.bin / "codex")
+        backend = Backend()
+        with mock.patch.object(_dirs, "bridge_host", return_value="sparrowd"):
+            rc, _out, err = self.connect(backend)
+        self.assert_code_unspent(backend, rc, err)
+        self.assertIn("whose worker pool owns each agent's seat", err)
+
+    def test_the_bearer_is_never_in_argv_of_any_command_connect_runs(self):
+        fake = self.fake()
+        seen = []
+        real_run = subprocess.run
+
+        def spy(cmd, *a, **kw):
+            seen.append(list(cmd))
+            return real_run(cmd, *a, **kw)
+        with mock.patch.object(subprocess, "run", side_effect=spy):
+            rc, _out, err = self.connect(Backend(), fake)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(seen, "the preflight ran codex")
+        for cmd in seen + fake.calls + fake.runner.calls:
+            self.assertNotIn(BEARER, " ".join(map(str, cmd)))
+
+    def test_verify_and_uninstall_cover_the_wired_bridge(self):
+        fake = self.fake()
+        self.assertEqual(self.connect(Backend(), fake)[0], 0)
+        with mock.patch.object(sm, "_run", side_effect=fake):
+            rc, out, _err = self.main("verify")
+        self.assertEqual(self.checks(out)["bridge unit"], "PASS")
+        self.assertEqual(self.checks(out)["relay token"], "PASS")
+        self.assertIn("FAIL bridge: no bridge wrote a status under", out, "no live bridge here")
+        with mock.patch.object(sm, "_run", side_effect=fake):
+            rc, out, err = self.main("uninstall")
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"removed: {cm.service_path(B)}", out)
+        self.assertFalse(cm.service_path(B).exists())
+        self.assertIn(f"kept: {self.seat() / '.env'}", out)
+        self.assertTrue((self.seat() / "token").exists(), "the credential is kept")
+
+
+class InstallTokenEnvFile(Base):
+    """install --token-env-file: the agent's own root, its bridge wired by connect_bridge."""
+
+    def test_work_and_token_env_file_are_one_or_the_other(self):
+        seat = self.home / "seat.env"
+        seat.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\nAGENT_MXID={AGENT}\n")
+        rc, _out, err = self.main("install", "--work", str(self.work), "--token-env-file", str(seat))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn("with --work your bridge has its own", err)
+        rc, _out, err = self.main("install")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn("pass --work <dir>", err)
+        self.assertFalse(cli.config_path().exists())
+
+    def test_a_seat_naming_another_agent_is_refused_before_anything_is_written(self):
+        seat = cb.bridge_home(self.home / "x")
+        self.assertEqual(_sources.write_seat_credentials(
+            seat, agent_id=AGENT, instance="a" * 32, tier="owner", relay_url=RELAY, bearer=BEARER), "")
+        env = Path(_sources.seat_channel_dir(seat)) / ".env"
+        with mock.patch.object(cb, "install_identity", return_value="@other:ag2.space"):
+            rc, _out, err = self.main("install", "--token-env-file", str(env))
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"names {AGENT}, not @other:ag2.space", err)
+        self.assertFalse(cli.config_path().exists())
 
 
 if __name__ == "__main__":

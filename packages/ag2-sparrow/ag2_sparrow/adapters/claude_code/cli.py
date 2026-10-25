@@ -17,8 +17,6 @@ card. The relay token stays in Sparrow's env file, the Claude login in its confi
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 import re
 import shutil
@@ -28,8 +26,10 @@ import time
 import uuid
 from pathlib import Path
 
-from ... import _dirs, agent_identity, connect_common as cm, gateway_credential_sources as _sources, task_io
-from ...bounded_file_read import read_regular
+from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ...connect_bridge import (DECLARATION, EXTERNAL, STATUS_MAX_AGE_S, UNIT, bridge_env, bridge_home,  # noqa: F401
+                               bridge_mode, bridge_state, install_identity, kept_token, seat_env, served_elsewhere,
+                               statuses, url_vault_key, vault_key, worker_name)
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, _v  # noqa: F401
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, launcher, trust
@@ -39,12 +39,8 @@ SHAPE, COMMAND, MIN_CLI = LOCAL.name, LOCAL.command, LOCAL.min_version
 MARKER, PLIST_MARKER, SERVICE_NAME, AGENT_LABEL = LOCAL.marker, LOCAL.plist_marker, LOCAL.service_name, LOCAL.agent_label
 ENV_KEEP = LOCAL.env_keep
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-# Who runs the agent's bridge: this install's own unit, a host supervisor from a declaration, or
-# whoever already did (an explicit root); a config without BRIDGE predates the choice: external.
-UNIT, EXTERNAL = "unit", "external"
-STATUS_MAX_AGE_S = 180
-DECLARATION = "worker.json"
 SETUP_VENDOR = "claude"     # the served setup list this adapter follows: acp.claude
+PLUGIN = Path(__file__).resolve().with_name("ag2space-inbox")      # package data, shipped in the wheel
 
 
 def config_path() -> Path:
@@ -106,204 +102,22 @@ def mint_session_id() -> str:
     return str(uuid.uuid4())
 
 
-# ── the agent and its bridge ─────────────────────────────────────────────────
-
-def bridge_mode(cfg: dict) -> str:
-    return cfg.get("BRIDGE") or EXTERNAL
-
-
-def bridge_home(root) -> Path:
-    """Beside the root, never in it: the bridge's state and lock workspace, one per agent."""
-    return Path(str(root) + ".bridge")
-
-
-def bridge_state(cfg: dict) -> Path:
-    """The state dir of the bridge that feeds this root, as install recorded it (BRIDGE_STATE_DIR: the
-    bridge's own beside the root, or --bridge-state-dir for a bridge you run). A config from before the
-    key names its HITL store's, as install then derived it; one naming neither, the dir beside the root."""
-    if cfg.get("BRIDGE_STATE_DIR"):
-        return Path(cfg["BRIDGE_STATE_DIR"])
-    if cfg.get("HITL_STORE"):
-        return Path(cfg["HITL_STORE"]).parent.parent
-    return bridge_home(cm.work_root(cfg)) / "state"
-
-
-def worker_name(segment: str) -> str:
-    """The supervisor's worker name: a plain name, distinct per segment by its digest."""
-    readable = re.sub(r"[^a-z0-9-]", "-", segment)[:40].strip("-") or "agent"
-    return f"bridge-{readable}-{hashlib.sha256(segment.encode('utf-8')).hexdigest()[:8]}"
-
-
-def vault_key(segment: str) -> str:
-    return "AG2_RELAY_TOKEN_" + worker_name(segment).upper().replace("-", "_")
-
-
-def url_vault_key(segment: str) -> str:
-    """Where the owner stores the agent's gateway URL for a token that is a bare secret."""
-    return "AG2_RELAY_URL_" + worker_name(segment).upper().replace("-", "_")
-
-
-def bridge_env(root, agent_id: str, token_file: str = "", state=None) -> dict:
-    """What the agent's bridge runs with: exactly this root's tasks/ and results/, its own state beside it
-    (`state`: the dir the config records, so the unit, verify and the card store name one dir)."""
-    env = {"AGENT_CONNECT_TASK_DIR": os.path.join(root, "tasks"), "AGENT_CONNECT_RESULT_DIR": os.path.join(root, "results"),
-           "AGENT_CONNECT_STATE_DIR": str(state or bridge_home(root) / "state"), "AGENT_MXID": agent_id}
-    if token_file:
-        env["AG2_DEVICE_ENV"] = token_file
-    return env
-
-
-def seat_env(token_file: str, agent_id: str) -> "tuple[dict, str]":
-    """(the seat's launch variables, '') when `token_file` is a seat .env, ({}, '') when it is none, or
-    ({}, why): the credential owner exports the seat and clears what the bridge would inherit."""
-    if not token_file:
-        return {}, ""
-    seat, problem = _sources.seat_bridge_environ(token_file, read_regular)
-    if not problem and seat and seat["AGENT_MXID"] != agent_id:
-        problem = f"the seat .env {token_file} names {seat['AGENT_MXID']}, not {agent_id}"
-    return ({}, problem) if problem else (seat, "")
-
-
-def install_identity(token_file: str, host_binding: bool) -> str:
-    """The agent id by the bridge's own chain over the token file it will run with; the host's binding
-    counts only when that file is the host's own device env."""
-    files = agent_identity.env_files([token_file]) if token_file else []
-    return agent_identity.resolve(_dirs.state_dir() if host_binding else None,
-                                  lambda key: agent_identity.file_value(files, key))
-
-
-def statuses(state_dir: Path, now=None) -> list:
-    """[(path, record)] for each gateway status under `state_dir` written in the last STATUS_MAX_AGE_S."""
-    out, now = [], time.time() if now is None else now
-    for path in sorted(Path(state_dir).glob("gateway-status*.json"))[:32]:
-        try:
-            rec = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(rec, dict) and 0 <= now - float(rec["ts"]) <= STATUS_MAX_AGE_S:
-                out.append((path, rec))
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return out
-
-
-def served_elsewhere(agent_id: str, root: str) -> str:
-    """'' unless a running bridge of the host already serves `agent_id` from another inbox: one token
-    polled by two bridges splits the agent's tasks between them."""
-    tasks = os.path.realpath(os.path.join(root, "tasks"))
-    for path, rec in statuses(_dirs.state_dir()):
-        if rec.get("agent_id") == agent_id and rec.get("tasks_dir") != tasks:
-            return (f"a running bridge already serves {agent_id} ({path}); one token is one bridge: stop that "
-                    f"bridge, or give this session another agent")
-    return ""
-
+# ── the agent and its bridge: connect_bridge's, as one owner ─────────────────
 
 def bridge_fix(cfg: dict) -> str:
-    root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    if mode == UNIT:
-        return f"see {cm.launcher_log(BRIDGE)}, or run {COMMAND} install again"
-    if mode != EXTERNAL:
-        return (f"{mode} runs {bridge_home(root) / DECLARATION} on its next scan of the declarations: start it if it "
-                f"is not running (src/sparrowd.py), with the token in the vault under {cfg.get('TOKEN_VAULT_KEY')}")
-    return (f"start the bridge with AGENT_CONNECT_TASK_DIR={root}/tasks AGENT_CONNECT_RESULT_DIR={root}/results "
-            f"AGENT_CONNECT_STATE_DIR={bridge_state(cfg)}")
+    return cb.bridge_fix(cfg, COMMAND, BRIDGE)
 
 
 def bridge_problem(cfg: dict, now=None) -> str:
-    """'' when a running, connected bridge of this agent writes exactly this root's tasks and results."""
-    root, state = cm.work_root(cfg), bridge_state(cfg)
-    tasks, results = (os.path.realpath(os.path.join(root, d)) for d in ("tasks", "results"))
-    fresh = statuses(state, now)
-    serving = [(p, r) for p, r in fresh if r.get("tasks_dir") == tasks]
-    if not serving:
-        seen = ", ".join(sorted({str(r.get("tasks_dir") or "an unreported inbox") for _, r in fresh}))
-        why = (f"the running bridge feeds {seen}, not {tasks}" if fresh else
-               f"no bridge wrote a status under {state} in the last {STATUS_MAX_AGE_S} s")
-        return f"{why}; {bridge_fix(cfg)}"
-    path, rec = serving[0]
-    if rec.get("results_dir") != results:
-        return f"{path}: results go to {rec.get('results_dir')}, not {results}; {bridge_fix(cfg)}"
-    if not rec.get("connected"):
-        return f"{path}: the bridge runs but is not connected ({rec.get('error') or 'no error given'})"
-    if cfg.get("AGENT_ID") and rec.get("agent_id") and rec["agent_id"] != cfg["AGENT_ID"]:
-        return f"{path}: the bridge serves {rec['agent_id']}, not {cfg['AGENT_ID']}; {bridge_fix(cfg)}"
-    return ""
+    return cb.bridge_problem(cfg, COMMAND, BRIDGE, now)
 
 
 def wire_bridge(cfg: dict) -> str:
-    """After the launcher's install: the agent's bridge pointed at this root, as its own unit or as a
-    declaration the host's supervisor runs. '' or why not."""
-    root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    env = bridge_env(root, cfg["AGENT_ID"], cfg.get("TOKEN_ENV_FILE", ""), bridge_state(cfg))
-    seat, problem = seat_env(cfg.get("TOKEN_ENV_FILE", ""), cfg["AGENT_ID"])
-    if problem:
-        return problem
-    env.update(seat)
-    bridge_state(cfg).mkdir(parents=True, exist_ok=True)
-    if mode != UNIT:
-        path = bridge_home(root) / DECLARATION
-        name = worker_name(Path(root).name)
-        problem = _sources.write_bridge_declaration(
-            path, written_by=f"{COMMAND} install", host=mode, name=name, module="ag2_sparrow.remote_gateway_bridge",
-            env=env, token_vault_key=cfg["TOKEN_VAULT_KEY"])
-        if problem:
-            return problem
-        print(f"declared: {path} ({mode} runs it as worker {name} on its next scan; the token is read from "
-              f"the vault: vault set {cfg['TOKEN_VAULT_KEY']} <the agent's relay token>)")
-        print(f"if that token is a bare secret, not https://<gateway>|<secret>, also: vault set "
-              f"{url_vault_key(Path(root).name)} <the agent's gateway URL>")
-        return ""
-    sup = cm.supervisor_path(BRIDGE)
-    text, problem = cm.owned_text(sup, cm.supervisor_marker(BRIDGE), "supervisor file")
-    if problem:
-        return problem
-    unit, problem = cm.render_supervisor(BRIDGE, env)
-    if problem:
-        return problem
-    state = cm.manager_state(BRIDGE)
-    if state == "unknown":
-        return f"{cm.job_name(BRIDGE)}'s state is unknown"
-    if text is not None or state != "absent":
-        problem = cm.stop_supervisor(BRIDGE)
-        if problem:
-            return problem
-    cm._write(sup, unit, 0o644)
-    print(f"installed: {sup}")
-    problem = cm.start_supervisor(BRIDGE)
-    if problem:
-        return problem
-    print(f"started: {cm.job_name(BRIDGE)}, feeding {root}/tasks as {cfg['AGENT_ID']}")
-    return ""
+    return cb.wire_bridge(cfg, COMMAND, BRIDGE)
 
 
 def unwire_bridge(cfg: dict) -> str:
-    """uninstall: the marked bridge unit stopped and removed, or the marked declaration removed; the
-    bridge's state beside the root is kept. '' or why not."""
-    root, mode = cm.work_root(cfg), bridge_mode(cfg)
-    if mode == EXTERNAL:
-        return ""
-    if mode != UNIT:
-        path = bridge_home(root) / DECLARATION
-        removed, problem = _sources.remove_bridge_declaration(path, written_by=f"{COMMAND} install")
-        if problem:
-            return problem
-        if removed:
-            print(f"removed: {path}")
-        return ""
-    sup = cm.supervisor_path(BRIDGE)
-    text, problem = cm.owned_text(sup, cm.supervisor_marker(BRIDGE), "supervisor file")
-    if problem:
-        return problem
-    state = cm.manager_state(BRIDGE)
-    if state == "unknown":
-        return f"{cm.job_name(BRIDGE)}'s state is unknown"
-    if text is not None or state != "absent":
-        problem = cm.stop_supervisor(BRIDGE)
-        if problem:
-            return problem
-        print(f"stopped: {cm.job_name(BRIDGE)}")
-    if text is not None:
-        sup.unlink()
-        print(f"removed: {sup}")
-    return ""
+    return cb.unwire_bridge(cfg, COMMAND, BRIDGE)
 
 
 def resolve_root(args) -> "tuple[dict, str]":
@@ -329,8 +143,7 @@ def resolve_root(args) -> "tuple[dict, str]":
         where = f"in {token_file} or the environment" if token_file else "in the environment"
         return {}, (f"the agent id is unknown, so its root cannot be named: bind the agent first, or set AGENT_MXID "
                     f"{where}, or pass --work <dir>")
-    root, problem = cm.canonical_root(str(_dirs.agents_dir() / agent_identity.root_segment(agent_id)), "")
-    problem = problem or served_elsewhere(agent_id, root)
+    root, problem = cb.agent_root(agent_id)
     if not problem and mode == UNIT and not os.path.isfile(token_file):
         problem = (f"{token_file} is missing: put the agent's REMOTE_TASK_TOKEN there (mode 600), or pass "
                    "--token-env-file")
@@ -345,7 +158,7 @@ def install(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    plugin = Path(args.plugin_dir).expanduser().resolve()
+    plugin = plugin_dir(args)
     if not (plugin / ".claude-plugin" / "plugin.json").is_file():
         print(f"error: {plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -412,15 +225,18 @@ def install(args) -> int:
     return 0
 
 
+def plugin_dir(args) -> Path:
+    """--plugin-dir when given, else the ag2space-inbox plugin this package ships."""
+    return Path(args.plugin_dir).expanduser().resolve() if args.plugin_dir else PLUGIN
+
+
 def connect_preflight(args) -> str:
     """'' when this host can run the agent, checked before the single-use code is spent; else why not."""
-    if _dirs.bridge_host():
-        return (f"this host's bridges are run by {_dirs.bridge_host()}, whose worker pool owns each agent's seat; "
-                f"{COMMAND} connect is for a host with no core")
-    if _dirs.task_dir_configured():
-        return "AGENT_CONNECT_TASK_DIR is set; connect wires the agent's own root, so unset it first"
+    problem = cb.host_problem(COMMAND)
+    if problem:
+        return problem
     claude = shutil.which(args.claude) or args.claude
-    plugin = Path(args.plugin_dir).expanduser().resolve()
+    plugin = plugin_dir(args)
     if not (plugin / ".claude-plugin" / "plugin.json").is_file():
         return f"{plugin} is not a Claude Code plugin (no .claude-plugin/plugin.json)"
     login = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": str(Path(args.claude_config_dir).expanduser()
@@ -430,28 +246,16 @@ def connect_preflight(args) -> str:
 
 
 def connect(args) -> int:
-    """Preflight, redeem the code, write the agent's seat beside its root, then install exactly as `install`
-    does with the seat's .env as the token env file. The bearer goes only into the seat's token file."""
-    code, problem = cm.read_code(args.code)
-    problem = problem or cm.code_problem(args.base, code) or connect_preflight(args)
-    if problem:
-        print(f"error: {problem}; the code was not used", file=sys.stderr)
-        return EXIT_UNUSABLE
-    redeemed, problem = cm.redeem_code(args.base, code)
+    """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
+    exactly as `install` does with the seat's .env as the token env file."""
+    seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    problem = cm.relay_problem(args.base, redeemed["relay_url"], args.trust_relay_host or "")
-    root, problem = ("", problem) if problem else cm.canonical_root(
-        str(_dirs.agents_dir() / agent_identity.root_segment(redeemed["agent_id"])), "")
-    seat_env, problem = ("", problem) if problem else cm.write_seat(bridge_home(root), redeemed)
-    if problem:
-        print(f"error: the code is spent but the seat was not written: {problem}; make a new code", file=sys.stderr)
-        return EXIT_UNUSABLE
-    print(f"connected: {redeemed['agent_id']}; credentials in {Path(seat_env).parent} (mode 600)")
     print(cm.served_setup_line(SETUP_VENDOR))
     session = {k: v for k, v in vars(args).items() if k not in ("code", "trust_relay_host")}
-    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat_env, bridge_state_dir=None))
+    rc = install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+                                    bridge_state_dir=None))
     if rc == 0:
         print(f"next: {COMMAND} verify (the bridge reports connected within a minute)")
     return rc
@@ -579,7 +383,7 @@ def verify(_args) -> int:
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
     print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
                                       if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
-    root, mode = cm.work_root(cfg), bridge_mode(cfg)
+    root = cm.work_root(cfg)
     if cfg.get("BRIDGE_STATE_DIR"):
         want = card.store_root(bridge_state(cfg))
         cm.check(results, cfg.get("HITL_STORE") == str(want), "hitl store",
@@ -593,18 +397,8 @@ def verify(_args) -> int:
     problem = bridge_problem(cfg)
     cm.check(results, not problem, "bridge", problem or f"a connected bridge feeds {root}/tasks and {root}/results")
 
-    def relay(results_):
-        if mode == UNIT:
-            cm.relay_check(results_, Path(cfg["TOKEN_ENV_FILE"]))
-            sup = cm.supervisor_path(BRIDGE)
-            text, problem_ = cm.supervisor_text(sup)
-            cm.check(results_, text is not None and cm.marked(text, cm.supervisor_marker(BRIDGE)), "bridge unit",
-                     problem_ or (f"{sup} missing; run {COMMAND} install" if text is None else
-                                  f"{sup} ({cm.job_name(BRIDGE)} {cm.manager_state(BRIDGE)})"))
-        elif mode != EXTERNAL:
-            print(f"INFO relay token: the vault key {cfg.get('TOKEN_VAULT_KEY')}, read by {mode} at start; "
-                  f"declared in {bridge_home(root) / DECLARATION}")
-    cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line, relay=relay)
+    cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line,
+                   relay=lambda results_: cb.relay_rows(results_, cfg, COMMAND, BRIDGE))
     print(f"INFO session id: {cfg['SESSION_ID']}")
     print(f"INFO folder trust: {trust_line(cfg, root)}")
     alarm = records.read_progress_alarm(config_dir())
@@ -662,12 +456,6 @@ def _stop_and_unregister(cfg: dict) -> str:
     return problem
 
 
-def kept_token(cfg: dict):
-    """The token file uninstall names as kept: the agent's own, none under a vault, else the host's."""
-    mode = bridge_mode(cfg)
-    return cfg.get("TOKEN_ENV_FILE", "") if mode == UNIT else None if mode == EXTERNAL else ""
-
-
 def uninstall(_args) -> int:
     return cm.uninstall(LOCAL, before_free=_stop_and_unregister, token_file=kept_token)
 
@@ -708,7 +496,8 @@ def hold_cmd(args) -> int:
 
 def session_options(p) -> None:
     """The session's options, shared by install and connect."""
-    p.add_argument("--plugin-dir", required=True, help="the ag2space-inbox plugin directory from the repo")
+    p.add_argument("--plugin-dir", help="an ag2space-inbox plugin directory to use instead of the one this package "
+                   "ships")
     p.add_argument("--claude-config-dir", help="CLAUDE_CONFIG_DIR holding the login the session uses (default: "
                    "the CLI's own)")
     p.add_argument("--hmac-key-file", help="the task-envelope key Sutando stamps with (AG2_HMAC_KEY_FILE)")

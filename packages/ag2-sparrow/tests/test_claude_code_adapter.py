@@ -47,7 +47,7 @@ from ag2_sparrow.team_result_guard import resolve_access_tier  # noqa: E402
 from ag2_sparrow import task_io  # noqa: E402
 
 ADAPTER = PKG / "adapters" / "claude-code"
-MOD = ADAPTER / "ag2space-inbox"
+MOD = PKG / "ag2_sparrow" / "adapters" / "claude_code" / "ag2space-inbox"
 REGISTER = MOD / "hooks" / "register.ts"
 SRC = PKG.parents[1] / "src"
 HOST_PATH_RE = re.compile(r"/Users/|/home/[a-z]|/private/tmp|~/\.claude|~/\.sutando")
@@ -87,7 +87,7 @@ class PluginShape(unittest.TestCase):
             self.assertIn(name, src)
 
     def test_no_hardcoded_host_paths_in_added_files(self):
-        for path in sorted(p for p in ADAPTER.rglob("*") if p.is_file()):
+        for path in sorted(p for p in (*ADAPTER.rglob("*"), *MOD.rglob("*")) if p.is_file()):
             self.assertIsNone(HOST_PATH_RE.search(path.read_text(errors="replace")), path)
 
     def test_mod_tests_exist_for_the_claude_harness_and_ci_runs_them(self):
@@ -2195,9 +2195,11 @@ class ConnectCode(AgentRootBase):
     """`connect --base --code`: preflight before the code is spent, one redemption, the seat written by its
     owner, then install's own path with the seat's .env; the bearer never in argv, output, unit or config."""
 
-    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-")):
+    def connect(self, backend, fake=None, *extra, sleeps=None, stdin=None, base=BASE, code_args=("--code", "-"),
+                plugin=True):
         fake = fake or self.bridged()
-        argv = ["connect", "--base", base, *code_args, "--plugin-dir", str(self.plugin), "--claude-config-dir",
+        argv = ["connect", "--base", base, *code_args, *(("--plugin-dir", str(self.plugin)) if plugin else ()),
+                "--claude-config-dir",
                 str(self.home / ".claude-sutando"), "--hmac-key-file", str(self.home / "task-hmac.key"), *extra]
         out, err = io.StringIO(), io.StringIO()
         stdin = io.StringIO(CODE + "\n") if stdin is None else stdin
@@ -2236,6 +2238,12 @@ class ConnectCode(AgentRootBase):
         self.assertIn("setup: built-in", out)
         for text in (out, err, unit, cli.config_path().read_text(), (seat / ".env").read_text()):
             self.assertNotIn(BEARER, text)
+
+    def test_without_plugin_dir_the_shipped_plugin_is_used(self):
+        self.assertTrue((cli.PLUGIN / ".claude-plugin" / "plugin.json").is_file())
+        rc, _out, err = self.connect(Backend(), plugin=False)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.cfg()["PLUGIN_DIR"], str(cli.PLUGIN))
 
     def test_the_instance_is_minted_once_and_kept_across_a_reconnect(self):
         fake = self.bridged()
