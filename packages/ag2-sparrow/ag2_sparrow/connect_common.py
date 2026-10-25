@@ -37,7 +37,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import _dirs, diagnostics, gateway_credential_sources as _sources, service_manager as _sm, setup_fetch, task_io
+from . import _dirs, diagnostics, gateway_credential_sources as _sources, gateway_instance, service_manager as _sm
+from . import setup_fetch, task_io
 from .bounded_file_read import read_regular
 from .task_io import LockRefused, acquire_lock, install_id, lock_held, lock_holder, lock_path, release_lock  # noqa: F401
 
@@ -1077,19 +1078,20 @@ def code_problem(base: str, code: str) -> str:
 
 
 def _post_json(url: str, body: dict, opener) -> "tuple[int, bytes]":
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
-                                 headers={"Content-Type": "application/json", "Accept": "application/json"})
-    try:
-        with opener(req, timeout=REDEEM_TIMEOUT_S) as resp:
-            return resp.status, resp.read(64 * 1024)
-    except urllib.error.HTTPError as e:
-        return e.code, b""
+    with gateway_instance.gateway_call(url):
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        try:
+            with (opener or urllib.request.urlopen)(req, timeout=REDEEM_TIMEOUT_S) as resp:
+                return resp.status, resp.read(64 * 1024)
+        except urllib.error.HTTPError as e:
+            return e.code, b""
 
 
 def redeem_code(base: str, code: str, opener=None, sleep=None) -> "tuple[dict | None, str]":
     """({relay_url, bearer, agent_id}, '') or (None, why). The bearer and URL are registered as secrets
     before this returns, so no later line can print them; a 503 is retried on REDEEM_BACKOFF_S."""
-    opener, sleep = opener or urllib.request.urlopen, sleep or time.sleep
+    sleep = sleep or time.sleep
     url = base.rstrip("/") + REDEEM_PATH
     for wait in (*REDEEM_BACKOFF_S, None):
         try:
