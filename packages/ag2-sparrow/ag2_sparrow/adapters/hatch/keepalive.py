@@ -310,11 +310,14 @@ def sparrow_env(pid: int) -> "dict[str, str] | None":
     return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
 
 
-def proven_sparrow(pid: int, lock: "dict | None") -> bool:
-    """`pid` runs Sparrow now and is the process that took `lock`, not a later one given its pid:
-    its start time is the one the lock declares or, for a lock that declares none, no later than
-    the lock was taken. False whenever that cannot be read."""
-    if not isinstance(lock, dict) or lock.get("pid") != pid or not is_sparrow_pid(pid):
+def proven_sparrow(cfg: dict, pid: int, lock: "dict | None") -> bool:
+    """`pid` runs Sparrow now and is the process that took `lock`, this workspace's canonical
+    lock (cli.canonical_lock), not a later one given its pid: its start time is the one the lock
+    declares or, for a lock that declares none, a whole second before the lock was taken (start
+    times have one-second resolution, so the same second proves nothing). False whenever that
+    cannot be read."""
+    if not _cli.canonical_lock(lock, _state_dir(cfg), _instance(cfg)) or lock.get("pid") != pid \
+            or not is_sparrow_pid(pid):
         return False
     start = agent_identity.start_time(pid)
     if start is None:
@@ -325,14 +328,13 @@ def proven_sparrow(pid: int, lock: "dict | None") -> bool:
         began = calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return False
-    acquired = lock.get("acquired_at")
-    return _is_epoch(acquired) and began <= acquired + 1
+    return began + 1 <= lock["acquired_at"]
 
 
 def _stop(cfg: dict, pid: int) -> bool:
     """SIGTERM to `pid`, then wait for it to exit; never a SIGKILL. The lock is re-read and the
     target proven to be its Sparrow right before the signal, else nothing is sent."""
-    if not proven_sparrow(pid, _cli._lock_record(_state_dir(cfg), _instance(cfg))):
+    if not proven_sparrow(cfg, pid, _cli._lock_record(_state_dir(cfg), _instance(cfg))):
         print(f"error: pid {pid} is not proven to be the Sparrow holding the lock; it was not "
               "signalled", file=sys.stderr)
         return False
@@ -389,7 +391,7 @@ def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | No
     pid = _cli.live_lock_holder(holder)
     if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
-    if not proven_sparrow(pid, holder):
+    if not proven_sparrow(cfg, pid, holder):
         return None  # the live pid is not proven to be the Sparrow that took this lock
     acquired = (holder or {}).get("acquired_at")
     if "send_lock" in holder:

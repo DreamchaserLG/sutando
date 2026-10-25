@@ -30,7 +30,8 @@ import time
 from importlib import resources
 from pathlib import Path
 
-from ... import (_dirs, agent_identity, delivery_destination, diagnostics, gateway_credential_io,
+from ... import (_dirs, agent_identity, bounded_file_read, delivery_destination, diagnostics,
+                 gateway_credential_io,
                  gateway_credentials, gateway_instance, outbox, result_ready, task_hold,
                  workspace_lock)
 from ...persisted_number import bounded_number
@@ -458,16 +459,44 @@ def _parse_unit_props(stdout: str) -> "dict | None":
     return props
 
 
+_LOCK_MAX_BYTES = 4096
+
+
+def _lock_role(instance: str) -> str:
+    return f"gateway-bridge{gateway_instance.suffix(instance)}"
+
+
 def _lock_record(state_dir: Path, instance: str) -> "dict | None":
-    """This host's Sparrow single-instance lock record, or None when there is none to read."""
-    lock = state_dir.parent / "state" / "locks" / \
-        f"gateway-bridge{gateway_instance.suffix(instance)}.lock"
+    """This host's Sparrow single-instance lock record, or None when there is none to read. It
+    is read without following a symlink and never blocks: a FIFO, a non-regular or an oversized
+    file is refused."""
+    lock = state_dir.parent / "state" / "locks" / f"{_lock_role(instance)}.lock"
+    text = bounded_file_read.read_regular(str(lock), _LOCK_MAX_BYTES, follow=False)[0]
     try:
-        holder = json.loads(lock.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        holder = json.loads(text) if text is not None else None
+    except ValueError:
         return None
     ok = isinstance(holder, dict) and holder.get("host") == workspace_lock._host_label()
     return holder if ok else None
+
+
+def canonical_lock(lock: "dict | None", state_dir: Path, instance: str) -> bool:
+    """`lock` is this workspace's own Sparrow lock as workspace_lock writes it: its role, this
+    workspace, its schema, a valid pid, and times that are finite, not ahead of now, with the
+    lock taken no later than its last heartbeat. Only such a record may authorize a signal."""
+    if not isinstance(lock, dict):
+        return False
+    try:
+        same = os.path.realpath(lock.get("workspace")) == os.path.realpath(Path(state_dir).parent)
+    except (TypeError, ValueError):
+        return False
+    now = time.time()
+    acquired = bounded_number(lock.get("acquired_at"), 1, now)
+    beat = bounded_number(lock.get("heartbeat_at"), 1, now)
+    return (same and lock.get("role") == _lock_role(instance)
+            and lock.get("schema_version") == workspace_lock.SCHEMA_VERSION
+            and outbox.valid_pid(lock.get("pid")) is not None
+            and acquired is not None and beat is not None and acquired <= beat)
 
 
 def _proc_stat(pid: int) -> bytes:
