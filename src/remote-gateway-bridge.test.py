@@ -2337,8 +2337,8 @@ def main() -> int:
         rtc._post_heartbeat = real_hb
     check(hb_calls["n"] == 3, "main: one full loop iteration ran (reconcile wired)")
     check(STATE["poll_paths"][poll_paths_before_main:] == [
-              f"/v1/tasks?wait={rtc.POLL_WAIT}&capabilities=voice-outcome-v1"],
-          "wire poll preserves the established scalar voice proof without guessing a multi-capability encoding")
+              f"/v1/tasks?wait={rtc.POLL_WAIT}&capabilities=voice-outcome-v1,room-context-v1"],
+          "wire poll preserves wait and voice proof alongside the confirmed room-context capability")
 
     # #2267 parity: a token pasted into a room message must never persist —
     # not in the task file, not in the owner-presence summary.
