@@ -154,9 +154,9 @@ def _read(path: Path) -> dict | None:
         return None  # corrupt → treat as absent/reapable
 
 
-def _payload(role: str, workspace: Path) -> dict:
+def _payload(role: str, workspace: Path, declares: "dict | None" = None) -> dict:
     now = _now()
-    return {
+    return {**(declares or {}),
         "role": role,
         "pid": os.getpid(),
         "host": _host_label(),
@@ -197,10 +197,12 @@ def _write_atomic(path: Path, data: dict) -> None:
 
 
 def acquire(role: str, workspace: Path | str | None = None,
-            stale_seconds: int = DEFAULT_STALE_SECONDS) -> LockResult:
+            stale_seconds: int = DEFAULT_STALE_SECONDS, declares: "dict | None" = None) -> LockResult:
+    """Take the role's lock; `declares` adds fields the holder states about itself for readers
+    (never overriding the lock's own), written in the same step as the take."""
     ws = workspace if isinstance(workspace, Path) else _resolve_workspace(workspace)
     path = _lock_path(ws, role)
-    data = _payload(role, ws)
+    data = _payload(role, ws, declares)
     # The whole read-decide-write runs under the guard flock, so no other
     # acquire/heartbeat/release can interleave — the reap→take is atomic.
     with _guard(ws, role):

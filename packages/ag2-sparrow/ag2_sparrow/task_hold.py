@@ -265,7 +265,9 @@ def _rewrite_notice(result_dir: Path, tid: str, token: str, change) -> dict:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
             try:
                 try:
-                    os.write(fd, json.dumps(new).encode("utf-8"))
+                    view = memoryview(json.dumps(new).encode("utf-8"))
+                    while view:  # a short write is legal: the record is whole or not replaced
+                        view = view[os.write(fd, view):]
                     os.fsync(fd)
                 finally:
                     os.close(fd)
@@ -296,7 +298,7 @@ def arm_notice(result_dir: Path, tid: str, token: str) -> None:
 def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
     """Asked at a drain's send of a message about `tid` named with `ts`: why a hold line (ts below
     NOTICE_GEN_LIMIT) must not be sent, or None. Only the record's own generation, once armed,
-    with its hold standing, is sent; a record from before generations is not judged."""
+    with its hold standing, is sent; a record from before generations needs its hold standing."""
     if ts is None or not 0 <= ts < NOTICE_GEN_LIMIT:
         return None
     try:
@@ -304,7 +306,7 @@ def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
     except (OSError, ValueError) as e:
         return f"its hold could not be checked ({e})"
     if fields is not None and fields["gen"] is None:
-        return None
+        return None if read(result_dir, tid) is not None else "no hold stands on it"
     if fields is None or fields["gen"] != ts:
         return "a later hold line replaced it, or no hold queued it"
     if not fields["armed"] or read(result_dir, tid) is None:

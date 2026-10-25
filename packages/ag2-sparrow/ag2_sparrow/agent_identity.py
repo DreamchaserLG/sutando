@@ -186,7 +186,9 @@ def _write_at(dfd: int, name: str, record: dict) -> None:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
     try:
         try:
-            os.write(fd, json.dumps(record).encode("utf-8"))
+            view = memoryview(json.dumps(record).encode("utf-8"))
+            while view:  # a short write is legal: the record is whole or not published
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -224,7 +226,8 @@ def _poison_at(dfd: int, name: str) -> None:
 _OWN_START: dict = {}
 
 
-def _own_start() -> "str | None":
+def own_start() -> "str | None":
+    """This process's start time, which binds what it writes to it rather than to its pid."""
     pid = os.getpid()
     if pid not in _OWN_START:
         _OWN_START.clear()
@@ -252,7 +255,7 @@ def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None
     if valid_pid(os.getpid()) is None:
         raise OSError(f"pid {os.getpid()} is outside the pid domain readers accept")
     record = {"agent_id": (agent_id or "").strip(), "instance": instance or "",
-              "pid": os.getpid(), "start": _own_start(), "ts": time.time(),
+              "pid": os.getpid(), "start": own_start(), "ts": time.time(),
               **({"send_lock": send_lock} if send_lock is not None else {})}
     dfd = _auth_dir(state_dir, create=True)
     try:
@@ -285,6 +288,20 @@ def retract_lane(state_dir, instance: str, pid: "int | None" = None, ts: "float 
                 _invalidate_at(dfd, _lane_name(instance), instance)
         finally:
             _close(dfd)
+
+
+def owned_by(rec: "dict | None", pid: int, acquired_at=None) -> bool:
+    """`rec` (a lane record or a lock's declarations) was written by the live process `pid`
+    itself, not by an earlier one that had its pid: its start time is that process's, or, with no
+    start time to compare, its `ts` postdates the lock taken at `acquired_at`."""
+    if not isinstance(rec, dict) or rec.get("pid") != pid:
+        return False
+    live, start = start_time(pid), rec.get("start")
+    if live is not None and isinstance(start, str):
+        return start == live
+    ts, acquired = rec.get("ts"), acquired_at
+    return all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (ts, acquired)) \
+        and ts >= acquired - 1
 
 
 def lane_state(state_dir, instance: str, now: "float | None" = None) -> "tuple[str, dict | None]":

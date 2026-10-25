@@ -1207,7 +1207,8 @@ def _scan_line(result_dir: Path, notice: Path, tid: str, want: str) -> "str | No
 def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
     """One read of the live drain's lane: (pid, homeserver, declares the send-lock protocol hold
     and reply rely on), or None when there is no such drain: no fresh record, its publisher gone,
-    or the lock names another live process. A drain from an older package lacks the protocol, and
+    the lock names another live process, or the record is not that process's own (another one
+    wrote it under a reused pid). A drain from an older package lacks the protocol, and
     keepawake replaces it."""
     state = Path(cfg.get("STATE_DIR") or _dirs.state_dir())
     rec = agent_identity.published_lane_record(state, instance)
@@ -1216,6 +1217,8 @@ def _lane_snapshot(cfg: dict, instance: str) -> "tuple[int, str, bool] | None":
     holder = _lock_record(state, instance)
     if holder is not None and live_lock_holder(holder) != rec["pid"]:
         return None  # a lock names the live drain, and it is not the publisher
+    if not agent_identity.owned_by(rec, rec["pid"], (holder or {}).get("acquired_at")):
+        return None
     return (rec["pid"], delivery_destination.homeserver_of(rec["agent_id"]),
             rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL)
 

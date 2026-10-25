@@ -57,6 +57,8 @@ REAL_ENSURE_SPARROW = keepalive.ensure_sparrow
 # The CLIs run in-process so repository coverage traces them.
 SCRIPT = HATCH / "ag2-sparrow-hatch.sh"
 AGENT = "@watch-agent:ag2.space"
+# This process's start, as a drain writes it into its lane record and lock.
+OWN_START = task_io.start_time(os.getpid())
 
 RUNTIME = r"""
 log() { printf 'LOG %s\n' "$1" >>"$EVENTS"; }
@@ -2633,6 +2635,73 @@ class StartSparrow(Base):
                                     "acquired_at": now - ago, "heartbeat_at": now,
                                     "schema_version": 1}))
 
+    def declared_lock(self, proc, ago, **declares):
+        """`proc`'s lock as this package's drain takes it: its protocol and start declared."""
+        path = self.state / "locks" / "gateway-bridge.lock"
+        now = int(time.time())
+        path.write_text(json.dumps({**declares, "role": "gateway-bridge", "pid": proc.pid,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "acquired_at": now - ago, "heartbeat_at": now,
+                                    "schema_version": 1}))
+
+    def test_keepawake_keeps_a_drain_whose_lane_and_its_fallback_both_failed(self):
+        # Reviewer's probe: the first publication and the empty-record fallback both refused, so
+        # no lane record exists; the drain's lock still says it honours the protocol.
+        from ag2_sparrow import remote_gateway_bridge as gb
+        old = self.old_sparrow()
+        self.declared_lock(old, keepalive.LANE_GRACE_S + 60,
+                           send_lock=delivery_destination.SEND_LOCK_PROTOCOL,
+                           start=task_io.start_time(old.pid))
+        full = OSError(errno.ENOSPC, "No space left on device")
+        with mock.patch.object(agent_identity, "_write_at", side_effect=full), \
+                mock.patch.object(agent_identity, "_poison_at", side_effect=full), \
+                mock.patch.object(gb, "_STATE", self.state), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                mock.patch.dict(gb._LANE_OWNED, clear=True):
+            gb._lane_identity()
+        self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_ABSENT)
+        want = keepalive.health_command(str(self.reply_stub))
+        for _ in range(2):
+            r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+            self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+        self.assertIsNone(old.poll(), "a drain whose lock declares the protocol is never replaced")
+
+    def test_keepawake_judges_a_declaring_lock_by_its_protocol_and_its_process(self):
+        want = keepalive.health_command(str(self.reply_stub))
+        for proto, start, restarted in ((delivery_destination.SEND_LOCK_PROTOCOL - 1, "own", 1),
+                                        (delivery_destination.SEND_LOCK_PROTOCOL, "2001-01-01T00:00:00Z", 0)):
+            with self.subTest(proto=proto, start=start):
+                old = self.old_sparrow()
+                self.declared_lock(old, keepalive.LANE_GRACE_S + 60, send_lock=proto,
+                                   start=task_io.start_time(old.pid) if start == "own" else start)
+                r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertTrue(line.endswith(f" restarted={restarted}" + (
+                    " reason=drain-predates-send-lock" if restarted else "")), line)
+                if restarted:
+                    self.assertEqual(old.wait(5), -signal.SIGTERM)
+                else:
+                    old.kill()
+                    old.wait(5)
+
+    def test_the_drain_declares_its_protocol_and_start_in_the_lock_it_takes(self):
+        from ag2_sparrow import remote_gateway_bridge as gb, workspace_lock
+        ws = self.home / "lockws"
+        ws.mkdir()
+        self.assertEqual(workspace_lock.acquire("gateway-bridge", ws, declares=gb._lock_declares()).status,
+                         "acquired")
+        holder = workspace_lock.read_holder("gateway-bridge", ws)
+        self.assertEqual((holder["send_lock"], holder["start"], holder["pid"]),
+                         (delivery_destination.SEND_LOCK_PROTOCOL, OWN_START, os.getpid()))
+        self.assertTrue(workspace_lock.heartbeat("gateway-bridge", ws))
+        self.assertEqual(workspace_lock.read_holder("gateway-bridge", ws)["send_lock"],
+                         delivery_destination.SEND_LOCK_PROTOCOL, "a heartbeat keeps the declaration")
+        workspace_lock.release("gateway-bridge", ws)
+        deferred = workspace_lock.LockResult("deferred", holder={})
+        with mock.patch.object(gb, "_lock_on", return_value=True), mock.patch.object(gb, "_log"), \
+                mock.patch.object(gb, "_ws_acquire", return_value=deferred) as take:
+            self.assertFalse(gb._acquire_singleton())
+        self.assertEqual(take.call_args.kwargs["declares"], gb._lock_declares(), "the drain's own take")
+
     def test_keepawake_replaces_a_main_version_sparrow_that_publishes_no_lane_record(self):
         old = self.old_sparrow()
         self.acquired(old, keepalive.LANE_GRACE_S + 60)  # no lane-identity file at all
@@ -2714,13 +2783,13 @@ class StartSparrow(Base):
         self.assertEqual(old.wait(5), -signal.SIGTERM)
 
     def test_own_record_falls_back_to_the_lock_when_no_start_time_compares(self):
-        rec = {"pid": 7, "ts": 1000.0}
-        with mock.patch.object(keepalive.task_io, "start_time", return_value=None):
-            self.assertTrue(keepalive._own_record({**rec, "start": "x"}, 7, 1000))
-            self.assertFalse(keepalive._own_record(rec, 7, 1002), "written before this lock")
-            self.assertFalse(keepalive._own_record(rec, 7, None), "no lock time: unbound")
-        self.assertFalse(keepalive._own_record(rec, 8, 1000))
-        self.assertFalse(keepalive._own_record(None, 7, 1000))
+        rec, owned = {"pid": 7, "ts": 1000.0}, agent_identity.owned_by
+        with mock.patch.object(agent_identity, "start_time", return_value=None):
+            self.assertTrue(owned({**rec, "start": "x"}, 7, 1000))
+            self.assertFalse(owned(rec, 7, 1002), "written before this lock")
+            self.assertFalse(owned(rec, 7, None), "no lock time: unbound")
+        self.assertFalse(owned(rec, 8, 1000))
+        self.assertFalse(owned(None, 7, 1000))
 
     def test_a_failed_lane_publication_reads_invalid_and_replaces_no_drain(self):
         from ag2_sparrow import remote_gateway_bridge as gb
@@ -4052,7 +4121,7 @@ class Hold(Base):
         (auth / "ag2space.json").write_text(json.dumps({"agent_id": self.mxid}))
         if self.lane_record:
             (auth / "lane-identity.json").write_text(json.dumps(
-                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "ts": time.time(),
+                {"agent_id": self.mxid, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time(),
                  **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
         return env
 
@@ -4789,6 +4858,7 @@ class Hold(Base):
         raised, took = self.bounded_req(url, 0.3, client)
         self.assertIsInstance(raised, urllib.error.HTTPError, repr(raised))
         self.assertLess(took, 1.0, "a TLS-wrapped error body arriving slowly is cut at the deadline")
+        self.assertTrue(raised.fp.closed, "its buffered response is closed, its socket released")
 
     def test_the_deadline_covers_a_stalled_tls_handshake(self):
         import socket as sk
@@ -5064,6 +5134,36 @@ class Hold(Base):
         self.drain_pass(posts)
         self.assertEqual(len(posts), 1, "the retry is not stuck, and its one line posts once")
 
+    def test_hold_refuses_a_fresh_lane_record_another_process_wrote_under_its_pid(self):
+        # Reviewer's probe: this pid and protocol 3, fresh, but a predecessor's start time.
+        self.add_task(self.TID, "$ev1")
+        self.env()
+        self.lane_record = False
+        record = self.home / "state" / "auth" / "lane-identity.json"
+        record.write_text(json.dumps({**json.loads(record.read_text()),
+                                      "start": "2001-01-01T00:00:00Z", "ts": time.time()}))
+        self.assertIsNone(hatch_cli._lane_snapshot({"STATE_DIR": str(self.home / "state")}, ""))
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+        self.assertIn("no live Sparrow drain has published its lane identity", r.stderr)
+        self.assertFalse(task_hold.notice_marked(self.results, self.TID))
+
+    def test_a_hold_whose_writes_are_short_still_posts_its_one_line(self):
+        self.add_task(self.TID, "$ev1")
+        real = os.write
+        short = mock.patch.object(os, "write", lambda fd, data: real(fd, bytes(data[:1])))
+        with short:
+            r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1, self.statuses(hatch_cli._hold_notice(self.results, self.TID)))
+        self.assertTrue(task_hold.notice_record(self.results, self.TID)["armed"])
+        with short:
+            agent_identity.publish_lane(self.home / "state", "", AGENT, delivery_destination.SEND_LOCK_PROTOCOL)
+        self.assertEqual(agent_identity.lane_state(self.home / "state", "")[0], agent_identity.LANE_FRESH,
+                         "the lane record is whole too")
+
     def test_a_refused_hold_leaves_a_line_an_earlier_hold_queued(self):
         self.add_task(self.TID, "$ev1")
         self.armed_mark()
@@ -5080,8 +5180,8 @@ class Hold(Base):
         self.add_task(self.TID, "$ev1")
         line = self.line()
         for setup, sent in (("no record", False), ("unarmed", False), ("armed, no marker", False),
-                            ("unreadable record", False), ("legacy record", True),
-                            ("armed with marker", True)):
+                            ("unreadable record", False), ("legacy record", False),
+                            ("legacy record with marker", True), ("armed with marker", True)):
             with self.subTest(setup):
                 shutil.rmtree(self.results / task_hold.HOLD_DIR, ignore_errors=True)
                 for f in self.results.glob("proactive-*"):
@@ -5092,11 +5192,11 @@ class Hold(Base):
                 path = self.results / task_hold.HOLD_DIR / f"{self.TID}.notice"
                 if setup == "unreadable record":
                     path.write_text("{")
-                if setup == "legacy record":
-                    path.write_text(json.dumps({"token": "t"}))
+                if setup.startswith("legacy record"):
+                    path.write_text(json.dumps({"token": "t"}))  # a notice from before generations
                 if setup.startswith("armed"):
                     task_hold.arm_notice(self.results, self.TID, token)
-                if setup == "armed with marker":
+                if setup.endswith("with marker"):
                     task_hold.place(self.results, self.TID)
                 self.notice.write_text(line)
                 posts = []
@@ -5447,7 +5547,7 @@ class Hold(Base):
                 auth = self.home / "state" / "auth"
                 auth.mkdir(parents=True, exist_ok=True)
                 (auth / "lane-identity.json").write_text(
-                    json.dumps({"agent_id": AGENT, "instance": "", "pid": os.getpid(), "ts": ts}))
+                    json.dumps({"agent_id": AGENT, "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": ts}))
                 self.assertIsNone(agent_identity.published_lane_record(self.home / "state", ""))
                 r = self.hold(str(self.result_file))
                 self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
@@ -6009,7 +6109,7 @@ class DeliveryDestination(unittest.TestCase):
         (state / "auth" / "ag2space.json").write_text('{"agent_id": "@e:enrolled.space"}')
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "no enrollment fallback")
         lane = state / "auth" / "lane-identity.json"
-        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
+        lane.write_text(json.dumps({"agent_id": "@l:lane.space", "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time()}))
         self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "lane.space")
 
     def test_one_bounded_number_reader_for_persisted_values(self):
@@ -6043,7 +6143,7 @@ class DeliveryDestination(unittest.TestCase):
                            (float("inf"), ""), (float("nan"), ""), (float("-inf"), "")):
             with self.subTest(age=now - ts):
                 lane.write_text(json.dumps({"agent_id": "@a:ag2.space", "instance": "",
-                                            "pid": os.getpid(), "ts": ts}))
+                                            "pid": os.getpid(), "start": OWN_START, "ts": ts}))
                 self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), server)
 
     def test_a_drain_that_cannot_write_lets_its_lane_go_stale(self):
@@ -6120,13 +6220,13 @@ class DeliveryDestination(unittest.TestCase):
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait()
         for rec in ({"agent_id": "@old:ag2.space", "instance": "", "pid": dead.pid, "ts": time.time()},
-                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "ts": time.time()},
-                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "instance": "dev", "pid": os.getpid(), "start": OWN_START, "ts": time.time()},
+                    {"agent_id": "@old:ag2.space", "pid": os.getpid(), "start": OWN_START, "ts": time.time()},
                     {"agent_id": "@old:ag2.space", "instance": "", "pid": True, "ts": time.time()}):
             with self.subTest(rec=rec):
                 lane.write_text(json.dumps(rec))
                 self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "")
-        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "ts": time.time()}))
+        lane.write_text(json.dumps({"agent_id": "@l:ag2.space", "instance": "", "pid": os.getpid(), "start": OWN_START, "ts": time.time()}))
         with mock.patch.object(hatch_cli, "_lock_record", return_value={"pid": 4242}), \
                 mock.patch.object(hatch_cli, "live_lock_holder", return_value=4242):
             self.assertEqual(hatch_cli._lane_homeserver(cfg, ""), "", "the lock names another live drain")

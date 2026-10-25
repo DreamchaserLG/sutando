@@ -2774,6 +2774,8 @@ def _req(method: str, path: str, payload: dict | None = None, timeout: int = _RE
                     e.sparrow_body = io.BytesIO(e.read() or b"")
                 except Exception:  # noqa: BLE001 - a cut or broken error body reads as empty
                     e.sparrow_body = io.BytesIO()
+                with contextlib.suppress(Exception):
+                    e.close()  # its body is buffered: the connection is released now, not at GC
                 raise
             with opened as resp:
                 return _parse_response(resp, _read_by(resp, deadline))
@@ -7797,13 +7799,20 @@ def _exit_on_signal(signum, _frame) -> None:
     sys.exit(0)
 
 
+def _lock_declares() -> dict:
+    """What this drain states in its lock as it takes it: the proactive send-lock protocol it
+    honours and its process start, so a reader judges the holder by its lock alone."""
+    return {"send_lock": _delivery_destination.SEND_LOCK_PROTOCOL,
+            "start": agent_identity.own_start()}
+
+
 def _acquire_singleton() -> bool:
     """True → we hold the poller lock (or it is disabled / errored → fail-open).
     False → a live bridge already owns this workspace and the caller must NOT poll."""
     if not _lock_on():
         return True
     try:
-        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S)
+        r = _ws_acquire(_LOCK_ROLE, _LOCK_WS, stale_seconds=_LOCK_STALE_S, declares=_lock_declares())
     except Exception as e:  # fail-open — never wedge task delivery on a lock bug
         _log(f"singleton: acquire error ({diagnostics.describe(e)}) — proceeding without lock")
         return True

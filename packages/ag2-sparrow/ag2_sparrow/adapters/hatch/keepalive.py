@@ -28,7 +28,7 @@ import sys
 import time
 from pathlib import Path
 
-from ... import _dirs, agent_identity, delivery_destination, diagnostics, task_hold, task_io
+from ... import _dirs, agent_identity, delivery_destination, diagnostics, task_hold
 from ...persisted_number import bounded_number
 from . import cli as _cli, task_fields
 
@@ -347,18 +347,6 @@ def unmanaged_health_problem(cfg: dict) -> "tuple[int | None, str | None]":
     return pid, health_env_problem(cfg, pid)
 
 
-def _own_record(rec: "dict | None", pid: int, acquired) -> bool:
-    """`rec` was written by the live holder `pid` itself, not by an earlier process that had its
-    pid: its start time is that process's, or, with no start to compare, it postdates this lock."""
-    if rec is None or rec.get("pid") != pid:
-        return False
-    live, start = task_io.start_time(pid), rec.get("start")
-    if live is not None and isinstance(start, str):
-        return start == live
-    ts = rec.get("ts")
-    return _is_epoch(acquired) and isinstance(ts, (int, float)) and ts >= acquired - 1
-
-
 def _is_epoch(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -367,20 +355,25 @@ def drain_predates_send_lock(cfg: dict, now: "float | None" = None) -> "int | No
     """The pid of the live, connected Sparrow that is not this package's drain: its own lane
     record, fresh or stale, lacks the send-lock protocol, or it has held its lock past
     LANE_GRACE_S with no record of its own, as a drain from before lane records (the released
-    main) does. A record another process left under a reused pid is not its own. None otherwise,
-    and when the record is invalid or cannot be read: neither proves the protocol is missing."""
+    main) does. A drain whose lock declares its protocol is judged by that alone, so a lane record
+    it could not write is no evidence against it. A record another process left under a reused
+    pid is not its own. None otherwise, and when the record is invalid or cannot be read."""
     state, instance = _state_dir(cfg), _instance(cfg)
     holder = _cli._lock_record(state, instance)
     pid = _cli.live_lock_holder(holder)
     if pid is None or _cli.check_sparrow(state, now=now, instance=instance)[0] != _cli.SPARROW_OK:
         return None
+    acquired = (holder or {}).get("acquired_at")
+    if "send_lock" in (holder or {}):
+        if not agent_identity.owned_by(holder, pid, None):
+            return None  # a lock under a reused pid: its declaration is not this process's
+        return None if holder["send_lock"] == delivery_destination.SEND_LOCK_PROTOCOL else pid
     lane, rec = agent_identity.lane_state(state, instance)
     if lane in (agent_identity.LANE_INVALID, agent_identity.LANE_UNREADABLE):
         print(f"lane record of Sparrow (pid {pid}) {lane}; not replacing it", file=sys.stderr)
         return None
-    acquired = (holder or {}).get("acquired_at")
     # Stale counts too: a drain slowed by its sends still declares what it honours.
-    if _own_record(rec, pid, acquired):
+    if agent_identity.owned_by(rec, pid, acquired):
         return None if rec.get("send_lock") == delivery_destination.SEND_LOCK_PROTOCOL else pid
     # This package's drain publishes its record on its first pass, every few seconds after.
     now = time.time() if now is None else now
