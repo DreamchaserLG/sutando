@@ -2597,7 +2597,8 @@ class StartSparrow(Base):
     def lane_of(self, proc, **extra):
         (self.state / "auth").mkdir(parents=True, exist_ok=True)
         (self.state / "auth" / "lane-identity.json").write_text(json.dumps(
-            {"agent_id": AGENT, "instance": "", "pid": proc.pid, "ts": time.time(), **extra}))
+            {"agent_id": AGENT, "instance": "", "pid": proc.pid, "ts": time.time(),
+             "start": task_io.start_time(proc.pid), **extra}))
 
     def test_keepawake_replaces_a_running_sparrow_from_before_the_send_lock(self):
         old = self.old_sparrow()
@@ -2680,6 +2681,74 @@ class StartSparrow(Base):
         r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
         self.assertTrue(line.endswith(" listener=up restarted=1 reason=drain-predates-send-lock"), line)
         self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_keepawake_judges_a_stale_record_only_when_this_process_wrote_it(self):
+        # A predecessor's stale record under a reused pid, declaring the protocol or not, is no
+        # evidence: the holder is judged by its grace period alone, as one with no record is.
+        want = keepalive.health_command(str(self.reply_stub))
+        stale = time.time() - agent_identity.LANE_FRESH_S - 15
+        for declared, held_for, restarted in (
+                (True, keepalive.LANE_GRACE_S + 60, 1), (False, 5, 0),
+                (False, keepalive.LANE_GRACE_S + 60, 1), (True, 5, 0)):
+            with self.subTest(declared=declared, held_for=held_for):
+                old = self.old_sparrow()
+                self.acquired(old, held_for)
+                proto = {"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if declared else {}
+                self.lane_of(old, ts=stale, start="2001-01-01T00:00:00Z", **proto)
+                self.assertEqual(agent_identity.lane_state(self.state, "")[0], agent_identity.LANE_STALE)
+                r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                self.assertTrue(line.endswith(f" listener=up restarted={restarted}"
+                                              + (" reason=drain-predates-send-lock" if restarted else "")),
+                                line)
+                if restarted:
+                    self.assertEqual(old.wait(5), -signal.SIGTERM)
+                else:
+                    self.assertIsNone(old.poll())
+                    old.kill()
+                    old.wait(5)
+        old = self.old_sparrow()
+        self.acquired(old, 5)
+        self.lane_of(old, ts=stale)  # the holder's own record, stale, without the protocol
+        r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+        self.assertTrue(line.endswith(" restarted=1 reason=drain-predates-send-lock"), line)
+        self.assertEqual(old.wait(5), -signal.SIGTERM)
+
+    def test_own_record_falls_back_to_the_lock_when_no_start_time_compares(self):
+        rec = {"pid": 7, "ts": 1000.0}
+        with mock.patch.object(keepalive.task_io, "start_time", return_value=None):
+            self.assertTrue(keepalive._own_record({**rec, "start": "x"}, 7, 1000))
+            self.assertFalse(keepalive._own_record(rec, 7, 1002), "written before this lock")
+            self.assertFalse(keepalive._own_record(rec, 7, None), "no lock time: unbound")
+        self.assertFalse(keepalive._own_record(rec, 8, 1000))
+        self.assertFalse(keepalive._own_record(None, 7, 1000))
+
+    def test_a_failed_lane_publication_reads_invalid_and_replaces_no_drain(self):
+        from ag2_sparrow import remote_gateway_bridge as gb
+        want = keepalive.health_command(str(self.reply_stub))
+        lane = self.state / "auth" / "lane-identity.json"
+        for before in ("a record", "no record"):
+            with self.subTest(before):
+                old = self.old_sparrow()
+                self.acquired(old, keepalive.LANE_GRACE_S + 60)
+                lane.parent.mkdir(parents=True, exist_ok=True)
+                lane.unlink(missing_ok=True)
+                if before == "a record":
+                    self.lane_of(old, send_lock=delivery_destination.SEND_LOCK_PROTOCOL, ts=0)
+                full = OSError(errno.ENOSPC, "No space left on device")
+                with mock.patch.object(agent_identity, "_write_at", side_effect=full), \
+                        mock.patch.object(gb, "_STATE", self.state), mock.patch.object(gb, "_log"), \
+                        mock.patch.object(gb, "_reenroll_identity", return_value=AGENT), \
+                        mock.patch.dict(gb._LANE_OWNED, clear=True):
+                    gb._lane_identity()  # the drain's own publisher, failing on a full disk
+                self.assertTrue(lane.exists(), "a failed publication leaves evidence, not absence")
+                self.assertEqual(agent_identity.lane_state(self.state, ""),
+                                 (agent_identity.LANE_INVALID, None))
+                for _ in range(2):
+                    r, line = self.keepawake({"REMOTE_HEALTH_COMMAND": want})
+                    self.assertTrue(line.endswith(" listener=up restarted=0"), line)
+                self.assertIsNone(old.poll(), "no replacement loop on a persistent write failure")
+                old.kill()
+                old.wait(5)
 
     def test_keepawake_keeps_a_drain_whose_lane_record_is_invalid(self):
         # A modern drain's corrupt record, failed-write tombstone or emptied one is no proof the
@@ -3987,6 +4056,10 @@ class Hold(Base):
                  **({"send_lock": delivery_destination.SEND_LOCK_PROTOCOL} if self.send_lock else {})}))
         return env
 
+    def armed_mark(self):
+        """A notice record whose generation a hold armed, as a hold that stood leaves it."""
+        task_hold.arm_notice(self.results, self.TID, task_hold.mark_notice(self.results, self.TID))
+
     def hold(self, *args, cfg=None, env=None):
         with mock.patch.object(hatch_cli, "_installed_config", return_value=cfg or {}):
             return run_main(hatch_cli.main, ["hold", *args], {**self.env(), **(env or {})})
@@ -4894,83 +4967,145 @@ class Hold(Base):
         self.assertEqual(len(posts), 1)
         self.assertIn("was already posted before this answer", self.reply_now().stderr)
 
-    def test_hold_refuses_when_the_drain_is_swapped_after_the_line_is_queued(self):
-        self.add_task(self.TID, "$ev1")
+    def lock_holder(self, pid):
         lock = self.home / "state" / "locks" / "gateway-bridge.lock"
         lock.parent.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
+                                    "host": hatch_cli.workspace_lock._host_label(),
+                                    "heartbeat_at": now, "schema_version": 1}))
 
-        def holder(pid):
-            now = int(time.time())
-            lock.write_text(json.dumps({"role": "gateway-bridge", "pid": pid, "acquired_at": now,
-                                        "host": hatch_cli.workspace_lock._host_label(),
-                                        "heartbeat_at": now, "schema_version": 1}))
-        holder(os.getpid())
-        real = hatch_cli._publish_once
+    def statuses(self, notice):
+        return [(i.get("status"), i.get("reason")) for i in
+                delivery_destination.lane_items(self.results, notice.stem)]
 
-        def publish_then_swap(path, body):
+    def hold_refused_while_the_drain_waits(self, posts):
+        """Reviewer's production ordering: hold publishes line A under the send lock; the real
+        drain claims A, then waits for that lock; the drain is swapped before hold's second fence,
+        so hold refuses; the drain then takes the lock and sends. Returns (hold result, A)."""
+        self.add_task(self.TID, "$ev1")
+        self.lock_holder(os.getpid())
+        real, seen, drain = hatch_cli._publish_once, {}, []
+
+        def publish_then_drain_claims(path, body):
             done = real(path, body)
-            holder(os.getppid())
+            seen["a"] = path
+            t = threading.Thread(target=self.drain_pass, args=(posts,), daemon=True)
+            t.start()
+            drain.append(t)
+            deadline = time.monotonic() + 10
+            while path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)  # until the drain's claim renames it, before it asks for the lock
+            self.assertFalse(path.exists(), "the drain claimed the line")
+            self.lock_holder(os.getppid())
             return done
-        with mock.patch.object(hatch_cli, "_publish_once", publish_then_swap):
-            r = self.hold(str(self.result_file))
+        saved = dict(os.environ)
+        try:
+            with mock.patch.object(delivery_destination, "DRAIN_LOCK_WAIT_S", 20.0), \
+                    mock.patch.object(hatch_cli, "_publish_once", publish_then_drain_claims):
+                r = self.hold(str(self.result_file), env={"AGENT_MXID": AGENT})
+            self.assertEqual(len(drain), 1, r.stdout + r.stderr)
+            drain[0].join(30)
+            self.assertFalse(drain[0].is_alive(), "the drain finished its send")
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        return r, seen["a"]
+
+    def test_a_refused_hold_line_the_drain_claimed_before_the_lock_is_never_sent(self):
+        posts = []
+        r, a = self.hold_refused_while_the_drain_waits(posts)
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
         self.assertIn("drain changed", r.stderr)
-        self.assertIn("its line was withdrawn unsent", r.stderr)
         self.assertIsNone(task_hold.read(self.results, self.TID), "no marker without the fence")
-        self.assertFalse(self.notice.exists(), "the refused hold's line is not left queued")
-        self.assertFalse(task_hold.notice_marked(self.results, self.TID))
-        holder(os.getpid())
+        self.assertEqual(posts, [], f"line A of a refused hold was sent; outbox={self.statuses(a)}")
+        self.assertEqual([s for s, _ in self.statuses(a)], ["PARKED"])
+        self.assertTrue(self.statuses(a)[0][1].startswith(hatch_cli.WITHDRAWN + ":"), self.statuses(a))
+        self.assertFalse(a.exists() or list(self.results.glob(f"{a.stem}.sending.*")),
+                         "the drain retired A's file")
+        # A put back under its live name, as an orphan recovery would, still never sends.
+        a.write_text(self.line())
+        self.lock_holder(os.getpid())
+        self.drain_pass(posts)
+        self.assertEqual(posts, [])
+
+    def test_the_next_hold_queues_a_new_generation_the_drain_sends_once(self):
+        posts = []
+        r, a = self.hold_refused_while_the_drain_waits(posts)
+        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stderr)
+        self.lock_holder(os.getpid())
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
+        b = hatch_cli._hold_notice(self.results, self.TID)
+        self.assertNotEqual(b.name, a.name)
+        self.assertEqual(b.read_text(), self.line(), "B is queued whole, nothing deleted or hid it")
+        a.write_text(self.line())  # A back under its live name beside B
+        self.drain_pass(posts)
+        self.drain_pass(posts)
+        self.assertEqual(posts, [self.line().split("\n")[1]], "B is sent exactly once, A never")
+        self.assertEqual([s for s, _ in self.statuses(b)], ["DELIVERED"])
+        self.assertTrue(all(s == "PARKED" for s, _ in self.statuses(a)), self.statuses(a))
+        self.assertIn("already posted before this answer", self.reply_now().stderr)
+
+    def test_a_hold_whose_arming_or_advance_fails_stays_retryable(self):
+        self.add_task(self.TID, "$ev1")
+        for broken in ("arm_notice", "advance_notice"):
+            with self.subTest(broken):
+                with mock.patch.object(task_hold, broken, side_effect=OSError(28, "No space left")):
+                    r = self.hold(str(self.result_file))
+                self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
+                self.assertIn("hold was not recorded", r.stderr)
+                self.assertIsNone(task_hold.read(self.results, self.TID))
+                self.assertFalse(task_hold.notice_record(self.results, self.TID)["armed"])
+                posts = []
+                self.drain_pass(posts)
+                self.assertEqual(posts, [], "a line no hold armed is never sent")
+        r = self.hold(str(self.result_file))
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stdout + r.stderr)
         posts = []
         self.drain_pass(posts)
-        self.assertEqual(posts, [], "no successor posts the line of a refused hold")
-        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED,
-                         "a later hold queues the line afresh")
         self.drain_pass(posts)
-        self.assertEqual(len(posts), 1)
-
-    def test_a_refused_hold_whose_line_a_drain_already_claimed_says_it_may_post(self):
-        self.add_task(self.TID, "$ev1")
-        real = hatch_cli._publish_once
-        claim = self.notice.with_name(f"{self.notice.stem}.sending.{os.getppid()}")
-
-        def publish_then_claim(path, body):
-            done = real(path, body)
-            os.rename(path, claim)  # a drain that ignores the send lock took it at once
-            return done
-        swapped = iter([True, True])
-        with mock.patch.object(hatch_cli, "_publish_once", publish_then_claim), \
-                mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
-                    (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
-            r = self.hold(str(self.result_file))
-        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
-        self.assertIn("already taken by the drain and may post", r.stderr)
-        self.assertTrue(task_hold.notice_marked(self.results, self.TID), "never queued twice")
-        self.assertIsNone(task_hold.read(self.results, self.TID))
+        self.assertEqual(len(posts), 1, "the retry is not stuck, and its one line posts once")
 
     def test_a_refused_hold_leaves_a_line_an_earlier_hold_queued(self):
         self.add_task(self.TID, "$ev1")
-        task_hold.mark_notice(self.results, self.TID)
+        self.armed_mark()
         self.notice.write_text(self.line())
         swapped = iter([True, True])
         with mock.patch.object(hatch_cli, "_lane_snapshot", side_effect=lambda *a: (
                 (os.getpid(), "ag2.space", True) if next(swapped, False) else None)):
             r = self.hold(str(self.result_file))
         self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout + r.stderr)
-        self.assertIn("drain changed while hold ran; no hold recorded", r.stderr)
+        self.assertIn("drain changed while hold ran; its line is never sent", r.stderr)
         self.assertEqual(self.notice.read_text(), self.line(), "not this run's line to take back")
 
-    def test_retire_line_takes_back_only_the_file_it_queued(self):
-        notice = self.results / "proactive-x.txt"
-        self.assertFalse(hatch_cli._retire_line(notice, 1), "nothing there to take back")
-        self.assertFalse(hatch_cli._retire_line(notice, None), "no inode: nothing proven ours")
-        notice.write_text("another line")
-        self.assertFalse(hatch_cli._retire_line(notice, hatch_cli._ino(notice) + 1))
-        self.assertEqual(notice.read_text(), "another line", "another file is put back")
-        mine = lambda: sorted(p.name for p in self.results.iterdir() if "proactive-x" in p.name)
-        self.assertEqual(mine(), ["proactive-x.txt"])
-        self.assertTrue(hatch_cli._retire_line(notice, hatch_cli._ino(notice)))
-        self.assertEqual(mine(), [])
-        self.assertIsNone(hatch_cli._ino(notice))
+    def test_the_drain_withdraws_a_hold_line_its_record_does_not_arm(self):
+        self.add_task(self.TID, "$ev1")
+        line = self.line()
+        for setup, sent in (("no record", False), ("unarmed", False), ("armed, no marker", False),
+                            ("unreadable record", False), ("legacy record", True),
+                            ("armed with marker", True)):
+            with self.subTest(setup):
+                shutil.rmtree(self.results / task_hold.HOLD_DIR, ignore_errors=True)
+                for f in self.results.glob("proactive-*"):
+                    f.unlink()
+                shutil.rmtree(self.results / delivery_destination.RECEIPT_DIR, ignore_errors=True)
+                if setup != "no record":
+                    token = task_hold.mark_notice(self.results, self.TID)
+                path = self.results / task_hold.HOLD_DIR / f"{self.TID}.notice"
+                if setup == "unreadable record":
+                    path.write_text("{")
+                if setup == "legacy record":
+                    path.write_text(json.dumps({"token": "t"}))
+                if setup.startswith("armed"):
+                    task_hold.arm_notice(self.results, self.TID, token)
+                if setup == "armed with marker":
+                    task_hold.place(self.results, self.TID)
+                self.notice.write_text(line)
+                posts = []
+                self.drain_pass(posts)
+                self.assertEqual(bool(posts), sent, self.statuses(self.notice))
+                task_hold.release(self.results, self.TID)
 
     def test_a_deadline_bound_error_keeps_its_body_through_the_scrub(self):
         import http.server
@@ -5058,15 +5193,14 @@ class Hold(Base):
         self.assertIn("not proven queued", r.stderr)
         self.assertIsNone(task_hold.read(self.results, self.TID))
 
-    def test_the_owner_failing_after_a_loser_checked_leaves_no_hold(self):
+    def test_a_hold_that_finds_an_unarmed_record_queues_the_next_generation(self):
         self.add_task(self.TID, "$ev1")
         owner = task_hold.mark_notice(self.results, self.TID)  # caller A, mid-queue
-        r = self.hold(str(self.result_file))  # caller B finds A's record, no line yet
-        self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED)
-        task_hold.clear_notice(self.results, self.TID, owner)  # A's queue write failed
-        self.assertIsNone(task_hold.read(self.results, self.TID))
-        self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
-        self.assertTrue(self.notice.exists(), "the retry queues the line A never queued")
+        r = self.hold(str(self.result_file))  # caller B finds A's unarmed record, no line yet
+        self.assertEqual(r.returncode, hatch_cli.REPLY_POSTED, r.stderr)
+        self.assertTrue(hatch_cli._hold_notice(self.results, self.TID).exists())
+        with self.assertRaises(ValueError):
+            task_hold.arm_notice(self.results, self.TID, owner)  # A's generation is retired
 
     def test_a_publish_that_wrote_nothing_installs_no_hold(self):
         self.add_task(self.TID, "$ev1")
@@ -5103,7 +5237,11 @@ class Hold(Base):
             self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_UNCONFIRMED)
         self.assertFalse(self.notice.exists())
         self.assertEqual(self.hold(str(self.result_file)).returncode, hatch_cli.REPLY_POSTED)
-        self.assertTrue(self.notice.exists())
+        self.assertTrue(hatch_cli._hold_notice(self.results, self.TID).exists(),
+                        "the retry queues the next generation")
+        posts = []
+        self.drain_pass(posts)
+        self.assertEqual(len(posts), 1)
 
     def test_a_line_the_drain_already_delivered_is_never_queued_again(self):
         self.add_task(self.TID, "$ev1")
@@ -5134,7 +5272,7 @@ class Hold(Base):
         for content in ("", "   \n", "something else\n"):
             with self.subTest(content=content):
                 self.add_task(self.TID, "$ev1")
-                task_hold.mark_notice(self.results, self.TID)
+                self.armed_mark()
                 self.notice.write_text(content)
                 r = self.hold(str(self.result_file))
                 self.assertEqual(r.returncode, hatch_cli.REPLY_UNCONFIRMED, r.stdout)
@@ -5208,7 +5346,7 @@ class Hold(Base):
 
     def test_only_a_claim_the_drain_makes_counts_as_queued(self):
         self.add_task(self.TID, "$ev1")
-        task_hold.mark_notice(self.results, self.TID)
+        self.armed_mark()
         stray = self.results / f"{self.notice.stem}.sending.x"
         stray.write_text(self.line())
         self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
@@ -5221,7 +5359,7 @@ class Hold(Base):
 
     def test_a_leading_zero_claim_is_neither_queued_nor_live(self):
         self.add_task(self.TID, "$ev1")
-        task_hold.mark_notice(self.results, self.TID)
+        self.armed_mark()
         stray = self.results / f"{self.notice.stem}.sending.0{os.getpid()}"
         stray.write_text(self.line())
         self.assertEqual(hatch_cli._line_state(self.results, self.TID, self.line()), "unknown")
@@ -5259,7 +5397,7 @@ class Hold(Base):
 
     def test_an_adjacent_infix_claim_is_not_this_notices_claim(self):
         self.add_task(self.TID, "$ev1")
-        task_hold.mark_notice(self.results, self.TID)
+        self.armed_mark()
         for infix in ("x", "5"):  # `<stem>.sending.5.sending.<pid>` parses a canonical pid too
             with self.subTest(infix=infix):
                 fake = self.results / f"{self.notice.stem}.sending.{infix}.sending.{os.getpid()}"
@@ -5276,7 +5414,7 @@ class Hold(Base):
 
     def test_a_pid_past_the_native_range_is_no_claim(self):
         self.add_task(self.TID, "$ev1")
-        task_hold.mark_notice(self.results, self.TID)
+        self.armed_mark()
         for pid in (os.getpid() + 2**32, 2**31):
             with self.subTest(pid=pid):
                 alias = self.results / f"{self.notice.stem}.sending.{pid}"
@@ -5497,6 +5635,32 @@ class TaskHold(unittest.TestCase):
             token = task_hold.place(self.results, "task-1784700000001")
         self.assertIsNotNone(token)
         self.assertEqual(task_hold.read(self.results, "task-1784700000001")["token"], token)
+
+    def test_a_notice_record_moves_through_generations_and_judges_only_hold_lines(self):
+        from ag2_sparrow.proactive_routing import about_task_filename, about_task_ts
+        tid = "task-1784700000003"
+        self.assertIsNone(task_hold.notice_record(self.results, tid))
+        token = task_hold.mark_notice(self.results, tid)
+        self.assertEqual(task_hold.notice_record(self.results, tid),
+                         {"token": token, "gen": 0, "armed": False})
+        token2, gen = task_hold.advance_notice(self.results, tid, token)
+        self.assertEqual(gen, 1)
+        with self.assertRaises(ValueError):
+            task_hold.advance_notice(self.results, tid, token)  # a retired generation's token
+        task_hold.arm_notice(self.results, tid, token2)
+        with self.assertRaises(ValueError):
+            task_hold.advance_notice(self.results, tid, token2)  # an armed one is not replaced
+        task_hold.place(self.results, tid)
+        self.assertEqual(about_task_ts(about_task_filename(tid, 1)), 1)
+        self.assertIsNone(about_task_ts("proactive-1.txt"))
+        self.assertIsNone(task_hold.line_veto(self.results, tid, 1), "armed, held: sent")
+        self.assertIsNotNone(task_hold.line_veto(self.results, tid, 0), "a retired generation")
+        self.assertIsNone(task_hold.line_veto(self.results, tid, None), "not about a task")
+        self.assertIsNone(task_hold.line_veto(self.results, tid, 1784700000000), "a timestamped message")
+        (self.dir / f"{tid}.notice").write_text(json.dumps({"token": "t", "gen": -1}))
+        with self.assertRaises(ValueError):
+            task_hold.notice_record(self.results, tid)
+        self.assertIn("could not be checked", task_hold.line_veto(self.results, tid, 1))
 
     def test_a_fifo_at_a_hold_marker_reads_as_no_hold_without_blocking(self):
         tid = "task-1784700000002"
@@ -6037,7 +6201,7 @@ class DeliveryDestination(unittest.TestCase):
         raw = (state / "auth" / "lane-identity.json").read_text()
         self.assertNotIn(secret, raw)
         rec = json.loads(raw)
-        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "ts", "send_lock"})
+        self.assertEqual(set(rec), {"agent_id", "instance", "pid", "start", "ts", "send_lock"})
         self.assertEqual((rec["agent_id"], rec["instance"], rec["pid"]), ("@a:lane.space", "", os.getpid()))
         self.assertEqual(hatch_cli._lane_homeserver({"STATE_DIR": str(state)}, ""), "lane.space")
         self.assertEqual(sorted(p.name for p in (state / "auth").iterdir()),

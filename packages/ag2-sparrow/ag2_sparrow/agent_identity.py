@@ -38,6 +38,7 @@ from . import gateway_credential_sources as _sources
 from .outbox import valid_pid
 from .persisted_number import bounded_number
 from .gateway_instance import suffix as _instance_suffix
+from .task_io import start_time
 
 ENV_KEYS = ("AGENT_MXID", "AGENT_ID")
 FILE_KEYS = ("AGENT_MXID", "AGENT_ID", "AG2SPACE_USER_ID")
@@ -214,6 +215,23 @@ def _invalidate_at(dfd: int, name: str, instance: str) -> None:
     os.close(fd)
 
 
+def _poison_at(dfd: int, name: str) -> None:
+    """Leave the record empty in place, or create it empty: it reads invalid, never absent, so a
+    failed publication is not taken for a drain that never publishes. Truncation needs no space."""
+    os.close(os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dfd))
+
+
+_OWN_START: dict = {}
+
+
+def _own_start() -> "str | None":
+    pid = os.getpid()
+    if pid not in _OWN_START:
+        _OWN_START.clear()
+        _OWN_START[pid] = start_time(pid)
+    return _OWN_START[pid]
+
+
 def _well_formed(rec: dict, instance: str) -> "tuple[dict, float] | None":
     if rec.get("instance") != (instance or "") or rec.get("retracted"):
         return None
@@ -227,13 +245,14 @@ def _well_formed(rec: dict, instance: str) -> "tuple[dict, float] | None":
 def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None" = None) -> dict:
     """Record, under the lane lock, the identity the live drain of `instance` resolved, so a reader
     that must not open the credential env sees that drain's lane; returns the record written.
-    It holds the id, instance, pid, a timestamp and, when given, the proactive `send_lock` protocol
-    the drain honours. On a failed write the old record is invalidated in the same locked step, and
-    OSError is raised either way."""
+    It holds the id, instance, pid, the process's start time (which binds it to that process, not
+    to a reused pid), a timestamp and, when given, the proactive `send_lock` protocol the drain
+    honours. On a failed write the record is emptied in the same locked step, so it reads invalid,
+    and OSError is raised either way."""
     if valid_pid(os.getpid()) is None:
         raise OSError(f"pid {os.getpid()} is outside the pid domain readers accept")
     record = {"agent_id": (agent_id or "").strip(), "instance": instance or "",
-              "pid": os.getpid(), "ts": time.time(),
+              "pid": os.getpid(), "start": _own_start(), "ts": time.time(),
               **({"send_lock": send_lock} if send_lock is not None else {})}
     dfd = _auth_dir(state_dir, create=True)
     try:
@@ -241,7 +260,8 @@ def publish_lane(state_dir, instance: str, agent_id: str, send_lock: "int | None
             try:
                 _write_at(dfd, _lane_name(instance), record)
             except OSError:
-                _invalidate_at(dfd, _lane_name(instance), instance)
+                with contextlib.suppress(OSError):
+                    _poison_at(dfd, _lane_name(instance))
                 raise
     finally:
         _close(dfd)

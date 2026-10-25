@@ -32,9 +32,9 @@ UNDELIVERED_DIR = "undelivered"
 CLAIM_INFIX = ".sending."
 # A directory of its own, so no reader listing the results dir sees a lock file.
 SEND_LOCK_DIR = ".proactive-send-lock"
-# The protocol a drain that sends under send_lock publishes in its lane record; a producer relying
-# on it refuses to act for a live drain without it.
-SEND_LOCK_PROTOCOL = 2
+# The protocol a drain that sends under send_lock, and sends a hold line only once armed, publishes
+# in its lane record; a producer relying on it refuses to act for a live drain without it.
+SEND_LOCK_PROTOCOL = 3
 # The drain's whole send under the send lock, every phase included.
 SEND_DEADLINE_S = 15.0
 # The longest a producer waits for the send lock, above the drain's longest send under it; the

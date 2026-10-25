@@ -324,7 +324,8 @@ from .bounded_file_read import read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
-from .proactive_routing import PROACTIVE_OUTBOX_DIRNAME, about_task, proactive_filename, proactive_item_id
+from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
+                                proactive_item_id)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -349,6 +350,7 @@ from .result_publish import (is_staged_for as _is_staged_for, publish_staged as 
                              stage_text as _stage_text)
 from .dedup_recovery import plan_dedup_recovery, classify_holder_delivery
 from . import pool_record
+from . import task_hold
 from .send_allowlist import is_path_sendable
 from .workspace_lock import acquire as _ws_acquire, heartbeat as _ws_heartbeat, release as _ws_release
 from .workspace_lock import DEFAULT_STALE_SECONDS as _WS_STALE_SECONDS
@@ -5817,6 +5819,9 @@ def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
         return None
     if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
         return "the task has been answered"
+    held = task_hold.line_veto(RESULTS_DIR, tid, about_task_ts(item_id.rsplit("~", 1)[0] + ".txt"))
+    if held is not None:
+        return held
     try:
         veto = PROACTIVE_DISPATCH_GATE(tid) if PROACTIVE_DISPATCH_GATE is not None else None
         if veto is None and PROACTIVE_ROUTE_GATE is not None:

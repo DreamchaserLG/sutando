@@ -24,6 +24,8 @@ LOCK_NAME = ".lock"
 OWNER_GO = "owner-go"
 _REASON_RE = re.compile(r"[a-z0-9-]{1,40}")
 _MAX_BYTES = 4096
+# A hold line about a task is named with its notice generation, far below any message timestamp.
+NOTICE_GEN_LIMIT = 10**6
 # Epoch seconds before year 5138: bounds `since` to a sane, finite range.
 _MAX_EPOCH = 1e11
 SINCE_SKEW_S = 5.0
@@ -76,14 +78,20 @@ def _open_dir(result_dir: Path, create: bool) -> "int | None":
     return fd
 
 
-def _read_at(dfd: int, name: str) -> "dict | None":
-    text = bounded_file_read.read_regular(name, _MAX_BYTES, dir_fd=dfd, follow=False)[0]
+def _json_at(dfd: int, name: str) -> "tuple[dict | None, str]":
+    """(object, "") or (None, why): "" absent, else read_regular's refusal or "not a record"."""
+    text, why = bounded_file_read.read_regular(name, _MAX_BYTES, dir_fd=dfd, follow=False)
     if text is None:
-        return None
+        return None, why
     try:
         record = json.loads(text, parse_constant=lambda c: None)
     except ValueError:
-        return None
+        return None, "not a record"
+    return (record, "") if isinstance(record, dict) else (None, "not a record")
+
+
+def _read_at(dfd: int, name: str) -> "dict | None":
+    record = _json_at(dfd, name)[0]
     if not (isinstance(record, dict) and isinstance(record.get("reason"), str)
             and _REASON_RE.fullmatch(record["reason"]) and _valid_since(record.get("since"))
             and isinstance(record.get("token"), str) and record["token"]):
@@ -183,23 +191,8 @@ def _unlink_owned(dfd: int, name: str, token: "str | None") -> bool:
     """Unlink `name` when `token` is None or is the token the file records; under the
     dir lock, so the file read is the file removed."""
     with _locked(dfd):
-        if token is not None:
-            try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
-            except OSError:
-                return False
-            try:
-                raw = os.read(fd, _MAX_BYTES + 1)
-            except OSError:
-                return False
-            finally:
-                os.close(fd)
-            try:
-                record = json.loads(raw.decode("utf-8"), parse_constant=lambda c: None)
-            except (UnicodeDecodeError, ValueError):
-                return False
-            if not (isinstance(record, dict) and record.get("token") == token):
-                return False
+        if token is not None and (_json_at(dfd, name)[0] or {}).get("token") != token:
+            return False
         try:
             os.unlink(name, dir_fd=dfd)
         except FileNotFoundError:
@@ -224,11 +217,99 @@ def _notice_name(tid: str) -> str:
 
 
 def mark_notice(result_dir: Path, tid: str) -> "str | None":
-    """Record, durably and once, that this caller queues the task's one notice: its token,
-    or None when another caller already did."""
+    """Record, durably and once, that this caller queues the task's first notice, generation 0,
+    not yet armed: its token, or None when another caller already did."""
     token = secrets.token_hex(16)
-    body = json.dumps({"token": token}).encode("utf-8")
+    body = json.dumps({"token": token, "gen": 0, "armed": False}).encode("utf-8")
     return token if _create_at(result_dir, _notice_name(tid), body) else None
+
+
+def _notice_fields(record: dict) -> dict:
+    gen = record.get("gen")
+    if not (isinstance(record.get("token"), str) and isinstance(record.get("armed", False), bool)
+            and (gen is None or (type(gen) is int and 0 <= gen < NOTICE_GEN_LIMIT))):
+        raise ValueError("the notice record is not one a hold wrote")
+    return {"token": record["token"], "gen": gen, "armed": record.get("armed", False)}
+
+
+def notice_record(result_dir: Path, tid: str) -> "dict | None":
+    """{"token", "gen", "armed"} of the task's notice record, None when it has none. "gen" is
+    None for a record from before generations. OSError or ValueError when it cannot be read."""
+    name = _notice_name(tid)
+    dfd = _open_dir(result_dir, create=False)
+    if dfd is None:
+        return None
+    try:
+        record, why = _json_at(dfd, name)
+    finally:
+        os.close(dfd)
+    if record is None:
+        if not why:
+            return None
+        raise OSError(f"the notice record of {tid} is unusable: {why}")
+    return _notice_fields(record)
+
+
+def _rewrite_notice(result_dir: Path, tid: str, token: str, change) -> dict:
+    """Replace the notice record `token` names with `change(fields)`, in one locked step."""
+    name = _notice_name(tid)
+    dfd = _held_dir(result_dir, create=False)
+    try:
+        with _locked(dfd):
+            record, why = _json_at(dfd, name)
+            fields = _notice_fields(record) if record is not None else None
+            if fields is None or fields["token"] != token or fields["gen"] is None:
+                raise ValueError(f"the notice record of {tid} changed ({why or 'another token'})")
+            new = change(fields)
+            tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd)
+            try:
+                try:
+                    os.write(fd, json.dumps(new).encode("utf-8"))
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+            finally:
+                _quietly(os.unlink, tmp, dir_fd=dfd)
+            return new
+    finally:
+        os.close(dfd)
+
+
+def advance_notice(result_dir: Path, tid: str, token: str) -> "tuple[str, int]":
+    """Retire the record's unarmed generation for the next one: (new token, new gen)."""
+    new_token = secrets.token_hex(16)
+
+    def nxt(fields):
+        if fields["armed"] or fields["gen"] + 1 >= NOTICE_GEN_LIMIT:
+            raise ValueError(f"the notice of {tid} is armed or out of generations")
+        return {"token": new_token, "gen": fields["gen"] + 1, "armed": False}
+    return new_token, _rewrite_notice(result_dir, tid, token, nxt)["gen"]
+
+
+def arm_notice(result_dir: Path, tid: str, token: str) -> None:
+    """Mark the record's generation as the one line a hold stands on, which a drain may send."""
+    _rewrite_notice(result_dir, tid, token, lambda f: {**f, "armed": True})
+
+
+def line_veto(result_dir: Path, tid: str, ts: "int | None") -> "str | None":
+    """Asked at a drain's send of a message about `tid` named with `ts`: why a hold line (ts below
+    NOTICE_GEN_LIMIT) must not be sent, or None. Only the record's own generation, once armed,
+    with its hold standing, is sent; a record from before generations is not judged."""
+    if ts is None or not 0 <= ts < NOTICE_GEN_LIMIT:
+        return None
+    try:
+        fields = notice_record(result_dir, tid)
+    except (OSError, ValueError) as e:
+        return f"its hold could not be checked ({e})"
+    if fields is not None and fields["gen"] is None:
+        return None
+    if fields is None or fields["gen"] != ts:
+        return "a later hold line replaced it, or no hold queued it"
+    if not fields["armed"] or read(result_dir, tid) is None:
+        return "no hold stands on it"
+    return None
 
 
 def clear_notice(result_dir: Path, tid: str, token: str) -> None:

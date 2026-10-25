@@ -138,6 +138,12 @@ def about_task(name) -> "str | None":
     return m.group(1) if m else None
 
 
+def about_task_ts(name) -> "int | None":
+    """The `<ts>` a proactive message about a task was named with, or None for any other name."""
+    m = _ABOUT_TASK_RE.match(Path(name).name)
+    return int(m.group(2)) if m else None
+
+
 def proactive_destination(name) -> "str | None":
     """The declared destination, or None for legacy/undestined names. An
     unrecognized tag still reads as a destination: a file aimed at a channel
