@@ -1168,14 +1168,21 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
 def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
                workspace: Optional[Path] = None, env_only: bool = False) -> dict:
     """The plan entry for `instance`; with `env_only`, built from AG2_REMOTE_TOKEN_<INST> alone
-    (the fallback when the record cannot be read), never primary."""
+    (the fallback when the record cannot be read), never primary. A readable record still
+    refuses a row it marks disabled, in either mode."""
     environ = os.environ if environ is None else environ
     if env_only:
-        for inst, var in env_token_vars(environ):
-            if inst == instance:
-                return {"instance": inst, "token_ref": var, "channel_dir": channel_dir_for(inst, environ),
-                        "primary": False}
-        raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
+        try:
+            rows = _read(record_path(workspace))
+        except (SchemaError, OSError):
+            rows = []
+        var = next((v for inst, v in env_token_vars(environ) if inst == instance), "")
+        if any(r.get("disabled") and (r["instance"] == instance or (var and r["token_ref"] == var)) for r in rows):
+            raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
+        if not var:
+            raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
+        return {"instance": instance, "token_ref": var, "channel_dir": channel_dir_for(instance, environ),
+                "primary": False}
     for entry in launch_plan(environ, workspace=workspace):
         if entry["instance"] == instance:
             return entry
@@ -1287,6 +1294,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     `disconnect` or `remove` always finds the bridge it must stop. A child still without a lease
     after `LEASE_TIMEOUT_S` is killed when it is ours and the launch fails (`lease_timeout`)."""
     environ = os.environ if environ is None else environ
+    # Holding the lock to the lease is safe: the bridge's startup never reads this record.
     with locked_file(_lock_path(workspace), create_mode=0o600):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
         try:

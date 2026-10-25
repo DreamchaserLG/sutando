@@ -18,6 +18,7 @@ isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -817,9 +818,26 @@ class Record(Base):
 
     def test_write_is_atomic_and_leaves_no_temp_file(self):
         self.add()
-        names = sorted(p.name for p in C.record_path(self.ws).parent.iterdir())
-        self.assertEqual(names, sorted([C.LOCK_NAME, C.STATE_NAME]))
-        self.assertEqual(json.loads(C.record_path(self.ws).read_text())["schema_version"], 1)
+        path = C.record_path(self.ws)
+        before = path.read_bytes()
+        calls = []
+        real_replace = os.replace
+
+        def replace(src, dst):
+            calls.append((Path(src), Path(dst), Path(src).read_text()))
+            raise OSError("publish interrupted")
+        with unittest.mock.patch.object(C.os, "replace", replace), self.assertRaises(OSError):
+            self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual(len(calls), 1, "the record is published by exactly one os.replace")
+        tmp, dst, body = calls[0]
+        self.assertEqual((dst, tmp.parent), (path, path.parent), "the temp file sits beside the record")
+        self.assertIn("beta-fixture-net", body, "the whole new record was in the temp file before the swap")
+        self.assertEqual(path.read_bytes(), before, "a failed publish leaves the record as it was")
+        names = sorted(p.name for p in path.parent.iterdir())
+        self.assertEqual(names, sorted([C.LOCK_NAME, C.STATE_NAME]), "no temp file is left behind")
+        self.assertIs(os.replace, real_replace)
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        self.assertEqual(json.loads(path.read_text())["schema_version"], 1)
 
     def test_concurrent_writers_serialize_through_the_lock(self):
         errors = []
@@ -1050,6 +1068,42 @@ class Launching(Base):
                          "the lock is held across the spawn; the disconnect commits only after it")
         self.assertTrue(record["ok"])
         self.assertTrue(self.rows()[0]["disabled"])
+
+    def test_the_child_takes_its_lease_while_launch_holds_the_record_lock(self):
+        """launch holds connections.lock until the lease: a child that needed it first would stall."""
+        self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
+        script = (
+            "import os, sys, time\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "import workspace_lock as wl\n"
+            "from file_lock import try_lock_fd\n"
+            "fd = os.open(sys.argv[3], os.O_RDWR)\n"
+            "print('record-lock-free' if try_lock_fd(fd) else 'record-lock-held', flush=True)\n"
+            "os.close(fd)\n"
+            "r = wl.acquire(sys.argv[4], Path(sys.argv[2]))\n"
+            "print(r.status, flush=True)\n"
+            "time.sleep(30)\n")
+        started = []
+
+        def spawn(argv, env, log_path):
+            proc = subprocess.Popen([sys.executable, "-c", script, str(ROOT / "src"), str(self.ws),
+                                     str(C._lock_path(self.ws)), C._bridge_role(env["GATEWAY_INSTANCE"])],
+                                    stdout=subprocess.PIPE, env=isolated_child_env(), text=True)
+            started.append(proc)
+            return proc
+        try:
+            t0 = time.monotonic()
+            record = C.launch("beta-fixture-net", repo=self.repo, logs_dir=self.logs, environ={},
+                              workspace=self.ws, vault=self.vault, spawn=spawn)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(started[0].stdout.readline().strip(), "record-lock-held")
+            self.assertNotEqual(started[0].stdout.readline().strip(), "deferred")
+        finally:
+            for proc in started:
+                bridge_lease.stop(proc)
+        self.assertEqual((record["ok"], record["lease"]), (True, "held"))
+        self.assertLess(elapsed, C.LEASE_TIMEOUT_S / 2, "the lease came without waiting on the record lock")
 
     def test_reconnect_without_a_running_bridge_just_launches(self):
         self.add(TOKEN_B, fetch=agents("@s:beta-fixture.net"))
@@ -1308,6 +1362,21 @@ class Disconnect(Base):
         self.assertIn("disconnected; reconnect it", str(cm.exception))
         self.assertNotIsInstance(cm.exception, C.UnknownConnection)
         self.assertEqual(self.spawned, [])
+
+    def test_env_only_still_refuses_a_row_a_readable_record_marks_disabled(self):
+        C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
+        env = {"AG2_REMOTE_TOKEN_BETA_FIXTURE_NET": TOKEN_B}
+        with self.assertRaises(C.ConnectionsError) as cm:
+            C.launch("beta-fixture-net", repo=self.ws / "repo", logs_dir=self.ws / "logs", environ=env,
+                     workspace=self.ws, vault=self.vault, spawn=self.spawn, env_only=True)
+        self.assertIn("disconnected; reconnect it", str(cm.exception))
+        self.assertNotIsInstance(cm.exception, C.UnknownConnection)
+        with self.assertRaises(C.ConnectionsError, msg="the env spelling of the instance names the same row"):
+            C.plan_entry("beta_fixture_net", env, workspace=self.ws, env_only=True)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(C.plan_entry("alpha_fixture_net", {"AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET": TOKEN_A},
+                                      workspace=self.ws, env_only=True)["instance"], "alpha_fixture_net",
+                         "an enabled row still launches from the environment")
 
     def test_reconnect_clears_the_flag_and_launches(self):
         C.disconnect("beta-fixture-net", workspace=self.ws, kill=lambda *a: None)
