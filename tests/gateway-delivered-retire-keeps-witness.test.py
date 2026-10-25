@@ -833,5 +833,103 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
                 self.assertEqual(lane.posts, [], "a PARKED send is never repeated on doubt")
 
 
+
+class DecidedClaimEdges(unittest.TestCase):
+    """The reconciler's and placer's refusal paths, each called directly on one lane."""
+
+    def setUp(self):
+        self.lane = Lane(gb, scratch("gw-decided-edges-"))
+        self.res = self.lane.results
+        self.root = self.res / ".outbox-ag2space-proactive"
+        for name, value in (("RESULTS_DIR", self.res), ("ARCHIVE_RESULTS_DIR", self.res / "archive")):
+            patcher = mock.patch.object(gb, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.logs = []
+        patcher = mock.patch.object(gb, "_log", self.logs.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def retained(self, body: bytes, status: str = "QUEUED", epoch: int = 1) -> Path:
+        item = gb._proactive_item_id("proactive-1", body.decode().strip())
+        outbox._write_item(self.root, item, {"item_id": item, "status": status, "attempts": 0,
+                                             "resend_epoch": epoch, "payload": body.decode()})
+        digest = __import__("hashlib").sha256(body).hexdigest()[:32]
+        r = self.res / f".proactive-1{gb._DECIDED_INFIX}{digest}-e0.7"
+        r.write_bytes(body)
+        return r
+
+    def test_a_name_it_does_not_own_is_left_alone(self):
+        r = self.res / f".proactive-1{gb._DECIDED_INFIX}not-a-digest"
+        r.write_text("x\n")
+        gb._reconcile_decided(r)
+        self.assertEqual(r.read_text(), "x\n")
+
+    def test_an_unreadable_retained_original_is_kept(self):
+        r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-e0.1"
+        r.mkdir()
+        gb._reconcile_decided(r)
+        self.assertTrue(r.is_dir())
+
+    def test_new_bytes_that_cannot_be_reclaimed_are_kept_where_they_are(self):
+        r = self.res / f".proactive-1{gb._DECIDED_INFIX}{'0' * 32}-e0.1"
+        r.write_text("new bytes\n")
+        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", side_effect=OSError(5, "EIO")):
+            gb._reconcile_decided(r)
+        self.assertEqual(r.read_text(), "new bytes\n")
+        self.assertFalse((self.res / "proactive-1.txt").exists())
+
+    def test_a_requeue_is_not_handed_back_over_a_newer_live_file(self):
+        r = self.retained(b"body\n")
+        (self.res / "proactive-1.txt").write_text("a newer body\n")
+        gb._reconcile_decided(r)
+        self.assertEqual((self.res / "proactive-1.txt").read_text(), "a newer body\n")
+        self.assertTrue(r.exists(), "the decision epoch is not advanced")
+
+    def test_a_requeue_already_live_is_only_recorded(self):
+        r = self.retained(b"body\n")
+        (self.res / "proactive-1.txt").write_text("body\n")
+        gb._reconcile_decided(r)
+        self.assertFalse(r.exists())
+        self.assertEqual(len(list(self.res.glob(f".proactive-1{gb._DECIDED_INFIX}*-e1.7"))), 1)
+
+    def test_a_requeue_with_no_copy_left_is_published_fresh(self):
+        r = self.retained(b"body\n")
+        gb._reconcile_decided(r)
+        self.assertEqual((self.res / "proactive-1.txt").read_text(), "body\n")
+        self.assertTrue(any("handed back" in m for m in self.logs))
+
+    def test_a_parked_copy_that_cannot_move_is_retried_later(self):
+        r = self.retained(b"body\n")
+        parked = self.res / "undelivered"
+        parked.mkdir()
+        (parked / "proactive-1-1.txt").write_text("body\n")
+        with mock.patch.object(gb.undelivered_quarantine, "rename_noreplace", side_effect=OSError(5, "EIO")):
+            gb._reconcile_decided(r)
+        self.assertFalse((self.res / "proactive-1.txt").exists())
+        self.assertTrue(r.exists(), "the decision epoch is not advanced")
+
+    def test_a_copy_that_cannot_be_placed_leaves_the_claim(self):
+        item = gb._proactive_item_id("proactive-1", "parked body")
+        outbox._write_item(self.root, item, {"item_id": item, "status": "PARKED", "attempts": 0,
+                                             "payload": "parked body\n"})
+        claim = self.res / f"proactive-1.sending.{_dead_pid()}.1"
+        claim.write_text("parked body\n")
+        with mock.patch.object(gb, "_publish_text_whole", side_effect=OSError(28, "No space left on device")):
+            gb._recover_orphan_proactive()
+        self.assertEqual(claim.read_text(), "parked body\n")
+        self.assertEqual(list((self.res / "undelivered").glob("proactive-1-*")), [], "nothing parked")
+
+    def test_a_superseded_copy_needs_the_claims_own_bytes(self):
+        claim = self.res / "proactive-1.sending.1.1"
+        claim.write_text("body\n")
+        self.assertIsNone(gb._retire_superseded_parked_copy(claim, "proactive-1", None, 0))
+        self.assertTrue(claim.exists())
+
+    def test_a_claim_that_is_not_utf8_is_unknown(self):
+        claim = self.res / "proactive-1.sending.1.1"
+        claim.write_bytes(b"\xff\xfe not text\n")
+        self.assertEqual(gb._claim_receipt(claim, "proactive-1"), ("unknown", None, None))
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
