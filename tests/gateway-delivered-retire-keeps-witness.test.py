@@ -1536,11 +1536,11 @@ class DeliveredNoticeKeepsItsLinkAndIsNeverResent(unittest.TestCase):
         lane.write("proactive-2.txt", "healthy sibling\n")
         real = gb._reconcile_decided
 
-        def reconcile(r):
+        def raising_for_one(r):
             if r.name.startswith(".proactive-3"):
                 raise RuntimeError("an uncertain original")
             return real(r)
-        with mock.patch.object(gb, "_reconcile_decided", reconcile):
+        with mock.patch.object(gb, "_reconcile_decided", raising_for_one):
             for _ in range(2):
                 try:
                     lane.drain()
