@@ -13,7 +13,7 @@
       -> {"ok": every room's run succeeded, "action": "refreshed", "rooms": {room: {"code": exit code,
           ...that room's result}}}: one --if-newer run per room the marker has an entry for, in the
           audience recorded for it; a room whose record is already current makes no room call. The
-          skill's launch hook (manifest `on_launch`, scripts/on_launch.py) runs it on every core
+          skill's launch hook (its `on_launch` script, scripts/on_launch.py) runs it on every core
           launch, so an update's newer list reaches every page. A refresh (any --if-newer run) never
           creates a page: a deleted one is "skipped" ("page deleted"), a creation cut short is left to
           the next explicit publish ("creation pending"). It never rewrites a legacy entry with no
