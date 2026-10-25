@@ -140,6 +140,49 @@ root = build([f"archive/2026-05/{F}", f"archive/2026-06/{F}", f"archive/2026-07/
 check("months are searched in ascending order",
       ltp.find_archived_task(root, TID) == root / "archive" / "2026-05" / F)
 
+# Month discovery is cached per archive-root mtime (#5879): unchanged roots
+# are not re-scanned, new month dirs are seen next call, failures not cached.
+root = build([f"archive/2026-07/{F}"])
+ltp.find_archived_task(root, TID)          # prove the uncached path first
+
+scans = 0
+_real_scandir = ltp.os.scandir
+
+
+def _counting_scandir(path):
+    global scans
+    if str(path).endswith("archive"):
+        scans += 1
+    return _real_scandir(path)
+
+
+ltp.os.scandir = _counting_scandir
+ltp._MONTH_DIRS_CACHE.clear()               # count from a cold cache
+try:
+    for _ in range(5):
+        got = ltp.find_archived_task(root, TID)
+    check("an unchanged archive root is scanned exactly once across repeated lookups",
+          scans == 1, f"scans={scans}")
+    check("cached lookups still resolve the file", got == root / "archive" / "2026-07" / F, str(got))
+    (root / "archive" / "2026-08").mkdir()
+    got = ltp.find_archived_task(root, TID)
+    check("a newly created month dir invalidates the cache on the next call",
+          scans == 2, f"scans={scans}")
+finally:
+    ltp.os.scandir = _real_scandir
+
+# A root that could not be scanned (unreadable) must not leave a "no months"
+# answer cached: once it becomes readable, the next call sees the partition.
+if os.getuid() != 0:
+    root = build([f"archive/2026-05/{F}"])
+    (root / "archive").chmod(0o000)
+    check("unreadable root still degrades to no-months under the cache",
+          ltp.find_archived_task(root, TID) is None)
+    (root / "archive").chmod(0o755)
+    check("an unreadable root is not cached: readable again finds the month file",
+          ltp.find_archived_task(root, TID) == root / "archive" / "2026-05" / F,
+          str(ltp.find_archived_task(root, TID)))
+
 if failures:
     print(f"\n{len(failures)} failure(s): {failures}")
     sys.exit(1)
