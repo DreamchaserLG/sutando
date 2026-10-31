@@ -783,7 +783,7 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
-# Month-dir discovery is cached against the archive root's own mtime (#5879).
+# Month-dir discovery is cached against the archive root's own mtime.
 _MONTH_DIRS_CACHE: dict[str, tuple[int, list[str]]] = {}
 _MONTH_DIRS_CACHE_MAX = 128
 
@@ -799,7 +799,7 @@ def _month_partitions(archive_root: Path) -> list[str]:
     scandir on the hot path: on a fixture sized like a long-lived host
     (50k flat entries + 24 month dirs) the rediscovery was ~94% of every
     orphan-scan tick — pure interpreter time re-matching month names that had
-    not changed, while the bridge busy-looped at ~100% of one core (#5879).
+    not changed, while the bridge busy-looped at ~100% of one core.
 
     Entries are keyed by the root's st_mtime_ns so a hit can never go stale:
     creating, removing or renaming anything directly under the root —
