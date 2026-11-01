@@ -175,18 +175,29 @@ finally:
 # once it becomes readable, the next call sees the partition.
 #
 # Two failures stand between the caller and that guarantee, and only one of them
-# is reachable through the permission bits:
+# is this PR's:
 #
-#   stat()   -> raises  -> no cache key exists to compare against
-#   scandir() -> raises -> answered as "no months", and nothing is stored
+#   scandir() -> raises -> answered as "no months", nothing stored   <- the cache
+#   stat()    -> raises -> no cache key exists to compare against    <- pre-existing
 #
-# Both are asked below in the form that actually reproduces here, rather than
-# through a chmod: `0o300` (no read, keeps search) makes `os.scandir` fail for
-# everyone, but running as root drops the DAC read check on the directory, so
-# the same fixture that should report no-months reports `2026-05` instead — the
-# chmod version passes as root for the wrong reason and fails as a normal user.
-# The stat failure is the one non-root CI hits through `Path.exists()` in
-# `newest_archived`, which re-raises EACCES rather than returning False.
+# So each is asked on the function that owns it, and separately.
+#
+# The scandir() failure goes through `find_archived_task` with ONLY `os.scandir`
+# broken. `Path.stat` is deliberately restored for that call: `newest_archived`
+# reaches `base.exists()`, and on 3.9/3.12/3.13 pathlib re-raises EACCES from
+# `Path.stat()` instead of returning False — production has no handler for it.
+# Patching stat there would abort the file on a failure this PR does not
+# introduce, and the check would report pre-existing `newest_archived` behaviour
+# rather than the cache contract it is named for.
+#
+# The stat() failure — no cache key, so the scan still decides and failing still
+# stores nothing — is asked on `_month_partitions` directly, with both denied:
+# that is an unreadable root in full, and the place the no-months answer is owed.
+#
+# Neither is asked through a chmod: `0o300` (no read, keeps search) fails
+# `os.scandir` for everyone, but root drops the DAC read check, so the same
+# fixture reports `2026-05` there — the chmod form passes as root for the wrong
+# reason.
 root = build([f"archive/2026-05/{F}"])
 archive_root = root / "archive"
 
@@ -201,16 +212,29 @@ def denied_permission(*_a, **_kw):
 def lookups_that_break() -> dict[str, object]:
     """The answers a caller gets while the root is unreadable."""
     answers: dict[str, object] = {}
+
+    # A scan that cannot read the root is "no months", not an error, and the
+    # failed read is not stored — otherwise the partition would stay invisible
+    # after the root becomes readable again.
     ltp._MONTH_DIRS_CACHE.clear()
     ltp.os.scandir = denied_permission
-    Path.stat = denied_permission
     try:
         answers["find"] = ltp.find_archived_task(root, TID)
-        answers["partition"] = ltp._month_partitions(archive_root)
         answers["cached"] = str(archive_root) in ltp._MONTH_DIRS_CACHE
     finally:
         ltp.os.scandir = real_scandir
+
+    # An unstatable root has no cache key to compare against, so the scan
+    # decides — and failing, it still stores nothing.
+    Path.stat = denied_permission
+    ltp.os.scandir = denied_permission
+    try:
+        answers["partition"] = ltp._month_partitions(archive_root)
+        answers["cached"] = (answers["cached"]
+                             or str(archive_root) in ltp._MONTH_DIRS_CACHE)
+    finally:
         Path.stat = real_stat
+        ltp.os.scandir = real_scandir
     return answers
 
 
